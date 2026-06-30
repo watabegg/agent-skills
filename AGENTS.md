@@ -4,7 +4,7 @@ A skill is a set of local instructions stored in a `SKILL.md` file.
 
 ### Available skills
 
-- japanese-tech-writing: 日本語の質問回答と技術文書の文章規範。整形（読みやすい段落分け、引用ブロック、脚注、コラム記法）、段落と論証の構成（パラグラフライティング）、論証の厳密さ（ツッコミどころの除去）、読み手の負荷の管理、視点と語り、演出の抑制、LLM っぽい空句の禁止、冗長の排除を定める。日本語で回答するすべての質問、技術書の章・草稿・記事・解説文の執筆、推敲・リライト、設計、実装方針、コードレビュー、調査結果、作業報告を書くときに使用する。 (file: skills/japanese-tech-writing/SKILL.md)
+- japanese-tech-writing: 日本語の長文・高負荷な技術文書を書くときの文章規範。Use for substantial Japanese deliverables such as design docs, spec Markdown, implementation plans, code review reports, investigation reports, technical articles, book chapters, and serious rewrites or proofreading. Do not use for casual chat, short status updates, simple Q&A, command results, or brief final reports. (file: skills/japanese-tech-writing/SKILL.md)
 - pencil-pencli: Safely inspect, edit, validate, and export Pencil design files through the Pencil headless CLI. Use whenever Codex needs to work with Pencil, PenCLI, design.pen, *.pen, *.pencli, encrypted Pencil design files, or any request to read/change/export a Pencil canvas or design file. Prefer `pencil interactive` headless mode over direct MCP tool calls; never inspect encrypted Pencil files with shell reads, grep, cat, sed, Python, or normal filesystem tools. (file: skills/pencil-pencli/SKILL.md)
 
 ### How to use skills

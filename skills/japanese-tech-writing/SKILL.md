@@ -1,6 +1,6 @@
 ---
 name: japanese-tech-writing
-description: 日本語の質問回答と技術文書の文章規範。整形（読みやすい段落分け、引用ブロック、脚注、コラム記法）、段落と論証の構成（パラグラフライティング）、論証の厳密さ（ツッコミどころの除去）、読み手の負荷の管理、視点と語り、演出の抑制、LLM っぽい空句の禁止、冗長の排除を定める。日本語で回答するすべての質問、技術書の章・草稿・記事・解説文の執筆、推敲・リライト、設計、実装方針、コードレビュー、調査結果、作業報告を書くときに使用する。
+description: 日本語の長文・高負荷な技術文書を書くときの文章規範。Use for substantial Japanese deliverables such as design docs, spec Markdown, implementation plans, code review reports, investigation reports, technical articles, book chapters, and serious rewrites or proofreading. Do not use for casual chat, short status updates, simple Q&A, command results, or brief final reports.
 ---
 
 # 日本語技術文書の文章規範
@@ -11,7 +11,9 @@ description: 日本語の質問回答と技術文書の文章規範。整形（�
 
 ## 本文
 
-日本語で質問に答えるとき、または技術的な原稿（書籍の章、記事、解説文）を書く・推敲するときは、以下の規範に従う。
+日本語の長文・高負荷な技術文書を書くとき、または技術的な原稿（設計書、仕様書、実装計画、コードレビュー、調査報告、書籍の章、記事、解説文）を推敲するときは、以下の規範に従う。
+
+短い進捗報告、単純な質問への回答、コマンド結果の要約、数行の最終報告、通常の会話ではこの Skill を使わない。短い回答では、通常の日本語で簡潔に返す。
 
 ## 整形
 
