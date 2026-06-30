@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pencil / PenCLI"
+  short_description: "Pencil design files via MCP"
+  default_prompt: "Use $pencil-pencli to inspect or edit design.pen safely through the Pencil MCP tools."
