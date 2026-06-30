@@ -67,7 +67,7 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - 段落構成、論証の厳密さ、読み手の負荷、LLM っぽい表現の抑制を扱う。
   - 短い進捗報告、単純な質問回答、通常の会話では使わない。
 - 出典:
-  - この Skill は k16shikano 氏の Gist「日本語技術文書の文章規範」（https://gist.github.com/k16shikano/fd287c3133457c4fd8f5601d34aa817d）を元にしたものです。
+  - この Skill は [k16shikano 氏の Gist「日本語技術文書の文章規範」](https://gist.github.com/k16shikano/fd287c3133457c4fd8f5601d34aa817d) を元にしたものです。
   - この repo では Codex Skill として使うための frontmatter と、個人運用上の調整を加えています。
 - 主な利用シーン:
   - 設計書、仕様書、実装計画、技術記事の執筆や推敲。
