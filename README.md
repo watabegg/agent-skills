@@ -20,10 +20,8 @@
 ├── AGENTS.md
 ├── README.md
 └── skills/
-    ├── find-skills/
     ├── japanese-tech-writing/
-    ├── pencil-pencli/
-    └── react-doctor/
+    └── pencil-pencli/
 ```
 
 ## Codex への依頼でグローバルインストールする
@@ -62,19 +60,14 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 
 ## 各 Skill の説明
 
-### `find-skills`
-
-- 目的:
-  - ユーザーが「こういうことをする skill はあるか」と尋ねたとき、install 可能な skill を探す。
-  - 既存の agent skills ecosystem から候補を見つけ、必要なら導入手順まで案内する。
-- 主な利用シーン:
-  - 「X をやる skill ある？」「X 用の skill を探して」「機能拡張したい」など。
-
 ### `japanese-tech-writing`
 
 - 目的:
   - 日本語の質問回答、技術文書、設計、レビュー、作業報告の文章規範を定める。
   - 段落構成、論証の厳密さ、読み手の負荷、LLM っぽい表現の抑制を扱う。
+- 出典:
+  - この Skill は k16shikano 氏の Gist「日本語技術文書の文章規範」（https://gist.github.com/k16shikano/fd287c3133457c4fd8f5601d34aa817d）を元にしたものです。
+  - この repo では Codex Skill として使うための frontmatter と、個人運用上の調整を加えています。
 - 主な利用シーン:
   - 日本語で回答する通常の技術相談。
   - 技術書、記事、設計文書、コードレビュー、調査報告の執筆や推敲。
@@ -87,15 +80,6 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 - 主な利用シーン:
   - Pencil canvas の確認、編集、validation、export。
   - `pencil interactive` を使った design file の headless 操作。
-
-### `react-doctor`
-
-- 目的:
-  - React codebase の security、performance、correctness、architecture の問題を診断する。
-  - レビュー、性能改善、品質改善で actionable diagnostics を出す。
-- 主な利用シーン:
-  - React コードレビュー。
-  - パフォーマンス問題、security リスク、設計健全性の監査。
 
 ## Skill を追加する方法
 
