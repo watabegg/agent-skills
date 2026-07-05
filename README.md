@@ -23,6 +23,7 @@
     ├── japanese-tech-writing/
     ├── pencil-pencli/
     └── shinshu-portal-auth/
+        └── env.example
 ```
 
 ## Codex への依頼でグローバルインストールする
@@ -91,7 +92,12 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - DOM 構造、リンク、ボタン、入力、テーブル、スクリーンショットを調査用に要約する。
 - 主な利用シーン:
   - `*.ealps.shinshu-u.ac.jp`、`gakumu-web02.shinshu-u.ac.jp/campus`、`shinshuuniversity.sharepoint.com` のページを開いて、課題、時間割、学務情報、ACSU SharePoint リンクを確認する。
-  - `ACSU_LOGIN_ID`、`ACSU_LOGIN_PASSWORD`、`ACSU_LOGIN_MULTIFACTOR` をローカル `.env` などから読み、値をログや commit に残さず調査する。
+  - `ACSU_LOGIN_ID`、`ACSU_LOGIN_PASSWORD`、`ACSU_LOGIN_MULTIFACTOR` を `~/.config/shinshu-portal-auth/env` などから読み、値をログや commit に残さず調査する。
+- 秘匿値の置き場所:
+  - `skills/shinshu-portal-auth/env.example` を `~/.config/shinshu-portal-auth/env` にコピーして実値を入れる。
+  - `chmod 600 ~/.config/shinshu-portal-auth/env` を設定する。
+  - 別ファイルを使う場合だけ `SHINSHU_AUTH_ENV` または `--env-file` で指定する。
+  - この repo は public 前提なので、実値入りの `.env`、`env`、Cookie、Chrome profile は commit しない。
 
 ## Skill を追加する方法
 

@@ -29,8 +29,10 @@ Optional keys:
 
 Recommended storage:
 
-- Put secrets in a local `.env` or another file named by `SHINSHU_AUTH_ENV`.
-- Keep that file out of git. For public repositories, commit only `.env.example` with key names and dummy values.
+- Put secrets in `~/.config/shinshu-portal-auth/env` with mode `600`.
+- Use `skills/shinshu-portal-auth/env.example` as the template; never put real values in the skill repo.
+- Use `SHINSHU_AUTH_ENV` or `--env-file` only when you need a different local secret file.
+- Keep secret files out of git. For public repositories, commit only example files with key names and dummy values.
 - Do not copy Chrome `Login Data`, cookies, or profile state into a repo.
 - Keep generated screenshots and JSON summaries in `/tmp` or another ignored path unless the user explicitly asks for sanitized evidence.
 
@@ -39,7 +41,7 @@ Recommended storage:
 1. Confirm the target URL is one of the expected domains or a direct ACSU/Microsoft login continuation for those domains.
 2. Confirm the local secret source exists without printing values:
    ```bash
-   node -e "const fs=require('fs'); const f=process.env.SHINSHU_AUTH_ENV||'.env'; if(fs.existsSync(f)) console.log('env file present:', f)"
+   node -e "const fs=require('fs'), os=require('os'), path=require('path'); const f=process.env.SHINSHU_AUTH_ENV||path.join(os.homedir(),'.config/shinshu-portal-auth/env'); if(fs.existsSync(f)) console.log('env file present:', f)"
    ```
 3. Run the bundled script:
    ```bash
