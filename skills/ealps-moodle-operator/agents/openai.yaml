@@ -1,0 +1,4 @@
+interface:
+  display_name: "eALPS Moodle Operator"
+  short_description: "eALPSの課題確認と小テスト提出操作を安全に補助する"
+  default_prompt: "Use $ealps-moodle-operator to inspect an eALPS course, collect assignment details, and prepare safe submission steps."

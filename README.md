@@ -22,6 +22,7 @@
 └── skills/
     ├── japanese-tech-writing/
     ├── pencil-pencli/
+    ├── ealps-moodle-operator/
     └── shinshu-portal-auth/
         └── env.example
 ```
@@ -98,6 +99,17 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - `chmod 600 ~/.config/shinshu-portal-auth/env` を設定する。
   - 別ファイルを使う場合だけ `SHINSHU_AUTH_ENV` または `--env-file` で指定する。
   - この repo は public 前提なので、実値入りの `.env`、`env`、Cookie、Chrome profile は commit しない。
+
+### `ealps-moodle-operator`
+
+- 目的:
+  - `shinshu-portal-auth` で eALPS にログインした後の Moodle 操作を扱う。
+  - コースセクション、課題、資料、小テストの確認、Moodle filemanager 経由のファイル提出、小テストの回答保存と最終送信、提出状態の検証を扱う。
+  - 提出や小テスト送信のような副作用のある操作は、ユーザーが明示した場合だけ実行する。
+- 主な利用シーン:
+  - eALPS の課題一覧を確認して、ローカルに問題文や提出用コードを整理する。
+  - 課題ファイルの提出、小テスト回答、提出後の `評定のために提出済み` や `ステータス 終了` の確認を行う。
+  - `/tmp` に保存した Moodle 操作 JSON から、提出状況を表形式で要約する。
 
 ## Skill を追加する方法
 
