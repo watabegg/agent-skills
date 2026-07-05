@@ -6,6 +6,7 @@ import path from 'node:path';
 import net from 'node:net';
 
 const WISEPOINT_ALPHABET = 'ABCDEFGHIJKLMNOPRSTUVWXYZ';
+const DEFAULT_ENV_FILE = path.join(os.homedir(), '.config', 'shinshu-portal-auth', 'env');
 
 function usage() {
   console.log(`Usage:
@@ -15,7 +16,7 @@ Options:
   --url <url>        Target URL. Repeat for multiple pages in one browser session.
   --out-dir <dir>    Output directory for JSON summaries and screenshots. Default: /tmp/shinshu-portal-<timestamp>
   --env-file <file>  Env file containing ACSU_LOGIN_ID, ACSU_LOGIN_PASSWORD, ACSU_LOGIN_MULTIFACTOR.
-                     Defaults to SHINSHU_AUTH_ENV, then .env if present.
+                     Defaults to SHINSHU_AUTH_ENV, then ~/.config/shinshu-portal-auth/env, then .env.
   --timeout-ms <n>   Per-page auth/navigation loop timeout. Default: 160000.
   --headed           Do not use xvfb-run even when DISPLAY is absent.
   --help             Show this help.
@@ -55,7 +56,10 @@ function parseEnvFile(file) {
 }
 
 function loadSecrets(envFileArg) {
-  const envFile = envFileArg || process.env.SHINSHU_AUTH_ENV || (fs.existsSync('.env') ? '.env' : null);
+  const envFile = envFileArg
+    || process.env.SHINSHU_AUTH_ENV
+    || (fs.existsSync(DEFAULT_ENV_FILE) ? DEFAULT_ENV_FILE : null)
+    || (fs.existsSync('.env') ? '.env' : null);
   const fileEnv = parseEnvFile(envFile);
   const env = { ...fileEnv, ...process.env };
   const missing = ['ACSU_LOGIN_ID', 'ACSU_LOGIN_PASSWORD', 'ACSU_LOGIN_MULTIFACTOR'].filter((k) => !env[k]);
