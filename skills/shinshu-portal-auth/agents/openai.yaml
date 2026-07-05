@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shinshu Portal Auth"
+  short_description: "Access Shinshu ACSU portals safely"
+  default_prompt: "Use $shinshu-portal-auth to access eALPS, ACSU SharePoint, timetable, or campus portal pages without exposing credentials."

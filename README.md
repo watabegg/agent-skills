@@ -21,7 +21,8 @@
 ├── README.md
 └── skills/
     ├── japanese-tech-writing/
-    └── pencil-pencli/
+    ├── pencil-pencli/
+    └── shinshu-portal-auth/
 ```
 
 ## Codex への依頼でグローバルインストールする
@@ -81,6 +82,16 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 - 主な利用シーン:
   - Pencil canvas の確認、編集、validation、export。
   - `pencil interactive` を使った design file の headless 操作。
+
+### `shinshu-portal-auth`
+
+- 目的:
+  - 信州大学 ACSU 認証が必要な eALPS、時間割ポータル、キャンパス情報システム、SharePoint ACSU サイトを、秘匿値を出力せずにブラウザ自動化で開く。
+  - Tampermonkey に依存せず、ACSU ID/password、WisePoint 画像パスワード、Shibboleth 同意、SharePoint の Microsoft サインインから ACSU へのフェデレーションを扱う。
+  - DOM 構造、リンク、ボタン、入力、テーブル、スクリーンショットを調査用に要約する。
+- 主な利用シーン:
+  - `*.ealps.shinshu-u.ac.jp`、`gakumu-web02.shinshu-u.ac.jp/campus`、`shinshuuniversity.sharepoint.com` のページを開いて、課題、時間割、学務情報、ACSU SharePoint リンクを確認する。
+  - `ACSU_LOGIN_ID`、`ACSU_LOGIN_PASSWORD`、`ACSU_LOGIN_MULTIFACTOR` をローカル `.env` などから読み、値をログや commit に残さず調査する。
 
 ## Skill を追加する方法
 
