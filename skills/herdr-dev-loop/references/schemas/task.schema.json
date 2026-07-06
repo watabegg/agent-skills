@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Task Frontmatter",
+  "type": "object",
+  "required": ["id", "kind", "status", "branch", "base_ref", "base_sha", "write_allow", "acceptance"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+    "kind": {"type": "string"},
+    "status": {"type": "string"},
+    "branch": {"type": "string"},
+    "base_ref": {"type": "string"},
+    "base_sha": {"type": "string"},
+    "write_allow": {"type": "array", "items": {"type": "string"}},
+    "write_deny": {"type": "array", "items": {"type": "string"}},
+    "acceptance": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,1484 @@
+#!/usr/bin/env python3
+"""Herdr Dev Loop helper.
+
+This script keeps the Herdr/Codex multi-agent loop file-backed and bounded.
+It intentionally avoids non-stdlib dependencies so it can run inside arbitrary
+repositories.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+LOOP_DIR = Path(".ai") / "loop"
+TASK_STATUSES_FINAL = {"done", "partial", "blocked", "failed", "abandoned"}
+
+
+class HLoopError(RuntimeError):
+    pass
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def run_cmd(
+    cmd: list[str],
+    cwd: Path | None = None,
+    check: bool = True,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=check,
+    )
+
+
+def git(repo: Path, args: list[str], check: bool = True) -> str:
+    proc = run_cmd(["git", "-C", str(repo), *args], check=check)
+    if proc.returncode != 0 and check:
+        raise HLoopError(proc.stderr.strip())
+    return (proc.stdout or "").strip()
+
+
+def repo_root(path: Path) -> Path:
+    proc = run_cmd(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
+    if proc.returncode != 0:
+        raise HLoopError(f"not inside a git repository: {path}")
+    return Path(proc.stdout.strip()).resolve()
+
+
+def loop_path(repo: Path) -> Path:
+    return repo / LOOP_DIR
+
+
+def state_path(repo: Path) -> Path:
+    return loop_path(repo) / "STATE.json"
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise HLoopError(f"missing file: {path}") from exc
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def append_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def load_state(repo: Path) -> dict[str, Any]:
+    path = state_path(repo)
+    if not path.exists():
+        raise HLoopError(f"STATE.json not found: {path}")
+    try:
+        return json.loads(read_text(path))
+    except json.JSONDecodeError as exc:
+        raise HLoopError(f"invalid STATE.json: {exc}") from exc
+
+
+def save_state(repo: Path, state: dict[str, Any]) -> None:
+    state["updated_at"] = now_iso()
+    write_text(state_path(repo), json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+
+
+def journal(repo: Path, message: str) -> None:
+    append_text(loop_path(repo) / "JOURNAL.md", f"\n## {now_iso()}\n\n{message}\n")
+
+
+def parse_scalar(raw: str) -> Any:
+    value = raw.strip()
+    if value == "":
+        return ""
+    lower = value.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if value == "[]":
+        return []
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [parse_scalar(part.strip()) for part in inner.split(",")]
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+    return value
+
+
+def read_frontmatter(path: Path) -> dict[str, Any]:
+    text = read_text(path)
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    data: dict[str, Any] = {}
+    current_key: str | None = None
+    for line in text[4:end].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        item = re.match(r"^\s*-\s+(.*)$", line)
+        if item and current_key:
+            data.setdefault(current_key, [])
+            if not isinstance(data[current_key], list):
+                data[current_key] = [data[current_key]]
+            data[current_key].append(parse_scalar(item.group(1)))
+            continue
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if raw_value == "":
+            data[key] = []
+            current_key = key
+        else:
+            data[key] = parse_scalar(raw_value)
+            current_key = None
+    return data
+
+
+def yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if text == "" or re.search(r"[:#\[\]{}]|^\s|\s$", text):
+        return json.dumps(text, ensure_ascii=False)
+    return text
+
+
+def frontmatter(fields: dict[str, Any]) -> str:
+    lines = ["---"]
+    for key, value in fields.items():
+        if isinstance(value, list):
+            if value:
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {yaml_scalar(item)}")
+            else:
+                lines.append(f"{key}: []")
+        else:
+            lines.append(f"{key}: {yaml_scalar(value)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def ensure_loop_dirs(repo: Path) -> None:
+    for rel in [
+        "tasks",
+        "results",
+        "reviews",
+        "prompts",
+        "reports",
+        "inbox/manager",
+        "inbox/user",
+    ]:
+        (loop_path(repo) / rel).mkdir(parents=True, exist_ok=True)
+
+
+def slugify(text: str, max_len: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return (slug or "task")[:max_len].strip("-") or "task"
+
+
+def next_id(prefix: str, existing: dict[str, Any]) -> str:
+    nums = []
+    for key in existing:
+        if re.fullmatch(rf"{prefix}\d{{3}}", key):
+            nums.append(int(key[1:]))
+    return f"{prefix}{(max(nums) if nums else 0) + 1:03d}"
+
+
+def current_branch(repo: Path) -> str:
+    return git(repo, ["branch", "--show-current"])
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", branch], check=False)
+    return proc.returncode == 0
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def json_from_cmd(cmd: list[str], cwd: Path | None = None) -> dict[str, Any]:
+    proc = run_cmd(cmd, cwd=cwd, check=False)
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "").strip())
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise HLoopError(f"expected JSON from {' '.join(cmd)}: {exc}") from exc
+
+
+def find_key(value: Any, key: str) -> Any | None:
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        for child in value.values():
+            found = find_key(child, key)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_key(child, key)
+            if found is not None:
+                return found
+    return None
+
+
+def extract_pane_id(payload: dict[str, Any]) -> str:
+    found = find_key(payload, "pane_id")
+    if found:
+        return str(found)
+    result = payload.get("result", {})
+    candidates = [
+        result.get("pane", {}),
+        result.get("root_pane", {}),
+        payload.get("pane", {}),
+    ]
+    for candidate in candidates:
+        pane_id = candidate.get("pane_id") if isinstance(candidate, dict) else None
+        if pane_id:
+            return str(pane_id)
+    raise HLoopError(f"could not find pane_id in Herdr response: {payload}")
+
+
+def current_pane_id() -> str:
+    if os.environ.get("HERDR_PANE_ID"):
+        return str(os.environ["HERDR_PANE_ID"])
+    payload = json_from_cmd(["herdr", "pane", "current", "--current"])
+    return extract_pane_id(payload)
+
+
+def current_workspace_id() -> str | None:
+    return os.environ.get("HERDR_WORKSPACE_ID")
+
+
+def check_herdr_env() -> None:
+    if os.environ.get("HERDR_ENV") != "1":
+        raise HLoopError("HERDR_ENV=1 is required; run this skill inside Herdr")
+
+
+def task_file(repo: Path, task_id: str) -> Path:
+    return loop_path(repo) / "tasks" / f"{task_id}.md"
+
+
+def result_file(worktree: Path, task_id: str) -> Path:
+    return loop_path(worktree) / "results" / task_id / "result.md"
+
+
+def review_file(repo: Path, review_id: str) -> Path:
+    return loop_path(repo) / "reviews" / f"{review_id}.md"
+
+
+def prompt_file(repo: Path, name: str) -> Path:
+    return loop_path(repo) / "prompts" / name
+
+
+def normalize_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
+    if not base_sha or not head_sha:
+        return []
+    out = git(repo, ["diff", "--name-only", f"{base_sha}..{head_sha}"], check=False)
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def matches_any(path: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
+def validate_change_scope(task_id: str, task_meta: dict[str, Any], files: list[str]) -> list[str]:
+    allow = normalize_list(task_meta.get("write_allow"))
+    deny = normalize_list(task_meta.get("write_deny"))
+    result_pattern = f".ai/loop/results/{task_id}/**"
+    violations = []
+    for path in files:
+        allowed = matches_any(path, allow) or fnmatch.fnmatch(path, result_pattern)
+        denied = matches_any(path, deny)
+        if not allowed or denied:
+            suffix = "denied" if denied else "not allowed"
+            violations.append(f"{path} ({suffix})")
+    return violations
+
+
+def all_tasks_merged(state: dict[str, Any]) -> bool:
+    tasks = state.get("tasks", {})
+    return bool(tasks) and all(task.get("status") == "merged" for task in tasks.values())
+
+
+def last_validation_passed(state: dict[str, Any]) -> bool:
+    results = state.get("last_validation", {}).get("results", [])
+    return bool(results) and all(item.get("result") == "passed" for item in results)
+
+
+def running_review_exists(state: dict[str, Any]) -> bool:
+    return any(review.get("status") == "running" for review in state.get("reviews", {}).values())
+
+
+def pending_review_exists(state: dict[str, Any]) -> bool:
+    return any(
+        review.get("status") in {"running", "reported"}
+        for review in state.get("reviews", {}).values()
+    )
+
+
+def review_gate_passed(state: dict[str, Any]) -> bool:
+    if int(state.get("max_reviewers", 1)) <= 0:
+        return True
+    if state.get("needs_review"):
+        return False
+    reviews = state.get("reviews", {})
+    return any(review.get("status") == "triaged" for review in reviews.values())
+
+
+def render_worker_prompt(
+    task_id: str,
+    task_meta: dict[str, Any],
+    worktree: Path,
+    branch: str,
+) -> str:
+    return f"""You are Worker {task_id}.
+
+You are running in your own git worktree:
+{worktree}
+
+Your branch:
+{branch}
+
+Read first:
+- .ai/loop/MISSION.md
+- .ai/loop/PLAN.md
+- .ai/loop/tasks/{task_id}.md
+
+Use $codex-impl.
+
+Manager has fixed kickoff choices for this bounded task:
+- Implementation gap-check count: 1
+- Review/fix loop limit: skip review unless this task explicitly requires it
+- Forced QA environment: local
+- QA target diff: this task branch against {task_meta.get("base_ref", "the integration branch")}
+
+Rules:
+- Edit only the files allowed by write_allow in .ai/loop/tasks/{task_id}.md.
+- Do not edit .ai/loop/STATE.json.
+- Do not edit .ai/loop/MISSION.md or .ai/loop/PLAN.md.
+- Do not edit other task files or other result directories.
+- Do not merge, rebase, or switch to the integration branch.
+- If the task needs a specification decision not present in MISSION/PLAN/task, write status: blocked.
+
+Required output:
+- Write .ai/loop/results/{task_id}/result.md using the required frontmatter.
+- Commit your work on your branch.
+
+Before finishing:
+- Run relevant tests/build from the task.
+- Record exact commands and results.
+- Review your own diff.
+- Ensure no unrelated changes.
+
+Final terminal line:
+HERDR_LOOP_TASK_DONE:{task_id}:<done|blocked|failed|partial>
+"""
+
+
+def render_reviewer_prompt(
+    review_id: str,
+    base_branch: str,
+    integration_branch: str,
+) -> str:
+    return f"""You are Reviewer {review_id}.
+
+Compare:
+- base branch: {base_branch}
+- integration branch: {integration_branch}
+
+Read:
+- .ai/loop/MISSION.md
+- .ai/loop/PLAN.md
+- .ai/loop/DECISIONS.md
+
+Use $codex-review-multi-v2.
+
+Rules:
+- Do not edit code.
+- Review the integration branch against base.
+- For every finding, re-investigate whether it can actually occur in this codebase.
+- Do not report vague best-practice issues unless they create concrete risk.
+- Prefer concrete code paths, failing scenarios, or missing tests.
+- Classify severity as P0/P1/P2/P3.
+- Recommend Manager action: fix_task, decision_needed, accepted_risk_candidate, or false_positive_candidate.
+
+Output:
+- Write .ai/loop/reviews/{review_id}.md.
+
+Final terminal line:
+HERDR_LOOP_REVIEW_DONE:{review_id}:<reported|blocked|failed>
+"""
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    checks: dict[str, Any] = {
+        "repo": str(repo),
+        "HERDR_ENV": os.environ.get("HERDR_ENV"),
+        "HERDR_PANE_ID": os.environ.get("HERDR_PANE_ID"),
+        "HERDR_WORKSPACE_ID": os.environ.get("HERDR_WORKSPACE_ID"),
+        "HERDR_TAB_ID": os.environ.get("HERDR_TAB_ID"),
+        "commands": {
+            "git": command_exists("git"),
+            "herdr": command_exists("herdr"),
+            "codex": command_exists("codex"),
+        },
+        "skills": {
+            "codex-impl": str(codex_home / "skills/codex-impl/SKILL.md"),
+            "codex-review-multi-v2": str(
+                codex_home / "skills/codex-review-multi-v2/SKILL.md"
+            ),
+            "herdr": str(Path.home() / ".agents/skills/herdr/SKILL.md"),
+        },
+    }
+    checks["skills"] = {
+        key: {"path": value, "exists": Path(value).exists()}
+        for key, value in checks["skills"].items()
+    }
+    if command_exists("codex"):
+        proc = run_cmd(["codex", "--version"], check=False)
+        checks["codex_version"] = (proc.stdout or proc.stderr).strip()
+    if command_exists("herdr") and os.environ.get("HERDR_ENV") == "1":
+        status_proc = run_cmd(["herdr", "status"], check=False)
+        checks["herdr_status"] = (status_proc.stdout or status_proc.stderr).strip()
+        try:
+            current = json_from_cmd(["herdr", "pane", "current", "--current"])
+            checks["current_pane_id"] = extract_pane_id(current)
+        except HLoopError as exc:
+            checks["herdr_error"] = str(exc)
+    ok = (
+        checks["HERDR_ENV"] == "1"
+        and all(checks["commands"].values())
+        and all(item["exists"] for item in checks["skills"].values())
+    )
+    checks["ok"] = ok
+    if args.json:
+        print(json.dumps(checks, ensure_ascii=False, indent=2))
+    else:
+        for key, value in checks.items():
+            print(f"{key}: {value}")
+    return 0 if ok else 1
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    base = args.base or current_branch(repo) or "main"
+    goal_id = args.goal_id or slugify(args.goal, 32)
+    integration = args.integration or f"ai/{goal_id}/integration"
+    if args.create_branch:
+        if branch_exists(repo, integration):
+            git(repo, ["switch", integration])
+        else:
+            git(repo, ["switch", "-c", integration, base])
+
+    mission = loop_path(repo) / "MISSION.md"
+    plan = loop_path(repo) / "PLAN.md"
+    decisions = loop_path(repo) / "DECISIONS.md"
+    user_action = loop_path(repo) / "USER_ACTION_REQUIRED.md"
+    journal_path = loop_path(repo) / "JOURNAL.md"
+    if not mission.exists() or args.force:
+        write_text(
+            mission,
+            f"""# Mission
+
+## Goal
+{args.goal}
+
+## Context
+TBD by Manager.
+
+## Constraints
+- Use Herdr-managed panes only when `HERDR_ENV=1`.
+- Persist loop state in `.ai/loop`.
+- Stop on blocking specification decisions.
+
+## Non-goals
+- Do not run unbounded autonomous loops.
+
+## Done when
+- All planned tasks are merged into `{integration}`.
+- Required validation passes.
+- No blocking review finding remains.
+
+## Base branch
+{base}
+
+## Integration branch
+{integration}
+
+## Validation levels
+- L0: format / lint / typecheck
+- L1: relevant unit tests
+- L2: full build / full test
+- L3: e2e or manual verification
+""",
+        )
+    if not plan.exists() or args.force:
+        write_text(
+            plan,
+            """# Plan
+
+## Strategy
+TBD by Manager.
+
+## Task graph
+- Add tasks with `hloop task new`.
+
+## Parallelization rules
+- Run Workers in parallel only when their `write_allow` patterns do not overlap.
+
+## Validation plan
+- Run task-specific validation before merge.
+- Run integration validation after each merge.
+
+## Review plan
+- Run Reviewer after integration advances and before final completion.
+""",
+        )
+    if not decisions.exists():
+        write_text(decisions, "# Decisions\n\n")
+    if not user_action.exists():
+        write_text(user_action, "# User Action Required\n\nNo blocking user action.\n")
+    if not journal_path.exists():
+        write_text(journal_path, "# Journal\n")
+    state = {
+        "goal_id": goal_id,
+        "phase": "initialized",
+        "base_branch": base,
+        "integration_branch": integration,
+        "merge_mode": args.merge_mode,
+        "worker_runner": args.worker_runner,
+        "reviewer_runner": args.reviewer_runner,
+        "cycle": 0,
+        "max_workers": args.max_workers,
+        "max_reviewers": args.max_reviewers,
+        "validation_commands": args.validation or [],
+        "tasks": {},
+        "reviews": {},
+        "blocking_decisions": [],
+        "created_at": now_iso(),
+    }
+    if state_path(repo).exists() and not args.force:
+        old = load_state(repo)
+        old.setdefault("validation_commands", args.validation or [])
+        print(f"STATE.json already exists: {state_path(repo)}")
+        return 0
+    save_state(repo, state)
+    journal(repo, f"Initialized loop `{goal_id}` on integration branch `{integration}`.")
+    print(f"initialized .ai/loop for {goal_id}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0
+    print(f"goal_id: {state.get('goal_id')}")
+    print(f"phase: {state.get('phase')}")
+    print(f"base: {state.get('base_branch')}")
+    print(f"integration: {state.get('integration_branch')}")
+    print(f"current_branch: {current_branch(repo)}")
+    print("tasks:")
+    for task_id, task in state.get("tasks", {}).items():
+        print(f"  {task_id}: {task.get('status')} {task.get('branch', '')}")
+    print("reviews:")
+    for review_id, review in state.get("reviews", {}).items():
+        print(f"  {review_id}: {review.get('status')}")
+    return 0
+
+
+def cmd_task_new(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = load_state(repo)
+    task_id = args.id or next_id("T", state.setdefault("tasks", {}))
+    if task_id in state["tasks"]:
+        raise HLoopError(f"task already exists: {task_id}")
+    title_slug = slugify(args.title)
+    branch = args.branch or f"ai/{state['goal_id']}/{task_id}-{title_slug}"
+    base_ref = args.base_ref or state["integration_branch"]
+    if not branch_exists(repo, base_ref):
+        raise HLoopError(
+            f"base_ref does not exist: {base_ref}. Run init with --create-branch "
+            "or create/switch to the integration branch before adding tasks."
+        )
+    base_sha = args.base_sha or git(repo, ["rev-parse", base_ref])
+    fields = {
+        "id": task_id,
+        "kind": args.kind,
+        "status": "queued",
+        "created_from": "PLAN.md",
+        "branch": branch,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "priority": args.priority,
+        "depends_on": args.depends_on or [],
+        "write_allow": args.write_allow or [],
+        "write_deny": args.write_deny or [],
+        "acceptance": args.acceptance or ["Task acceptance criteria are satisfied."],
+        "validation_minimum": args.validation_minimum,
+    }
+    body = f"""# Task {task_id}: {args.title}
+
+## Goal
+{args.title}
+
+## Context
+Read:
+- .ai/loop/MISSION.md
+- .ai/loop/PLAN.md
+
+## Instructions
+Use $codex-impl.
+
+Follow this sequence:
+1. Gap-check the task against the current code.
+2. Implement the smallest safe change.
+3. Review your own diff.
+4. Run targeted tests/build.
+5. Write result artifact.
+6. Commit your work.
+
+## Done when
+{chr(10).join(f"- {item}" for item in fields["acceptance"])}
+"""
+    write_text(task_file(repo, task_id), frontmatter(fields) + "\n" + body)
+    state["tasks"][task_id] = {
+        "status": "queued",
+        "branch": branch,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "write_allow": fields["write_allow"],
+        "write_deny": fields["write_deny"],
+        "depends_on": fields["depends_on"],
+        "created_at": now_iso(),
+    }
+    state["phase"] = "dispatching"
+    save_state(repo, state)
+    journal(repo, f"Created task `{task_id}`: {args.title}")
+    print(f"created {task_id}: {task_file(repo, task_id)}")
+    return 0
+
+
+def default_worktree(repo: Path, task_id: str) -> Path:
+    return repo.parent / f"{repo.name}.{task_id.lower()}"
+
+
+def ensure_task_visible_in_worktree(worktree: Path, task_id: str) -> None:
+    missing = [
+        loop_path(worktree) / "MISSION.md",
+        loop_path(worktree) / "PLAN.md",
+        task_file(worktree, task_id),
+    ]
+    absent = [str(path) for path in missing if not path.exists()]
+    if absent:
+        raise HLoopError(
+            "worker worktree does not contain required .ai/loop files. "
+            "Commit Manager-owned .ai/loop changes on the integration branch first. "
+            f"Missing: {', '.join(absent)}"
+        )
+
+
+def start_pane_launcher(
+    *,
+    manager_pane: str,
+    direction: str,
+    cwd: Path,
+    command: str,
+) -> str:
+    split_cmd = [
+        "herdr",
+        "pane",
+        "split",
+        manager_pane,
+        "--direction",
+        direction,
+        "--cwd",
+        str(cwd),
+        "--no-focus",
+    ]
+    pane_id = extract_pane_id(json_from_cmd(split_cmd))
+    run_cmd(["herdr", "pane", "run", pane_id, command], check=True, capture=True)
+    return pane_id
+
+
+def start_agent_launcher(
+    *,
+    name: str,
+    direction: str,
+    cwd: Path,
+    command: str,
+) -> str:
+    cmd = ["herdr", "agent", "start", name, "--cwd", str(cwd)]
+    workspace_id = current_workspace_id()
+    if workspace_id:
+        cmd.extend(["--workspace", workspace_id])
+    cmd.extend(["--split", direction, "--no-focus", "--", "bash", "-lc", command])
+    return extract_pane_id(json_from_cmd(cmd))
+
+
+def codex_command_for_prompt(
+    *,
+    runner: str,
+    sandbox: str,
+    prompt_rel: Path,
+    output_rel: Path | None = None,
+) -> str:
+    prompt_ref = shlex.quote(str(prompt_rel))
+    if runner == "exec":
+        parts = ["codex", "exec", "--sandbox", sandbox]
+        if output_rel is not None:
+            parts.extend(["--output-last-message", str(output_rel)])
+        parts.append("-")
+        return f"{shlex.join(parts)} < {prompt_ref}"
+    if runner == "tui":
+        parts = [
+            "codex",
+            "--sandbox",
+            sandbox,
+            "--ask-for-approval",
+            "never",
+            "--no-alt-screen",
+        ]
+        return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
+    raise HLoopError(f"unsupported runner: {runner}")
+
+
+def cmd_worker_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not task_state:
+        raise HLoopError(f"unknown task: {task_id}")
+    if task_state.get("status") not in {"queued", "failed_validation"}:
+        raise HLoopError(f"task is not startable: {task_id} status={task_state.get('status')}")
+    task_meta = read_frontmatter(task_file(repo, task_id))
+    branch = task_state.get("branch") or task_meta["branch"]
+    integration = state["integration_branch"]
+    worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id)
+    prompt = render_worker_prompt(task_id, task_meta, worktree, branch)
+    prompt_rel = LOOP_DIR / "prompts" / f"{task_id}.worker.md"
+    runner = args.runner or state.get("worker_runner", "tui")
+    command = (
+        f"cd {shlex.quote(str(worktree))} && "
+        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
+    )
+    if args.dry_run:
+        print(f"DRY RUN worktree: git worktree add {worktree} -b {branch} {integration}")
+        print(f"DRY RUN prompt: {worktree / prompt_rel}")
+        print(f"DRY RUN {args.launcher}/{runner} command: {command}")
+        return 0
+    check_herdr_env()
+    if not branch_exists(repo, integration):
+        raise HLoopError(
+            f"integration branch does not exist: {integration}. "
+            "Run `hloop init --create-branch` or create it before starting Workers."
+        )
+    if not worktree.exists():
+        if branch_exists(repo, branch):
+            git(repo, ["worktree", "add", str(worktree), branch])
+        else:
+            git(repo, ["worktree", "add", str(worktree), "-b", branch, integration])
+    ensure_task_visible_in_worktree(worktree, task_id)
+    write_text(worktree / prompt_rel, prompt)
+    if args.launcher == "agent":
+        pane_id = start_agent_launcher(
+            name=f"hloop-{state['goal_id']}-{task_id}-worker",
+            direction=args.direction,
+            cwd=worktree,
+            command=command,
+        )
+    else:
+        manager_pane = args.manager_pane or current_pane_id()
+        pane_id = start_pane_launcher(
+            manager_pane=manager_pane,
+            direction=args.direction,
+            cwd=worktree,
+            command=command,
+        )
+    task_state.update(
+        {
+            "status": "running",
+            "pane_id": pane_id,
+            "worktree": str(worktree),
+            "prompt": str(worktree / prompt_rel),
+            "runner": runner,
+            "started_at": now_iso(),
+        }
+    )
+    state["phase"] = "running"
+    save_state(repo, state)
+    journal(repo, f"Started Worker `{task_id}` in pane `{pane_id}` and worktree `{worktree}`.")
+    print(f"started {task_id} in pane {pane_id}")
+    return 0
+
+
+def cmd_worker_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not task_state:
+        raise HLoopError(f"unknown task: {task_id}")
+    worktree = Path(task_state.get("worktree") or default_worktree(repo, task_id)).resolve()
+    result = result_file(worktree, task_id)
+    if not result.exists():
+        raise HLoopError(f"result not found: {result}")
+    result_text = read_text(result)
+    meta = read_frontmatter(result)
+    status = str(meta.get("status", ""))
+    if status not in TASK_STATUSES_FINAL:
+        raise HLoopError(f"invalid result status in {result}: {status}")
+    head_sha = str(meta.get("head_sha") or git(worktree, ["rev-parse", "HEAD"]))
+    manager_base_sha = str(task_state.get("base_sha") or "")
+    reported_base_sha = str(meta.get("base_sha") or "")
+    base_sha = manager_base_sha
+    if not base_sha:
+        raise HLoopError(f"manager base_sha is missing for {task_id}")
+    files = normalize_list(meta.get("changed_files")) or changed_files(worktree, base_sha, head_sha)
+    task_state.update(
+        {
+            "status": "result_reported" if status == "done" else status,
+            "result_status": status,
+            "merge_ready": normalize_bool(meta.get("merge_ready")),
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+            "reported_base_sha": reported_base_sha,
+            "changed_files": files,
+            "blocking_questions": normalize_list(meta.get("blocking_questions")),
+            "validation_recorded": (
+                "validation:" in result_text
+                or "## Tests run" in result_text
+                or "## Validation" in result_text
+            ),
+            "result_path": str(result),
+            "harvested_at": now_iso(),
+        }
+    )
+    state["phase"] = "harvesting"
+    save_state(repo, state)
+    journal(repo, f"Harvested Worker `{task_id}` with status `{status}`.")
+    print(f"harvested {task_id}: {status}")
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not task_state:
+        raise HLoopError(f"unknown task: {task_id}")
+    if current_branch(repo) != state["integration_branch"]:
+        raise HLoopError(
+            f"current branch must be integration branch {state['integration_branch']}; "
+            f"currently {current_branch(repo)}"
+        )
+    if task_state.get("result_status") != "done" or task_state.get("merge_ready") is not True:
+        raise HLoopError(f"task is not merge ready: {task_id}")
+    if normalize_list(task_state.get("blocking_questions")):
+        raise HLoopError(f"task has blocking questions: {task_id}")
+    if not task_state.get("validation_recorded"):
+        raise HLoopError(f"task result does not record validation: {task_id}")
+    branch = task_state["branch"]
+    mode = args.mode or state.get("merge_mode", "squash")
+    if mode not in {"squash", "cherry-pick"}:
+        raise HLoopError(f"unsupported merge mode: {mode}")
+    actual_head = git(repo, ["rev-parse", branch])
+    reported_head = str(task_state.get("head_sha") or "")
+    if reported_head and reported_head != actual_head:
+        if not args.dry_run:
+            task_state["status"] = "blocked_head_mismatch"
+            state["phase"] = "blocked_conflict"
+            save_state(repo, state)
+        raise HLoopError(
+            f"worker head mismatch for {task_id}: result={reported_head} actual={actual_head}"
+        )
+    base_sha = str(task_state.get("base_sha") or "")
+    if not base_sha:
+        raise HLoopError(f"manager base_sha is missing for {task_id}")
+    reported_base_sha = str(task_state.get("reported_base_sha") or "")
+    if reported_base_sha and reported_base_sha != base_sha:
+        if not args.dry_run:
+            task_state["status"] = "blocked_base_mismatch"
+            state["phase"] = "blocked_conflict"
+            save_state(repo, state)
+        raise HLoopError(
+            f"worker base mismatch for {task_id}: result={reported_base_sha} manager={base_sha}"
+        )
+    files = changed_files(repo, base_sha, actual_head)
+    task_state["head_sha"] = actual_head
+    task_state["changed_files"] = files
+    files = normalize_list(task_state.get("changed_files"))
+    violations = validate_change_scope(task_id, task_state, files)
+    if violations:
+        if not args.dry_run:
+            task_state["status"] = "blocked_write_scope"
+            state["phase"] = "blocked_conflict"
+            save_state(repo, state)
+        raise HLoopError("write-scope violations: " + "; ".join(violations))
+    if args.dry_run:
+        if mode == "squash":
+            print(f"DRY RUN git merge --squash {branch}")
+            print(f"DRY RUN git commit -m 'ai-loop({task_id}): squash {branch}'")
+        else:
+            commits = git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"])
+            print(f"DRY RUN git cherry-pick {' '.join(commits.splitlines())}")
+        return 0
+    try:
+        staged = run_cmd(["git", "-C", str(repo), "diff", "--cached", "--quiet"], check=False)
+        if staged.returncode != 0:
+            raise HLoopError("index has staged changes; commit or unstage them before integration")
+        if mode == "squash":
+            git(repo, ["merge", "--squash", branch])
+            git(repo, ["commit", "-m", f"ai-loop({task_id}): squash {branch}"])
+        else:
+            commits = git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"]).splitlines()
+            if not commits:
+                raise HLoopError(f"no commits to cherry-pick for {task_id}")
+            git(repo, ["cherry-pick", *commits])
+    except subprocess.CalledProcessError as exc:
+        task_state["status"] = "blocked_merge_conflict"
+        state["phase"] = "blocked_conflict"
+        save_state(repo, state)
+        journal(repo, f"Merge failed for `{task_id}` from `{branch}`. Resolve or abort manually.")
+        append_text(
+            loop_path(repo) / "USER_ACTION_REQUIRED.md",
+            f"\n## Merge conflict for {task_id}\n\nResolve or abort the merge for `{branch}`.\n",
+        )
+        raise exc
+    task_state["status"] = "merged"
+    task_state["merged_at"] = now_iso()
+    task_state["merge_mode"] = mode
+    task_state["cleanup_pending"] = True
+    state["needs_validation"] = True
+    state["last_merged_task"] = task_id
+    state["phase"] = "validating"
+    save_state(repo, state)
+    journal(repo, f"Merged Worker `{task_id}` from `{branch}`.")
+    print(f"merged {task_id}")
+    return 0
+
+
+def cleanup_task(repo: Path, task_id: str, task_state: dict[str, Any], dry_run: bool = False) -> None:
+    branch = task_state.get("branch")
+    worktree_raw = task_state.get("worktree")
+    worktree = Path(worktree_raw).resolve() if worktree_raw else default_worktree(repo, task_id)
+    if worktree.exists() and worktree != repo:
+        if dry_run:
+            print(f"DRY RUN git worktree remove {worktree}")
+        else:
+            git(repo, ["worktree", "remove", str(worktree)])
+    if branch and branch_exists(repo, branch):
+        if dry_run:
+            print(f"DRY RUN git branch -D {branch}")
+        else:
+            git(repo, ["branch", "-D", branch])
+    if not dry_run:
+        task_state["cleanup_pending"] = False
+        task_state["cleanup_done"] = True
+        task_state["cleaned_at"] = now_iso()
+
+
+def cleanup_merged_tasks(repo: Path, state: dict[str, Any], dry_run: bool = False) -> None:
+    for task_id, task in state.get("tasks", {}).items():
+        if task.get("status") == "merged" and task.get("cleanup_pending"):
+            cleanup_task(repo, task_id, task, dry_run=dry_run)
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    commands = getattr(args, "validation_command", None) or state.get("validation_commands") or [
+        "git diff --check"
+    ]
+    results = []
+    failed = False
+    for command in commands:
+        if args.dry_run:
+            print(f"DRY RUN {command}")
+            results.append({"command": command, "result": "dry-run"})
+            continue
+        proc = subprocess.run(command, cwd=str(repo), text=True, shell=True)
+        result = "passed" if proc.returncode == 0 else f"failed:{proc.returncode}"
+        results.append({"command": command, "result": result})
+        if proc.returncode != 0:
+            failed = True
+            break
+    if not args.dry_run:
+        state["last_validation"] = {"at": now_iso(), "results": results}
+        state["needs_validation"] = failed
+        if failed:
+            state["phase"] = "failed_validation"
+        elif all_tasks_merged(state) and int(state.get("max_reviewers", 1)) > 0:
+            if not getattr(args, "no_cleanup", False):
+                cleanup_merged_tasks(repo, state)
+            state["needs_review"] = True
+            state["phase"] = "reviewing"
+        else:
+            if not getattr(args, "no_cleanup", False):
+                cleanup_merged_tasks(repo, state)
+            state["phase"] = "dispatching"
+        save_state(repo, state)
+        journal(repo, f"Validation results: {results}")
+    return 1 if failed else 0
+
+
+def cmd_reviewer_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    review_id = args.review_id or next_id("R", state.setdefault("reviews", {}))
+    if review_id in state["reviews"]:
+        raise HLoopError(f"review already exists: {review_id}")
+    base = args.base or state["base_branch"]
+    head = args.head or state["integration_branch"]
+    prompt = render_reviewer_prompt(review_id, base, head)
+    prompt_path = prompt_file(repo, f"{review_id}.reviewer.md")
+    review_path = review_file(repo, review_id)
+    prompt_rel = prompt_path.relative_to(repo)
+    review_rel = review_path.relative_to(repo)
+    runner = args.runner or state.get("reviewer_runner", "exec")
+    command = (
+        f"cd {shlex.quote(str(repo))} && "
+        f"{codex_command_for_prompt(runner=runner, sandbox='read-only', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+    )
+    if args.dry_run:
+        print(f"DRY RUN prompt: {prompt_path}")
+        print(f"DRY RUN {args.launcher}/{runner} command: {command}")
+        return 0
+    check_herdr_env()
+    write_text(prompt_path, prompt)
+    if args.launcher == "agent":
+        pane_id = start_agent_launcher(
+            name=f"hloop-{state['goal_id']}-{review_id}-reviewer",
+            direction=args.direction,
+            cwd=repo,
+            command=command,
+        )
+    else:
+        manager_pane = args.manager_pane or current_pane_id()
+        pane_id = start_pane_launcher(
+            manager_pane=manager_pane,
+            direction=args.direction,
+            cwd=repo,
+            command=command,
+        )
+    state["reviews"][review_id] = {
+        "status": "running",
+        "base": base,
+        "head": head,
+        "pane_id": pane_id,
+        "runner": runner,
+        "prompt": str(prompt_path),
+        "review_path": str(review_path),
+        "started_at": now_iso(),
+    }
+    state["phase"] = "reviewing"
+    save_state(repo, state)
+    journal(repo, f"Started Reviewer `{review_id}` in pane `{pane_id}`.")
+    print(f"started {review_id} in pane {pane_id}")
+    return 0
+
+
+def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    review_id = args.review_id
+    review_state = state.get("reviews", {}).get(review_id)
+    if not review_state:
+        raise HLoopError(f"unknown review: {review_id}")
+    path = Path(review_state.get("review_path") or review_file(repo, review_id))
+    if not path.exists() or not read_text(path).strip():
+        raise HLoopError(f"review artifact not found or empty: {path}")
+    review_state["status"] = "reported"
+    review_state["harvested_at"] = now_iso()
+    state["last_review_id"] = review_id
+    state["needs_review"] = True
+    state["phase"] = "reviewing"
+    save_state(repo, state)
+    journal(repo, f"Harvested Reviewer `{review_id}`; Manager triage is required.")
+    print(f"harvested {review_id}; run `hloop reviewer close {review_id} --verdict <verdict>` after triage")
+    return 0
+
+
+def cmd_reviewer_close(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    review_id = args.review_id
+    review_state = state.get("reviews", {}).get(review_id)
+    if not review_state:
+        raise HLoopError(f"unknown review: {review_id}")
+    if review_state.get("status") not in {"reported", "triaged"}:
+        raise HLoopError(f"review is not ready for close: {review_id}")
+    review_state["status"] = "triaged"
+    review_state["verdict"] = args.verdict
+    review_state["triage_reason"] = args.reason
+    review_state["triaged_at"] = now_iso()
+    if args.verdict == "blocked":
+        state["needs_review"] = True
+        state["phase"] = "blocked_user_decision"
+    else:
+        state["needs_review"] = False
+        state["phase"] = "dispatching"
+    save_state(repo, state)
+    journal(repo, f"Closed Reviewer `{review_id}` with verdict `{args.verdict}`: {args.reason}")
+    print(f"closed {review_id}: {args.verdict}")
+    return 0
+
+
+def write_sets_overlap(a: list[str], b: list[str]) -> bool:
+    for left in a:
+        for right in b:
+            if left == right or fnmatch.fnmatch(left, right) or fnmatch.fnmatch(right, left):
+                return True
+    return False
+
+
+def queued_dispatchable_tasks(state: dict[str, Any]) -> list[str]:
+    running_sets = [
+        normalize_list(task.get("write_allow"))
+        for task in state.get("tasks", {}).values()
+        if task.get("status") == "running"
+    ]
+    dispatchable = []
+    for task_id, task in state.get("tasks", {}).items():
+        if task.get("status") != "queued":
+            continue
+        depends = normalize_list(task.get("depends_on"))
+        if any(state["tasks"].get(dep, {}).get("status") != "merged" for dep in depends):
+            continue
+        write_allow = normalize_list(task.get("write_allow"))
+        if any(write_sets_overlap(write_allow, active) for active in running_sets):
+            continue
+        dispatchable.append(task_id)
+        running_sets.append(write_allow)
+    return dispatchable
+
+
+def cmd_tick(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    if not args.dry_run:
+        state["cycle"] = int(state.get("cycle", 0)) + 1
+        save_state(repo, state)
+    if state.get("blocking_decisions"):
+        if args.dry_run:
+            print("DRY RUN blocked: pending user decision")
+            return 2
+        state["phase"] = "blocked_user_decision"
+        save_state(repo, state)
+        print("blocked: pending user decision")
+        return 2
+
+    if state.get("needs_validation") or state.get("phase") == "validating":
+        return cmd_validate(args)
+
+    # Harvest any running worker with a visible result artifact.
+    for task_id, task in state.get("tasks", {}).items():
+        if task.get("status") == "running":
+            worktree = Path(task.get("worktree") or default_worktree(repo, task_id))
+            if result_file(worktree, task_id).exists():
+                if args.dry_run:
+                    print(f"DRY RUN harvest worker {task_id}")
+                    return 0
+                args.task_id = task_id
+                return cmd_worker_harvest(args)
+
+    # Merge one ready task.
+    for task_id, task in state.get("tasks", {}).items():
+        if task.get("status") == "result_reported" and task.get("merge_ready"):
+            args.task_id = task_id
+            return cmd_merge(args)
+
+    # Harvest any reported review artifact.
+    for review_id, review in state.get("reviews", {}).items():
+        if review.get("status") == "running":
+            path = Path(review.get("review_path") or review_file(repo, review_id))
+            if path.exists() and read_text(path).strip():
+                if args.dry_run:
+                    print(f"DRY RUN harvest reviewer {review_id}")
+                    return 0
+                args.review_id = review_id
+                return cmd_reviewer_harvest(args)
+
+    if (
+        state.get("needs_review")
+        and int(state.get("max_reviewers", 1)) > 0
+        and not pending_review_exists(state)
+    ):
+        args.review_id = None
+        args.base = None
+        args.head = None
+        args.runner = args.reviewer_runner
+        return cmd_reviewer_start(args)
+
+    if state.get("needs_review") and pending_review_exists(state):
+        print("review triage required")
+        return 0
+
+    running_count = sum(1 for t in state.get("tasks", {}).values() if t.get("status") == "running")
+    max_workers = args.max_workers or state.get("max_workers", 2)
+    slots = max(0, max_workers - running_count)
+    for task_id in queued_dispatchable_tasks(state)[:slots]:
+        args.task_id = task_id
+        args.worktree = None
+        args.runner = args.worker_runner
+        return cmd_worker_start(args)
+
+    if (
+        all_tasks_merged(state)
+        and not state.get("needs_validation")
+        and not state.get("needs_review")
+        and not running_review_exists(state)
+        and last_validation_passed(state)
+        and review_gate_passed(state)
+    ):
+        if args.dry_run:
+            print("DRY RUN done: all tasks merged, validation passed, review gate closed")
+            return 0
+        state["phase"] = "done"
+        save_state(repo, state)
+        print("done: all tasks merged")
+        return 0
+
+    print("no progressable transition found")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    lines = [
+        "# Final Report",
+        "",
+        f"- Goal ID: {state.get('goal_id')}",
+        f"- Phase: {state.get('phase')}",
+        f"- Base branch: {state.get('base_branch')}",
+        f"- Integration branch: {state.get('integration_branch')}",
+        "",
+        "## Tasks",
+    ]
+    for task_id, task in state.get("tasks", {}).items():
+        cleanup = "cleaned" if task.get("cleanup_done") else "cleanup pending"
+        lines.append(
+            f"- {task_id}: {task.get('status')} ({task.get('branch', '')}, {cleanup})"
+        )
+    lines.extend(["", "## Reviews"])
+    for review_id, review in state.get("reviews", {}).items():
+        lines.append(f"- {review_id}: {review.get('status')}")
+    lines.extend(["", "## Validation"])
+    for item in state.get("last_validation", {}).get("results", []):
+        lines.append(f"- `{item.get('command')}`: {item.get('result')}")
+    lines.append("")
+    path = loop_path(repo) / "reports" / "FINAL.md"
+    write_text(path, "\n".join(lines))
+    print(path)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hloop",
+        description="File-backed Herdr/Codex Manager loop helper.",
+        epilog=(
+            "Safe first run: python3 /path/to/herdr-dev-loop/scripts/hloop "
+            "--repo /path/to/repo init --goal-id demo --goal '...' "
+            "--base main --create-branch"
+        ),
+    )
+    parser.add_argument("--repo", default=".", help="repository path")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="check local Herdr/Codex/skill dependencies")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+
+    init = sub.add_parser("init", help="initialize .ai/loop")
+    init.add_argument("--goal-id")
+    init.add_argument("--goal", required=True)
+    init.add_argument("--base")
+    init.add_argument("--integration")
+    init.add_argument("--max-workers", type=int, default=2)
+    init.add_argument("--max-reviewers", type=int, default=1)
+    init.add_argument("--merge-mode", choices=["squash", "cherry-pick"], default="squash")
+    init.add_argument("--worker-runner", choices=["tui", "exec"], default="tui")
+    init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="exec")
+    init.add_argument("--validation", action="append")
+    init.add_argument(
+        "--create-branch",
+        action="store_true",
+        help="create or switch to the integration branch before writing .ai/loop files",
+    )
+    init.add_argument("--force", action="store_true")
+    init.set_defaults(func=cmd_init)
+
+    status = sub.add_parser("status", help="show loop status")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    task = sub.add_parser("task", help="task operations")
+    task_sub = task.add_subparsers(dest="task_command", required=True)
+    task_new = task_sub.add_parser("new", help="create a queued task")
+    task_new.add_argument("title")
+    task_new.add_argument("--id")
+    task_new.add_argument("--kind", default="implementation")
+    task_new.add_argument("--branch")
+    task_new.add_argument("--base-ref")
+    task_new.add_argument("--base-sha")
+    task_new.add_argument("--priority", default="P1")
+    task_new.add_argument("--depends-on", action="append")
+    task_new.add_argument("--write-allow", action="append")
+    task_new.add_argument("--write-deny", action="append")
+    task_new.add_argument("--acceptance", action="append")
+    task_new.add_argument("--validation-minimum", default="L1")
+    task_new.set_defaults(func=cmd_task_new)
+
+    worker = sub.add_parser("worker", help="worker operations")
+    worker_sub = worker.add_subparsers(dest="worker_command", required=True)
+    worker_start = worker_sub.add_parser("start")
+    worker_start.add_argument("task_id")
+    worker_start.add_argument("--worktree")
+    worker_start.add_argument("--manager-pane")
+    worker_start.add_argument("--direction", choices=["right", "down"], default="right")
+    worker_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    worker_start.add_argument("--runner", choices=["tui", "exec"])
+    worker_start.add_argument("--dry-run", action="store_true")
+    worker_start.set_defaults(func=cmd_worker_start)
+    worker_harvest = worker_sub.add_parser("harvest")
+    worker_harvest.add_argument("task_id")
+    worker_harvest.set_defaults(func=cmd_worker_harvest)
+
+    merge = sub.add_parser("merge", help="merge a Worker task")
+    merge.add_argument("task_id")
+    merge.add_argument("--mode", choices=["squash", "cherry-pick"])
+    merge.add_argument("--dry-run", action="store_true")
+    merge.set_defaults(func=cmd_merge)
+
+    validate = sub.add_parser("validate", help="run integration validation")
+    validate.add_argument("--command", dest="validation_command", action="append")
+    validate.add_argument("--no-cleanup", action="store_true")
+    validate.add_argument("--dry-run", action="store_true")
+    validate.set_defaults(func=cmd_validate)
+
+    reviewer = sub.add_parser("reviewer", help="reviewer operations")
+    reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
+    reviewer_start = reviewer_sub.add_parser("start")
+    reviewer_start.add_argument("--review-id")
+    reviewer_start.add_argument("--base")
+    reviewer_start.add_argument("--head")
+    reviewer_start.add_argument("--manager-pane")
+    reviewer_start.add_argument("--direction", choices=["right", "down"], default="down")
+    reviewer_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    reviewer_start.add_argument("--runner", choices=["exec", "tui"])
+    reviewer_start.add_argument("--dry-run", action="store_true")
+    reviewer_start.set_defaults(func=cmd_reviewer_start)
+    reviewer_harvest = reviewer_sub.add_parser("harvest")
+    reviewer_harvest.add_argument("review_id")
+    reviewer_harvest.set_defaults(func=cmd_reviewer_harvest)
+    reviewer_close = reviewer_sub.add_parser("close")
+    reviewer_close.add_argument("review_id")
+    reviewer_close.add_argument(
+        "--verdict",
+        choices=["passed", "accepted-risk", "fix-tasks-created", "blocked"],
+        required=True,
+    )
+    reviewer_close.add_argument("--reason", required=True)
+    reviewer_close.set_defaults(func=cmd_reviewer_close)
+
+    tick = sub.add_parser("tick", help="run one bounded loop tick")
+    tick.add_argument("--once", action="store_true", help="document intent; tick is always bounded")
+    tick.add_argument("--max-workers", type=int)
+    tick.add_argument("--manager-pane")
+    tick.add_argument("--direction", choices=["right", "down"], default="right")
+    tick.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    tick.add_argument("--worker-runner", choices=["tui", "exec"])
+    tick.add_argument("--reviewer-runner", choices=["exec", "tui"])
+    tick.add_argument("--dry-run", action="store_true")
+    tick.add_argument(
+        "--stop-on-user-decision",
+        action="store_true",
+        help="deprecated; ticks always stop on blocking decisions",
+    )
+    tick.set_defaults(func=cmd_tick)
+
+    report = sub.add_parser("report", help="write reports/FINAL.md")
+    report.set_defaults(func=cmd_report)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except HLoopError as exc:
+        print(f"hloop: {exc}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        detail = stderr or stdout or str(exc)
+        print(f"hloop: command failed: {detail}", file=sys.stderr)
+        return exc.returncode or 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Review Frontmatter",
+  "type": "object",
+  "required": ["review_id", "base", "head", "status"],
+  "properties": {
+    "review_id": {"type": "string", "pattern": "^R[0-9]{3}$"},
+    "base": {"type": "string"},
+    "head": {"type": "string"},
+    "status": {"enum": ["running", "reported", "blocked", "failed"]}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop State",
+  "type": "object",
+  "required": ["goal_id", "phase", "base_branch", "integration_branch", "cycle", "max_workers", "max_reviewers", "tasks", "reviews", "blocking_decisions"],
+  "properties": {
+    "goal_id": {"type": "string"},
+    "phase": {"type": "string"},
+    "base_branch": {"type": "string"},
+    "integration_branch": {"type": "string"},
+    "cycle": {"type": "integer", "minimum": 0},
+    "max_workers": {"type": "integer", "minimum": 1},
+    "max_reviewers": {"type": "integer", "minimum": 0},
+    "tasks": {"type": "object"},
+    "reviews": {"type": "object"},
+    "blocking_decisions": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}

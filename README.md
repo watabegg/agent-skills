@@ -23,6 +23,7 @@
     ├── japanese-tech-writing/
     ├── pencil-pencli/
     ├── ealps-moodle-operator/
+    ├── herdr-dev-loop/
     └── shinshu-portal-auth/
         └── env.example
 ```
@@ -110,6 +111,20 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - eALPS の課題一覧を確認して、ローカルに問題文や提出用コードを整理する。
   - 課題ファイルの提出、小テスト回答、提出後の `評定のために提出済み` や `ステータス 終了` の確認を行う。
   - `/tmp` に保存した Moodle 操作 JSON から、提出状況を表形式で要約する。
+
+### `herdr-dev-loop`
+
+- 目的:
+  - Herdr 上で Manager / Worker / Reviewer の Codex agent を、git worktree、integration branch、`.ai/loop` artifact によって安全に協調させる。
+  - Worker には `$codex-impl`、Reviewer には `$codex-review-multi-v2` を使わせ、仕様判断が必要な場合は `DECISIONS.md` と `USER_ACTION_REQUIRED.md` に分離して止める。
+  - `scripts/hloop` で init、task 作成、Worker/Reviewer 起動、harvest、merge、validation、report を実行する。
+  - Worker は対話式 Codex TUI を既定にし、Reviewer は read-only な非対話 `codex exec` を既定にする。
+- 主な利用シーン:
+  - `/goal` や大きめの実装依頼を、複数 Codex agent に分割して進めたいとき。
+  - Worker の書き込み範囲、Reviewer の read-only 境界、merge gate、validation gate をファイルベースで固定したいとき。
+  - Herdr pane id や Codex CLI の挙動を `hloop doctor` で確認しながら、bounded tick で運用したいとき。
+- 注意:
+  - 実プロジェクトで生成される `.ai/loop`、pane transcript、秘密値、社内 URL、本番運用情報はこの public repo に commit しない。
 
 ## Skill を追加する方法
 
