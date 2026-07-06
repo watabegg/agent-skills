@@ -30,13 +30,29 @@ Each tick starts by reading:
 Then run, at most, one material transition:
 
 1. harvest completed Workers or Reviewers
-2. merge one ready Worker
-3. validate integration
-4. start one Reviewer
-5. dispatch queued Workers up to the safe worker limit
-6. generate a final report
+2. close any harvested Worker/Reviewer pane and archive the captured Codex session unless inspection is explicitly requested
+3. merge one ready Worker when no Reviewer is currently reading the integration branch
+4. validate integration
+5. start one Reviewer
+6. dispatch queued Workers up to the safe worker limit
+7. wait for a running Reviewer only after no other safe transition is available
+8. generate a final report
 
 Prefer a small number of obvious transitions over attempting to finish a goal in one tick.
+
+## Reviewer Wait Behavior
+
+Assume review can take minutes. A running Reviewer is not the same as a reported review; do not print `review triage required` until the artifact exists and has been harvested.
+
+While a Reviewer is running:
+
+- do not merge Worker branches into the integration branch under review
+- harvest finished Workers and close their panes
+- dispatch queued Workers only when their write scopes are non-overlapping and the state machine allows it
+- wait up to `review_wait_ms` when there is no other safe work
+- tick again later if the wait times out
+
+When the review artifact appears, harvest it, close the Reviewer pane, archive the captured Codex session, and require Manager triage before closing the review gate.
 
 ## Stop Conditions
 

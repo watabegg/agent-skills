@@ -11,6 +11,8 @@
     "cycle": {"type": "integer", "minimum": 0},
     "max_workers": {"type": "integer", "minimum": 1},
     "max_reviewers": {"type": "integer", "minimum": 0},
+    "session_cleanup": {"type": "string", "enum": ["archive", "none", "delete"]},
+    "review_wait_ms": {"type": "integer", "minimum": 0},
     "tasks": {"type": "object"},
     "reviews": {"type": "object"},
     "blocking_decisions": {"type": "array", "items": {"type": "string"}}
