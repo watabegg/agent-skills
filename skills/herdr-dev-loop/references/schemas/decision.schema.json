@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Decision Record",
+  "type": "object",
+  "required": ["id", "status", "blocking", "question", "options"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^D[0-9]{3}$"},
+    "status": {"enum": ["pending", "answered", "accepted", "rejected", "superseded"]},
+    "blocking": {"type": "boolean"},
+    "question": {"type": "string"},
+    "options": {"type": "array", "items": {"type": "string"}},
+    "recommended_default": {"type": "string"},
+    "created_from": {"type": "string"}
+  },
+  "additionalProperties": true
+}

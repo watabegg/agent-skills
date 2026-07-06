@@ -1,0 +1,4 @@
+interface:
+  display_name: "Herdr Dev Loop"
+  short_description: "Herdr上で複数Codex agentの実装ループを安全に運用する"
+  default_prompt: "Use $herdr-dev-loop to initialize a bounded Herdr-managed Manager/Worker/Reviewer development loop for this goal."
