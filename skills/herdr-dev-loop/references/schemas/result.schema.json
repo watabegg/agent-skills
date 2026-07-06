@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Worker Result Frontmatter",
   "type": "object",
-  "required": ["task_id", "status", "merge_ready", "branch", "head_sha", "base_sha", "changed_files", "blocking_questions"],
+  "required": ["task_id", "status", "merge_ready", "branch", "head_sha", "base_sha", "changed_files", "validation_recorded", "blocking_questions"],
   "properties": {
     "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
     "status": {"enum": ["done", "partial", "blocked", "failed", "abandoned"]},
@@ -11,6 +11,10 @@
     "head_sha": {"type": "string"},
     "base_sha": {"type": "string"},
     "changed_files": {"type": "array", "items": {"type": "string"}},
+    "validation_recorded": {"type": "boolean"},
+    "validation_commands": {"type": "array", "items": {"type": "string"}},
+    "validation_results": {"type": "array", "items": {"type": "string"}},
+    "validation_summary": {"type": "string"},
     "blocking_questions": {"type": "array", "items": {"type": "string"}}
   },
   "additionalProperties": true

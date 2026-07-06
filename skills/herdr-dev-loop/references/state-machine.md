@@ -12,10 +12,13 @@ Use a bounded state machine. Do not let Manager, Worker, or Reviewer coordinate 
 - `merging`: Manager is merging one Worker branch.
 - `validating`: Manager is running integration validation.
 - `reviewing`: Reviewer is running or its artifact is being triaged.
+- `waiting_worker`: Workers are still running and no result artifact is ready.
+- `waiting_review`: a Reviewer is still running after the bounded wait.
 - `blocked_user_decision`: a blocking decision is required from the user.
 - `blocked_environment`: required tool, credentials, branch, or worktree state is missing.
 - `blocked_conflict`: merge conflict or write-scope conflict needs judgment.
 - `failed_validation`: integration validation failed and no obvious local fix was applied.
+- `no_progress`: no safe transition exists and Manager inspection is required.
 - `done`: all tasks are merged, validation passes, and no blocking review finding remains.
 
 ## Tick Order
@@ -70,3 +73,5 @@ Set a blocked or failed phase and stop when:
 - Reviewer reports a P0/P1 finding that cannot be fixed without a user decision.
 
 Do not dispatch new Workers while blocked.
+
+Waiting for a running Worker or Reviewer is not itself a hard failure. Set `waiting_worker` or `waiting_review`, report the exact agent ids, and tick again later. Set `no_progress` only when no agent is running, no dependency can advance, and the next Manager action is unclear.
