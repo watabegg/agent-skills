@@ -34,10 +34,17 @@ Required command shape:
 ```bash
 codex --sandbox workspace-write --ask-for-approval never --no-alt-screen "$(cat .ai/loop/prompts/T001.worker.md)"
 codex exec --sandbox workspace-write - < .ai/loop/prompts/T001.worker.md
-codex exec --sandbox read-only --output-last-message .ai/loop/reviews/R001.md - < .ai/loop/prompts/R001.reviewer.md
+codex --sandbox workspace-write --ask-for-approval never --no-alt-screen "$(cat .ai/loop/prompts/R001.reviewer.md)"
+codex exec --sandbox workspace-write --output-last-message .ai/loop/reviews/R001.md - < .ai/loop/prompts/R001.reviewer.md
 ```
 
-The helper uses `--sandbox workspace-write` for Workers and `--sandbox read-only` for Reviewers. Worker default is TUI; Reviewer default is exec.
+The helper uses `--sandbox workspace-write` for Workers and Reviewers. Worker default is TUI. Reviewer default is also TUI, but runs in a detached review worktree so the Manager can monitor progress and the Reviewer can write only the final review artifact. `hloop reviewer harvest` copies the artifact back to the Manager repo and blocks if the review worktree changed any other file.
+
+Use this while a review is running:
+
+```bash
+python3 <skill>/scripts/hloop reviewer watch R001 --lines 120
+```
 
 Codex saved sessions can be archived after pane cleanup:
 

@@ -26,9 +26,11 @@ For each running Worker:
 For each running Reviewer:
 
 - read `reviews/<review-id>.md`
+- inspect live progress with `hloop reviewer watch <review-id>` when Manager needs status before the artifact exists
 - expect the review to take several minutes; wait patiently only after other safe Manager work is exhausted
 - while the review is running, do not advance the integration branch being reviewed
-- if the review is still running, harvest finished Workers, prepare task/validation notes, or dispatch safe queued Workers instead of idling
+- if the review is still running, harvest finished Workers, prepare task/validation notes, or dispatch safe queued Workers up to `max_workers` instead of idling
+- treat the review worktree as disposable; harvest copies `.ai/loop/reviews/<review-id>.md` back to the Manager repo and removes the worktree when no write-scope violation occurred
 - triage findings into fix task, decision, accepted risk, or false positive
 - never ask Reviewer to edit code
 - after harvesting the review artifact, close the Reviewer pane and archive the captured Codex session unless `--keep-pane` is needed for inspection

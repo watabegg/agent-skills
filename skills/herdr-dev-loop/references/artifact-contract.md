@@ -42,8 +42,12 @@ Recommended optional fields:
 - `review_wait_ms`: bounded wait for a running Reviewer before returning control
 - per task/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
 - per task/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
+- per review `worktree`, `worktree_review_path_harvested`, `worktree_cleanup_status`
+- per review `write_scope_violations`
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
+
+Reviewer artifacts are written in a detached review worktree first, then copied back to the Manager repo during harvest. The review worktree may use `workspace-write`, but only `.ai/loop/reviews/<review-id>.md` is an allowed Reviewer write.
 
 ## Task File
 
