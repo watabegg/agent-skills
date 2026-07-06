@@ -1,6 +1,6 @@
 ---
 name: herdr-dev-loop
-description: Orchestrate a bounded Herdr-managed multi-agent coding loop with interactive Worker Codex TUI panes and read-only Reviewer runs. Use inside Herdr when Codex needs to run Manager, Worker, and Reviewer agents across git worktrees, persist the goal in .ai/loop artifacts, make Workers use $codex-impl, make Reviewers use $codex-review-multi-v2, merge into an integration branch, and stop on blocking specification decisions or unsafe state.
+description: Orchestrate a bounded Herdr-managed multi-agent coding loop with interactive Worker and Reviewer Codex TUI panes. Use inside Herdr when Codex needs to run Manager, Worker, and Reviewer agents across git worktrees, persist the goal in .ai/loop artifacts, make Workers use $codex-impl, make Reviewers use $codex-review-multi-v2, merge into an integration branch, monitor Reviewer panes, harvest review artifacts from detached review worktrees, and stop on blocking specification decisions or unsafe state.
 ---
 
 # Herdr Dev Loop
@@ -27,15 +27,15 @@ Use the helper script instead of hand-typing pane prompts:
 
 ```bash
 python3 <this-skill>/scripts/hloop doctor
-python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --worker-runner tui --reviewer-runner exec --session-cleanup archive --review-wait-ms 600000
+python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --worker-runner tui --reviewer-runner tui --max-workers 3 --session-cleanup archive --review-wait-ms 600000
 python3 <this-skill>/scripts/hloop task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 git add .ai/loop && git commit -m "ai-loop: initialize goal"
-python3 <this-skill>/scripts/hloop tick --once --max-workers 2
+python3 <this-skill>/scripts/hloop tick --once --max-workers 3
 ```
 
 The script is deliberately explicit. Use `--dry-run` on `worker start`, `reviewer start`, and `tick` when checking the commands before spawning panes.
 
-Worker agents default to interactive Codex TUI panes so the Manager can add requirements or interrupt them in Herdr. Reviewer agents default to non-interactive `codex exec` because review artifacts should be reproducible and read-only. Override with `--runner exec` or `--runner tui` when needed.
+Worker and Reviewer agents default to interactive Codex TUI panes so the Manager can inspect progress, add requirements, or interrupt them in Herdr. Reviewers run in detached review worktrees with `workspace-write` sandbox so the final review report can be written reliably; the prompt and harvest guard still forbid code edits. Override with `--runner exec` only when non-interactive review is intentionally preferred.
 
 After a Worker or Reviewer artifact is harvested, close its Herdr pane and archive its captured Codex session unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
 
@@ -81,7 +81,7 @@ Do not let Workers edit `STATE.json`, `MISSION.md`, `PLAN.md`, other task files,
 Run bounded ticks:
 
 ```bash
-python3 skills/herdr-dev-loop/scripts/hloop tick --once --max-workers 2 --stop-on-user-decision
+python3 skills/herdr-dev-loop/scripts/hloop tick --once --max-workers 3 --stop-on-user-decision
 ```
 
 Each tick must:
@@ -98,7 +98,7 @@ Each tick must:
 
 Do not run an unbounded loop. Prefer `--once`; use `--max-cycles` only after the workflow is stable.
 
-Assume Reviewer runs can take several minutes. If a Reviewer is still running, wait up to `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting for review completion, continue Manager work that does not mutate the reviewed integration head: refine tasks, prepare validation notes, harvest finished Workers, or dispatch non-overlapping queued Workers when the state machine permits it. Do not merge Worker branches while a Reviewer is actively reading the integration branch.
+Assume Reviewer runs can take several minutes. Use `hloop reviewer watch <review-id>` to inspect the TUI pane. If a Reviewer is still running, wait up to `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting for review completion, continue Manager work that does not mutate the reviewed integration head: refine tasks, prepare validation notes, harvest finished Workers, or dispatch non-overlapping queued Workers up to `max_workers`. Do not merge Worker branches while a Reviewer is actively reading the integration branch.
 
 ## References
 
