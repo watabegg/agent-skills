@@ -1,6 +1,6 @@
 # Prompt Templates
 
-`scripts/hloop` renders concrete prompts from these contracts. Keep prompts short and force agents back to `.ai/loop` files. Worker prompts are usually sent into interactive Codex TUI panes; Reviewer prompts are usually sent through non-interactive `codex exec`.
+`scripts/hloop` renders concrete prompts from these contracts. Keep prompts short and force agents back to `.ai/loop` files. Worker and Reviewer prompts are usually sent into interactive Codex TUI panes. Use non-interactive `codex exec` only for bounded automation where Manager does not need live TUI inspection.
 
 ## Worker Prompt Shape
 
@@ -27,6 +27,10 @@ Rules:
 Required output:
 - .ai/loop/results/T001/result.md
 - one git commit on your branch
+
+Result frontmatter:
+- use flat validation fields: `validation_recorded`, `validation_commands`, `validation_results`, and `validation_summary`
+- commit `.ai/loop/results/T001/result.md` on the Worker branch before finishing
 
 Final terminal line:
 HERDR_LOOP_TASK_DONE:T001:<done|blocked|failed|partial>

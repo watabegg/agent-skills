@@ -35,6 +35,8 @@ python3 <this-skill>/scripts/hloop tick --once --max-workers 3
 
 The script is deliberately explicit. Use `--dry-run` on `worker start`, `reviewer start`, and `tick` when checking the commands before spawning panes.
 
+Mutating `hloop` commands enforce their own preflight. `tick`, `worker start`, `worker harvest`, `merge`, `validate`, `reviewer start`, and `reviewer harvest` check the relevant Herdr environment, current branch, required commands, and non-loop dirty files before changing state.
+
 Worker and Reviewer agents default to interactive Codex TUI panes so the Manager can inspect progress, add requirements, or interrupt them in Herdr. Reviewers run in detached review worktrees with `workspace-write` sandbox so the final review report can be written reliably; the prompt and harvest guard still forbid code edits. Override with `--runner exec` only when non-interactive review is intentionally preferred.
 
 When sending additional instructions to a running TUI, use `hloop worker message <task-id> --file <prompt.md>` or `hloop reviewer message <review-id> --file <prompt.md>`. Do not send prompts directly with `herdr pane run` unless you have manually verified the pane is a ready Codex TUI. The helper blocks common mistakes: shell panes, pending Codex trust prompts, and busy Codex sessions. It sends via `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered; if the first Enter races the TUI, it retries.
@@ -130,6 +132,6 @@ Stop immediately when:
 - merge conflict requires judgment.
 - integration validation fails and rollback is not obvious.
 - Reviewer reports P0/P1 that needs a user decision.
-- no progress was made in the last tick.
+- no progressable transition exists and no Worker or Reviewer is merely still running.
 
 When stopped, update `STATE.json`, `JOURNAL.md`, and `USER_ACTION_REQUIRED.md` with the concrete blocker before asking the user.

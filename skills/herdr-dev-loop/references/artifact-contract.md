@@ -16,6 +16,7 @@ All loop coordination is file-backed under `.ai/loop`.
   results/
   reviews/
   prompts/
+  validation/
   reports/
 ```
 
@@ -44,6 +45,7 @@ Recommended optional fields:
 - per task/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
 - per review `worktree`, `worktree_review_path_harvested`, `worktree_cleanup_status`
 - per review `write_scope_violations`
+- `last_validation.results[].log`: relative path to captured stdout/stderr under `.ai/loop/validation/`
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 
@@ -86,13 +88,16 @@ task_id: T001
 status: done
 merge_ready: true
 branch: ai/example/T001-login
-head_sha: def456
+head_sha: HEAD
 base_sha: abc123
 changed_files:
   - src/auth/login.ts
-validation:
-  - command: npm test -- tests/auth/login.test.ts
-    result: passed
+validation_recorded: true
+validation_commands:
+  - npm test -- tests/auth/login.test.ts
+validation_results:
+  - passed
+validation_summary: "auth login tests passed"
 blocking_questions: []
 ---
 ```
@@ -106,6 +111,12 @@ Allowed `status` values:
 - `abandoned`
 
 Only `status: done` may set `merge_ready: true`.
+
+`merge_ready: true` requires `validation_recorded: true`. Keep validation fields flat; do not use nested YAML maps in frontmatter because `hloop` intentionally uses a stdlib-only parser.
+
+The result artifact must be committed on the Worker branch at `HEAD:.ai/loop/results/<task-id>/result.md`. `hloop worker harvest` rejects artifacts that exist only in the worktree or differ from the committed version.
+
+Use `head_sha: HEAD` when writing the artifact from the Worker branch. `hloop worker harvest` resolves it to the actual branch head; writing the exact commit SHA inside the same commit is not required.
 
 ## Review Artifact
 

@@ -20,7 +20,7 @@ Pick commands from current repository evidence:
 - CI workflow files
 - README or project docs
 
-Record exact commands and results in Worker result artifacts and in `STATE.json.last_validation`.
+Record exact commands and results in Worker result artifacts and in `STATE.json.last_validation`. Integration validation must also capture stdout/stderr under `.ai/loop/validation/` and record the relative log path in `STATE.json.last_validation.results[].log`.
 
 ## Integration Failure
 
