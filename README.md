@@ -118,10 +118,10 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - Herdr 上で Manager / Worker / Reviewer の Codex agent を、git worktree、integration branch、`.ai/loop` artifact によって安全に協調させる。
   - Worker には `$codex-impl`、Reviewer には `$codex-review-multi-v2` を使わせ、仕様判断が必要な場合は `DECISIONS.md` と `USER_ACTION_REQUIRED.md` に分離して止める。
   - `scripts/hloop` で init、task 作成、Worker/Reviewer 起動、harvest、merge、validation、report を実行する。
-  - Worker は対話式 Codex TUI を既定にし、Reviewer は read-only な非対話 `codex exec` を既定にする。
+  - Worker と Reviewer は対話式 Codex TUI を既定にし、Reviewer は detached review worktree で最終 review artifact だけを書き込む。
 - 主な利用シーン:
   - `/goal` や大きめの実装依頼を、複数 Codex agent に分割して進めたいとき。
-  - Worker の書き込み範囲、Reviewer の read-only 境界、merge gate、validation gate をファイルベースで固定したいとき。
+  - Worker の書き込み範囲、Reviewer の review artifact 境界、merge gate、validation gate をファイルベースで固定したいとき。
   - Herdr pane id や Codex CLI の挙動を `hloop doctor` で確認しながら、bounded tick で運用したいとき。
 - 注意:
   - 実プロジェクトで生成される `.ai/loop`、pane transcript、秘密値、社内 URL、本番運用情報はこの public repo に commit しない。

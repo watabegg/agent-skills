@@ -13,6 +13,7 @@
     "max_reviewers": {"type": "integer", "minimum": 0},
     "session_cleanup": {"type": "string", "enum": ["archive", "none", "delete"]},
     "review_wait_ms": {"type": "integer", "minimum": 0},
+    "reviewer_runner": {"type": "string", "enum": ["tui", "exec"]},
     "tasks": {"type": "object"},
     "reviews": {"type": "object"},
     "blocking_decisions": {"type": "array", "items": {"type": "string"}}

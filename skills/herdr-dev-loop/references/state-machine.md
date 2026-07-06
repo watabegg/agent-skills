@@ -34,7 +34,7 @@ Then run, at most, one material transition:
 3. merge one ready Worker when no Reviewer is currently reading the integration branch
 4. validate integration
 5. start one Reviewer
-6. dispatch queued Workers up to the safe worker limit
+6. dispatch queued Workers in a batch up to the safe worker limit
 7. wait for a running Reviewer only after no other safe transition is available
 8. generate a final report
 
@@ -48,11 +48,12 @@ While a Reviewer is running:
 
 - do not merge Worker branches into the integration branch under review
 - harvest finished Workers and close their panes
-- dispatch queued Workers only when their write scopes are non-overlapping and the state machine allows it
+- dispatch queued Workers up to `max_workers` when their write scopes are non-overlapping and the state machine allows it
+- inspect live Reviewer output with `hloop reviewer watch <review-id>` instead of guessing from pane status alone
 - wait up to `review_wait_ms` when there is no other safe work
 - tick again later if the wait times out
 
-When the review artifact appears, harvest it, close the Reviewer pane, archive the captured Codex session, and require Manager triage before closing the review gate.
+When the review artifact appears, harvest it from the detached review worktree, verify the Reviewer changed no files except the review artifact, close the Reviewer pane, archive the captured Codex session, remove the review worktree, and require Manager triage before closing the review gate.
 
 ## Stop Conditions
 
