@@ -36,6 +36,15 @@ Required top-level fields:
 
 Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pane id.
 
+Recommended optional fields:
+
+- `session_cleanup`: `archive`, `none`, or `delete`; default to `archive`
+- `review_wait_ms`: bounded wait for a running Reviewer before returning control
+- per task/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
+- per task/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
+
+Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
+
 ## Task File
 
 Each task is `tasks/TNNN.md` with frontmatter:
