@@ -14,6 +14,7 @@ main or master
 
 - Manager works on the integration branch.
 - Manager creates task branches from the current integration branch.
+- `worker start` records the current integration branch HEAD as the Manager-owned task base.
 - Manager integrates one Worker branch at a time.
 - Default to `squash` so each task becomes one integration commit.
 - Use `cherry-pick` only when preserving Worker commit boundaries matters.
@@ -34,6 +35,7 @@ main or master
 Before merge, require:
 
 - result artifact exists
+- result artifact is committed at `HEAD:.ai/loop/results/<task-id>/result.md`
 - result `status: done`
 - result `merge_ready: true`
 - result `head_sha` matches the Worker branch head
@@ -41,6 +43,7 @@ Before merge, require:
 - changed files do not match `write_deny`
 - no blocking questions
 - validation commands are recorded
+- validation is recorded with flat result frontmatter fields, not nested YAML maps
 - no conflict markers are present
 
 If validation fails after integration, stop and keep the Worker branch/worktree for debugging. Revert only when the revert is mechanically obvious and safe.

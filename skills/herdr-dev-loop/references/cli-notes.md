@@ -2,6 +2,8 @@
 
 These notes describe the local command assumptions used by `scripts/hloop`. Re-check with `hloop doctor` because Herdr and Codex CLI can change.
 
+`hloop doctor` treats `git`, `herdr`, `codex`, `$codex-impl`, and `$codex-review-multi-v2` as hard requirements. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
+
 ## Herdr
 
 Required commands:
@@ -79,6 +81,6 @@ Required skills:
 
 - `$codex-impl`: normally at `~/.codex/skills/codex-impl/SKILL.md`
 - `$codex-review-multi-v2`: normally at `~/.codex/skills/codex-review-multi-v2/SKILL.md`
-- `$herdr`: often at `~/.agents/skills/herdr/SKILL.md`
+- `$herdr`: often at `~/.agents/skills/herdr/SKILL.md`, or set `HERDR_SKILL_PATH`
 
 Do not copy private skill contents into public artifacts unless they are already intended for publication.

@@ -12,6 +12,8 @@ Manager owns integration and final judgment.
 6. Check current branch against `STATE.json`.
 7. Check `git status --short`.
 
+`hloop` enforces the same preflight for mutating commands. Treat a preflight failure as an environmental block, not as a reason to continue by hand.
+
 ## TUI Follow-Up Messages
 
 When Manager needs to add requirements or clarify scope for a running Worker or Reviewer, write the follow-up prompt to `.ai/loop/inbox/manager/` and send it with:
@@ -30,6 +32,7 @@ For each running Worker:
 - check Herdr pane output only as a hint
 - prefer `results/<task-id>/result.md`
 - parse status and merge readiness
+- require the result artifact to be committed at Worker `HEAD`
 - compute actual changed files from git
 - compare changed files to `write_allow` and `write_deny`
 - after harvesting the result artifact, close the Worker pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
@@ -66,6 +69,7 @@ When done, generate `reports/FINAL.md` with:
 - merged tasks
 - cleanup status for local Worker branches/worktrees
 - validation commands and results
+- validation log paths from `.ai/loop/validation/`
 - review status
 - accepted risks
 - remaining follow-ups
