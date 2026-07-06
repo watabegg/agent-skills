@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,9 @@ LOOP_DIR = Path(".ai") / "loop"
 TASK_STATUSES_FINAL = {"done", "partial", "blocked", "failed", "abandoned"}
 SESSION_CLEANUP_MODES = {"none", "archive", "delete"}
 DEFAULT_REVIEW_WAIT_MS = 600_000
+DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
+DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
+DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
 
 
 class HLoopError(RuntimeError):
@@ -287,6 +291,180 @@ def pane_info(pane_id: str) -> dict[str, Any] | None:
         return None
     pane = payload.get("result", {}).get("pane")
     return pane if isinstance(pane, dict) else None
+
+
+def pane_text(pane_id: str, lines: int = 160) -> str:
+    proc = run_cmd(
+        [
+            "herdr",
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            str(lines),
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout or ""
+
+
+def codex_tui_blocker(pane: dict[str, Any] | None, text: str) -> str | None:
+    if pane is None:
+        return "pane is missing or closed"
+    if pane.get("agent") != "codex":
+        return "pane is not a Codex TUI"
+    if "Do you trust the contents of this directory?" in text or "Press enter to continue" in text:
+        return "Codex trust prompt is pending"
+    status = str(pane.get("agent_status") or "unknown")
+    if status == "working" or "esc to interrupt" in text or "• Working" in text:
+        return "Codex is still working"
+    if status in {"blocked", "unknown"}:
+        return f"Codex is not ready: agent_status={status}"
+    return None
+
+
+def message_anchors(message: str) -> list[str]:
+    anchors: list[str] = []
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped:
+            anchors.append(stripped[:160])
+    if not anchors and message.strip():
+        anchors.append(message.strip()[:160])
+    if len(anchors) > 1:
+        return [anchors[0], anchors[-1]]
+    return anchors
+
+
+def message_visible_in_text(message: str, text: str) -> bool:
+    anchors = message_anchors(message)
+    return bool(anchors) and all(anchor in text for anchor in anchors)
+
+
+def codex_output_after_message(message: str, text: str) -> bool:
+    anchors = message_anchors(message)
+    if not anchors:
+        return False
+    index = text.rfind(anchors[-1])
+    if index < 0:
+        return False
+    after = text[index + len(anchors[-1]) :]
+    return "\n• " in after
+
+
+def wait_codex_tui_ready(pane_id: str, timeout_ms: int) -> tuple[dict[str, Any], str]:
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    last_blocker = "Codex TUI did not become ready"
+    while True:
+        pane = pane_info(pane_id)
+        text = pane_text(pane_id)
+        blocker = codex_tui_blocker(pane, text)
+        if blocker is None and pane is not None:
+            return pane, text
+        last_blocker = blocker or last_blocker
+        if time.monotonic() >= deadline:
+            raise HLoopError(f"Codex TUI is not ready for manager message: {last_blocker}")
+        time.sleep(0.5)
+
+
+def wait_manager_message_visible(pane_id: str, message: str, timeout_ms: int) -> str:
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    while True:
+        text = pane_text(pane_id)
+        if message_visible_in_text(message, text):
+            return text
+        if time.monotonic() >= deadline:
+            raise HLoopError("manager message was not visible in the Codex input after send-text")
+        time.sleep(0.2)
+
+
+def manager_message_submitted(
+    pane_id: str,
+    message: str,
+    typed_snapshot: str,
+    initial_session_id: str | None,
+    timeout_ms: int,
+) -> bool:
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    while True:
+        pane = pane_info(pane_id)
+        text = pane_text(pane_id)
+        status = str((pane or {}).get("agent_status") or "unknown")
+        session_id = extract_agent_session_id(pane)
+        if status in {"working", "blocked"} or "esc to interrupt" in text or "• Working" in text:
+            return True
+        if codex_output_after_message(message, text):
+            return True
+        if session_id and session_id != initial_session_id and text != typed_snapshot:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def send_codex_tui_message(
+    pane_id: str,
+    message: str,
+    timeout_ms: int,
+    input_settle_ms: int,
+    submit_verify_ms: int,
+    submit_attempts: int,
+) -> None:
+    if not message.strip():
+        raise HLoopError("manager message is empty")
+    check_herdr_env()
+    initial_pane, _ = wait_codex_tui_ready(pane_id, timeout_ms)
+    initial_session_id = extract_agent_session_id(initial_pane)
+    run_cmd(["herdr", "pane", "send-text", pane_id, message], check=True, capture=True)
+    typed_snapshot = wait_manager_message_visible(
+        pane_id,
+        message,
+        max(input_settle_ms, 1_000),
+    )
+    if input_settle_ms > 0:
+        time.sleep(input_settle_ms / 1000)
+    attempts = max(1, submit_attempts)
+    for attempt in range(attempts):
+        run_cmd(["herdr", "pane", "send-keys", pane_id, "Enter"], check=True, capture=True)
+        if manager_message_submitted(
+            pane_id,
+            message,
+            typed_snapshot,
+            initial_session_id,
+            submit_verify_ms,
+        ):
+            return
+        if attempt + 1 < attempts and input_settle_ms > 0:
+            time.sleep(input_settle_ms / 1000)
+    raise HLoopError(
+        f"manager message was typed but not submitted after {attempts} Enter attempt(s)"
+    )
+
+
+def manager_message_from_args(args: argparse.Namespace) -> tuple[str, str]:
+    if getattr(args, "file", None):
+        path = Path(args.file).resolve()
+        return read_text(path), str(path)
+    if getattr(args, "message", None):
+        return str(args.message), "argv"
+    if not sys.stdin.isatty():
+        return sys.stdin.read(), "stdin"
+    raise HLoopError("provide a message argument, --file, or stdin")
+
+
+def record_manager_message(target_state: dict[str, Any], source: str, message: str) -> None:
+    target_state.setdefault("manager_messages", []).append(
+        {
+            "at": now_iso(),
+            "source": source,
+            "bytes": len(message.encode("utf-8")),
+            "lines": len(message.splitlines()) or 1,
+        }
+    )
 
 
 def extract_agent_session_id(pane: dict[str, Any] | None) -> str | None:
@@ -1179,6 +1357,34 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_worker_message(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not task_state:
+        raise HLoopError(f"unknown task: {task_id}")
+    if task_state.get("status") != "running":
+        raise HLoopError(f"worker is not running: {task_id} status={task_state.get('status')}")
+    pane_id = str(task_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"worker has no pane_id: {task_id}")
+    message, source = manager_message_from_args(args)
+    send_codex_tui_message(
+        pane_id,
+        message,
+        args.timeout_ms,
+        args.input_settle_ms,
+        args.submit_verify_ms,
+        args.submit_attempts,
+    )
+    record_manager_message(task_state, source, message)
+    save_state(repo, state)
+    journal(repo, f"Sent Manager message to Worker `{task_id}` in pane `{pane_id}` from {source}.")
+    print(f"sent manager message to {task_id} in pane {pane_id}")
+    return 0
+
+
 def cmd_merge(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
@@ -1555,6 +1761,34 @@ def cmd_reviewer_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reviewer_message(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    review_id = args.review_id
+    review_state = state.get("reviews", {}).get(review_id)
+    if not review_state:
+        raise HLoopError(f"unknown review: {review_id}")
+    if review_state.get("status") != "running":
+        raise HLoopError(f"reviewer is not running: {review_id} status={review_state.get('status')}")
+    pane_id = str(review_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"reviewer has no pane_id: {review_id}")
+    message, source = manager_message_from_args(args)
+    send_codex_tui_message(
+        pane_id,
+        message,
+        args.timeout_ms,
+        args.input_settle_ms,
+        args.submit_verify_ms,
+        args.submit_attempts,
+    )
+    record_manager_message(review_state, source, message)
+    save_state(repo, state)
+    journal(repo, f"Sent Manager message to Reviewer `{review_id}` in pane `{pane_id}` from {source}.")
+    print(f"sent manager message to {review_id} in pane {pane_id}")
+    return 0
+
+
 def write_sets_overlap(a: list[str], b: list[str]) -> bool:
     for left in a:
         for right in b:
@@ -1822,6 +2056,30 @@ def build_parser() -> argparse.ArgumentParser:
     worker_harvest.add_argument("--keep-pane", action="store_true")
     worker_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     worker_harvest.set_defaults(func=cmd_worker_harvest)
+    worker_message = worker_sub.add_parser("message")
+    worker_message.add_argument("task_id")
+    worker_message.add_argument("message", nargs="?")
+    worker_message.add_argument("--file")
+    worker_message.add_argument("--timeout-ms", type=int, default=30_000)
+    worker_message.add_argument(
+        "--input-settle-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+        help="delay between send-text visibility and Enter",
+    )
+    worker_message.add_argument(
+        "--submit-verify-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+        help="time to wait for Codex to start working or answer after Enter",
+    )
+    worker_message.add_argument(
+        "--submit-attempts",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
+        help="Enter retry count when the message remains typed but unsubmitted",
+    )
+    worker_message.set_defaults(func=cmd_worker_message)
 
     merge = sub.add_parser("merge", help="merge a Worker task")
     merge.add_argument("task_id")
@@ -1873,6 +2131,30 @@ def build_parser() -> argparse.ArgumentParser:
         default="recent-unwrapped",
     )
     reviewer_watch.set_defaults(func=cmd_reviewer_watch)
+    reviewer_message = reviewer_sub.add_parser("message")
+    reviewer_message.add_argument("review_id")
+    reviewer_message.add_argument("message", nargs="?")
+    reviewer_message.add_argument("--file")
+    reviewer_message.add_argument("--timeout-ms", type=int, default=30_000)
+    reviewer_message.add_argument(
+        "--input-settle-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+        help="delay between send-text visibility and Enter",
+    )
+    reviewer_message.add_argument(
+        "--submit-verify-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+        help="time to wait for Codex to start working or answer after Enter",
+    )
+    reviewer_message.add_argument(
+        "--submit-attempts",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
+        help="Enter retry count when the message remains typed but unsubmitted",
+    )
+    reviewer_message.set_defaults(func=cmd_reviewer_message)
 
     tick = sub.add_parser("tick", help="run one bounded loop tick")
     tick.add_argument("--once", action="store_true", help="document intent; tick is always bounded")

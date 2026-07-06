@@ -12,6 +12,17 @@ Manager owns integration and final judgment.
 6. Check current branch against `STATE.json`.
 7. Check `git status --short`.
 
+## TUI Follow-Up Messages
+
+When Manager needs to add requirements or clarify scope for a running Worker or Reviewer, write the follow-up prompt to `.ai/loop/inbox/manager/` and send it with:
+
+```bash
+hloop worker message T001 --file .ai/loop/inbox/manager/T001-followup.md
+hloop reviewer message R001 --file .ai/loop/inbox/manager/R001-followup.md
+```
+
+Do not send follow-ups directly with `herdr pane run` unless debugging the pane itself. `hloop ... message` refuses to send when the target pane is not Codex, is showing the trust prompt, or is still working. It then uses `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered before reporting success.
+
 ## Harvest Rules
 
 For each running Worker:

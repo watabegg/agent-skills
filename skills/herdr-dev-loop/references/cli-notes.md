@@ -11,6 +11,8 @@ Required commands:
 - `herdr pane get <pane-id>`
 - `herdr pane split <pane-id> --direction right|down --cwd <path> --no-focus`
 - `herdr pane run <pane-id> <command>`
+- `herdr pane send-text <pane-id> <text>`
+- `herdr pane send-keys <pane-id> Enter`
 - `herdr pane read <pane-id> --source recent-unwrapped --lines <n>`
 - `herdr pane close <pane-id>`
 - `herdr agent list`
@@ -45,6 +47,23 @@ Use this while a review is running:
 ```bash
 python3 <skill>/scripts/hloop reviewer watch R001 --lines 120
 ```
+
+Use the helper to send additional Manager instructions into a TUI:
+
+```bash
+python3 <skill>/scripts/hloop worker message T001 --file .ai/loop/inbox/manager/T001-followup.md
+python3 <skill>/scripts/hloop reviewer message R001 --file .ai/loop/inbox/manager/R001-followup.md
+```
+
+Avoid direct `herdr pane run <pane> "<prompt>"` for Manager follow-ups. Empirical failure modes in Herdr 0.7.1 / Codex CLI 0.142.5:
+
+- sending to a pane before Codex starts executes the prompt as a shell command
+- sending while the Codex trust prompt is visible consumes Enter for trust and drops the prompt
+- sending while Codex is working can mix the new instruction into the active turn
+- sending `send-text` and `Enter` back-to-back can leave the prompt typed but not submitted
+- `herdr wait output --match <marker>` can match the echoed prompt text before Codex has answered
+
+`hloop ... message` checks that the pane is a Codex TUI, rejects trust prompts and working sessions, then uses `pane send-text`, waits until the prompt is visible, pauses before `pane send-keys Enter`, and verifies that Codex started working or answered. If verification fails because the prompt stayed typed, it retries Enter. Tune with `--input-settle-ms`, `--submit-verify-ms`, and `--submit-attempts` only after inspecting the pane. For long or multi-line instructions, prefer `--file` to avoid shell quoting issues.
 
 Codex saved sessions can be archived after pane cleanup:
 
