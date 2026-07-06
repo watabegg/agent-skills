@@ -24,6 +24,8 @@ from typing import Any
 
 LOOP_DIR = Path(".ai") / "loop"
 TASK_STATUSES_FINAL = {"done", "partial", "blocked", "failed", "abandoned"}
+SESSION_CLEANUP_MODES = {"none", "archive", "delete"}
+DEFAULT_REVIEW_WAIT_MS = 600_000
 
 
 class HLoopError(RuntimeError):
@@ -275,6 +277,117 @@ def extract_pane_id(payload: dict[str, Any]) -> str:
     raise HLoopError(f"could not find pane_id in Herdr response: {payload}")
 
 
+def pane_info(pane_id: str) -> dict[str, Any] | None:
+    proc = run_cmd(["herdr", "pane", "get", pane_id], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    pane = payload.get("result", {}).get("pane")
+    return pane if isinstance(pane, dict) else None
+
+
+def extract_agent_session_id(pane: dict[str, Any] | None) -> str | None:
+    if not pane:
+        return None
+    session = pane.get("agent_session")
+    if isinstance(session, dict):
+        value = session.get("value")
+        if value:
+            return str(value)
+    for key in ("agent_session_id", "session_id"):
+        value = pane.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def session_cleanup_mode(args: argparse.Namespace, state: dict[str, Any]) -> str:
+    mode = getattr(args, "session_cleanup", None) or state.get("session_cleanup", "archive")
+    mode = str(mode)
+    if mode not in SESSION_CLEANUP_MODES:
+        raise HLoopError(f"unsupported session cleanup mode: {mode}")
+    return mode
+
+
+def cleanup_codex_session(session_id: str, mode: str) -> tuple[bool, str]:
+    if mode == "none":
+        return True, "skipped"
+    if not command_exists("codex"):
+        return False, "codex command not found"
+    cmd = ["codex", "archive", session_id]
+    if mode == "delete":
+        cmd = ["codex", "delete", "--force", session_id]
+    proc = run_cmd(cmd, check=False)
+    if proc.returncode == 0:
+        return True, mode
+    message = (proc.stderr or proc.stdout or "").strip()
+    return False, message or f"codex {mode} failed"
+
+
+def cleanup_completed_agent_pane(
+    repo: Path,
+    agent_state: dict[str, Any],
+    *,
+    label: str,
+    keep_pane: bool = False,
+    session_cleanup: str = "archive",
+    dry_run: bool = False,
+) -> None:
+    pane_id = str(agent_state.get("pane_id") or "")
+    if not pane_id or agent_state.get("pane_closed_at"):
+        return
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        agent_state["pane_cleanup_status"] = "skipped:not-in-herdr"
+        return
+    try:
+        current = current_pane_id()
+    except HLoopError:
+        current = ""
+    if pane_id == current:
+        agent_state["pane_cleanup_status"] = "skipped:manager-pane"
+        journal(repo, f"Skipped closing `{label}` pane `{pane_id}` because it is the current Manager pane.")
+        return
+    pane = pane_info(pane_id)
+    if pane is None:
+        agent_state["pane_closed_at"] = now_iso()
+        agent_state["pane_cleanup_status"] = "already-closed"
+        return
+    session_id = extract_agent_session_id(pane)
+    if session_id:
+        agent_state["codex_session_id"] = session_id
+    if keep_pane:
+        agent_state["pane_cleanup_status"] = "kept"
+        return
+    if dry_run:
+        print(f"DRY RUN herdr pane close {pane_id}")
+        if session_id and session_cleanup != "none":
+            print(f"DRY RUN codex {session_cleanup} {session_id}")
+        return
+    proc = run_cmd(["herdr", "pane", "close", pane_id], check=False)
+    if proc.returncode == 0:
+        agent_state["pane_closed_at"] = now_iso()
+        agent_state["pane_cleanup_status"] = "closed"
+        journal(repo, f"Closed `{label}` pane `{pane_id}` after harvesting its artifact.")
+    else:
+        message = (proc.stderr or proc.stdout or "").strip()
+        agent_state["pane_cleanup_status"] = "failed"
+        agent_state["pane_cleanup_error"] = message
+        journal(repo, f"Failed to close `{label}` pane `{pane_id}`: {message}")
+        return
+    if session_id:
+        ok, detail = cleanup_codex_session(session_id, session_cleanup)
+        agent_state["codex_session_cleanup"] = detail
+        if ok:
+            agent_state["codex_session_cleaned_at"] = now_iso()
+            journal(repo, f"Codex session `{session_id}` for `{label}` cleanup: {detail}.")
+        else:
+            agent_state["codex_session_cleanup_error"] = detail
+            journal(repo, f"Failed Codex session cleanup for `{label}` session `{session_id}`: {detail}")
+
+
 def current_pane_id() -> str:
     if os.environ.get("HERDR_PANE_ID"):
         return str(os.environ["HERDR_PANE_ID"])
@@ -362,6 +475,10 @@ def running_review_exists(state: dict[str, Any]) -> bool:
     return any(review.get("status") == "running" for review in state.get("reviews", {}).values())
 
 
+def reported_review_exists(state: dict[str, Any]) -> bool:
+    return any(review.get("status") == "reported" for review in state.get("reviews", {}).values())
+
+
 def pending_review_exists(state: dict[str, Any]) -> bool:
     return any(
         review.get("status") in {"running", "reported"}
@@ -376,6 +493,46 @@ def review_gate_passed(state: dict[str, Any]) -> bool:
         return False
     reviews = state.get("reviews", {})
     return any(review.get("status") == "triaged" for review in reviews.values())
+
+
+def review_wait_ms(args: argparse.Namespace, state: dict[str, Any]) -> int:
+    raw = getattr(args, "review_wait_ms", None)
+    if raw is None:
+        raw = state.get("review_wait_ms", DEFAULT_REVIEW_WAIT_MS)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"invalid review_wait_ms: {raw}") from exc
+
+
+def wait_for_running_review(repo: Path, review_id: str, review: dict[str, Any], wait_ms: int) -> bool:
+    path = Path(review.get("review_path") or review_file(repo, review_id))
+    if path.exists() and read_text(path).strip():
+        return True
+    pane_id = str(review.get("pane_id") or "")
+    if wait_ms <= 0 or not pane_id or os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        return False
+    proc = run_cmd(
+        [
+            "herdr",
+            "wait",
+            "output",
+            pane_id,
+            "--match",
+            f"HERDR_LOOP_REVIEW_DONE:{review_id}:",
+            "--source",
+            "recent-unwrapped",
+            "--timeout",
+            str(wait_ms),
+        ],
+        check=False,
+    )
+    if proc.returncode == 0:
+        review["last_wait_result"] = "done-marker"
+    else:
+        review["last_wait_result"] = "timeout"
+    review["last_waited_at"] = now_iso()
+    return path.exists() and read_text(path).strip() != ""
 
 
 def render_worker_prompt(
@@ -604,6 +761,8 @@ TBD by Manager.
         "merge_mode": args.merge_mode,
         "worker_runner": args.worker_runner,
         "reviewer_runner": args.reviewer_runner,
+        "session_cleanup": args.session_cleanup,
+        "review_wait_ms": args.review_wait_ms,
         "cycle": 0,
         "max_workers": args.max_workers,
         "max_reviewers": args.max_reviewers,
@@ -913,6 +1072,13 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
             "harvested_at": now_iso(),
         }
     )
+    cleanup_completed_agent_pane(
+        repo,
+        task_state,
+        label=f"Worker {task_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
     state["phase"] = "harvesting"
     save_state(repo, state)
     journal(repo, f"Harvested Worker `{task_id}` with status `{status}`.")
@@ -1041,6 +1207,13 @@ def cleanup_task(repo: Path, task_id: str, task_state: dict[str, Any], dry_run: 
 def cleanup_merged_tasks(repo: Path, state: dict[str, Any], dry_run: bool = False) -> None:
     for task_id, task in state.get("tasks", {}).items():
         if task.get("status") == "merged" and task.get("cleanup_pending"):
+            cleanup_completed_agent_pane(
+                repo,
+                task,
+                label=f"Worker {task_id}",
+                session_cleanup=str(state.get("session_cleanup", "archive")),
+                dry_run=dry_run,
+            )
             cleanup_task(repo, task_id, task, dry_run=dry_run)
 
 
@@ -1150,6 +1323,13 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
         raise HLoopError(f"review artifact not found or empty: {path}")
     review_state["status"] = "reported"
     review_state["harvested_at"] = now_iso()
+    cleanup_completed_agent_pane(
+        repo,
+        review_state,
+        label=f"Reviewer {review_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
     state["last_review_id"] = review_id
     state["needs_review"] = True
     state["phase"] = "reviewing"
@@ -1168,6 +1348,13 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
         raise HLoopError(f"unknown review: {review_id}")
     if review_state.get("status") not in {"reported", "triaged"}:
         raise HLoopError(f"review is not ready for close: {review_id}")
+    cleanup_completed_agent_pane(
+        repo,
+        review_state,
+        label=f"Reviewer {review_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
     review_state["status"] = "triaged"
     review_state["verdict"] = args.verdict
     review_state["triage_reason"] = args.reason
@@ -1242,11 +1429,12 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 args.task_id = task_id
                 return cmd_worker_harvest(args)
 
-    # Merge one ready task.
-    for task_id, task in state.get("tasks", {}).items():
-        if task.get("status") == "result_reported" and task.get("merge_ready"):
-            args.task_id = task_id
-            return cmd_merge(args)
+    # Merge one ready task unless a Reviewer is actively reading the integration head.
+    if not running_review_exists(state):
+        for task_id, task in state.get("tasks", {}).items():
+            if task.get("status") == "result_reported" and task.get("merge_ready"):
+                args.task_id = task_id
+                return cmd_merge(args)
 
     # Harvest any reported review artifact.
     for review_id, review in state.get("reviews", {}).items():
@@ -1270,7 +1458,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.runner = args.reviewer_runner
         return cmd_reviewer_start(args)
 
-    if state.get("needs_review") and pending_review_exists(state):
+    if state.get("needs_review") and reported_review_exists(state):
         print("review triage required")
         return 0
 
@@ -1282,6 +1470,26 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.worktree = None
         args.runner = args.worker_runner
         return cmd_worker_start(args)
+
+    if state.get("needs_review") and running_review_exists(state):
+        wait_ms = review_wait_ms(args, state)
+        for review_id, review in state.get("reviews", {}).items():
+            if review.get("status") != "running":
+                continue
+            if args.dry_run:
+                print(f"DRY RUN wait reviewer {review_id} for {wait_ms}ms")
+                return 0
+            if wait_for_running_review(repo, review_id, review, wait_ms):
+                save_state(repo, state)
+                args.review_id = review_id
+                return cmd_reviewer_harvest(args)
+            save_state(repo, state)
+            journal(
+                repo,
+                f"Reviewer `{review_id}` still running after waiting {wait_ms}ms; Manager may continue other work.",
+            )
+            print(f"reviewer {review_id} still running after {wait_ms}ms; continue other work or tick again")
+            return 0
 
     if (
         all_tasks_merged(state)
@@ -1361,6 +1569,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--merge-mode", choices=["squash", "cherry-pick"], default="squash")
     init.add_argument("--worker-runner", choices=["tui", "exec"], default="tui")
     init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="exec")
+    init.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES), default="archive")
+    init.add_argument("--review-wait-ms", type=int, default=DEFAULT_REVIEW_WAIT_MS)
     init.add_argument("--validation", action="append")
     init.add_argument(
         "--create-branch",
@@ -1404,6 +1614,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker_start.set_defaults(func=cmd_worker_start)
     worker_harvest = worker_sub.add_parser("harvest")
     worker_harvest.add_argument("task_id")
+    worker_harvest.add_argument("--keep-pane", action="store_true")
+    worker_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     worker_harvest.set_defaults(func=cmd_worker_harvest)
 
     merge = sub.add_parser("merge", help="merge a Worker task")
@@ -1432,6 +1644,8 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_start.set_defaults(func=cmd_reviewer_start)
     reviewer_harvest = reviewer_sub.add_parser("harvest")
     reviewer_harvest.add_argument("review_id")
+    reviewer_harvest.add_argument("--keep-pane", action="store_true")
+    reviewer_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     reviewer_harvest.set_defaults(func=cmd_reviewer_harvest)
     reviewer_close = reviewer_sub.add_parser("close")
     reviewer_close.add_argument("review_id")
@@ -1441,6 +1655,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     reviewer_close.add_argument("--reason", required=True)
+    reviewer_close.add_argument("--keep-pane", action="store_true")
+    reviewer_close.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     reviewer_close.set_defaults(func=cmd_reviewer_close)
 
     tick = sub.add_parser("tick", help="run one bounded loop tick")
@@ -1451,6 +1667,9 @@ def build_parser() -> argparse.ArgumentParser:
     tick.add_argument("--launcher", choices=["pane", "agent"], default="pane")
     tick.add_argument("--worker-runner", choices=["tui", "exec"])
     tick.add_argument("--reviewer-runner", choices=["exec", "tui"])
+    tick.add_argument("--keep-pane", action="store_true")
+    tick.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    tick.add_argument("--review-wait-ms", type=int)
     tick.add_argument("--dry-run", action="store_true")
     tick.add_argument(
         "--stop-on-user-decision",

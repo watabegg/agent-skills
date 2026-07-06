@@ -27,7 +27,7 @@ Use the helper script instead of hand-typing pane prompts:
 
 ```bash
 python3 <this-skill>/scripts/hloop doctor
-python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --worker-runner tui --reviewer-runner exec
+python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --worker-runner tui --reviewer-runner exec --session-cleanup archive --review-wait-ms 600000
 python3 <this-skill>/scripts/hloop task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 git add .ai/loop && git commit -m "ai-loop: initialize goal"
 python3 <this-skill>/scripts/hloop tick --once --max-workers 2
@@ -36,6 +36,8 @@ python3 <this-skill>/scripts/hloop tick --once --max-workers 2
 The script is deliberately explicit. Use `--dry-run` on `worker start`, `reviewer start`, and `tick` when checking the commands before spawning panes.
 
 Worker agents default to interactive Codex TUI panes so the Manager can add requirements or interrupt them in Herdr. Reviewer agents default to non-interactive `codex exec` because review artifacts should be reproducible and read-only. Override with `--runner exec` or `--runner tui` when needed.
+
+After a Worker or Reviewer artifact is harvested, close its Herdr pane and archive its captured Codex session unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
 
 ## Source Of Truth
 
@@ -95,6 +97,8 @@ Each tick must:
 9. Stop if done, blocked, or unsafe.
 
 Do not run an unbounded loop. Prefer `--once`; use `--max-cycles` only after the workflow is stable.
+
+Assume Reviewer runs can take several minutes. If a Reviewer is still running, wait up to `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting for review completion, continue Manager work that does not mutate the reviewed integration head: refine tasks, prepare validation notes, harvest finished Workers, or dispatch non-overlapping queued Workers when the state machine permits it. Do not merge Worker branches while a Reviewer is actively reading the integration branch.
 
 ## References
 

@@ -21,12 +21,17 @@ For each running Worker:
 - parse status and merge readiness
 - compute actual changed files from git
 - compare changed files to `write_allow` and `write_deny`
+- after harvesting the result artifact, close the Worker pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
 
 For each running Reviewer:
 
 - read `reviews/<review-id>.md`
+- expect the review to take several minutes; wait patiently only after other safe Manager work is exhausted
+- while the review is running, do not advance the integration branch being reviewed
+- if the review is still running, harvest finished Workers, prepare task/validation notes, or dispatch safe queued Workers instead of idling
 - triage findings into fix task, decision, accepted risk, or false positive
 - never ask Reviewer to edit code
+- after harvesting the review artifact, close the Reviewer pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
 - close the review gate with `hloop reviewer close <review-id> --verdict <passed|accepted-risk|fix-tasks-created>`
 
 ## Triage Rules

@@ -8,9 +8,11 @@ Required commands:
 
 - `herdr pane current --current`
 - `herdr pane list`
+- `herdr pane get <pane-id>`
 - `herdr pane split <pane-id> --direction right|down --cwd <path> --no-focus`
 - `herdr pane run <pane-id> <command>`
 - `herdr pane read <pane-id> --source recent-unwrapped --lines <n>`
+- `herdr pane close <pane-id>`
 - `herdr agent list`
 - `herdr agent start <name> --cwd <path> --workspace <workspace-id> --split right|down --no-focus -- <argv...>`
 - `herdr agent read <target> --source recent-unwrapped --lines <n>`
@@ -23,6 +25,8 @@ When available, prefer environment-provided `HERDR_PANE_ID`, `HERDR_WORKSPACE_ID
 
 `herdr agent start` is useful for named Worker/Reviewer agents. `hloop` supports a pane launcher and an agent launcher; use `--dry-run` before relying on a launcher in a new Herdr version.
 
+After `hloop worker harvest` or `hloop reviewer harvest`, the helper closes the completed pane by default. Use `--keep-pane` only when the Manager needs to inspect the live transcript.
+
 ## Codex CLI
 
 Required command shape:
@@ -34,6 +38,14 @@ codex exec --sandbox read-only --output-last-message .ai/loop/reviews/R001.md - 
 ```
 
 The helper uses `--sandbox workspace-write` for Workers and `--sandbox read-only` for Reviewers. Worker default is TUI; Reviewer default is exec.
+
+Codex saved sessions can be archived after pane cleanup:
+
+```bash
+codex archive <session-id>
+```
+
+`hloop` reads the active Codex session id from `herdr pane get` when Herdr exposes `agent_session.value`. Default session cleanup is `archive`; use `--session-cleanup none` to keep sessions visible in `codex resume`, or `--session-cleanup delete` only when permanent deletion is intended.
 
 ## Local Skill Dependencies
 
