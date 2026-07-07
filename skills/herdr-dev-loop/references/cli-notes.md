@@ -2,7 +2,7 @@
 
 These notes describe the local command assumptions used by `scripts/hloop`. Re-check with `hloop doctor` because Herdr and Codex CLI can change.
 
-`hloop doctor` treats `git`, `herdr`, `codex`, `$codex-impl`, and `$codex-review-multi-v2` as hard requirements. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
+`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility skills; native HLoop Worker and Reviewer protocols do not require them. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
 
 ## Herdr
 
@@ -84,7 +84,7 @@ codex archive <session-id>
 Default init cadence keeps the loop active:
 
 ```bash
-hloop init ... --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3
+hloop init ... --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3
 ```
 
 `review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
@@ -106,10 +106,16 @@ hloop triage gap G001 --create-tasks
 
 ## Local Skill Dependencies
 
-Required skills:
+Required commands:
+
+- `git`
+- `herdr`
+- `codex`
+
+Optional compatibility skills:
 
 - `$codex-impl`: normally at `~/.codex/skills/codex-impl/SKILL.md`
 - `$codex-review-multi-v2`: normally at `~/.codex/skills/codex-review-multi-v2/SKILL.md`
-- `$herdr`: often at `~/.agents/skills/herdr/SKILL.md`, or set `HERDR_SKILL_PATH`
+- `$herdr`: often at `~/.agents/skills/herdr/SKILL.md`, or set `HERDR_SKILL_PATH`; only strict when `hloop doctor --strict-skills` is used
 
 Do not copy private skill contents into public artifacts unless they are already intended for publication.

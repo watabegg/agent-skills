@@ -10,18 +10,20 @@ You are Worker T001.
 Read first:
 - .ai/loop/MISSION.md
 - .ai/loop/PLAN.md
+- .ai/loop/PROFILE.md
+- .ai/loop/DECISIONS.md
 - .ai/loop/tasks/T001.md
 
-Use $codex-impl.
+Loop profile:
+- branch strategy
+- worker protocol
+- Worker QA profile
 
-Manager has fixed kickoff choices:
-- implementation gap-check count: 1
-- review/fix loop limit: skip review unless the task requires it
-- forced QA environment: local
+Follow the HLoop Worker Protocol unless the task explicitly chooses compatibility mode.
 
 Rules:
 - edit only write_allow paths
-- do not edit STATE.json, MISSION.md, PLAN.md, other tasks, or other results
+- do not edit STATE.json, MISSION.md, PLAN.md, PROFILE.md, DECISIONS.md, other tasks, or other results
 - do not merge, rebase, or switch to the integration branch
 
 Required output:
@@ -79,14 +81,19 @@ Compare:
 Read:
 - .ai/loop/MISSION.md
 - .ai/loop/PLAN.md
+- .ai/loop/PROFILE.md
 - .ai/loop/DECISIONS.md
+- .ai/loop/STATE.json
+- .ai/loop/tasks/*.md
+- .ai/loop/results/*/result.md
 
-Use $codex-review-multi-v2.
+Follow the HLoop Native Review Protocol unless PROFILE.md explicitly selects compatibility mode.
 
 Rules:
 - do not edit code
 - verify each finding against the code path
-- report only actionable issues
+- report only actionable issues across configured review lanes
+- assess Worker QA evidence and Manager final QA readiness/evidence separately
 
 Required output:
 - .ai/loop/reviews/R001.md

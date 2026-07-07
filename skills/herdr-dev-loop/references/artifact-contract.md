@@ -8,6 +8,7 @@ All loop coordination is file-backed under `.ai/loop`.
 .ai/loop/
   MISSION.md
   PLAN.md
+  PROFILE.md
   STATE.json
   JOURNAL.md
   DECISIONS.md
@@ -19,6 +20,7 @@ All loop coordination is file-backed under `.ai/loop`.
   prompts/
   triage/
   validation/
+  qa/
   reports/
 ```
 
@@ -30,6 +32,13 @@ Required top-level fields:
 - `phase`
 - `base_branch`
 - `integration_branch`
+- `branch_strategy`
+- `worker_qa_profile`
+- `manager_qa_profile`
+- `manager_qa_status`
+- `worker_protocol`
+- `review_protocol`
+- `review_lanes`
 - `cycle`
 - `max_workers`
 - `max_reviewers`
@@ -63,6 +72,19 @@ Recommended optional fields:
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 
+## PROFILE.md
+
+`PROFILE.md` is Manager-owned and records product-specific loop policy:
+
+- branch strategy: `integration`, `pr-per-task`, or `custom`
+- Worker protocol: `native` or `codex-impl`
+- Reviewer protocol: `native` or `codex-review-multi-v2`
+- review lanes
+- Worker QA profile: `repo-default`, `local`, `staging`, `preview`, `custom`, or `none`
+- Manager final QA profile: `repo-default`, `local`, `staging`, `preview`, `custom`, or `none`
+
+When `branch_strategy` is not `integration`, Manager must record the concrete merge, PR, or release handoff in `PLAN.md` before dispatching Workers.
+
 Reviewer artifacts are written in a detached review worktree first, then copied back to the Manager repo during harvest. The review worktree may use `workspace-write`, but only `.ai/loop/reviews/<review-id>.md` is an allowed Reviewer write.
 
 Gap Auditor artifacts are written in a detached gap worktree first, then copied back to the Manager repo during harvest. The gap worktree may use `workspace-write`, but only `.ai/loop/gaps/<gap-id>.md` is an allowed Gap Auditor write.
@@ -89,6 +111,8 @@ write_deny:
 acceptance:
   - Relevant auth tests pass.
 validation_minimum: L1
+worker_protocol: native
+worker_qa_profile: repo-default
 ---
 ```
 
@@ -133,6 +157,29 @@ Only `status: done` may set `merge_ready: true`.
 The result artifact must be committed on the Worker branch at `HEAD:.ai/loop/results/<task-id>/result.md`. `hloop worker harvest` rejects artifacts that exist only in the worktree or differ from the committed version.
 
 Use `head_sha: HEAD` when writing the artifact from the Worker branch. `hloop worker harvest` resolves it to the actual branch head; writing the exact commit SHA inside the same commit is not required.
+
+## Manager Final QA Artifact
+
+When `manager_qa_profile` is not `none`, Manager records final combined QA in `qa/FINAL.md`:
+
+```md
+---
+manager_qa_profile: staging
+status: passed
+summary: "Staging booking flow passed"
+evidence:
+  - https://staging.example.test/booking
+  - .ai/loop/reports/screenshots/booking.png
+---
+```
+
+Allowed statuses:
+
+- `passed`: final QA evidence is sufficient.
+- `accepted-risk`: Manager accepts the remaining QA risk and records why.
+- `blocked`: required final QA cannot run because a URL, credential, service, data dependency, or cleanup path is missing.
+- `failed`: final QA found a blocking product failure.
+- `not-required`: final QA is disabled because `manager_qa_profile: none`.
 
 ## Review Artifact
 
