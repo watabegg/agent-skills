@@ -19,12 +19,14 @@ The Worker prompt must say:
 
 Manager may fix these kickoff choices in the Worker prompt:
 
-- implementation gap-check count: `1`
+- implementation gap-check count: `1` for this bounded task branch only
 - review/fix loop limit: `skip review` unless the task says otherwise
 - forced QA environment: `local`
 - QA target: this task branch diff
 
 This prevents Workers from blocking on a preflight question that Manager already answered for the bounded task.
+
+This Worker-local gap check is not the final plan/spec coverage gate. Manager runs a separate Gap Auditor against the integration branch when the loop needs to confirm that the original repository plan/spec is still aligned with the combined implementation.
 
 ## Blocking
 

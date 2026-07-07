@@ -18,6 +18,7 @@ The Reviewer prompt must say:
 - distinguish newly introduced, diff-expanded pre-existing, and unrelated pre-existing issues
 - write no files while investigating
 - after review is complete, write only `reviews/<review-id>.md`
+- include `## Fix Task Candidates` with machine-readable task candidate blocks for findings that should become Worker fix tasks
 - print `HERDR_LOOP_REVIEW_DONE:<review-id>:<reported|blocked|failed>`
 
 ## Review Scope
@@ -48,5 +49,13 @@ python3 <this-skill>/scripts/hloop reviewer close R001 --verdict passed --reason
 ```
 
 Use `fix-tasks-created` when P0/P1/P2 findings were converted into new tasks, and `accepted-risk` only when the risk is recorded with a reason.
+
+Manager can generate a draft from the artifact:
+
+```bash
+python3 <this-skill>/scripts/hloop triage review R001
+```
+
+Add `--create-tasks` only after Manager approves the generated draft.
 
 After harvesting the review artifact, Manager should close the Reviewer Herdr pane and archive the captured Codex session. Keep the pane only when Manager needs to inspect the live transcript.

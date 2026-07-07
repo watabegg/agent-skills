@@ -14,8 +14,10 @@ All loop coordination is file-backed under `.ai/loop`.
   USER_ACTION_REQUIRED.md
   tasks/
   results/
+  gaps/
   reviews/
   prompts/
+  triage/
   validation/
   reports/
 ```
@@ -31,8 +33,10 @@ Required top-level fields:
 - `cycle`
 - `max_workers`
 - `max_reviewers`
+- `max_gap_auditors`
 - `tasks`
 - `reviews`
+- `gaps`
 - `blocking_decisions`
 
 Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pane id.
@@ -41,15 +45,27 @@ Recommended optional fields:
 
 - `session_cleanup`: `archive`, `none`, or `delete`; default to `archive`
 - `review_wait_ms`: bounded wait for a running Reviewer before returning control
-- per task/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
-- per task/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
+- `gap_wait_ms`: bounded wait for a running Gap Auditor before returning control
+- `review_after_merges`: validated integration merge count that opens the review gate; default `1`
+- `gap_after_merges`: validated integration merge count that opens the gap gate; default `3`
+- `unreviewed_merge_count`: integration merges not yet covered by a closed review gate
+- `ungapped_merge_count`: integration merges not yet covered by a closed gap gate
+- `spec_sources`: original repo plan/spec files or directories the Gap Auditor should compare against implementation
+- per task/gap/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
+- per task/gap/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
 - per review `worktree`, `worktree_review_path_harvested`, `worktree_cleanup_status`
 - per review `write_scope_violations`
+- per review `triage_drafts`, `created_fix_tasks`
+- per gap `worktree`, `worktree_gap_path_harvested`, `worktree_cleanup_status`
+- per gap `write_scope_violations`
+- per gap `triage_drafts`, `created_fix_tasks`
 - `last_validation.results[].log`: relative path to captured stdout/stderr under `.ai/loop/validation/`
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 
 Reviewer artifacts are written in a detached review worktree first, then copied back to the Manager repo during harvest. The review worktree may use `workspace-write`, but only `.ai/loop/reviews/<review-id>.md` is an allowed Reviewer write.
+
+Gap Auditor artifacts are written in a detached gap worktree first, then copied back to the Manager repo during harvest. The gap worktree may use `workspace-write`, but only `.ai/loop/gaps/<gap-id>.md` is an allowed Gap Auditor write.
 
 ## Task File
 
@@ -141,3 +157,82 @@ Findings use fixed severities:
 - `P3`: nit or non-blocking cleanup
 
 Manager must triage every P0/P1 and any P2 that affects the mission done criteria.
+
+Review artifacts should include:
+
+```md
+## Fix Task Candidates
+
+### FT001: Fix concrete regression
+action: fix_task
+severity: P1
+write_allow:
+  - src/example/**
+acceptance:
+  - The regression is fixed.
+rationale: The reviewed code path can fail when ...
+```
+
+`hloop triage review R001` reads this section and writes `.ai/loop/triage/R001.fix-task-draft.md`. It creates queued tasks only when Manager reruns with `--create-tasks`.
+
+## Gap Artifact
+
+Each Gap Auditor writes `gaps/GNNN.md`:
+
+```md
+---
+gap_id: G001
+base: main
+head: ai/example/integration
+status: gaps-found
+spec_sources:
+  - spec/product-plan.md
+gap_count: 2
+---
+
+# Gap Audit G001
+```
+
+Allowed `status` values:
+
+- `aligned`: implementation matches the relevant plan/spec contract
+- `gaps-found`: one or more implementation/spec alignment gaps were found
+- `blocked`: the auditor could not complete without a Manager or user decision
+- `failed`: the auditor failed for an operational reason
+
+Findings should classify each checked requirement as one of:
+
+- `implemented`
+- `partial`
+- `missing`
+- `deferred`
+- `obsolete-spec`
+- `needs-decision`
+
+Manager must triage every `missing`, `partial`, or `needs-decision` item that affects `MISSION.md` done criteria.
+
+Gap artifacts should include the same `## Fix Task Candidates` shape for missing or partial requirements that should become Worker fix tasks. Use `priority` instead of `severity` when that is more natural:
+
+```md
+## Fix Task Candidates
+
+### FT001: Implement missing plan requirement
+action: fix_task
+priority: P1
+write_allow:
+  - src/example/**
+acceptance:
+  - The plan requirement is implemented.
+rationale: The plan requires X, but the integration branch only implements Y.
+```
+
+## Triage Draft
+
+`hloop triage review R001` and `hloop triage gap G001` write:
+
+```text
+.ai/loop/triage/R001.fix-task-draft.md
+.ai/loop/triage/G001.fix-task-draft.md
+```
+
+Drafts are Manager-reviewed artifacts. They do not make tasks runnable. Rerun triage with `--create-tasks` after Manager approval to create queued fix tasks under `.ai/loop/tasks/`.
