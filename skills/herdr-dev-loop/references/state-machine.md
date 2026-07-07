@@ -1,6 +1,6 @@
 # State Machine
 
-Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewer coordinate through freeform chat when an artifact can represent the state.
+Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewer coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, and QA strategy.
 
 ## Phases
 
@@ -10,9 +10,11 @@ Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewe
 - `running`: at least one Worker or Reviewer is active.
 - `harvesting`: Manager is reading result or review artifacts.
 - `merging`: Manager is merging one Worker branch.
+- `branch_handoff`: a Worker result is ready, but `branch_strategy` requires Manager-controlled PR, release, or custom branch handoff instead of automatic merge.
 - `validating`: Manager is running integration validation.
 - `gap_checking`: Gap Auditor is running or its artifact is being triaged.
 - `reviewing`: Reviewer is running or its artifact is being triaged.
+- `manager_qa`: Manager final QA is required before completion.
 - `waiting_worker`: Workers are still running and no result artifact is ready.
 - `waiting_gap`: a Gap Auditor is still running after the bounded wait.
 - `waiting_review`: a Reviewer is still running after the bounded wait.
@@ -20,8 +22,9 @@ Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewe
 - `blocked_environment`: required tool, credentials, branch, or worktree state is missing.
 - `blocked_conflict`: merge conflict or write-scope conflict needs judgment.
 - `failed_validation`: integration validation failed and no obvious local fix was applied.
+- `failed_manager_qa`: Manager final QA found a blocking failure.
 - `no_progress`: no safe transition exists and Manager inspection is required.
-- `done`: all tasks are merged, validation passes, and no blocking gap or review finding remains.
+- `done`: all tasks are merged, validation passes, no blocking gap/review finding remains, and required Manager final QA is recorded.
 
 ## Tick Order
 
@@ -29,8 +32,9 @@ Each tick starts by reading:
 
 1. `.ai/loop/MISSION.md`
 2. `.ai/loop/PLAN.md`
-3. `.ai/loop/STATE.json`
-4. `.ai/loop/DECISIONS.md`
+3. `.ai/loop/PROFILE.md`
+4. `.ai/loop/STATE.json`
+5. `.ai/loop/DECISIONS.md`
 
 Then run, at most, one material transition:
 
@@ -43,13 +47,15 @@ Then run, at most, one material transition:
 7. start one Gap Auditor when validation passes and the gap gate is open
 8. start one Reviewer when validation passes and the review gate is open
 9. wait for a running Gap Auditor or Reviewer only after no other safe transition is available
-10. generate a final report
+10. require Manager final QA when `manager_qa_profile` is not `none`
+11. generate a final report
 
 Prefer a small number of obvious transitions over attempting to finish a goal in one tick.
 
 `pump` repeats this bounded tick order up to `--max-transitions`. It must stop when:
 
 - a Gap Auditor or Reviewer artifact needs Manager triage
+- branch strategy requires Manager handoff before merge or publish
 - all safe immediate transitions are exhausted and the loop is waiting, only when `--stop-on-waiting` is set
 - a blocked, failed, no-progress, or done phase is reached
 - the transition limit is reached
@@ -65,6 +71,11 @@ Defaults are intentionally active:
 - `max_gap_auditors: 1`
 - `review_after_merges: 1`
 - `gap_after_merges: 3`
+- `branch_strategy: integration`
+- `worker_protocol: native`
+- `review_protocol: native`
+- `worker_qa_profile: repo-default`
+- `manager_qa_profile: none`
 
 Reviewer should normally run after each validated integration advance. Gap Auditor is lower frequency and should run every three validated merges, or before final completion if no fresh gap audit covers the latest integration state.
 
@@ -99,6 +110,7 @@ Set a blocked or failed phase and stop when:
 - a Worker changed files outside its allowed scope.
 - a merge conflict appears.
 - validation fails.
+- Manager final QA fails or is blocked when required.
 - Gap Auditor reports a missing, partial, or needs-decision item that affects mission done criteria.
 - Reviewer reports a P0/P1 finding that cannot be fixed without a user decision.
 

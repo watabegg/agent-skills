@@ -1,6 +1,6 @@
 # Branch And Worktree Policy
 
-Use one integration branch and one branch/worktree per Worker task.
+Default strategy uses one integration branch and one branch/worktree per Worker task.
 
 ```text
 main or master
@@ -9,6 +9,16 @@ main or master
        -> ai/<goal-id>/T002-bar
        -> ai/<goal-id>/T003-review-fix
 ```
+
+The selected strategy lives in `.ai/loop/PROFILE.md` and `STATE.json.branch_strategy`.
+
+Supported strategy labels:
+
+- `integration`: built-in hloop automation owns an integration branch and merges Worker branches into it.
+- `pr-per-task`: Worker branches may be published or reviewed as PRs; Manager must record the product-specific merge and QA handoff in `PLAN.md`.
+- `custom`: project rules in `PLAN.md` override default branch assumptions. Manager must keep merge, validation, QA, and cleanup gates explicit.
+
+Only `integration` is fully automated by `hloop merge` / `hloop pump`. Other strategies can still use hloop for task, artifact, pane, review, gap, and triage coordination, but Manager must not pretend the default merge/publish path applies.
 
 ## Manager Rules
 
@@ -22,6 +32,14 @@ main or master
 - Manager removes the local Worker worktree and branch only after integration validation succeeds.
 - Manager does not edit Worker branches directly.
 - Manager does not keep merging when the integration branch is broken.
+
+For `pr-per-task` or `custom`, rewrite these rules in `PLAN.md` before dispatching Workers. Keep these invariants even when branch names or publish flow change:
+
+- each Worker has one clear write scope
+- Manager can identify the exact base commit
+- Manager can validate the produced diff before accepting it
+- Reviewers and Gap Auditors know what head they are reading
+- cleanup or PR handoff is recorded in the final report
 
 ## Worker Rules
 
