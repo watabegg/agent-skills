@@ -1,6 +1,6 @@
 ---
 name: herdr-dev-loop
-description: Orchestrate a bounded Herdr-managed multi-agent coding loop with pump/triage scheduling and interactive Worker, Gap Auditor, and Reviewer Codex TUI panes. Use inside Herdr when Codex needs to run Manager, Worker, Gap Auditor, and Reviewer agents across git worktrees, persist the goal in .ai/loop artifacts, drain task/fix-task queues with hloop pump, make Workers use $codex-impl, make Gap Auditors compare original plan/spec sources against implementation, make Reviewers use $codex-review-multi-v2, generate Manager-approved fix-task drafts from review/gap artifacts with hloop triage, merge into an integration branch, monitor agent panes, harvest artifacts from detached worktrees, and stop on blocking specification decisions or unsafe state.
+description: Orchestrate a bounded Herdr-managed multi-agent coding loop with pump/triage scheduling and interactive Worker, Gap Auditor, and Reviewer Codex TUI panes. Use inside Herdr when Codex needs to run Manager, Worker, Gap Auditor, and Reviewer agents across git worktrees, persist the goal in .ai/loop artifacts, drain task/fix-task queues with hloop pump, use HLoop-native Worker and Reviewer protocols by default, compare original plan/spec sources against implementation, generate Manager-approved fix-task drafts from review/gap artifacts with hloop triage, adapt branch/review/QA strategy through .ai/loop/PROFILE.md, merge into an integration or project-specific branch flow, monitor agent panes, harvest artifacts from detached worktrees, and stop on blocking specification decisions or unsafe state.
 ---
 
 # Herdr Dev Loop
@@ -15,8 +15,8 @@ Before starting or continuing a loop:
 
 1. Verify `HERDR_ENV=1`.
 2. Run `python3 <this-skill>/scripts/hloop doctor`.
-3. Confirm `herdr`, `codex`, `git`, `$codex-impl`, and `$codex-review-multi-v2` are available.
-4. Read the current `.ai/loop/MISSION.md`, `.ai/loop/PLAN.md`, `.ai/loop/STATE.json`, and `.ai/loop/DECISIONS.md` if they exist.
+3. Confirm `herdr`, `codex`, and `git` are available. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
+4. Read the current `.ai/loop/MISSION.md`, `.ai/loop/PLAN.md`, `.ai/loop/PROFILE.md`, `.ai/loop/STATE.json`, and `.ai/loop/DECISIONS.md` if they exist.
 5. Continue from disk state, not from thread memory.
 
 If `HERDR_ENV=1` is absent, stop and tell the user this skill requires Herdr.
@@ -27,7 +27,7 @@ Use the helper script instead of hand-typing pane prompts:
 
 ```bash
 python3 <this-skill>/scripts/hloop doctor
-python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
+python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
 python3 <this-skill>/scripts/hloop task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 git add .ai/loop && git commit -m "ai-loop: initialize goal"
 python3 <this-skill>/scripts/hloop pump --max-transitions 20 --max-workers 3
@@ -50,7 +50,8 @@ After a Worker, Gap Auditor, or Reviewer artifact is harvested, close its Herdr 
 The durable state lives under `.ai/loop`:
 
 - `MISSION.md`: user goal, constraints, non-goals, base branch, integration branch, done criteria
-- `PLAN.md`: task graph, parallelization rules, validation plan, review plan
+- `PLAN.md`: task graph, product-specific branch handoff, parallelization rules, validation plan, Worker QA plan, Manager final QA plan, review plan
+- `PROFILE.md`: Manager-owned branch strategy, Worker protocol, Reviewer protocol, review lanes, Worker QA profile, and Manager final QA profile
 - `STATE.json`: current phase, branches, task/review status, pane ids, worktrees
 - `DECISIONS.md`: pending, accepted, and rejected specification decisions that cannot be answered from the original plan/spec alone
 - `USER_ACTION_REQUIRED.md`: blocking questions for the user
@@ -59,6 +60,7 @@ The durable state lives under `.ai/loop`:
 - `gaps/*.md`: Gap Auditor plan/spec alignment artifacts
 - `reviews/*.md`: Reviewer artifacts
 - `triage/*.fix-task-draft.md`: Manager-reviewed fix-task drafts generated from review/gap artifacts
+- `qa/FINAL.md`: Manager-owned final QA evidence when `manager_qa_profile` is not `none`
 - `reports/FINAL.md`: final report
 
 If thread memory and `.ai/loop` disagree, trust `.ai/loop` and record the discrepancy in `JOURNAL.md`.
@@ -67,8 +69,8 @@ If thread memory and `.ai/loop` disagree, trust `.ai/loop` and record the discre
 
 Manager owns:
 
-- integration branch
-- `.ai/loop/MISSION.md`, `PLAN.md`, `STATE.json`, `DECISIONS.md`, `JOURNAL.md`
+- integration branch or product-specific branch handoff defined in `PROFILE.md` / `PLAN.md`
+- `.ai/loop/MISSION.md`, `PLAN.md`, `PROFILE.md`, `STATE.json`, `DECISIONS.md`, `JOURNAL.md`
 - task creation, merge decisions, validation, review triage, and user escalation
 
 Worker owns:
@@ -88,7 +90,7 @@ Gap Auditor owns:
 - no code edits
 - no generic code-review findings unless they directly prove plan/spec drift
 
-Do not let Workers edit `STATE.json`, `MISSION.md`, `PLAN.md`, other task files, or other result files.
+Do not let Workers edit `STATE.json`, `MISSION.md`, `PLAN.md`, `PROFILE.md`, `DECISIONS.md`, other task files, or other result files.
 
 ## Loop
 
@@ -109,7 +111,7 @@ Each tick or pump transition must:
 1. Preflight the environment and disk state.
 2. Harvest completed Workers, Gap Auditors, or Reviewers.
 3. Validate result artifacts and write scopes.
-4. Integrate at most one Worker branch into the integration branch with squash merge by default.
+4. Integrate at most one Worker branch according to `PROFILE.md`; built-in automation defaults to squash merge into the integration branch.
 5. Run integration validation.
 6. Triage harvested Gap Auditor or Reviewer artifacts before starting more work from stale assumptions.
 7. Dispatch queued implementation or fix Workers up to `max_workers` when `write_allow` patterns do not overlap.
@@ -124,6 +126,14 @@ Use `hloop triage review <review-id>` or `hloop triage gap <gap-id>` to convert 
 
 Default cadence is intentionally busy: keep up to three Workers running, run Reviewer after each validated integration advance, and run Gap Auditor every three validated merges or before final completion. Gap Auditor and Reviewer may run while Workers continue on isolated branches, but Manager must not merge Worker branches while a Gap Auditor or Reviewer is actively reading the integration branch.
 
+Default protocols are native to this skill:
+
+- Workers follow the HLoop Worker Protocol: inspect context, implement inside write scope, self-review, run repo-appropriate validation/QA, write the result artifact, and commit.
+- Reviewers follow the HLoop Native Review Protocol: review task/result artifacts, write-scope and merge safety, product correctness, risk, and validation/QA evidence. Use `$codex-review-multi-v2` only when `review_protocol: codex-review-multi-v2` is intentionally selected.
+- `$codex-impl` is only a Worker compatibility mode. Use it only when `worker_protocol: codex-impl` is intentionally selected.
+
+Use `.ai/loop/PROFILE.md` to adapt the loop to product reality. `branch_strategy: integration` enables the built-in integration-branch flow. `pr-per-task` and `custom` require Manager to record the exact handoff in `PLAN.md` and avoid assuming the default merge/publish steps. `worker_qa_profile` is the QA each Worker must record for its task; `manager_qa_profile` is the separate final QA gate Manager records in `qa/FINAL.md` after integration/review/gap gates.
+
 Assume Gap Auditor and Reviewer runs can take several minutes. Use `hloop gap watch <gap-id>` or `hloop reviewer watch <review-id>` to inspect the TUI pane. If an auditor or reviewer is still running, wait up to `gap_wait_ms` or `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting, continue Manager work that does not mutate the inspected integration head: refine tasks, prepare validation notes, harvest finished Workers, create fix tasks from already triaged findings, or dispatch non-overlapping queued Workers up to `max_workers`.
 
 ## References
@@ -132,11 +142,12 @@ Load only the reference needed for the current operation:
 
 - `references/state-machine.md`: phases, tick behavior, and stop conditions
 - `references/artifact-contract.md`: required `.ai/loop` file shapes and frontmatter
-- `references/branch-policy.md`: branch/worktree topology and merge rules
+- `references/branch-policy.md`: branch/worktree topology, default integration flow, and custom branch strategy rules
+- `references/profile-examples.md`: `/goal` prompt examples for branch strategy, review lanes, Worker QA, and Manager final QA selection
 - `references/manager-loop.md`: Manager checklist and triage rules
-- `references/worker-contract.md`: Worker prompt contract and `$codex-impl` usage
+- `references/worker-contract.md`: HLoop Worker Protocol and optional compatibility mode
 - `references/gap-contract.md`: Gap Auditor prompt contract and plan/spec alignment rules
-- `references/reviewer-contract.md`: Reviewer prompt contract and `$codex-review-multi-v2` usage
+- `references/reviewer-contract.md`: HLoop Native Review Protocol and optional compatibility mode
 - `references/decision-policy.md`: blocking decision criteria
 - `references/validation-policy.md`: validation levels and command selection
 - `references/public-repo-safety.md`: files and data that must not be committed

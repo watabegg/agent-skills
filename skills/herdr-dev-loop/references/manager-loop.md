@@ -7,10 +7,11 @@ Manager owns integration and final judgment.
 1. Run `hloop doctor`.
 2. Read `.ai/loop/MISSION.md`.
 3. Read `.ai/loop/PLAN.md`.
-4. Read `.ai/loop/STATE.json`.
-5. Read `.ai/loop/DECISIONS.md`.
-6. Check current branch against `STATE.json`.
-7. Check `git status --short`.
+4. Read `.ai/loop/PROFILE.md`.
+5. Read `.ai/loop/STATE.json`.
+6. Read `.ai/loop/DECISIONS.md`.
+7. Check current branch and branch strategy against `STATE.json` and `PROFILE.md`.
+8. Check `git status --short`.
 
 `hloop` enforces the same preflight for mutating commands. Treat a preflight failure as an environmental block, not as a reason to continue by hand.
 
@@ -33,6 +34,21 @@ Keep the loop active by default:
 - open the gap gate less often (`gap_after_merges: 3`) and before final completion
 - allow Gap Auditor and Reviewer to run while Workers continue on isolated branches
 - do not merge Worker branches while Gap Auditor or Reviewer is reading the integration branch
+
+## Product Profile
+
+Use `.ai/loop/PROFILE.md` as the Manager-owned policy layer. It decides:
+
+- branch strategy: default `integration`, or product-specific `pr-per-task` / `custom`
+- Worker protocol: default `native`, or compatibility `codex-impl`
+- Reviewer protocol: default `native`, or compatibility `codex-review-multi-v2`
+- review lanes
+- Worker QA profile
+- Manager final QA profile
+
+If `branch_strategy` is `pr-per-task` or `custom`, update `PLAN.md` with the exact merge, PR, release, and QA handoff before dispatching Workers. `hloop` can still coordinate tasks, panes, artifacts, review, gap checks, and triage, but Manager must not silently apply the default integration-branch assumptions.
+
+When a Worker is merge-ready under a non-`integration` branch strategy, `tick` / `pump` stop in `branch_handoff`. Manager then follows `PROFILE.md` and `PLAN.md` for the product-specific PR, release branch, or manual merge path before continuing.
 
 When Gap Auditor or Reviewer findings are actionable, create fix-task drafts with `hloop triage gap <gap-id>` or `hloop triage review <review-id>`. Review the draft, then rerun with `--create-tasks` when the tasks are acceptable. Close the gate with `fix-tasks-created`. Those fix Workers join the next dispatch phase. After the fix tasks merge and validation passes, the review/gap counters drive the next audit cycle.
 
@@ -104,6 +120,22 @@ Do not mark the loop done only because a gap artifact exists. Manager must close
 
 Specification choices that cannot be resolved from the original plan/spec belong in `DECISIONS.md`. If user input is required, also update `USER_ACTION_REQUIRED.md`, set the phase to `blocked_user_decision`, and stop dispatching new Workers until the decision is resolved.
 
+## Manager Final QA
+
+Worker QA is task-local. Manager final QA is a separate combined-implementation gate controlled by `manager_qa_profile`.
+
+When `manager_qa_profile` is `none`, no separate final QA gate is required.
+
+When `manager_qa_profile` is `local`, `preview`, `staging`, `repo-default`, or `custom`:
+
+- run it only after integration validation, review gates, and gap gates are closed for the current implementation head
+- record final QA with `hloop qa record --status passed --summary "..."`
+- include URLs, screenshots/logs, data setup, cleanup, or blockers with repeated `--evidence`
+- use `--status accepted-risk` only when Manager intentionally accepts the remaining QA risk and records why
+- use `--status blocked` or `failed` when final QA cannot run or finds a blocking issue
+
+If another Worker merge occurs after Manager final QA, `hloop merge` resets `manager_qa_status` to `pending` when final QA is required.
+
 ## Final Report
 
 When done, generate `reports/FINAL.md` with:
@@ -113,7 +145,9 @@ When done, generate `reports/FINAL.md` with:
 - merged tasks
 - cleanup status for local Worker branches/worktrees
 - validation commands and results
+- Manager final QA profile, status, and artifact
 - validation log paths from `.ai/loop/validation/`
+- branch strategy, Worker QA profile, and Manager final QA profile
 - gap status
 - review status
 - accepted risks

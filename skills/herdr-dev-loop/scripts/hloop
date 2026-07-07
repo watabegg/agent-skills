@@ -33,6 +33,22 @@ DEFAULT_MAX_REVIEWERS = 1
 DEFAULT_MAX_GAP_AUDITORS = 1
 DEFAULT_REVIEW_AFTER_MERGES = 1
 DEFAULT_GAP_AFTER_MERGES = 3
+DEFAULT_BRANCH_STRATEGY = "integration"
+DEFAULT_WORKER_QA_PROFILE = "repo-default"
+DEFAULT_MANAGER_QA_PROFILE = "none"
+DEFAULT_WORKER_PROTOCOL = "native"
+DEFAULT_REVIEW_PROTOCOL = "native"
+DEFAULT_REVIEW_LANES = [
+    "integration-contract",
+    "correctness",
+    "risk",
+    "validation-qa",
+]
+BRANCH_STRATEGIES = {"integration", "pr-per-task", "custom"}
+QA_PROFILES = {"repo-default", "local", "staging", "preview", "none", "custom"}
+MANAGER_QA_PASSING_STATUSES = {"passed", "accepted-risk", "not-required"}
+WORKER_PROTOCOLS = {"native", "codex-impl"}
+REVIEW_PROTOCOLS = {"native", "codex-review-multi-v2"}
 DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
@@ -291,6 +307,7 @@ def ensure_loop_dirs(repo: Path) -> None:
         "reports",
         "triage",
         "validation",
+        "qa",
         "inbox/manager",
         "inbox/user",
     ]:
@@ -712,6 +729,10 @@ def triage_draft_file(repo: Path, source_id: str) -> Path:
     return loop_path(repo) / "triage" / f"{source_id}.fix-task-draft.md"
 
 
+def manager_qa_file(repo: Path) -> Path:
+    return loop_path(repo) / "qa" / "FINAL.md"
+
+
 def normalize_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1060,12 +1081,141 @@ def wait_for_running_gap(repo: Path, gap_id: str, gap: dict[str, Any], wait_ms: 
     return path.exists() and read_text(path).strip() != ""
 
 
+def state_value(state: dict[str, Any], key: str, default: str) -> str:
+    value = str(state.get(key) or default)
+    return value
+
+
+def state_worker_qa_profile(state: dict[str, Any]) -> str:
+    return str(
+        state.get("worker_qa_profile")
+        or state.get("qa_profile")
+        or DEFAULT_WORKER_QA_PROFILE
+    )
+
+
+def state_manager_qa_profile(state: dict[str, Any]) -> str:
+    return str(state.get("manager_qa_profile") or DEFAULT_MANAGER_QA_PROFILE)
+
+
+def args_worker_qa_profile(args: argparse.Namespace) -> str:
+    return str(
+        getattr(args, "worker_qa_profile", None)
+        or getattr(args, "qa_profile", None)
+        or DEFAULT_WORKER_QA_PROFILE
+    )
+
+
+def manager_qa_required(state: dict[str, Any]) -> bool:
+    return state_manager_qa_profile(state) != "none"
+
+
+def manager_qa_passed(state: dict[str, Any]) -> bool:
+    if not manager_qa_required(state):
+        return True
+    return str(state.get("manager_qa_status") or "") in MANAGER_QA_PASSING_STATUSES
+
+
+def state_list(state: dict[str, Any], key: str, default: list[str]) -> list[str]:
+    return normalize_list(state.get(key)) or list(default)
+
+
+def worker_protocol_text(protocol: str, worker_qa_profile: str, base_ref: str) -> str:
+    if protocol == "codex-impl":
+        return f"""Compatibility mode:
+- You may use $codex-impl for this bounded task.
+- Manager has fixed kickoff choices for this task:
+  - implementation gap-check count: 1
+  - review/fix loop limit: skip review unless this task explicitly requires it
+  - Worker QA profile: {worker_qa_profile}
+  - QA target diff: this task branch against {base_ref}
+- Do not ask the user for codex-impl preflight choices; Manager already owns them.
+"""
+    return f"""HLoop Worker Protocol:
+1. Re-read MISSION, PLAN, DECISIONS, PROFILE, and your task contract.
+2. Inspect the current code enough to verify the task is still valid.
+3. Compare the task acceptance criteria against the implementation before editing.
+4. Implement the smallest coherent change inside your write scope.
+5. Self-review the diff for correctness, product behavior, security/privacy, data integrity, UX, and validation risk.
+6. Run repository-appropriate validation for the changed surface and the task validation minimum.
+7. Apply Worker QA profile `{worker_qa_profile}`:
+   - `repo-default`: choose the repo's documented local checks, scripts, or CI-equivalent commands.
+   - `local`: run local app/API/browser checks when the touched workflow is runnable.
+   - `staging` or `preview`: collect evidence only when the target URL/credentials are already available in the task or PROFILE; otherwise report blocked QA explicitly.
+   - `custom`: follow PROFILE.md and task instructions exactly.
+   - `none`: record why QA is intentionally skipped.
+8. Write the result artifact and commit your branch.
+
+Manager final QA is a separate gate. Do not treat staging/preview final QA as your task's done condition unless the task contract explicitly says so.
+
+Do not invoke another broad implementation orchestration skill unless the task explicitly opts into one.
+"""
+
+
+def review_protocol_text(
+    protocol: str,
+    lanes: list[str],
+    worker_qa_profile: str,
+    manager_qa_profile: str,
+    branch_strategy: str,
+) -> str:
+    lane_lines = "\n".join(f"- {lane}" for lane in lanes)
+    if protocol == "codex-review-multi-v2":
+        return f"""Compatibility mode:
+- You may use $codex-review-multi-v2, but still produce the HLoop artifact and Fix Task Candidates section.
+- Review lanes requested by Manager:
+{lane_lines}
+- Branch strategy: {branch_strategy}
+- Worker QA profile to assess: {worker_qa_profile}
+- Manager final QA profile to assess: {manager_qa_profile}
+"""
+    return f"""HLoop Native Review Protocol:
+Review the integration result as a Manager gate, not as a generic code review. Use these lanes:
+{lane_lines}
+
+Mandatory review sequence:
+1. Build the review inventory:
+   - `git diff --name-status <base-branch>...<integration-branch>`
+   - `git diff --stat <base-branch>...<integration-branch>`
+   - task/result artifacts, validation logs, and PROFILE/PLAN/DECISIONS.
+2. Read changed files plus the nearest callers, callees, tests, schemas, migrations, generated-code sources, and CI/workflow files needed to verify behavior.
+3. Cross-check each Worker result against actual changed files, write scopes, validation commands, Worker QA profile `{worker_qa_profile}`, and acceptance criteria.
+4. For every candidate finding, prove the trigger path in the current code. Discard it if the scenario is speculative, pre-existing and unrelated, or unsupported by code evidence.
+5. For validation or QA gaps, name the exact missing evidence and the product risk it leaves open. Separate Worker-local QA gaps from Manager final QA gaps.
+6. Prefer fewer high-confidence findings over broad checklists.
+
+Lane meanings:
+- `integration-contract`: task/result artifacts, write-scope boundaries, merge safety, generated-code boundaries, and state consistency.
+- `correctness`: user-visible behavior, edge cases, API/schema contracts, backward compatibility, and repository conventions.
+- `risk`: security, auth/authorization, privacy, tenant scope, data integrity, concurrency, idempotency, migrations, performance, rollback, and observability.
+- `validation-qa`: whether validation commands, logs, Worker QA profile `{worker_qa_profile}`, Manager final QA profile `{manager_qa_profile}`, and evidence are sufficient for the changed product surface.
+- `ux`: visual/interaction/accessibility/copy risks only when UI is touched.
+- Custom lane names from PROFILE.md should be interpreted literally and kept actionable.
+
+Branch strategy under review: `{branch_strategy}`. Judge findings against that strategy and the repository's product workflow, not against a fixed branch model.
+
+Do not invoke a generic multi-review skill unless PROFILE.md or the task explicitly opts into one.
+"""
+
+
 def render_worker_prompt(
     task_id: str,
     task_meta: dict[str, Any],
     worktree: Path,
     branch: str,
+    state: dict[str, Any],
 ) -> str:
+    worker_protocol = str(task_meta.get("worker_protocol") or state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL))
+    if worker_protocol not in WORKER_PROTOCOLS:
+        worker_protocol = DEFAULT_WORKER_PROTOCOL
+    worker_qa_profile = str(
+        task_meta.get("worker_qa_profile")
+        or task_meta.get("qa_profile")
+        or state_worker_qa_profile(state)
+    )
+    branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
+    base_ref = str(task_meta.get("base_ref") or "the integration branch")
+    protocol = worker_protocol_text(worker_protocol, worker_qa_profile, base_ref)
     return f"""You are Worker {task_id}.
 
 You are running in your own git worktree:
@@ -1077,20 +1227,21 @@ Your branch:
 Read first:
 - .ai/loop/MISSION.md
 - .ai/loop/PLAN.md
+- .ai/loop/PROFILE.md
+- .ai/loop/DECISIONS.md
 - .ai/loop/tasks/{task_id}.md
 
-Use $codex-impl.
+Loop profile:
+- Branch strategy: {branch_strategy}
+- Worker protocol: {worker_protocol}
+- Worker QA profile: {worker_qa_profile}
 
-Manager has fixed kickoff choices for this bounded task:
-- Implementation gap-check count: 1
-- Review/fix loop limit: skip review unless this task explicitly requires it
-- Forced QA environment: local
-- QA target diff: this task branch against {task_meta.get("base_ref", "the integration branch")}
+{protocol}
 
 Rules:
 - Edit only the files allowed by write_allow in .ai/loop/tasks/{task_id}.md.
 - Do not edit .ai/loop/STATE.json.
-- Do not edit .ai/loop/MISSION.md or .ai/loop/PLAN.md.
+- Do not edit Manager-owned files: .ai/loop/MISSION.md, PLAN.md, PROFILE.md, DECISIONS.md, JOURNAL.md, or USER_ACTION_REQUIRED.md.
 - Do not edit other task files or other result directories.
 - Do not merge, rebase, or switch to the integration branch.
 - If the task needs a specification decision not present in MISSION/PLAN/task, write status: blocked.
@@ -1118,7 +1269,22 @@ def render_reviewer_prompt(
     review_id: str,
     base_branch: str,
     integration_branch: str,
+    state: dict[str, Any],
 ) -> str:
+    review_protocol = state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
+    if review_protocol not in REVIEW_PROTOCOLS:
+        review_protocol = DEFAULT_REVIEW_PROTOCOL
+    worker_qa_profile = state_worker_qa_profile(state)
+    manager_qa_profile = state_manager_qa_profile(state)
+    branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
+    lanes = state_list(state, "review_lanes", DEFAULT_REVIEW_LANES)
+    protocol = review_protocol_text(
+        review_protocol,
+        lanes,
+        worker_qa_profile,
+        manager_qa_profile,
+        branch_strategy,
+    )
     return f"""You are Reviewer {review_id}.
 
 Compare:
@@ -1130,9 +1296,21 @@ You are running in a detached review worktree. Treat the review target as read-o
 Read:
 - .ai/loop/MISSION.md
 - .ai/loop/PLAN.md
+- .ai/loop/PROFILE.md
 - .ai/loop/DECISIONS.md
+- .ai/loop/STATE.json
+- .ai/loop/tasks/*.md
+- .ai/loop/results/*/result.md
+- .ai/loop/validation/*.log when present
 
-Use $codex-review-multi-v2.
+Review profile:
+- Branch strategy: {branch_strategy}
+- Worker QA profile: {worker_qa_profile}
+- Manager final QA profile: {manager_qa_profile}
+- Review protocol: {review_protocol}
+- Review lanes: {", ".join(lanes)}
+
+{protocol}
 
 Rules:
 - Do not edit code.
@@ -1241,11 +1419,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "codex": command_exists("codex"),
         },
         "skills": {
+            "herdr": str(herdr_skill or herdr_skill_candidates[0]),
+        },
+        "optional_skills": {
             "codex-impl": str(codex_home / "skills/codex-impl/SKILL.md"),
             "codex-review-multi-v2": str(
                 codex_home / "skills/codex-review-multi-v2/SKILL.md"
             ),
-            "herdr": str(herdr_skill or herdr_skill_candidates[0]),
         },
         "warnings": [],
     }
@@ -1253,9 +1433,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         key: {"path": value, "exists": Path(value).exists()}
         for key, value in checks["skills"].items()
     }
+    checks["optional_skills"] = {
+        key: {"path": value, "exists": Path(value).exists()}
+        for key, value in checks["optional_skills"].items()
+    }
     checks["skills"]["herdr"]["candidates"] = [str(path) for path in herdr_skill_candidates]
     if not checks["skills"]["herdr"]["exists"]:
         checks["warnings"].append("herdr skill file not found; continuing because the herdr CLI is authoritative")
+    for key, item in checks["optional_skills"].items():
+        if not item["exists"]:
+            checks["warnings"].append(
+                f"optional compatibility skill `{key}` not found; native hloop protocols do not require it"
+            )
     if command_exists("codex"):
         proc = run_cmd(["codex", "--version"], check=False)
         checks["codex_version"] = (proc.stdout or proc.stderr).strip()
@@ -1267,12 +1456,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             checks["current_pane_id"] = extract_pane_id(current)
         except HLoopError as exc:
             checks["herdr_error"] = str(exc)
-    required_skills_ok = all(
-        checks["skills"][key]["exists"]
-        for key in ("codex-impl", "codex-review-multi-v2")
-    )
     herdr_skill_ok = checks["skills"]["herdr"]["exists"] or not args.strict_skills
-    ok = checks["HERDR_ENV"] == "1" and all(checks["commands"].values()) and required_skills_ok and herdr_skill_ok
+    ok = checks["HERDR_ENV"] == "1" and all(checks["commands"].values()) and herdr_skill_ok
     checks["ok"] = ok
     if args.json:
         print(json.dumps(checks, ensure_ascii=False, indent=2))
@@ -1288,6 +1473,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     base = args.base or current_branch(repo) or "main"
     goal_id = args.goal_id or slugify(args.goal, 32)
     integration = args.integration or f"ai/{goal_id}/integration"
+    worker_qa_profile = args_worker_qa_profile(args)
+    manager_qa_profile = str(
+        getattr(args, "manager_qa_profile", None) or DEFAULT_MANAGER_QA_PROFILE
+    )
     if args.create_branch:
         if branch_exists(repo, integration):
             git(repo, ["switch", integration])
@@ -1296,6 +1485,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     mission = loop_path(repo) / "MISSION.md"
     plan = loop_path(repo) / "PLAN.md"
+    profile = loop_path(repo) / "PROFILE.md"
     decisions = loop_path(repo) / "DECISIONS.md"
     user_action = loop_path(repo) / "USER_ACTION_REQUIRED.md"
     journal_path = loop_path(repo) / "JOURNAL.md"
@@ -1337,6 +1527,57 @@ TBD by Manager.
 - L3: e2e or manual verification
 """,
         )
+    if not profile.exists() or args.force:
+        lanes = args.review_lane or DEFAULT_REVIEW_LANES
+        write_text(
+            profile,
+            f"""# Loop Profile
+
+Manager-owned project profile for branch strategy, implementation protocol, review strategy, Worker QA, and final Manager QA.
+
+## Branch Strategy
+{args.branch_strategy}
+
+- `integration`: hloop manages one integration branch plus one branch/worktree per Worker task.
+- `pr-per-task`: Manager may keep Worker branches PR-oriented; use hloop artifacts as coordination gates and adapt merge/publish steps in PLAN.
+- `custom`: product-specific branch rules in PLAN override default branch assumptions. Keep safety gates explicit.
+
+## Worker Protocol
+{args.worker_protocol}
+
+- `native`: Workers follow the HLoop Worker Protocol embedded in their prompt.
+- `codex-impl`: compatibility mode only; use when Manager intentionally wants the external skill's preflight/review/QA behavior.
+
+## Review Protocol
+{args.review_protocol}
+
+- `native`: Reviewers use HLoop review lanes tuned for Manager gating, task artifacts, validation evidence, and product risk.
+- `codex-review-multi-v2`: compatibility mode only; still require HLoop artifact shape and Fix Task Candidates.
+
+## Review Lanes
+{chr(10).join(f"- {item}" for item in lanes)}
+
+## Worker QA Profile
+{worker_qa_profile}
+
+- `repo-default`: choose repository-native checks from scripts, CI, docs, or existing QA artifacts.
+- `local`: run local app/API/browser checks when the touched workflow is runnable.
+- `staging`: use staging only when credentials and URLs are already available.
+- `preview`: use PR/preview only when a URL is already available or discoverable from repo tooling.
+- `custom`: follow the QA section in PLAN exactly.
+- `none`: record the reason QA is intentionally skipped.
+
+## Manager Final QA Profile
+{manager_qa_profile}
+
+- `none`: no separate Manager final QA gate.
+- `repo-default`: Manager records final repository-appropriate evidence after integration/review/gap gates pass.
+- `local`: Manager records final local app/API/browser evidence after the combined implementation is assembled.
+- `staging`: Manager records staging URL, data setup, cleanup, screenshots/logs, and blockers before final completion.
+- `preview`: Manager records PR/preview URL evidence before final completion.
+- `custom`: Manager follows the final QA section in PLAN exactly.
+""",
+        )
     if not plan.exists() or args.force:
         write_text(
             plan,
@@ -1344,6 +1585,9 @@ TBD by Manager.
 
 ## Strategy
 TBD by Manager.
+
+## Branch strategy
+Follow `.ai/loop/PROFILE.md`. If the product needs PR-per-task, release-branch, or custom flow, record the exact merge/publish handoff here before dispatching Workers.
 
 ## Task graph
 - Add tasks with `hloop task new`.
@@ -1354,6 +1598,15 @@ TBD by Manager.
 ## Validation plan
 - Run task-specific validation before merge.
 - Run integration validation after each merge.
+
+## Worker QA plan
+- Workers follow `.ai/loop/PROFILE.md` Worker QA profile unless a task overrides it.
+- Worker QA evidence belongs in each task result artifact.
+
+## Manager final QA plan
+- Manager follows `.ai/loop/PROFILE.md` Manager Final QA profile after the combined implementation is ready.
+- Manager final QA evidence belongs in `.ai/loop/qa/FINAL.md` and the final report.
+- If Manager final QA is staging or preview, record URL, environment, data setup, cleanup, screenshots/logs, and blockers.
 
 ## Review plan
 - Keep up to 3 Workers running when write scopes do not overlap.
@@ -1391,6 +1644,13 @@ None.
         "base_branch": base,
         "integration_branch": integration,
         "merge_mode": args.merge_mode,
+        "branch_strategy": args.branch_strategy,
+        "worker_qa_profile": worker_qa_profile,
+        "manager_qa_profile": manager_qa_profile,
+        "manager_qa_status": "not-required" if manager_qa_profile == "none" else "pending",
+        "worker_protocol": args.worker_protocol,
+        "review_protocol": args.review_protocol,
+        "review_lanes": args.review_lane or DEFAULT_REVIEW_LANES,
         "worker_runner": args.worker_runner,
         "reviewer_runner": args.reviewer_runner,
         "gap_runner": args.gap_runner,
@@ -1416,6 +1676,16 @@ None.
     if state_path(repo).exists() and not args.force:
         old = load_state(repo)
         old.setdefault("validation_commands", args.validation or [])
+        old.setdefault("branch_strategy", args.branch_strategy)
+        old.setdefault("worker_qa_profile", old.get("qa_profile", worker_qa_profile))
+        old.setdefault("manager_qa_profile", manager_qa_profile)
+        old.setdefault(
+            "manager_qa_status",
+            "not-required" if state_manager_qa_profile(old) == "none" else "pending",
+        )
+        old.setdefault("worker_protocol", args.worker_protocol)
+        old.setdefault("review_protocol", args.review_protocol)
+        old.setdefault("review_lanes", args.review_lane or DEFAULT_REVIEW_LANES)
         old.setdefault("review_after_merges", args.review_after_merges)
         old.setdefault("gap_after_merges", args.gap_after_merges)
         old.setdefault("unreviewed_merge_count", 0)
@@ -1444,6 +1714,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"base: {state.get('base_branch')}")
     print(f"integration: {state.get('integration_branch')}")
     print(f"current_branch: {current_branch(repo)}")
+    print(f"branch_strategy: {state_value(state, 'branch_strategy', DEFAULT_BRANCH_STRATEGY)}")
+    print(f"worker_protocol: {state_value(state, 'worker_protocol', DEFAULT_WORKER_PROTOCOL)}")
+    print(f"review_protocol: {state_value(state, 'review_protocol', DEFAULT_REVIEW_PROTOCOL)}")
+    print(f"worker_qa_profile: {state_worker_qa_profile(state)}")
+    print(f"manager_qa_profile: {state_manager_qa_profile(state)}")
+    print(f"manager_qa_status: {state.get('manager_qa_status', '')}")
     print(
         "review_queue: "
         f"{normalize_int(state.get('unreviewed_merge_count'), 0)}/"
@@ -1515,6 +1791,8 @@ def create_loop_task(
         "write_deny": write_deny,
         "acceptance": acceptance or ["Task acceptance criteria are satisfied."],
         "validation_minimum": validation_minimum,
+        "worker_protocol": state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
+        "worker_qa_profile": state_worker_qa_profile(state),
     }
     body = f"""# Task {task_id}: {title}
 
@@ -1531,8 +1809,6 @@ Read:
 - .ai/loop/{created_from}.md if it exists
 
 ## Instructions
-Use $codex-impl.
-
 Follow this sequence:
 1. Verify the referenced finding against the current code.
 2. Implement the smallest safe fix.
@@ -1540,6 +1816,8 @@ Follow this sequence:
 4. Run targeted tests/build.
 5. Write result artifact.
 6. Commit your work.
+
+Use the HLoop Worker Protocol from `.ai/loop/PROFILE.md` and your rendered worker prompt. Do not invoke an external implementation skill unless this task explicitly sets `worker_protocol: codex-impl`.
 
 ## Done when
 {chr(10).join(f"- {item}" for item in fields["acceptance"])}
@@ -1554,6 +1832,8 @@ Follow this sequence:
         "write_deny": fields["write_deny"],
         "depends_on": fields["depends_on"],
         "created_from": created_from,
+        "worker_protocol": fields["worker_protocol"],
+        "worker_qa_profile": fields["worker_qa_profile"],
         "created_at": now_iso(),
     }
     return task_id
@@ -1581,6 +1861,9 @@ def cmd_task_new(args: argparse.Namespace) -> int:
             "or create/switch to the integration branch before adding tasks."
         )
     base_sha = args.base_sha or git(repo, ["rev-parse", base_ref])
+    requested_worker_qa_profile = getattr(args, "worker_qa_profile", None) or getattr(
+        args, "qa_profile", None
+    )
     fields = {
         "id": task_id,
         "kind": args.kind,
@@ -1595,6 +1878,10 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         "write_deny": args.write_deny or [],
         "acceptance": args.acceptance or ["Task acceptance criteria are satisfied."],
         "validation_minimum": args.validation_minimum,
+        "worker_protocol": args.worker_protocol or state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
+        "worker_qa_profile": args_worker_qa_profile(args)
+        if requested_worker_qa_profile
+        else state_worker_qa_profile(state),
     }
     body = f"""# Task {task_id}: {args.title}
 
@@ -1607,8 +1894,6 @@ Read:
 - .ai/loop/PLAN.md
 
 ## Instructions
-Use $codex-impl.
-
 Follow this sequence:
 1. Gap-check the task against the current code.
 2. Implement the smallest safe change.
@@ -1616,6 +1901,8 @@ Follow this sequence:
 4. Run targeted tests/build.
 5. Write result artifact.
 6. Commit your work.
+
+Use the HLoop Worker Protocol from `.ai/loop/PROFILE.md` and your rendered worker prompt. Do not invoke an external implementation skill unless this task explicitly sets `worker_protocol: codex-impl`.
 
 ## Done when
 {chr(10).join(f"- {item}" for item in fields["acceptance"])}
@@ -1629,6 +1916,8 @@ Follow this sequence:
         "write_allow": fields["write_allow"],
         "write_deny": fields["write_deny"],
         "depends_on": fields["depends_on"],
+        "worker_protocol": fields["worker_protocol"],
+        "worker_qa_profile": fields["worker_qa_profile"],
         "created_at": now_iso(),
     }
     state["phase"] = "dispatching"
@@ -1654,6 +1943,8 @@ def ensure_task_visible_in_worktree(worktree: Path, task_id: str) -> None:
     missing = [
         loop_path(worktree) / "MISSION.md",
         loop_path(worktree) / "PLAN.md",
+        loop_path(worktree) / "PROFILE.md",
+        loop_path(worktree) / "DECISIONS.md",
         task_file(worktree, task_id),
     ]
     absent = [str(path) for path in missing if not path.exists()]
@@ -1669,6 +1960,7 @@ def ensure_review_visible_in_worktree(worktree: Path) -> None:
     missing = [
         loop_path(worktree) / "MISSION.md",
         loop_path(worktree) / "PLAN.md",
+        loop_path(worktree) / "PROFILE.md",
         loop_path(worktree) / "DECISIONS.md",
     ]
     absent = [str(path) for path in missing if not path.exists()]
@@ -1684,6 +1976,7 @@ def ensure_gap_visible_in_worktree(worktree: Path) -> None:
     missing = [
         loop_path(worktree) / "MISSION.md",
         loop_path(worktree) / "PLAN.md",
+        loop_path(worktree) / "PROFILE.md",
         loop_path(worktree) / "DECISIONS.md",
     ]
     absent = [str(path) for path in missing if not path.exists()]
@@ -1820,7 +2113,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     task_meta["base_ref"] = integration
     task_meta["base_sha"] = current_base_sha
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id)
-    prompt = render_worker_prompt(task_id, task_meta, worktree, branch)
+    prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
     prompt_rel = LOOP_DIR / "prompts" / f"{task_id}.worker.md"
     runner = args.runner or state.get("worker_runner", "tui")
     command = (
@@ -1852,7 +2145,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     task_meta["base_ref"] = integration
     task_meta["base_sha"] = current_base_sha
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id)
-    prompt = render_worker_prompt(task_id, task_meta, worktree, branch)
+    prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
     runner = args.runner or state.get("worker_runner", "tui")
     command = (
         f"cd {shlex.quote(str(worktree))} && "
@@ -2097,6 +2390,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
     state["last_merged_task"] = task_id
     state["unreviewed_merge_count"] = normalize_int(state.get("unreviewed_merge_count"), 0) + 1
     state["ungapped_merge_count"] = normalize_int(state.get("ungapped_merge_count"), 0) + 1
+    if manager_qa_required(state):
+        state["manager_qa_status"] = "pending"
     state["phase"] = "validating"
     save_state(repo, state)
     journal(repo, f"Merged Worker `{task_id}` from `{branch}`.")
@@ -2220,7 +2515,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
     worktree = Path(args.worktree).resolve() if args.worktree else default_review_worktree(repo, review_id)
-    prompt = render_reviewer_prompt(review_id, base, head)
+    prompt = render_reviewer_prompt(review_id, base, head, state)
     prompt_rel = LOOP_DIR / "prompts" / f"{review_id}.reviewer.md"
     review_rel = LOOP_DIR / "reviews" / f"{review_id}.md"
     prompt_path = worktree / prompt_rel
@@ -2249,7 +2544,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
     worktree = Path(args.worktree).resolve() if args.worktree else default_review_worktree(repo, review_id)
-    prompt = render_reviewer_prompt(review_id, base, head)
+    prompt = render_reviewer_prompt(review_id, base, head, state)
     prompt_path = worktree / prompt_rel
     worktree_review_path = worktree / review_rel
     review_path = review_file(repo, review_id)
@@ -3016,6 +3311,21 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if not running_review_exists(state) and not running_gap_exists(state):
         for task_id, task in state.get("tasks", {}).items():
             if task.get("status") == "result_reported" and task.get("merge_ready"):
+                branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
+                if branch_strategy != "integration":
+                    if not args.dry_run:
+                        state["phase"] = "branch_handoff"
+                        state["branch_handoff_task"] = task_id
+                        save_state(repo, state)
+                        journal(
+                            repo,
+                            f"Worker `{task_id}` is merge-ready, but branch_strategy `{branch_strategy}` requires Manager handoff.",
+                        )
+                    print(
+                        f"branch handoff required for {task_id}: "
+                        f"branch_strategy={branch_strategy}; follow PROFILE.md and PLAN.md"
+                    )
+                    return 0
                 args.task_id = task_id
                 return cmd_merge(args)
 
@@ -3160,8 +3470,25 @@ def cmd_tick(args: argparse.Namespace) -> int:
         and gap_gate_passed(state)
         and review_gate_passed(state)
     ):
+        if not manager_qa_passed(state):
+            if args.dry_run:
+                print(
+                    "DRY RUN manager final QA required: "
+                    f"profile={state_manager_qa_profile(state)} "
+                    f"status={state.get('manager_qa_status', 'pending')}"
+                )
+                return 0
+            state["phase"] = "manager_qa"
+            state["manager_qa_status"] = state.get("manager_qa_status") or "pending"
+            save_state(repo, state)
+            print(
+                "manager final QA required before done: "
+                f"profile={state_manager_qa_profile(state)}; "
+                "record with `hloop qa record --status passed --summary ...`"
+            )
+            return 0
         if args.dry_run:
-            print("DRY RUN done: all tasks merged, validation passed, gap and review gates closed")
+            print("DRY RUN done: all tasks merged, validation passed, gap/review/manager QA gates closed")
             return 0
         state["phase"] = "done"
         save_state(repo, state)
@@ -3198,11 +3525,16 @@ def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[s
         "blocked_environment",
         "blocked_conflict",
         "failed_validation",
+        "failed_manager_qa",
         "no_progress",
     }:
         return (f"phase is {phase}", 2)
     if phase == "done":
         return ("loop is done", 0)
+    if phase == "branch_handoff":
+        return ("branch handoff required", 0)
+    if phase == "manager_qa":
+        return ("manager final QA required", 0)
     if getattr(args, "stop_on_triage", True):
         if state.get("needs_gap_check") and reported_gap_exists(state):
             return ("gap triage required", 0)
@@ -3254,6 +3586,71 @@ def cmd_pump(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_qa_record(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True)
+    previous_phase = str(state.get("phase") or "")
+    previous_qa_status = str(state.get("manager_qa_status") or "")
+    profile = str(args.profile or state_manager_qa_profile(state))
+    if profile == "none" and args.status == "skipped":
+        recorded_status = "not-required"
+    else:
+        recorded_status = args.status
+    if profile != "none" and recorded_status == "skipped":
+        raise HLoopError(
+            "manager final QA is required; use --status passed, accepted-risk, blocked, or failed"
+        )
+    if args.profile:
+        state["manager_qa_profile"] = profile
+    evidence = args.evidence or []
+    fields = {
+        "manager_qa_profile": profile,
+        "status": recorded_status,
+        "recorded_at": now_iso(),
+        "summary": args.summary,
+        "evidence": evidence,
+    }
+    lines = [
+        "# Manager Final QA",
+        "",
+        f"- Profile: {profile}",
+        f"- Status: {recorded_status}",
+        f"- Summary: {args.summary}",
+        "",
+        "## Evidence",
+    ]
+    if evidence:
+        lines.extend(f"- {item}" for item in evidence)
+    else:
+        lines.append("- No evidence paths or URLs recorded.")
+    if args.notes:
+        lines.extend(["", "## Notes", "", args.notes])
+    path = manager_qa_file(repo)
+    write_text(path, frontmatter(fields) + "\n" + "\n".join(lines) + "\n")
+    state["manager_qa_status"] = recorded_status
+    state["manager_qa_recorded_at"] = fields["recorded_at"]
+    state["manager_qa_artifact"] = str(path.relative_to(repo))
+    if recorded_status in {"passed", "accepted-risk", "not-required"}:
+        if previous_phase in {"manager_qa", "failed_manager_qa"} or previous_qa_status in {
+            "pending",
+            "blocked",
+            "failed",
+        }:
+            state["phase"] = "dispatching"
+    elif recorded_status == "blocked":
+        state["phase"] = "blocked_environment"
+        append_text(
+            loop_path(repo) / "USER_ACTION_REQUIRED.md",
+            f"\n## Manager final QA blocked\n\n{args.summary}\n",
+        )
+    elif recorded_status == "failed":
+        state["phase"] = "failed_manager_qa"
+    save_state(repo, state)
+    journal(repo, f"Recorded Manager final QA `{recorded_status}` for profile `{profile}`: {args.summary}")
+    print(path)
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
@@ -3264,6 +3661,12 @@ def cmd_report(args: argparse.Namespace) -> int:
         f"- Phase: {state.get('phase')}",
         f"- Base branch: {state.get('base_branch')}",
         f"- Integration branch: {state.get('integration_branch')}",
+        f"- Branch strategy: {state_value(state, 'branch_strategy', DEFAULT_BRANCH_STRATEGY)}",
+        f"- Worker protocol: {state_value(state, 'worker_protocol', DEFAULT_WORKER_PROTOCOL)}",
+        f"- Review protocol: {state_value(state, 'review_protocol', DEFAULT_REVIEW_PROTOCOL)}",
+        f"- Worker QA profile: {state_worker_qa_profile(state)}",
+        f"- Manager final QA profile: {state_manager_qa_profile(state)}",
+        f"- Manager final QA status: {state.get('manager_qa_status', '')}",
         "",
         "## Tasks",
     ]
@@ -3283,6 +3686,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines.extend(["", "## Validation"])
     for item in state.get("last_validation", {}).get("results", []):
         lines.append(f"- `{item.get('command')}`: {item.get('result')}")
+    lines.extend(["", "## Manager Final QA"])
+    qa_artifact = state.get("manager_qa_artifact")
+    if qa_artifact:
+        lines.append(f"- Artifact: `{qa_artifact}`")
+    else:
+        lines.append("- Artifact: not recorded")
+    lines.append(f"- Status: {state.get('manager_qa_status', '')}")
     lines.append("")
     path = loop_path(repo) / "reports" / "FINAL.md"
     write_text(path, "\n".join(lines))
@@ -3317,6 +3727,17 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--max-reviewers", type=int, default=DEFAULT_MAX_REVIEWERS)
     init.add_argument("--max-gap-auditors", type=int, default=DEFAULT_MAX_GAP_AUDITORS)
     init.add_argument("--merge-mode", choices=["squash", "cherry-pick"], default="squash")
+    init.add_argument("--branch-strategy", choices=sorted(BRANCH_STRATEGIES), default=DEFAULT_BRANCH_STRATEGY)
+    init.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
+    init.add_argument("--manager-qa-profile", choices=sorted(QA_PROFILES), default=DEFAULT_MANAGER_QA_PROFILE)
+    init.add_argument(
+        "--qa-profile",
+        choices=sorted(QA_PROFILES),
+        help="deprecated alias for --worker-qa-profile",
+    )
+    init.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS), default=DEFAULT_WORKER_PROTOCOL)
+    init.add_argument("--review-protocol", choices=sorted(REVIEW_PROTOCOLS), default=DEFAULT_REVIEW_PROTOCOL)
+    init.add_argument("--review-lane", action="append")
     init.add_argument("--worker-runner", choices=["tui", "exec"], default="tui")
     init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="tui")
     init.add_argument("--gap-runner", choices=["exec", "tui"], default="tui")
@@ -3359,6 +3780,13 @@ def build_parser() -> argparse.ArgumentParser:
     task_new.add_argument("--write-deny", action="append")
     task_new.add_argument("--acceptance", action="append")
     task_new.add_argument("--validation-minimum", default="L1")
+    task_new.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS))
+    task_new.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
+    task_new.add_argument(
+        "--qa-profile",
+        choices=sorted(QA_PROFILES),
+        help="deprecated alias for --worker-qa-profile",
+    )
     task_new.set_defaults(func=cmd_task_new)
 
     worker = sub.add_parser("worker", help="worker operations")
@@ -3413,6 +3841,20 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--no-cleanup", action="store_true")
     validate.add_argument("--dry-run", action="store_true")
     validate.set_defaults(func=cmd_validate)
+
+    qa = sub.add_parser("qa", help="manager final QA operations")
+    qa_sub = qa.add_subparsers(dest="qa_command", required=True)
+    qa_record = qa_sub.add_parser("record", help="record Manager final QA evidence")
+    qa_record.add_argument(
+        "--status",
+        choices=["passed", "accepted-risk", "blocked", "failed", "skipped"],
+        required=True,
+    )
+    qa_record.add_argument("--profile", choices=sorted(QA_PROFILES))
+    qa_record.add_argument("--summary", required=True)
+    qa_record.add_argument("--evidence", action="append")
+    qa_record.add_argument("--notes")
+    qa_record.set_defaults(func=cmd_qa_record)
 
     reviewer = sub.add_parser("reviewer", help="reviewer operations")
     reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
