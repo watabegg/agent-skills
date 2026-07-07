@@ -17,5 +17,21 @@
     "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
     "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {"enum": ["implementation", "fix"]}
+        },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "write_allow": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+        },
+        "required": ["write_allow"]
+      }
+    }
+  ],
   "additionalProperties": true
 }

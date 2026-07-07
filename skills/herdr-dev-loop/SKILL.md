@@ -15,9 +15,10 @@ Before starting or continuing a loop:
 
 1. Verify `HERDR_ENV=1`.
 2. Run `python3 <this-skill>/scripts/hloop doctor`.
-3. Confirm `herdr`, `codex`, and `git` are available. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
-4. Read the current `.ai/loop/MISSION.md`, `.ai/loop/PLAN.md`, `.ai/loop/PROFILE.md`, `.ai/loop/STATE.json`, and `.ai/loop/DECISIONS.md` if they exist.
-5. Continue from disk state, not from thread memory.
+3. After installing or updating this skill, run `python3 <this-skill>/scripts/hloop selftest`.
+4. Confirm `herdr`, `codex`, and `git` are available. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
+5. Read the current `.ai/loop/MISSION.md`, `.ai/loop/PLAN.md`, `.ai/loop/PROFILE.md`, `.ai/loop/STATE.json`, and `.ai/loop/DECISIONS.md` if they exist.
+6. Continue from disk state, not from thread memory.
 
 If `HERDR_ENV=1` is absent, stop and tell the user this skill requires Herdr.
 
@@ -26,6 +27,7 @@ If `HERDR_ENV=1` is absent, stop and tell the user this skill requires Herdr.
 Use the helper script instead of hand-typing pane prompts:
 
 ```bash
+python3 <this-skill>/scripts/hloop selftest
 python3 <this-skill>/scripts/hloop doctor
 python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
 python3 <this-skill>/scripts/hloop task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
