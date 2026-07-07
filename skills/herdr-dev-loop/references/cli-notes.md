@@ -27,9 +27,9 @@ Herdr pane ids are not durable and may not use the old `1-3` shape. Parse ids fr
 
 When available, prefer environment-provided `HERDR_PANE_ID`, `HERDR_WORKSPACE_ID`, and `HERDR_TAB_ID` for the current Manager context. Some Herdr `--current` subcommands can refer to the UI-focused pane, so pass explicit ids after preflight.
 
-`herdr agent start` is useful for named Worker/Reviewer agents. `hloop` supports a pane launcher and an agent launcher; use `--dry-run` before relying on a launcher in a new Herdr version.
+`herdr agent start` is useful for named Worker/Gap Auditor/Reviewer agents. `hloop` supports a pane launcher and an agent launcher; use `--dry-run` before relying on a launcher in a new Herdr version.
 
-After `hloop worker harvest` or `hloop reviewer harvest`, the helper closes the completed pane by default. Use `--keep-pane` only when the Manager needs to inspect the live transcript.
+After `hloop worker harvest`, `hloop gap harvest`, or `hloop reviewer harvest`, the helper closes the completed pane by default. Use `--keep-pane` only when the Manager needs to inspect the live transcript.
 
 ## Codex CLI
 
@@ -38,15 +38,18 @@ Required command shape:
 ```bash
 codex --sandbox workspace-write --ask-for-approval never --no-alt-screen "$(cat .ai/loop/prompts/T001.worker.md)"
 codex exec --sandbox workspace-write - < .ai/loop/prompts/T001.worker.md
+codex --sandbox workspace-write --ask-for-approval never --no-alt-screen "$(cat .ai/loop/prompts/G001.gap.md)"
+codex exec --sandbox workspace-write --output-last-message .ai/loop/gaps/G001.md - < .ai/loop/prompts/G001.gap.md
 codex --sandbox workspace-write --ask-for-approval never --no-alt-screen "$(cat .ai/loop/prompts/R001.reviewer.md)"
 codex exec --sandbox workspace-write --output-last-message .ai/loop/reviews/R001.md - < .ai/loop/prompts/R001.reviewer.md
 ```
 
-The helper uses `--sandbox workspace-write` for Workers and Reviewers. Worker default is TUI. Reviewer default is also TUI, but runs in a detached review worktree so the Manager can monitor progress and the Reviewer can write only the final review artifact. `hloop reviewer harvest` copies the artifact back to the Manager repo and blocks if the review worktree changed any other file.
+The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Reviewers. Worker default is TUI. Gap Auditor and Reviewer default are also TUI, but run in detached worktrees so the Manager can monitor progress and each agent can write only the final Markdown artifact. `hloop gap harvest` and `hloop reviewer harvest` copy the artifact back to the Manager repo and block if the detached worktree changed any other file.
 
-Use this while a review is running:
+Use this while a gap audit or review is running:
 
 ```bash
+python3 <skill>/scripts/hloop gap watch G001 --lines 120
 python3 <skill>/scripts/hloop reviewer watch R001 --lines 120
 ```
 
@@ -54,6 +57,7 @@ Use the helper to send additional Manager instructions into a TUI:
 
 ```bash
 python3 <skill>/scripts/hloop worker message T001 --file .ai/loop/inbox/manager/T001-followup.md
+python3 <skill>/scripts/hloop gap message G001 --file .ai/loop/inbox/manager/G001-followup.md
 python3 <skill>/scripts/hloop reviewer message R001 --file .ai/loop/inbox/manager/R001-followup.md
 ```
 
@@ -74,6 +78,31 @@ codex archive <session-id>
 ```
 
 `hloop` reads the active Codex session id from `herdr pane get` when Herdr exposes `agent_session.value`. Default session cleanup is `archive`; use `--session-cleanup none` to keep sessions visible in `codex resume`, or `--session-cleanup delete` only when permanent deletion is intended.
+
+## Cadence Options
+
+Default init cadence keeps the loop active:
+
+```bash
+hloop init ... --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3
+```
+
+`review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
+
+Use `pump` for queue-drain behavior:
+
+```bash
+hloop pump --max-transitions 20 --max-workers 3 --stop-on-triage
+```
+
+Use `triage` to turn machine-readable `Fix Task Candidates` into a Manager-readable draft, and only then create queued fix tasks:
+
+```bash
+hloop triage review R001
+hloop triage review R001 --create-tasks
+hloop triage gap G001
+hloop triage gap G001 --create-tasks
+```
 
 ## Local Skill Dependencies
 

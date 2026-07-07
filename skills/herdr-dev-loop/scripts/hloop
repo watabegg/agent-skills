@@ -27,6 +27,12 @@ LOOP_DIR = Path(".ai") / "loop"
 TASK_STATUSES_FINAL = {"done", "partial", "blocked", "failed", "abandoned"}
 SESSION_CLEANUP_MODES = {"none", "archive", "delete"}
 DEFAULT_REVIEW_WAIT_MS = 600_000
+DEFAULT_GAP_WAIT_MS = 600_000
+DEFAULT_MAX_WORKERS = 3
+DEFAULT_MAX_REVIEWERS = 1
+DEFAULT_MAX_GAP_AUDITORS = 1
+DEFAULT_REVIEW_AFTER_MERGES = 1
+DEFAULT_GAP_AFTER_MERGES = 3
 DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
@@ -198,13 +204,92 @@ def frontmatter(fields: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def parse_simple_field_block(lines: list[str]) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    current_key: str | None = None
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        item = re.match(r"^\s*-\s+(.*)$", line)
+        if item and current_key:
+            data.setdefault(current_key, [])
+            if not isinstance(data[current_key], list):
+                data[current_key] = [data[current_key]]
+            data[current_key].append(parse_scalar(item.group(1)))
+            continue
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if raw_value == "":
+            data[key] = []
+            current_key = key
+        else:
+            data[key] = parse_scalar(raw_value)
+            current_key = None
+    return data
+
+
+def extract_fix_task_candidates(text: str, source_id: str) -> list[dict[str, Any]]:
+    lines = text.splitlines()
+    in_section = False
+    blocks: list[tuple[str, list[str]]] = []
+    current_title: str | None = None
+    current_lines: list[str] = []
+    for line in lines:
+        if re.match(r"^##\s+Fix Task Candidates\s*$", line, re.IGNORECASE):
+            in_section = True
+            continue
+        if in_section and re.match(r"^##\s+", line):
+            break
+        if not in_section:
+            continue
+        heading = re.match(r"^###\s+(.*)$", line)
+        if heading:
+            if current_title is not None:
+                blocks.append((current_title, current_lines))
+            current_title = heading.group(1).strip()
+            current_lines = []
+            continue
+        if current_title is not None:
+            current_lines.append(line)
+    if current_title is not None:
+        blocks.append((current_title, current_lines))
+
+    candidates: list[dict[str, Any]] = []
+    for title, block_lines in blocks:
+        data = parse_simple_field_block(block_lines)
+        action = str(data.get("action") or "fix_task")
+        if action not in {"fix_task", "fix-task"}:
+            continue
+        clean_title = re.sub(r"^FT\d+\s*:\s*", "", title).strip()
+        candidate = {
+            "title": str(data.get("title") or clean_title),
+            "kind": str(data.get("kind") or "fix"),
+            "priority": str(data.get("priority") or data.get("severity") or "P1"),
+            "source": str(data.get("source") or source_id),
+            "source_finding": str(data.get("source_finding") or data.get("finding") or clean_title),
+            "write_allow": normalize_list(data.get("write_allow")),
+            "write_deny": normalize_list(data.get("write_deny")),
+            "acceptance": normalize_list(data.get("acceptance"))
+            or ["The referenced review/gap finding is fixed."],
+            "depends_on": normalize_list(data.get("depends_on")),
+            "rationale": str(data.get("rationale") or data.get("reason") or ""),
+        }
+        candidates.append(candidate)
+    return candidates
+
+
 def ensure_loop_dirs(repo: Path) -> None:
     for rel in [
         "tasks",
         "results",
         "reviews",
+        "gaps",
         "prompts",
         "reports",
+        "triage",
         "validation",
         "inbox/manager",
         "inbox/user",
@@ -605,6 +690,10 @@ def review_file(repo: Path, review_id: str) -> Path:
     return loop_path(repo) / "reviews" / f"{review_id}.md"
 
 
+def gap_file(repo: Path, gap_id: str) -> Path:
+    return loop_path(repo) / "gaps" / f"{gap_id}.md"
+
+
 def prompt_file(repo: Path, name: str) -> Path:
     return loop_path(repo) / "prompts" / name
 
@@ -612,6 +701,15 @@ def prompt_file(repo: Path, name: str) -> Path:
 def review_artifact_path(repo: Path, review_id: str, review: dict[str, Any]) -> Path:
     path = review.get("worktree_review_path") or review.get("review_path")
     return Path(path) if path else review_file(repo, review_id)
+
+
+def gap_artifact_path(repo: Path, gap_id: str, gap: dict[str, Any]) -> Path:
+    path = gap.get("worktree_gap_path") or gap.get("gap_path")
+    return Path(path) if path else gap_file(repo, gap_id)
+
+
+def triage_draft_file(repo: Path, source_id: str) -> Path:
+    return loop_path(repo) / "triage" / f"{source_id}.fix-task-draft.md"
 
 
 def normalize_list(value: Any) -> list[str]:
@@ -628,6 +726,15 @@ def normalize_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def normalize_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
@@ -766,6 +873,25 @@ def validate_reviewer_worktree_scope(
     return violations
 
 
+def validate_gap_worktree_scope(
+    gap_id: str,
+    gap_state: dict[str, Any],
+    worktree: Path,
+) -> list[str]:
+    allowed = {
+        str((LOOP_DIR / "gaps" / f"{gap_id}.md").as_posix()),
+        str((LOOP_DIR / "prompts" / f"{gap_id}.gap.md").as_posix()),
+    }
+    baseline = set(normalize_list(gap_state.get("baseline_dirty_files")))
+    violations = []
+    for path in porcelain_paths(worktree):
+        if path in baseline:
+            continue
+        if path not in allowed:
+            violations.append(path)
+    return violations
+
+
 def all_tasks_merged(state: dict[str, Any]) -> bool:
     tasks = state.get("tasks", {})
     return bool(tasks) and all(task.get("status") == "merged" for task in tasks.values())
@@ -780,8 +906,16 @@ def running_review_exists(state: dict[str, Any]) -> bool:
     return any(review.get("status") == "running" for review in state.get("reviews", {}).values())
 
 
+def running_gap_exists(state: dict[str, Any]) -> bool:
+    return any(gap.get("status") == "running" for gap in state.get("gaps", {}).values())
+
+
 def reported_review_exists(state: dict[str, Any]) -> bool:
     return any(review.get("status") == "reported" for review in state.get("reviews", {}).values())
+
+
+def reported_gap_exists(state: dict[str, Any]) -> bool:
+    return any(gap.get("status") == "reported" for gap in state.get("gaps", {}).values())
 
 
 def pending_review_exists(state: dict[str, Any]) -> bool:
@@ -791,13 +925,59 @@ def pending_review_exists(state: dict[str, Any]) -> bool:
     )
 
 
+def pending_gap_exists(state: dict[str, Any]) -> bool:
+    return any(
+        gap.get("status") in {"running", "reported"}
+        for gap in state.get("gaps", {}).values()
+    )
+
+
 def review_gate_passed(state: dict[str, Any]) -> bool:
-    if int(state.get("max_reviewers", 1)) <= 0:
+    if int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) <= 0:
         return True
     if state.get("needs_review"):
         return False
     reviews = state.get("reviews", {})
     return any(review.get("status") == "triaged" for review in reviews.values())
+
+
+def gap_gate_passed(state: dict[str, Any]) -> bool:
+    if int(state.get("max_gap_auditors", DEFAULT_MAX_GAP_AUDITORS)) <= 0:
+        return True
+    if state.get("needs_gap_check"):
+        return False
+    gaps = state.get("gaps", {})
+    return any(gap.get("status") == "triaged" for gap in gaps.values())
+
+
+def review_after_merges(state: dict[str, Any]) -> int:
+    return max(1, normalize_int(state.get("review_after_merges"), DEFAULT_REVIEW_AFTER_MERGES))
+
+
+def gap_after_merges(state: dict[str, Any]) -> int:
+    return max(1, normalize_int(state.get("gap_after_merges"), DEFAULT_GAP_AFTER_MERGES))
+
+
+def should_open_review_gate(state: dict[str, Any]) -> bool:
+    if int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) <= 0:
+        return False
+    if state.get("needs_review") or pending_review_exists(state):
+        return False
+    count = normalize_int(state.get("unreviewed_merge_count"), 0)
+    if count >= review_after_merges(state):
+        return True
+    return all_tasks_merged(state) and (count > 0 or not review_gate_passed(state))
+
+
+def should_open_gap_gate(state: dict[str, Any]) -> bool:
+    if int(state.get("max_gap_auditors", DEFAULT_MAX_GAP_AUDITORS)) <= 0:
+        return False
+    if state.get("needs_gap_check") or pending_gap_exists(state):
+        return False
+    count = normalize_int(state.get("ungapped_merge_count"), 0)
+    if count >= gap_after_merges(state):
+        return True
+    return all_tasks_merged(state) and (count > 0 or not gap_gate_passed(state))
 
 
 def review_wait_ms(args: argparse.Namespace, state: dict[str, Any]) -> int:
@@ -808,6 +988,16 @@ def review_wait_ms(args: argparse.Namespace, state: dict[str, Any]) -> int:
         return max(0, int(raw))
     except (TypeError, ValueError) as exc:
         raise HLoopError(f"invalid review_wait_ms: {raw}") from exc
+
+
+def gap_wait_ms(args: argparse.Namespace, state: dict[str, Any]) -> int:
+    raw = getattr(args, "gap_wait_ms", None)
+    if raw is None:
+        raw = state.get("gap_wait_ms", DEFAULT_GAP_WAIT_MS)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"invalid gap_wait_ms: {raw}") from exc
 
 
 def wait_for_running_review(repo: Path, review_id: str, review: dict[str, Any], wait_ms: int) -> bool:
@@ -837,6 +1027,36 @@ def wait_for_running_review(repo: Path, review_id: str, review: dict[str, Any], 
     else:
         review["last_wait_result"] = "timeout"
     review["last_waited_at"] = now_iso()
+    return path.exists() and read_text(path).strip() != ""
+
+
+def wait_for_running_gap(repo: Path, gap_id: str, gap: dict[str, Any], wait_ms: int) -> bool:
+    path = gap_artifact_path(repo, gap_id, gap)
+    if path.exists() and read_text(path).strip():
+        return True
+    pane_id = str(gap.get("pane_id") or "")
+    if wait_ms <= 0 or not pane_id or os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        return False
+    proc = run_cmd(
+        [
+            "herdr",
+            "wait",
+            "output",
+            pane_id,
+            "--match",
+            f"HERDR_LOOP_GAP_DONE:{gap_id}:",
+            "--source",
+            "recent-unwrapped",
+            "--timeout",
+            str(wait_ms),
+        ],
+        check=False,
+    )
+    if proc.returncode == 0:
+        gap["last_wait_result"] = "done-marker"
+    else:
+        gap["last_wait_result"] = "timeout"
+    gap["last_waited_at"] = now_iso()
     return path.exists() and read_text(path).strip() != ""
 
 
@@ -930,9 +1150,68 @@ Output:
 - After review is complete, write only .ai/loop/reviews/{review_id}.md.
 - Include frontmatter: review_id, base, head, status: reported|blocked|failed.
 - If blocked or failed, still write the artifact with the concrete reason.
+- Include a `## Fix Task Candidates` section. For every finding that should become a Worker fix task, add:
+  `### FTNNN: <title>`, `action: fix_task`, `severity: P0|P1|P2|P3`, `write_allow:`, `acceptance:`, and `rationale:`.
+  If no fix task is needed, write `No fix task candidates.`
 
 Final terminal line:
 HERDR_LOOP_REVIEW_DONE:{review_id}:<reported|blocked|failed>
+"""
+
+
+def render_gap_prompt(
+    gap_id: str,
+    base_branch: str,
+    integration_branch: str,
+    spec_sources: list[str],
+) -> str:
+    if spec_sources:
+        source_lines = "\n".join(f"- {item}" for item in spec_sources)
+    else:
+        source_lines = "- No extra spec source was configured; use MISSION.md, PLAN.md, DECISIONS.md, tasks, and results as the implementation contract."
+    return f"""You are Gap Auditor {gap_id}.
+
+Purpose:
+- Compare the intended plan/spec against the current implementation.
+- Find specification coverage gaps, not generic code-review issues.
+
+Compare:
+- base branch: {base_branch}
+- integration branch: {integration_branch}
+
+You are running in a detached gap-audit worktree. Treat the target as read-only during investigation.
+
+Read:
+- .ai/loop/MISSION.md
+- .ai/loop/PLAN.md
+- .ai/loop/DECISIONS.md
+- .ai/loop/tasks/*.md
+- .ai/loop/results/*/result.md
+
+Spec sources:
+{source_lines}
+
+Rules:
+- Do not edit code.
+- Do not run formatters, generators, migrations, or automatic fix commands.
+- Do not commit, merge, rebase, or switch branches.
+- Check whether each planned requirement is implemented, partially implemented, intentionally deferred, obsolete, or blocked by a decision gap.
+- Verify every gap against the actual code path or missing artifact.
+- Do not report broad best-practice review findings unless they directly prove plan/spec drift.
+- Classify each item as implemented, partial, missing, deferred, obsolete-spec, or needs-decision.
+- Recommend Manager action: fix_task, decision_needed, accepted_risk_candidate, stale_spec_update, or no_action.
+
+Output:
+- During investigation, do not write files.
+- After the audit is complete, write only .ai/loop/gaps/{gap_id}.md.
+- Include frontmatter: gap_id, base, head, status: aligned|gaps-found|blocked|failed, spec_sources, gap_count.
+- If blocked or failed, still write the artifact with the concrete reason.
+- Include a `## Fix Task Candidates` section. For every missing or partial requirement that should become a Worker fix task, add:
+  `### FTNNN: <title>`, `action: fix_task`, `priority: P0|P1|P2|P3`, `write_allow:`, `acceptance:`, and `rationale:`.
+  If no fix task is needed, write `No fix task candidates.`
+
+Final terminal line:
+HERDR_LOOP_GAP_DONE:{gap_id}:<aligned|gaps-found|blocked|failed>
 """
 
 
@@ -1042,6 +1321,7 @@ TBD by Manager.
 ## Done when
 - All planned tasks are merged into `{integration}`.
 - Required validation passes.
+- No blocking plan/spec implementation gap remains.
 - No blocking review finding remains.
 
 ## Base branch
@@ -1076,11 +1356,31 @@ TBD by Manager.
 - Run integration validation after each merge.
 
 ## Review plan
-- Run Reviewer after integration advances and before final completion.
+- Keep up to 3 Workers running when write scopes do not overlap.
+- Run Reviewer frequently after validated integration advances.
+- Run Gap Auditor less frequently against original plan/spec sources, and always before final completion when configured.
 """,
         )
     if not decisions.exists():
-        write_text(decisions, "# Decisions\n\n")
+        write_text(
+            decisions,
+            """# Decisions
+
+Manager-owned record for specification choices that cannot be answered from the original plan/spec alone.
+
+## Pending Decisions
+
+None.
+
+## Accepted Decisions
+
+None.
+
+## Rejected Decisions
+
+None.
+""",
+        )
     if not user_action.exists():
         write_text(user_action, "# User Action Required\n\nNo blocking user action.\n")
     if not journal_path.exists():
@@ -1093,20 +1393,38 @@ TBD by Manager.
         "merge_mode": args.merge_mode,
         "worker_runner": args.worker_runner,
         "reviewer_runner": args.reviewer_runner,
+        "gap_runner": args.gap_runner,
         "session_cleanup": args.session_cleanup,
         "review_wait_ms": args.review_wait_ms,
+        "gap_wait_ms": args.gap_wait_ms,
+        "review_after_merges": args.review_after_merges,
+        "gap_after_merges": args.gap_after_merges,
+        "unreviewed_merge_count": 0,
+        "ungapped_merge_count": 0,
         "cycle": 0,
         "max_workers": args.max_workers,
         "max_reviewers": args.max_reviewers,
+        "max_gap_auditors": args.max_gap_auditors,
+        "spec_sources": args.spec_source or [],
         "validation_commands": args.validation or [],
         "tasks": {},
         "reviews": {},
+        "gaps": {},
         "blocking_decisions": [],
         "created_at": now_iso(),
     }
     if state_path(repo).exists() and not args.force:
         old = load_state(repo)
         old.setdefault("validation_commands", args.validation or [])
+        old.setdefault("review_after_merges", args.review_after_merges)
+        old.setdefault("gap_after_merges", args.gap_after_merges)
+        old.setdefault("unreviewed_merge_count", 0)
+        old.setdefault("ungapped_merge_count", 0)
+        old.setdefault("max_workers", args.max_workers)
+        old.setdefault("max_reviewers", args.max_reviewers)
+        old.setdefault("max_gap_auditors", args.max_gap_auditors)
+        old.setdefault("gaps", {})
+        save_state(repo, old)
         print(f"STATE.json already exists: {state_path(repo)}")
         return 0
     save_state(repo, state)
@@ -1126,6 +1444,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"base: {state.get('base_branch')}")
     print(f"integration: {state.get('integration_branch')}")
     print(f"current_branch: {current_branch(repo)}")
+    print(
+        "review_queue: "
+        f"{normalize_int(state.get('unreviewed_merge_count'), 0)}/"
+        f"{review_after_merges(state)}"
+    )
+    print(
+        "gap_queue: "
+        f"{normalize_int(state.get('ungapped_merge_count'), 0)}/"
+        f"{gap_after_merges(state)}"
+    )
     print("tasks:")
     for task_id, task in state.get("tasks", {}).items():
         print(f"  {task_id}: {task.get('status')} {task.get('branch', '')}")
@@ -1136,7 +1464,99 @@ def cmd_status(args: argparse.Namespace) -> int:
         worktree = review.get("worktree", "")
         watch = f" watch: hloop reviewer watch {review_id}" if pane else ""
         print(f"  {review_id}: {review.get('status')} pane={pane} runner={runner} worktree={worktree}{watch}")
+    print("gaps:")
+    for gap_id, gap in state.get("gaps", {}).items():
+        pane = gap.get("pane_id", "")
+        runner = gap.get("runner", "")
+        worktree = gap.get("worktree", "")
+        watch = f" watch: hloop gap watch {gap_id}" if pane else ""
+        print(f"  {gap_id}: {gap.get('status')} pane={pane} runner={runner} worktree={worktree}{watch}")
     return 0
+
+
+def create_loop_task(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    title: str,
+    kind: str,
+    priority: str,
+    write_allow: list[str],
+    write_deny: list[str],
+    acceptance: list[str],
+    depends_on: list[str],
+    created_from: str,
+    validation_minimum: str = "L1",
+    branch: str | None = None,
+    allow_no_write: bool = False,
+) -> str:
+    if kind == "implementation" and not write_allow and not allow_no_write:
+        raise HLoopError("implementation tasks require at least one write_allow")
+    if kind == "fix" and not write_allow and not allow_no_write:
+        raise HLoopError("fix tasks require at least one write_allow")
+    task_id = next_id("T", state.setdefault("tasks", {}))
+    title_slug = slugify(title)
+    task_branch = branch or f"ai/{state['goal_id']}/{task_id}-{title_slug}"
+    base_ref = state["integration_branch"]
+    if not branch_exists(repo, base_ref):
+        raise HLoopError(f"base_ref does not exist: {base_ref}")
+    base_sha = git(repo, ["rev-parse", base_ref])
+    fields = {
+        "id": task_id,
+        "kind": kind,
+        "status": "queued",
+        "created_from": created_from,
+        "branch": task_branch,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "priority": priority,
+        "depends_on": depends_on,
+        "write_allow": write_allow,
+        "write_deny": write_deny,
+        "acceptance": acceptance or ["Task acceptance criteria are satisfied."],
+        "validation_minimum": validation_minimum,
+    }
+    body = f"""# Task {task_id}: {title}
+
+## Goal
+{title}
+
+## Context
+Created from `{created_from}`.
+
+Read:
+- .ai/loop/MISSION.md
+- .ai/loop/PLAN.md
+- .ai/loop/DECISIONS.md
+- .ai/loop/{created_from}.md if it exists
+
+## Instructions
+Use $codex-impl.
+
+Follow this sequence:
+1. Verify the referenced finding against the current code.
+2. Implement the smallest safe fix.
+3. Review your own diff.
+4. Run targeted tests/build.
+5. Write result artifact.
+6. Commit your work.
+
+## Done when
+{chr(10).join(f"- {item}" for item in fields["acceptance"])}
+"""
+    write_text(task_file(repo, task_id), frontmatter(fields) + "\n" + body)
+    state["tasks"][task_id] = {
+        "status": "queued",
+        "branch": task_branch,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "write_allow": fields["write_allow"],
+        "write_deny": fields["write_deny"],
+        "depends_on": fields["depends_on"],
+        "created_from": created_from,
+        "created_at": now_iso(),
+    }
+    return task_id
 
 
 def cmd_task_new(args: argparse.Namespace) -> int:
@@ -1226,6 +1646,10 @@ def default_review_worktree(repo: Path, review_id: str) -> Path:
     return repo.parent / f"{repo.name}.{review_id.lower()}-review"
 
 
+def default_gap_worktree(repo: Path, gap_id: str) -> Path:
+    return repo.parent / f"{repo.name}.{gap_id.lower()}-gap"
+
+
 def ensure_task_visible_in_worktree(worktree: Path, task_id: str) -> None:
     missing = [
         loop_path(worktree) / "MISSION.md",
@@ -1256,6 +1680,21 @@ def ensure_review_visible_in_worktree(worktree: Path) -> None:
         )
 
 
+def ensure_gap_visible_in_worktree(worktree: Path) -> None:
+    missing = [
+        loop_path(worktree) / "MISSION.md",
+        loop_path(worktree) / "PLAN.md",
+        loop_path(worktree) / "DECISIONS.md",
+    ]
+    absent = [str(path) for path in missing if not path.exists()]
+    if absent:
+        raise HLoopError(
+            "gap audit worktree does not contain required .ai/loop files. "
+            "Commit Manager-owned .ai/loop changes on the integration branch first. "
+            f"Missing: {', '.join(absent)}"
+        )
+
+
 def cleanup_review_worktree(
     repo: Path,
     review_id: str,
@@ -1275,6 +1714,27 @@ def cleanup_review_worktree(
     git(repo, ["worktree", "remove", "--force", str(worktree)])
     review_state["worktree_cleanup_status"] = "removed"
     review_state["worktree_cleaned_at"] = now_iso()
+
+
+def cleanup_gap_worktree(
+    repo: Path,
+    gap_id: str,
+    gap_state: dict[str, Any],
+    *,
+    dry_run: bool = False,
+) -> None:
+    worktree_raw = gap_state.get("worktree")
+    if not worktree_raw:
+        return
+    worktree = Path(worktree_raw).resolve()
+    if not worktree.exists() or worktree == repo or gap_state.get("worktree_cleaned_at"):
+        return
+    if dry_run:
+        print(f"DRY RUN git worktree remove --force {worktree}")
+        return
+    git(repo, ["worktree", "remove", "--force", str(worktree)])
+    gap_state["worktree_cleanup_status"] = "removed"
+    gap_state["worktree_cleaned_at"] = now_iso()
 
 
 def start_pane_launcher(
@@ -1635,6 +2095,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
     task_state["cleanup_pending"] = True
     state["needs_validation"] = True
     state["last_merged_task"] = task_id
+    state["unreviewed_merge_count"] = normalize_int(state.get("unreviewed_merge_count"), 0) + 1
+    state["ungapped_merge_count"] = normalize_int(state.get("ungapped_merge_count"), 0) + 1
     state["phase"] = "validating"
     save_state(repo, state)
     journal(repo, f"Merged Worker `{task_id}` from `{branch}`.")
@@ -1729,15 +2191,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
         state["needs_validation"] = failed
         if failed:
             state["phase"] = "failed_validation"
-        elif all_tasks_merged(state) and int(state.get("max_reviewers", 1)) > 0:
-            if not getattr(args, "no_cleanup", False):
-                cleanup_merged_tasks(repo, state)
-            state["needs_review"] = True
-            state["phase"] = "reviewing"
         else:
             if not getattr(args, "no_cleanup", False):
                 cleanup_merged_tasks(repo, state)
-            state["phase"] = "dispatching"
+            if should_open_gap_gate(state):
+                state["needs_gap_check"] = True
+            if should_open_review_gate(state):
+                state["needs_review"] = True
+            if state.get("needs_gap_check"):
+                state["phase"] = "gap_checking"
+            elif state.get("needs_review"):
+                state["phase"] = "reviewing"
+            else:
+                state["phase"] = "dispatching"
         save_state(repo, state)
         journal(repo, f"Validation results: {results}")
     return 1 if failed else 0
@@ -1928,7 +2394,13 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
         state["phase"] = "blocked_user_decision"
     else:
         state["needs_review"] = False
-        state["phase"] = "dispatching"
+        state["unreviewed_merge_count"] = 0
+        if args.verdict == "fix-tasks-created":
+            state["phase"] = "dispatching"
+        elif state.get("needs_gap_check"):
+            state["phase"] = "gap_checking"
+        else:
+            state["phase"] = "dispatching"
     save_state(repo, state)
     journal(repo, f"Closed Reviewer `{review_id}` with verdict `{args.verdict}`: {args.reason}")
     print(f"closed {review_id}: {args.verdict}")
@@ -2011,6 +2483,471 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gap_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    gap_id = args.gap_id or next_id("G", state.setdefault("gaps", {}))
+    if gap_id in state["gaps"]:
+        raise HLoopError(f"gap audit already exists: {gap_id}")
+    base = args.base or state["base_branch"]
+    head = args.head or state["integration_branch"]
+    base_sha = git(repo, ["rev-parse", base])
+    head_sha = git(repo, ["rev-parse", head])
+    worktree = Path(args.worktree).resolve() if args.worktree else default_gap_worktree(repo, gap_id)
+    spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
+        state.get("spec_sources")
+    )
+    prompt = render_gap_prompt(gap_id, base, head, spec_sources)
+    prompt_rel = LOOP_DIR / "prompts" / f"{gap_id}.gap.md"
+    gap_rel = LOOP_DIR / "gaps" / f"{gap_id}.md"
+    prompt_path = worktree / prompt_rel
+    worktree_gap_path = worktree / gap_rel
+    final_gap_path = gap_file(repo, gap_id)
+    runner = args.runner or state.get("gap_runner", "tui")
+    command = (
+        f"cd {shlex.quote(str(worktree))} && "
+        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+    )
+    if args.dry_run:
+        print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
+        print(f"DRY RUN prompt: {prompt_path}")
+        print(f"DRY RUN {args.launcher}/{runner} command: {command}")
+        return 0
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_codex=True,
+        require_integration_branch=True,
+    )
+    if gap_id in state.setdefault("gaps", {}):
+        raise HLoopError(f"gap audit already exists: {gap_id}")
+    base = args.base or state["base_branch"]
+    head = args.head or state["integration_branch"]
+    base_sha = git(repo, ["rev-parse", base])
+    head_sha = git(repo, ["rev-parse", head])
+    worktree = Path(args.worktree).resolve() if args.worktree else default_gap_worktree(repo, gap_id)
+    spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
+        state.get("spec_sources")
+    )
+    prompt = render_gap_prompt(gap_id, base, head, spec_sources)
+    prompt_path = worktree / prompt_rel
+    worktree_gap_path = worktree / gap_rel
+    final_gap_path = gap_file(repo, gap_id)
+    runner = args.runner or state.get("gap_runner", "tui")
+    command = (
+        f"cd {shlex.quote(str(worktree))} && "
+        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+    )
+    if not worktree.exists():
+        git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+    ensure_gap_visible_in_worktree(worktree)
+    write_text(prompt_path, prompt)
+    baseline_dirty = porcelain_paths(worktree)
+    if args.launcher == "agent":
+        pane_id = start_agent_launcher(
+            name=f"hloop-{state['goal_id']}-{gap_id}-gap",
+            direction=args.direction,
+            cwd=worktree,
+            command=command,
+        )
+    else:
+        manager_pane = args.manager_pane or current_pane_id()
+        pane_id = start_pane_launcher(
+            manager_pane=manager_pane,
+            direction=args.direction,
+            cwd=worktree,
+            command=command,
+        )
+    state["gaps"][gap_id] = {
+        "status": "running",
+        "base": base,
+        "head": head,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "spec_sources": spec_sources,
+        "pane_id": pane_id,
+        "runner": runner,
+        "sandbox": "workspace-write",
+        "worktree": str(worktree),
+        "prompt": str(prompt_path),
+        "gap_path": str(final_gap_path),
+        "worktree_gap_path": str(worktree_gap_path),
+        "baseline_dirty_files": baseline_dirty,
+        "started_at": now_iso(),
+    }
+    state["phase"] = "gap_checking"
+    save_state(repo, state)
+    journal(repo, f"Started Gap Auditor `{gap_id}` in pane `{pane_id}` and worktree `{worktree}`.")
+    print(f"started {gap_id} in pane {pane_id}; watch with `hloop gap watch {gap_id}`")
+    return 0
+
+
+def cmd_gap_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_integration_branch=True,
+    )
+    gap_id = args.gap_id
+    gap_state = state.get("gaps", {}).get(gap_id)
+    if not gap_state:
+        raise HLoopError(f"unknown gap audit: {gap_id}")
+    path = gap_artifact_path(repo, gap_id, gap_state)
+    if not path.exists() or not read_text(path).strip():
+        raise HLoopError(f"gap artifact not found or empty: {path}")
+    meta = read_frontmatter(path)
+    artifact_status = str(meta.get("status", ""))
+    allowed_statuses = {"aligned", "gaps-found", "blocked", "failed"}
+    if artifact_status not in allowed_statuses:
+        raise HLoopError(f"invalid gap artifact status in {path}: {artifact_status}")
+    reported_gap_id = str(meta.get("gap_id") or "")
+    if reported_gap_id and reported_gap_id != gap_id:
+        raise HLoopError(f"gap_id mismatch: expected {gap_id}, got {reported_gap_id}")
+    final_path = gap_file(repo, gap_id)
+    if path.resolve() != final_path.resolve():
+        write_text(final_path, read_text(path))
+        gap_state["worktree_gap_path_harvested"] = str(path)
+        gap_state.pop("worktree_gap_path", None)
+    worktree_raw = gap_state.get("worktree")
+    violations: list[str] = []
+    if worktree_raw:
+        worktree = Path(worktree_raw).resolve()
+        if worktree.exists():
+            violations = validate_gap_worktree_scope(gap_id, gap_state, worktree)
+    gap_state["write_scope_violations"] = violations
+    gap_state["gap_path"] = str(final_path)
+    gap_state["status"] = "reported"
+    gap_state["artifact_status"] = artifact_status
+    gap_state["gap_count"] = meta.get("gap_count", "")
+    gap_state["harvested_at"] = now_iso()
+    cleanup_completed_agent_pane(
+        repo,
+        gap_state,
+        label=f"Gap Auditor {gap_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    state["last_gap_id"] = gap_id
+    state["needs_gap_check"] = True
+    if violations:
+        gap_state["status"] = "blocked_write_scope"
+        state["phase"] = "blocked_conflict"
+        save_state(repo, state)
+        journal(
+            repo,
+            f"Harvested Gap Auditor `{gap_id}` but blocked because it changed files outside the gap artifact: {violations}",
+        )
+        append_text(
+            loop_path(repo) / "USER_ACTION_REQUIRED.md",
+            f"\n## Gap Auditor write-scope violation for {gap_id}\n\n"
+            f"Gap artifact was copied to `{final_path}` but the gap worktree has unexpected changes:\n"
+            + "\n".join(f"- {item}" for item in violations)
+            + "\n",
+        )
+        print(f"blocked {gap_id}: gap auditor changed files outside the gap artifact")
+        return 2
+    cleanup_gap_worktree(repo, gap_id, gap_state)
+    state["phase"] = "gap_checking"
+    save_state(repo, state)
+    journal(repo, f"Harvested Gap Auditor `{gap_id}`; Manager triage is required.")
+    print(f"harvested {gap_id}; run `hloop gap close {gap_id} --verdict <verdict>` after triage")
+    return 0
+
+
+def cmd_gap_close(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_integration_branch=True,
+    )
+    gap_id = args.gap_id
+    gap_state = state.get("gaps", {}).get(gap_id)
+    if not gap_state:
+        raise HLoopError(f"unknown gap audit: {gap_id}")
+    if gap_state.get("status") not in {"reported", "triaged"}:
+        raise HLoopError(f"gap audit is not ready for close: {gap_id}")
+    cleanup_completed_agent_pane(
+        repo,
+        gap_state,
+        label=f"Gap Auditor {gap_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    cleanup_gap_worktree(repo, gap_id, gap_state)
+    gap_state["status"] = "triaged"
+    gap_state["verdict"] = args.verdict
+    gap_state["triage_reason"] = args.reason
+    gap_state["triaged_at"] = now_iso()
+    if args.verdict in {"blocked", "decision-needed"}:
+        state["needs_gap_check"] = True
+        state["phase"] = "blocked_user_decision"
+    else:
+        state["needs_gap_check"] = False
+        state["ungapped_merge_count"] = 0
+        if args.verdict == "fix-tasks-created":
+            state["needs_review"] = False
+            state["phase"] = "dispatching"
+        elif last_validation_passed(state) and should_open_review_gate(state):
+            state["needs_review"] = True
+            state["phase"] = "reviewing"
+        else:
+            state["phase"] = "dispatching"
+    save_state(repo, state)
+    journal(repo, f"Closed Gap Auditor `{gap_id}` with verdict `{args.verdict}`: {args.reason}")
+    print(f"closed {gap_id}: {args.verdict}")
+    return 0
+
+
+def cmd_gap_watch(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    gap_id = args.gap_id
+    gap_state = state.get("gaps", {}).get(gap_id)
+    if not gap_state:
+        raise HLoopError(f"unknown gap audit: {gap_id}")
+    pane_id = str(gap_state.get("pane_id") or "")
+    print(f"gap: {gap_id}")
+    print(f"status: {gap_state.get('status')}")
+    print(f"artifact_status: {gap_state.get('artifact_status', '')}")
+    print(f"runner: {gap_state.get('runner')}")
+    print(f"worktree: {gap_state.get('worktree', '')}")
+    print(f"artifact: {gap_artifact_path(repo, gap_id, gap_state)}")
+    if not pane_id:
+        print("pane: none")
+        return 0
+    print(f"pane: {pane_id}")
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        print("pane output unavailable: not inside Herdr")
+        return 0
+    info = pane_info(pane_id)
+    if info is None:
+        print("pane output unavailable: pane is closed or missing")
+        return 0
+    print(f"agent_status: {info.get('agent_status', 'unknown')}")
+    proc = run_cmd(
+        [
+            "herdr",
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            args.source,
+            "--lines",
+            str(args.lines),
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "").strip())
+    print(proc.stdout.rstrip())
+    return 0
+
+
+def cmd_gap_message(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_integration_branch=True,
+    )
+    gap_id = args.gap_id
+    gap_state = state.get("gaps", {}).get(gap_id)
+    if not gap_state:
+        raise HLoopError(f"unknown gap audit: {gap_id}")
+    if gap_state.get("status") != "running":
+        raise HLoopError(f"gap auditor is not running: {gap_id} status={gap_state.get('status')}")
+    pane_id = str(gap_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"gap auditor has no pane_id: {gap_id}")
+    message, source = manager_message_from_args(args)
+    send_codex_tui_message(
+        pane_id,
+        message,
+        args.timeout_ms,
+        args.input_settle_ms,
+        args.submit_verify_ms,
+        args.submit_attempts,
+    )
+    record_manager_message(gap_state, source, message)
+    save_state(repo, state)
+    journal(repo, f"Sent Manager message to Gap Auditor `{gap_id}` in pane `{pane_id}` from {source}.")
+    print(f"sent manager message to {gap_id} in pane {pane_id}")
+    return 0
+
+
+def render_fix_task_draft(
+    source_type: str,
+    source_id: str,
+    artifact_path: Path,
+    candidates: list[dict[str, Any]],
+) -> str:
+    fields = {
+        "source_type": source_type,
+        "source_id": source_id,
+        "status": "draft",
+        "candidate_count": len(candidates),
+    }
+    lines = [
+        frontmatter(fields).rstrip(),
+        "",
+        f"# Fix Task Drafts For {source_id}",
+        "",
+        f"- Source artifact: `{artifact_path}`",
+        f"- Candidate count: {len(candidates)}",
+        "",
+    ]
+    if not candidates:
+        lines.extend(
+            [
+                "No machine-readable fix task candidates were found.",
+                "",
+                "Manager action:",
+                "- Read the source artifact directly.",
+                "- Create fix tasks manually with `hloop task new` if findings are actionable.",
+                "- Close the gate as passed, accepted risk, decision needed, or fix tasks created.",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+    lines.append("## Candidates")
+    lines.append("")
+    for index, candidate in enumerate(candidates, start=1):
+        lines.extend(
+            [
+                f"### F{index:03d}: {candidate['title']}",
+                "",
+                f"- Priority: {candidate['priority']}",
+                f"- Source finding: {candidate['source_finding']}",
+                f"- Rationale: {candidate['rationale'] or 'TBD'}",
+                "- Write allow:",
+                *[f"  - `{item}`" for item in candidate["write_allow"]],
+                "- Acceptance:",
+                *[f"  - {item}" for item in candidate["acceptance"]],
+                "",
+                "Create command:",
+                "",
+                "```bash",
+            ]
+        )
+        cmd = [
+            "python3",
+            "<this-skill>/scripts/hloop",
+            "task",
+            "new",
+            candidate["title"],
+            "--kind",
+            candidate["kind"],
+            "--priority",
+            candidate["priority"],
+        ]
+        for item in candidate["write_allow"]:
+            cmd.extend(["--write-allow", item])
+        for item in candidate["write_deny"]:
+            cmd.extend(["--write-deny", item])
+        for item in candidate["acceptance"]:
+            cmd.extend(["--acceptance", item])
+        for item in candidate["depends_on"]:
+            cmd.extend(["--depends-on", item])
+        lines.append(shlex.join(cmd))
+        lines.extend(["```", ""])
+    return "\n".join(lines)
+
+
+def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo,
+        require_integration_branch=True,
+        mark_blocked=not args.dry_run,
+    )
+    source_id = args.source_id
+    if source_type == "review":
+        source_state = state.get("reviews", {}).get(source_id)
+        if not source_state:
+            raise HLoopError(f"unknown review: {source_id}")
+        artifact_path = review_file(repo, source_id)
+        created_from = f"reviews/{source_id}"
+    elif source_type == "gap":
+        source_state = state.get("gaps", {}).get(source_id)
+        if not source_state:
+            raise HLoopError(f"unknown gap audit: {source_id}")
+        artifact_path = gap_file(repo, source_id)
+        created_from = f"gaps/{source_id}"
+    else:
+        raise HLoopError(f"unsupported triage source: {source_type}")
+    if not artifact_path.exists() or not read_text(artifact_path).strip():
+        raise HLoopError(f"source artifact not found or empty: {artifact_path}")
+    text = read_text(artifact_path)
+    candidates = extract_fix_task_candidates(text, source_id)
+    draft_path = triage_draft_file(repo, source_id)
+    draft = render_fix_task_draft(source_type, source_id, artifact_path, candidates)
+    if args.dry_run:
+        print(draft)
+        return 0
+    write_text(draft_path, draft)
+    source_state.setdefault("triage_drafts", [])
+    if str(draft_path) not in source_state["triage_drafts"]:
+        source_state["triage_drafts"].append(str(draft_path))
+    created_task_ids: list[str] = []
+    if args.create_tasks:
+        existing_created = normalize_list(source_state.get("created_fix_tasks"))
+        if existing_created:
+            raise HLoopError(
+                f"fix tasks already created for {source_id}: {', '.join(existing_created)}"
+            )
+        missing_write_allow = [
+            candidate["title"] for candidate in candidates if not candidate["write_allow"]
+        ]
+        if missing_write_allow and not args.allow_no_write:
+            raise HLoopError(
+                "candidate is missing write_allow; inspect draft first: "
+                + ", ".join(missing_write_allow)
+            )
+        for candidate in candidates:
+            task_id = create_loop_task(
+                repo,
+                state,
+                title=candidate["title"],
+                kind=candidate["kind"],
+                priority=candidate["priority"],
+                write_allow=candidate["write_allow"],
+                write_deny=candidate["write_deny"],
+                acceptance=candidate["acceptance"],
+                depends_on=candidate["depends_on"],
+                created_from=created_from,
+                allow_no_write=args.allow_no_write,
+            )
+            created_task_ids.append(task_id)
+        source_state.setdefault("created_fix_tasks", [])
+        source_state["created_fix_tasks"].extend(created_task_ids)
+        state["phase"] = "dispatching"
+    source_state["last_triaged_at"] = now_iso()
+    source_state["fix_task_candidate_count"] = len(candidates)
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Triage draft for `{source_id}` wrote `{draft_path}` with {len(candidates)} candidate(s)"
+        + (f" and created tasks: {', '.join(created_task_ids)}" if created_task_ids else "."),
+    )
+    print(f"wrote {draft_path}")
+    if created_task_ids:
+        print("created fix tasks: " + ", ".join(created_task_ids))
+    elif candidates:
+        print("draft contains fix task candidates; rerun with --create-tasks after Manager approval")
+    else:
+        print("no machine-readable fix task candidates found")
+    return 0
+
+
+def cmd_triage_review(args: argparse.Namespace) -> int:
+    return cmd_triage_source(args, "review")
+
+
+def cmd_triage_gap(args: argparse.Namespace) -> int:
+    return cmd_triage_source(args, "gap")
+
+
 def write_sets_overlap(a: list[str], b: list[str]) -> bool:
     for left in a:
         for right in b:
@@ -2075,12 +3012,23 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 args.task_id = task_id
                 return cmd_worker_harvest(args)
 
-    # Merge one ready task unless a Reviewer is actively reading the integration head.
-    if not running_review_exists(state):
+    # Merge one ready task unless a Reviewer or Gap Auditor is reading the integration head.
+    if not running_review_exists(state) and not running_gap_exists(state):
         for task_id, task in state.get("tasks", {}).items():
             if task.get("status") == "result_reported" and task.get("merge_ready"):
                 args.task_id = task_id
                 return cmd_merge(args)
+
+    # Harvest any reported gap artifact.
+    for gap_id, gap in state.get("gaps", {}).items():
+        if gap.get("status") == "running":
+            path = gap_artifact_path(repo, gap_id, gap)
+            if path.exists() and read_text(path).strip():
+                if args.dry_run:
+                    print(f"DRY RUN harvest gap {gap_id}")
+                    return 0
+                args.gap_id = gap_id
+                return cmd_gap_harvest(args)
 
     # Harvest any reported review artifact.
     for review_id, review in state.get("reviews", {}).items():
@@ -2093,23 +3041,16 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 args.review_id = review_id
                 return cmd_reviewer_harvest(args)
 
-    if (
-        state.get("needs_review")
-        and int(state.get("max_reviewers", 1)) > 0
-        and not pending_review_exists(state)
-    ):
-        args.review_id = None
-        args.base = None
-        args.head = None
-        args.runner = args.reviewer_runner
-        return cmd_reviewer_start(args)
+    if state.get("needs_gap_check") and reported_gap_exists(state):
+        print("gap triage required")
+        return 0
 
     if state.get("needs_review") and reported_review_exists(state):
         print("review triage required")
         return 0
 
     running_count = sum(1 for t in state.get("tasks", {}).values() if t.get("status") == "running")
-    max_workers = args.max_workers or state.get("max_workers", 2)
+    max_workers = args.max_workers or state.get("max_workers", DEFAULT_MAX_WORKERS)
     slots = max(0, max_workers - running_count)
     dispatchable = queued_dispatchable_tasks(state)[:slots]
     if dispatchable and args.dry_run:
@@ -2134,6 +3075,54 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if started:
         print(f"started workers: {', '.join(started)}")
         return 0
+
+    if (
+        state.get("needs_gap_check")
+        and int(state.get("max_gap_auditors", DEFAULT_MAX_GAP_AUDITORS)) > 0
+        and not pending_gap_exists(state)
+    ):
+        args.gap_id = None
+        args.base = None
+        args.head = None
+        args.spec_source = None
+        args.runner = args.gap_runner
+        return cmd_gap_start(args)
+
+    if (
+        state.get("needs_review")
+        and int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) > 0
+        and not pending_review_exists(state)
+    ):
+        args.review_id = None
+        args.base = None
+        args.head = None
+        args.runner = args.reviewer_runner
+        return cmd_reviewer_start(args)
+
+    if state.get("needs_gap_check") and running_gap_exists(state):
+        wait_ms = gap_wait_ms(args, state)
+        for gap_id, gap in state.get("gaps", {}).items():
+            if gap.get("status") != "running":
+                continue
+            if args.dry_run:
+                print(f"DRY RUN wait gap {gap_id} for {wait_ms}ms")
+                return 0
+            if wait_for_running_gap(repo, gap_id, gap, wait_ms):
+                save_state(repo, state)
+                args.gap_id = gap_id
+                return cmd_gap_harvest(args)
+            save_state(repo, state)
+            journal(
+                repo,
+                f"Gap Auditor `{gap_id}` still running after waiting {wait_ms}ms; Manager may continue other work.",
+            )
+            state["phase"] = "waiting_gap"
+            save_state(repo, state)
+            print(
+                f"gap auditor {gap_id} still running after {wait_ms}ms; "
+                f"inspect with `hloop gap watch {gap_id}` or tick again"
+            )
+            return 0
 
     if state.get("needs_review") and running_review_exists(state):
         wait_ms = review_wait_ms(args, state)
@@ -2163,13 +3152,16 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if (
         all_tasks_merged(state)
         and not state.get("needs_validation")
+        and not state.get("needs_gap_check")
         and not state.get("needs_review")
+        and not running_gap_exists(state)
         and not running_review_exists(state)
         and last_validation_passed(state)
+        and gap_gate_passed(state)
         and review_gate_passed(state)
     ):
         if args.dry_run:
-            print("DRY RUN done: all tasks merged, validation passed, review gate closed")
+            print("DRY RUN done: all tasks merged, validation passed, gap and review gates closed")
             return 0
         state["phase"] = "done"
         save_state(repo, state)
@@ -2197,6 +3189,71 @@ def cmd_tick(args: argparse.Namespace) -> int:
     return 2
 
 
+def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[str, int] | None:
+    phase = str(state.get("phase") or "")
+    if state.get("blocking_decisions"):
+        return ("pending user decision", 2)
+    if phase in {
+        "blocked_user_decision",
+        "blocked_environment",
+        "blocked_conflict",
+        "failed_validation",
+        "no_progress",
+    }:
+        return (f"phase is {phase}", 2)
+    if phase == "done":
+        return ("loop is done", 0)
+    if getattr(args, "stop_on_triage", True):
+        if state.get("needs_gap_check") and reported_gap_exists(state):
+            return ("gap triage required", 0)
+        if state.get("needs_review") and reported_review_exists(state):
+            return ("review triage required", 0)
+    if getattr(args, "stop_on_waiting", True) and phase in {
+        "waiting_worker",
+        "waiting_gap",
+        "waiting_review",
+    }:
+        return (f"waiting in phase {phase}", 0)
+    return None
+
+
+def cmd_pump(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    transitions = 0
+    max_transitions = max(1, int(args.max_transitions))
+    while transitions < max_transitions:
+        state = load_state(repo)
+        stop = pump_stop_reason(state, args)
+        if stop:
+            reason, rc = stop
+            print(f"pump stopped: {reason}")
+            return rc
+        tick_args = argparse.Namespace(**vars(args))
+        tick_args.once = True
+        tick_args.dry_run = args.dry_run
+        tick_args.stop_on_user_decision = True
+        if not args.wait:
+            if tick_args.review_wait_ms is None:
+                tick_args.review_wait_ms = 0
+            if tick_args.gap_wait_ms is None:
+                tick_args.gap_wait_ms = 0
+        rc = cmd_tick(tick_args)
+        transitions += 1
+        if rc != 0:
+            print(f"pump stopped after {transitions} transition(s): tick returned {rc}")
+            return rc
+        state = load_state(repo)
+        stop = pump_stop_reason(state, args)
+        if stop:
+            reason, rc = stop
+            print(f"pump stopped after {transitions} transition(s): {reason}")
+            return rc
+        if args.sleep_ms > 0:
+            time.sleep(args.sleep_ms / 1000)
+    print(f"pump stopped: reached max transitions ({max_transitions})")
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
@@ -2218,6 +3275,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines.extend(["", "## Reviews"])
     for review_id, review in state.get("reviews", {}).items():
         lines.append(f"- {review_id}: {review.get('status')}")
+    lines.extend(["", "## Gap Audits"])
+    for gap_id, gap in state.get("gaps", {}).items():
+        artifact_status = gap.get("artifact_status", "")
+        suffix = f" ({artifact_status})" if artifact_status else ""
+        lines.append(f"- {gap_id}: {gap.get('status')}{suffix}")
     lines.extend(["", "## Validation"])
     for item in state.get("last_validation", {}).get("results", []):
         lines.append(f"- `{item.get('command')}`: {item.get('result')}")
@@ -2251,14 +3313,20 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--goal", required=True)
     init.add_argument("--base")
     init.add_argument("--integration")
-    init.add_argument("--max-workers", type=int, default=3)
-    init.add_argument("--max-reviewers", type=int, default=1)
+    init.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    init.add_argument("--max-reviewers", type=int, default=DEFAULT_MAX_REVIEWERS)
+    init.add_argument("--max-gap-auditors", type=int, default=DEFAULT_MAX_GAP_AUDITORS)
     init.add_argument("--merge-mode", choices=["squash", "cherry-pick"], default="squash")
     init.add_argument("--worker-runner", choices=["tui", "exec"], default="tui")
     init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="tui")
+    init.add_argument("--gap-runner", choices=["exec", "tui"], default="tui")
     init.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES), default="archive")
     init.add_argument("--review-wait-ms", type=int, default=DEFAULT_REVIEW_WAIT_MS)
+    init.add_argument("--gap-wait-ms", type=int, default=DEFAULT_GAP_WAIT_MS)
+    init.add_argument("--review-after-merges", type=int, default=DEFAULT_REVIEW_AFTER_MERGES)
+    init.add_argument("--gap-after-merges", type=int, default=DEFAULT_GAP_AFTER_MERGES)
     init.add_argument("--validation", action="append")
+    init.add_argument("--spec-source", action="append")
     init.add_argument(
         "--create-branch",
         action="store_true",
@@ -2409,6 +3477,92 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reviewer_message.set_defaults(func=cmd_reviewer_message)
 
+    gap = sub.add_parser("gap", help="plan/spec gap audit operations")
+    gap_sub = gap.add_subparsers(dest="gap_command", required=True)
+    gap_start = gap_sub.add_parser("start")
+    gap_start.add_argument("--gap-id")
+    gap_start.add_argument("--base")
+    gap_start.add_argument("--head")
+    gap_start.add_argument("--worktree")
+    gap_start.add_argument("--spec-source", action="append")
+    gap_start.add_argument("--manager-pane")
+    gap_start.add_argument("--direction", choices=["right", "down"], default="down")
+    gap_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    gap_start.add_argument("--runner", choices=["exec", "tui"])
+    gap_start.add_argument("--dry-run", action="store_true")
+    gap_start.set_defaults(func=cmd_gap_start)
+    gap_harvest = gap_sub.add_parser("harvest")
+    gap_harvest.add_argument("gap_id")
+    gap_harvest.add_argument("--keep-pane", action="store_true")
+    gap_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    gap_harvest.set_defaults(func=cmd_gap_harvest)
+    gap_close = gap_sub.add_parser("close")
+    gap_close.add_argument("gap_id")
+    gap_close.add_argument(
+        "--verdict",
+        choices=[
+            "aligned",
+            "accepted-risk",
+            "fix-tasks-created",
+            "decision-needed",
+            "stale-spec-updated",
+            "blocked",
+        ],
+        required=True,
+    )
+    gap_close.add_argument("--reason", required=True)
+    gap_close.add_argument("--keep-pane", action="store_true")
+    gap_close.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    gap_close.set_defaults(func=cmd_gap_close)
+    gap_watch = gap_sub.add_parser("watch")
+    gap_watch.add_argument("gap_id")
+    gap_watch.add_argument("--lines", type=int, default=120)
+    gap_watch.add_argument(
+        "--source",
+        choices=["visible", "recent", "recent-unwrapped"],
+        default="recent-unwrapped",
+    )
+    gap_watch.set_defaults(func=cmd_gap_watch)
+    gap_message = gap_sub.add_parser("message")
+    gap_message.add_argument("gap_id")
+    gap_message.add_argument("message", nargs="?")
+    gap_message.add_argument("--file")
+    gap_message.add_argument("--timeout-ms", type=int, default=30_000)
+    gap_message.add_argument(
+        "--input-settle-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+        help="delay between send-text visibility and Enter",
+    )
+    gap_message.add_argument(
+        "--submit-verify-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+        help="time to wait for Codex to start working or answer after Enter",
+    )
+    gap_message.add_argument(
+        "--submit-attempts",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
+        help="Enter retry count when the message remains typed but unsubmitted",
+    )
+    gap_message.set_defaults(func=cmd_gap_message)
+
+    triage = sub.add_parser("triage", help="generate or create fix tasks from review/gap artifacts")
+    triage_sub = triage.add_subparsers(dest="triage_command", required=True)
+    triage_review = triage_sub.add_parser("review")
+    triage_review.add_argument("source_id")
+    triage_review.add_argument("--create-tasks", action="store_true")
+    triage_review.add_argument("--allow-no-write", action="store_true")
+    triage_review.add_argument("--dry-run", action="store_true")
+    triage_review.set_defaults(func=cmd_triage_review)
+    triage_gap = triage_sub.add_parser("gap")
+    triage_gap.add_argument("source_id")
+    triage_gap.add_argument("--create-tasks", action="store_true")
+    triage_gap.add_argument("--allow-no-write", action="store_true")
+    triage_gap.add_argument("--dry-run", action="store_true")
+    triage_gap.set_defaults(func=cmd_triage_gap)
+
     tick = sub.add_parser("tick", help="run one bounded loop tick")
     tick.add_argument("--once", action="store_true", help="document intent; tick is always bounded")
     tick.add_argument("--max-workers", type=int)
@@ -2417,9 +3571,11 @@ def build_parser() -> argparse.ArgumentParser:
     tick.add_argument("--launcher", choices=["pane", "agent"], default="pane")
     tick.add_argument("--worker-runner", choices=["tui", "exec"])
     tick.add_argument("--reviewer-runner", choices=["exec", "tui"])
+    tick.add_argument("--gap-runner", choices=["exec", "tui"])
     tick.add_argument("--keep-pane", action="store_true")
     tick.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     tick.add_argument("--review-wait-ms", type=int)
+    tick.add_argument("--gap-wait-ms", type=int)
     tick.add_argument("--dry-run", action="store_true")
     tick.add_argument(
         "--stop-on-user-decision",
@@ -2427,6 +3583,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="deprecated; ticks always stop on blocking decisions",
     )
     tick.set_defaults(func=cmd_tick)
+
+    pump = sub.add_parser("pump", help="run multiple safe tick transitions until triage, blocked, done, or max transitions")
+    pump.add_argument("--max-transitions", type=int, default=20)
+    pump.add_argument("--max-workers", type=int)
+    pump.add_argument("--manager-pane")
+    pump.add_argument("--direction", choices=["right", "down"], default="right")
+    pump.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    pump.add_argument("--worker-runner", choices=["tui", "exec"])
+    pump.add_argument("--reviewer-runner", choices=["exec", "tui"])
+    pump.add_argument("--gap-runner", choices=["exec", "tui"])
+    pump.add_argument("--keep-pane", action="store_true")
+    pump.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    pump.add_argument("--review-wait-ms", type=int)
+    pump.add_argument("--gap-wait-ms", type=int)
+    pump.add_argument("--wait", action="store_true", help="use configured review/gap wait times instead of forcing 0ms waits")
+    pump.add_argument("--sleep-ms", type=int, default=0)
+    pump.add_argument("--dry-run", action="store_true")
+    pump.add_argument("--stop-on-triage", dest="stop_on_triage", action="store_true", default=True)
+    pump.add_argument("--no-stop-on-triage", dest="stop_on_triage", action="store_false")
+    pump.add_argument("--stop-on-waiting", dest="stop_on_waiting", action="store_true", default=False)
+    pump.add_argument("--no-stop-on-waiting", dest="stop_on_waiting", action="store_false")
+    pump.set_defaults(func=cmd_pump)
 
     report = sub.add_parser("report", help="write reports/FINAL.md")
     report.set_defaults(func=cmd_report)
