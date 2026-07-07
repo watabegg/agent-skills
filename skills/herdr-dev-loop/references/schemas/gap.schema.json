@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Gap Audit Frontmatter",
+  "type": "object",
+  "required": ["gap_id", "base", "head", "status"],
+  "properties": {
+    "gap_id": {"type": "string", "pattern": "^G[0-9]{3}$"},
+    "base": {"type": "string"},
+    "head": {"type": "string"},
+    "status": {"enum": ["aligned", "gaps-found", "blocked", "failed"]},
+    "spec_sources": {"type": "array", "items": {"type": "string"}},
+    "gap_count": {"type": ["integer", "string"]}
+  },
+  "additionalProperties": true
+}
