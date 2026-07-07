@@ -54,6 +54,8 @@ Record exact commands and results in Worker result artifacts and in `STATE.json.
 
 Record Worker QA evidence paths, preview URLs, staging URLs, screenshots, seeded data cleanup, or blockers in the Worker result artifact when they apply. Record Manager final QA evidence in `qa/FINAL.md` and the final report. Do not force browser QA for every repository; choose the product-appropriate QA surface from PROFILE and PLAN.
 
+In frontmatter, write command and result lists as multiline lists. Avoid inline lists because the stdlib parser splits inline list values on commas.
+
 ## Integration Failure
 
 When integration validation fails:

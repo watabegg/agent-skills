@@ -98,6 +98,8 @@ When the gap artifact appears, harvest it from the detached gap worktree, verify
 
 When the review artifact appears, harvest it from the detached review worktree, verify the Reviewer changed no files except the review artifact, close the Reviewer pane, archive the captured Codex session, remove the review worktree, and require Manager triage before closing the review gate.
 
+For Reviewers and Gap Auditors, artifact frontmatter status and Manager gate status are separate. `artifact_status` stores the artifact's reported result, while `gate_status` tracks Manager workflow progress such as `running`, `reported`, or `triaged`. The legacy per-agent `status` field mirrors `gate_status` for compatibility.
+
 ## Stop Conditions
 
 Set a blocked or failed phase and stop when:

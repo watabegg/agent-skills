@@ -52,6 +52,8 @@ REVIEW_PROTOCOLS = {"native", "codex-review-multi-v2"}
 DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
+REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
+GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
 
 
 class HLoopError(RuntimeError):
@@ -160,8 +162,7 @@ def parse_scalar(raw: str) -> Any:
     return value
 
 
-def read_frontmatter(path: Path) -> dict[str, Any]:
-    text = read_text(path)
+def parse_frontmatter_text(text: str) -> dict[str, Any]:
     if not text.startswith("---\n"):
         return {}
     end = text.find("\n---", 4)
@@ -191,6 +192,10 @@ def read_frontmatter(path: Path) -> dict[str, Any]:
             data[key] = parse_scalar(raw_value)
             current_key = None
     return data
+
+
+def read_frontmatter(path: Path) -> dict[str, Any]:
+    return parse_frontmatter_text(read_text(path))
 
 
 def yaml_scalar(value: Any) -> str:
@@ -924,31 +929,35 @@ def last_validation_passed(state: dict[str, Any]) -> bool:
 
 
 def running_review_exists(state: dict[str, Any]) -> bool:
-    return any(review.get("status") == "running" for review in state.get("reviews", {}).values())
+    return any(agent_gate_status(review) == "running" for review in state.get("reviews", {}).values())
 
 
 def running_gap_exists(state: dict[str, Any]) -> bool:
-    return any(gap.get("status") == "running" for gap in state.get("gaps", {}).values())
+    return any(agent_gate_status(gap) == "running" for gap in state.get("gaps", {}).values())
+
+
+def agent_gate_status(agent_state: dict[str, Any]) -> str:
+    return str(agent_state.get("gate_status") or agent_state.get("status") or "")
 
 
 def reported_review_exists(state: dict[str, Any]) -> bool:
-    return any(review.get("status") == "reported" for review in state.get("reviews", {}).values())
+    return any(agent_gate_status(review) == "reported" for review in state.get("reviews", {}).values())
 
 
 def reported_gap_exists(state: dict[str, Any]) -> bool:
-    return any(gap.get("status") == "reported" for gap in state.get("gaps", {}).values())
+    return any(agent_gate_status(gap) == "reported" for gap in state.get("gaps", {}).values())
 
 
 def pending_review_exists(state: dict[str, Any]) -> bool:
     return any(
-        review.get("status") in {"running", "reported"}
+        agent_gate_status(review) in {"running", "reported"}
         for review in state.get("reviews", {}).values()
     )
 
 
 def pending_gap_exists(state: dict[str, Any]) -> bool:
     return any(
-        gap.get("status") in {"running", "reported"}
+        agent_gate_status(gap) in {"running", "reported"}
         for gap in state.get("gaps", {}).values()
     )
 
@@ -959,7 +968,7 @@ def review_gate_passed(state: dict[str, Any]) -> bool:
     if state.get("needs_review"):
         return False
     reviews = state.get("reviews", {})
-    return any(review.get("status") == "triaged" for review in reviews.values())
+    return any(agent_gate_status(review) == "triaged" for review in reviews.values())
 
 
 def gap_gate_passed(state: dict[str, Any]) -> bool:
@@ -968,7 +977,7 @@ def gap_gate_passed(state: dict[str, Any]) -> bool:
     if state.get("needs_gap_check"):
         return False
     gaps = state.get("gaps", {})
-    return any(gap.get("status") == "triaged" for gap in gaps.values())
+    return any(agent_gate_status(gap) == "triaged" for gap in gaps.values())
 
 
 def review_after_merges(state: dict[str, Any]) -> int:
@@ -1254,8 +1263,10 @@ Before finishing:
 - Run relevant tests/build from the task.
 - Record exact commands and results in flat frontmatter fields:
   validation_recorded: true
-  validation_commands: [...]
-  validation_results: [...]
+  validation_commands:
+    - <command>
+  validation_results:
+    - <passed|failed|blocked>
   validation_summary: "..."
 - Review your own diff.
 - Ensure no unrelated changes.
@@ -1465,6 +1476,207 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for key, value in checks.items():
             print(f"{key}: {value}")
     return 0 if ok else 1
+
+
+def contract_required_state_fields(text: str) -> list[str]:
+    fields: list[str] = []
+    in_required = False
+    for line in text.splitlines():
+        if line.strip() == "Required top-level fields:":
+            in_required = True
+            continue
+        if in_required and line.strip().startswith("Treat `pane_id`"):
+            break
+        if not in_required:
+            continue
+        match = re.match(r"^-\s+`([^`]+)`\s*$", line.strip())
+        if match:
+            fields.append(match.group(1))
+    return fields
+
+
+def openai_yaml_interface_fields(text: str) -> set[str]:
+    fields: set[str] = set()
+    in_interface = False
+    for line in text.splitlines():
+        if line.strip() == "interface:":
+            in_interface = True
+            continue
+        if not in_interface:
+            continue
+        match = re.match(r"^\s{2}([a-zA-Z0-9_]+):\s+.+$", line)
+        if match:
+            fields.add(match.group(1))
+            continue
+        if line.strip() and not line.startswith(" "):
+            break
+    return fields
+
+
+def schema_has_merge_ready_guard(schema: dict[str, Any]) -> bool:
+    all_of = schema.get("allOf")
+    if not isinstance(all_of, list):
+        return False
+    for item in all_of:
+        if not isinstance(item, dict):
+            continue
+        condition = item.get("if", {})
+        then = item.get("then", {})
+        if not isinstance(condition, dict) or not isinstance(then, dict):
+            continue
+        if (
+            condition.get("properties", {})
+            .get("merge_ready", {})
+            .get("const")
+            is not True
+        ):
+            continue
+        required = set(normalize_list(then.get("required")))
+        props = then.get("properties", {})
+        if not isinstance(props, dict):
+            continue
+        if {
+            "status",
+            "validation_recorded",
+            "validation_commands",
+            "validation_results",
+        }.issubset(required) and props.get("status", {}).get("const") == "done":
+            return True
+    return False
+
+
+def schema_has_write_allow_guard(schema: dict[str, Any]) -> bool:
+    all_of = schema.get("allOf")
+    if not isinstance(all_of, list):
+        return False
+    for item in all_of:
+        if not isinstance(item, dict):
+            continue
+        condition = item.get("if", {})
+        then = item.get("then", {})
+        if not isinstance(condition, dict) or not isinstance(then, dict):
+            continue
+        kind = condition.get("properties", {}).get("kind", {})
+        write_allow = then.get("properties", {}).get("write_allow", {})
+        if kind.get("enum") == ["implementation", "fix"] and write_allow.get("minItems") == 1:
+            return True
+    return False
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    skill_root = (
+        Path(args.skill_dir).resolve()
+        if args.skill_dir
+        else Path(__file__).resolve().parents[1]
+    )
+    errors: list[str] = []
+
+    def check(condition: bool, message: str) -> None:
+        if not condition:
+            errors.append(message)
+
+    skill_md = skill_root / "SKILL.md"
+    skill_meta = parse_frontmatter_text(read_text(skill_md))
+    check(skill_meta.get("name") == "herdr-dev-loop", "SKILL.md frontmatter name is invalid")
+    check(bool(skill_meta.get("description")), "SKILL.md frontmatter description is missing")
+
+    openai_yaml = skill_root / "agents" / "openai.yaml"
+    fields = openai_yaml_interface_fields(read_text(openai_yaml))
+    check(
+        {"display_name", "short_description", "default_prompt"}.issubset(fields),
+        "agents/openai.yaml interface fields are incomplete",
+    )
+
+    schema_dir = skill_root / "references" / "schemas"
+    schemas: dict[str, dict[str, Any]] = {}
+    for path in sorted(schema_dir.glob("*.json")):
+        try:
+            data = json.loads(read_text(path))
+        except json.JSONDecodeError as exc:
+            errors.append(f"{path.name} is invalid JSON: {exc}")
+            continue
+        if not isinstance(data, dict):
+            errors.append(f"{path.name} is not a JSON object")
+            continue
+        schemas[path.name] = data
+
+    state_schema = schemas.get("state.schema.json", {})
+    contract_fields = contract_required_state_fields(
+        read_text(skill_root / "references" / "artifact-contract.md")
+    )
+    schema_required = normalize_list(state_schema.get("required"))
+    check(bool(contract_fields), "artifact-contract required state fields were not found")
+    check(
+        set(contract_fields) == set(schema_required),
+        "STATE.json required fields differ between artifact-contract.md and state.schema.json",
+    )
+
+    result_schema = schemas.get("result.schema.json", {})
+    task_schema = schemas.get("task.schema.json", {})
+    check(schema_has_merge_ready_guard(result_schema), "result.schema.json lacks merge_ready guard")
+    check(schema_has_write_allow_guard(task_schema), "task.schema.json lacks write_allow guard")
+
+    result_meta = parse_frontmatter_text(
+        """---
+task_id: T001
+status: done
+merge_ready: true
+branch: ai/demo/T001
+head_sha: HEAD
+base_sha: abc123
+changed_files:
+  - src/demo.ts
+validation_recorded: true
+validation_commands:
+  - npm test -- tests/demo.test.ts
+validation_results:
+  - passed
+validation_summary: "targeted tests passed"
+blocking_questions: []
+---
+"""
+    )
+    check(result_meta.get("merge_ready") is True, "sample result merge_ready did not parse")
+    check(
+        normalize_list(result_meta.get("validation_commands")),
+        "sample result validation_commands did not parse as a list",
+    )
+
+    review_meta = parse_frontmatter_text(
+        """---
+review_id: R001
+base: main
+head: ai/demo/integration
+status: reported
+---
+"""
+    )
+    check(
+        str(review_meta.get("status")) in REVIEW_ARTIFACT_STATUSES,
+        "sample review artifact status is invalid",
+    )
+
+    gap_meta = parse_frontmatter_text(
+        """---
+gap_id: G001
+base: main
+head: ai/demo/integration
+status: aligned
+gap_count: 0
+---
+"""
+    )
+    check(str(gap_meta.get("status")) in GAP_ARTIFACT_STATUSES, "sample gap artifact status is invalid")
+
+    result = {"ok": not errors, "skill_root": str(skill_root), "errors": errors}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif errors:
+        for error in errors:
+            print(f"selftest: {error}", file=sys.stderr)
+    else:
+        print("selftest ok")
+    return 0 if not errors else 1
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -1738,15 +1950,21 @@ def cmd_status(args: argparse.Namespace) -> int:
         pane = review.get("pane_id", "")
         runner = review.get("runner", "")
         worktree = review.get("worktree", "")
+        gate = agent_gate_status(review)
+        artifact = review.get("artifact_status", "")
+        suffix = f" artifact={artifact}" if artifact else ""
         watch = f" watch: hloop reviewer watch {review_id}" if pane else ""
-        print(f"  {review_id}: {review.get('status')} pane={pane} runner={runner} worktree={worktree}{watch}")
+        print(f"  {review_id}: gate={gate}{suffix} pane={pane} runner={runner} worktree={worktree}{watch}")
     print("gaps:")
     for gap_id, gap in state.get("gaps", {}).items():
         pane = gap.get("pane_id", "")
         runner = gap.get("runner", "")
         worktree = gap.get("worktree", "")
+        gate = agent_gate_status(gap)
+        artifact = gap.get("artifact_status", "")
+        suffix = f" artifact={artifact}" if artifact else ""
         watch = f" watch: hloop gap watch {gap_id}" if pane else ""
-        print(f"  {gap_id}: {gap.get('status')} pane={pane} runner={runner} worktree={worktree}{watch}")
+        print(f"  {gap_id}: gate={gate}{suffix} pane={pane} runner={runner} worktree={worktree}{watch}")
     return 0
 
 
@@ -2575,6 +2793,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         )
     state["reviews"][review_id] = {
         "status": "running",
+        "gate_status": "running",
         "base": base,
         "head": head,
         "base_sha": base_sha,
@@ -2610,6 +2829,13 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     path = review_artifact_path(repo, review_id, review_state)
     if not path.exists() or not read_text(path).strip():
         raise HLoopError(f"review artifact not found or empty: {path}")
+    meta = read_frontmatter(path)
+    artifact_status = str(meta.get("status", ""))
+    if artifact_status not in REVIEW_ARTIFACT_STATUSES:
+        raise HLoopError(f"invalid review artifact status in {path}: {artifact_status}")
+    reported_review_id = str(meta.get("review_id") or "")
+    if reported_review_id and reported_review_id != review_id:
+        raise HLoopError(f"review_id mismatch: expected {review_id}, got {reported_review_id}")
     final_path = review_file(repo, review_id)
     if path.resolve() != final_path.resolve():
         write_text(final_path, read_text(path))
@@ -2624,6 +2850,8 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     review_state["write_scope_violations"] = violations
     review_state["review_path"] = str(final_path)
     review_state["status"] = "reported"
+    review_state["gate_status"] = "reported"
+    review_state["artifact_status"] = artifact_status
     review_state["harvested_at"] = now_iso()
     cleanup_completed_agent_pane(
         repo,
@@ -2636,6 +2864,7 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     state["needs_review"] = True
     if violations:
         review_state["status"] = "blocked_write_scope"
+        review_state["gate_status"] = "blocked_write_scope"
         state["phase"] = "blocked_conflict"
         save_state(repo, state)
         journal(
@@ -2670,7 +2899,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
     review_state = state.get("reviews", {}).get(review_id)
     if not review_state:
         raise HLoopError(f"unknown review: {review_id}")
-    if review_state.get("status") not in {"reported", "triaged"}:
+    if agent_gate_status(review_state) not in {"reported", "triaged"}:
         raise HLoopError(f"review is not ready for close: {review_id}")
     cleanup_completed_agent_pane(
         repo,
@@ -2681,6 +2910,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
     )
     cleanup_review_worktree(repo, review_id, review_state)
     review_state["status"] = "triaged"
+    review_state["gate_status"] = "triaged"
     review_state["verdict"] = args.verdict
     review_state["triage_reason"] = args.reason
     review_state["triaged_at"] = now_iso()
@@ -2712,6 +2942,8 @@ def cmd_reviewer_watch(args: argparse.Namespace) -> int:
     pane_id = str(review_state.get("pane_id") or "")
     print(f"review: {review_id}")
     print(f"status: {review_state.get('status')}")
+    print(f"gate_status: {agent_gate_status(review_state)}")
+    print(f"artifact_status: {review_state.get('artifact_status', '')}")
     print(f"runner: {review_state.get('runner')}")
     print(f"worktree: {review_state.get('worktree', '')}")
     print(f"artifact: {review_artifact_path(repo, review_id, review_state)}")
@@ -2757,7 +2989,7 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     review_state = state.get("reviews", {}).get(review_id)
     if not review_state:
         raise HLoopError(f"unknown review: {review_id}")
-    if review_state.get("status") != "running":
+    if agent_gate_status(review_state) != "running":
         raise HLoopError(f"reviewer is not running: {review_id} status={review_state.get('status')}")
     pane_id = str(review_state.get("pane_id") or "")
     if not pane_id:
@@ -2855,6 +3087,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         )
     state["gaps"][gap_id] = {
         "status": "running",
+        "gate_status": "running",
         "base": base,
         "head": head,
         "base_sha": base_sha,
@@ -2893,8 +3126,7 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
         raise HLoopError(f"gap artifact not found or empty: {path}")
     meta = read_frontmatter(path)
     artifact_status = str(meta.get("status", ""))
-    allowed_statuses = {"aligned", "gaps-found", "blocked", "failed"}
-    if artifact_status not in allowed_statuses:
+    if artifact_status not in GAP_ARTIFACT_STATUSES:
         raise HLoopError(f"invalid gap artifact status in {path}: {artifact_status}")
     reported_gap_id = str(meta.get("gap_id") or "")
     if reported_gap_id and reported_gap_id != gap_id:
@@ -2913,6 +3145,7 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
     gap_state["write_scope_violations"] = violations
     gap_state["gap_path"] = str(final_path)
     gap_state["status"] = "reported"
+    gap_state["gate_status"] = "reported"
     gap_state["artifact_status"] = artifact_status
     gap_state["gap_count"] = meta.get("gap_count", "")
     gap_state["harvested_at"] = now_iso()
@@ -2927,6 +3160,7 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
     state["needs_gap_check"] = True
     if violations:
         gap_state["status"] = "blocked_write_scope"
+        gap_state["gate_status"] = "blocked_write_scope"
         state["phase"] = "blocked_conflict"
         save_state(repo, state)
         journal(
@@ -2961,7 +3195,7 @@ def cmd_gap_close(args: argparse.Namespace) -> int:
     gap_state = state.get("gaps", {}).get(gap_id)
     if not gap_state:
         raise HLoopError(f"unknown gap audit: {gap_id}")
-    if gap_state.get("status") not in {"reported", "triaged"}:
+    if agent_gate_status(gap_state) not in {"reported", "triaged"}:
         raise HLoopError(f"gap audit is not ready for close: {gap_id}")
     cleanup_completed_agent_pane(
         repo,
@@ -2972,6 +3206,7 @@ def cmd_gap_close(args: argparse.Namespace) -> int:
     )
     cleanup_gap_worktree(repo, gap_id, gap_state)
     gap_state["status"] = "triaged"
+    gap_state["gate_status"] = "triaged"
     gap_state["verdict"] = args.verdict
     gap_state["triage_reason"] = args.reason
     gap_state["triaged_at"] = now_iso()
@@ -3005,6 +3240,7 @@ def cmd_gap_watch(args: argparse.Namespace) -> int:
     pane_id = str(gap_state.get("pane_id") or "")
     print(f"gap: {gap_id}")
     print(f"status: {gap_state.get('status')}")
+    print(f"gate_status: {agent_gate_status(gap_state)}")
     print(f"artifact_status: {gap_state.get('artifact_status', '')}")
     print(f"runner: {gap_state.get('runner')}")
     print(f"worktree: {gap_state.get('worktree', '')}")
@@ -3051,7 +3287,7 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     gap_state = state.get("gaps", {}).get(gap_id)
     if not gap_state:
         raise HLoopError(f"unknown gap audit: {gap_id}")
-    if gap_state.get("status") != "running":
+    if agent_gate_status(gap_state) != "running":
         raise HLoopError(f"gap auditor is not running: {gap_id} status={gap_state.get('status')}")
     pane_id = str(gap_state.get("pane_id") or "")
     if not pane_id:
@@ -3331,7 +3567,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
     # Harvest any reported gap artifact.
     for gap_id, gap in state.get("gaps", {}).items():
-        if gap.get("status") == "running":
+        if agent_gate_status(gap) == "running":
             path = gap_artifact_path(repo, gap_id, gap)
             if path.exists() and read_text(path).strip():
                 if args.dry_run:
@@ -3342,7 +3578,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
     # Harvest any reported review artifact.
     for review_id, review in state.get("reviews", {}).items():
-        if review.get("status") == "running":
+        if agent_gate_status(review) == "running":
             path = review_artifact_path(repo, review_id, review)
             if path.exists() and read_text(path).strip():
                 if args.dry_run:
@@ -3412,7 +3648,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if state.get("needs_gap_check") and running_gap_exists(state):
         wait_ms = gap_wait_ms(args, state)
         for gap_id, gap in state.get("gaps", {}).items():
-            if gap.get("status") != "running":
+            if agent_gate_status(gap) != "running":
                 continue
             if args.dry_run:
                 print(f"DRY RUN wait gap {gap_id} for {wait_ms}ms")
@@ -3437,7 +3673,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if state.get("needs_review") and running_review_exists(state):
         wait_ms = review_wait_ms(args, state)
         for review_id, review in state.get("reviews", {}).items():
-            if review.get("status") != "running":
+            if agent_gate_status(review) != "running":
                 continue
             if args.dry_run:
                 print(f"DRY RUN wait reviewer {review_id} for {wait_ms}ms")
@@ -3677,12 +3913,14 @@ def cmd_report(args: argparse.Namespace) -> int:
         )
     lines.extend(["", "## Reviews"])
     for review_id, review in state.get("reviews", {}).items():
-        lines.append(f"- {review_id}: {review.get('status')}")
+        artifact_status = review.get("artifact_status", "")
+        suffix = f" ({artifact_status})" if artifact_status else ""
+        lines.append(f"- {review_id}: {agent_gate_status(review)}{suffix}")
     lines.extend(["", "## Gap Audits"])
     for gap_id, gap in state.get("gaps", {}).items():
         artifact_status = gap.get("artifact_status", "")
         suffix = f" ({artifact_status})" if artifact_status else ""
-        lines.append(f"- {gap_id}: {gap.get('status')}{suffix}")
+        lines.append(f"- {gap_id}: {agent_gate_status(gap)}{suffix}")
     lines.extend(["", "## Validation"])
     for item in state.get("last_validation", {}).get("results", []):
         lines.append(f"- `{item.get('command')}`: {item.get('result')}")
@@ -3717,6 +3955,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--strict-skills", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
+
+    selftest = sub.add_parser("selftest", help="lint skill-local schemas and artifact contracts")
+    selftest.add_argument("--skill-dir", help="skill directory; defaults to this hloop script's parent skill")
+    selftest.add_argument("--json", action="store_true")
+    selftest.set_defaults(func=cmd_selftest)
 
     init = sub.add_parser("init", help="initialize .ai/loop")
     init.add_argument("--goal-id")

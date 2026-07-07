@@ -32,6 +32,7 @@ Required output:
 
 Result frontmatter:
 - use flat validation fields: `validation_recorded`, `validation_commands`, `validation_results`, and `validation_summary`
+- write list fields as multiline YAML lists, not inline `[a, b]` lists
 - commit `.ai/loop/results/T001/result.md` on the Worker branch before finishing
 
 Final terminal line:
