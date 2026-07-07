@@ -84,8 +84,11 @@ codex archive <session-id>
 Default init cadence keeps the loop active:
 
 ```bash
+hloop selftest
 hloop init ... --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3
 ```
+
+Run `hloop selftest` after updating or installing the skill. It does not require `HERDR_ENV=1`; it checks skill-local frontmatter, agent metadata, JSON schemas, sample artifact parsing, and required field drift between `artifact-contract.md` and `state.schema.json`.
 
 `review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
 

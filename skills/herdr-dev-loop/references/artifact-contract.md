@@ -64,9 +64,13 @@ Recommended optional fields:
 - per task/gap/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
 - per review `worktree`, `worktree_review_path_harvested`, `worktree_cleanup_status`
 - per review `write_scope_violations`
+- per review `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`
+- per review `artifact_status`: artifact frontmatter status such as `reported`, `blocked`, or `failed`
 - per review `triage_drafts`, `created_fix_tasks`
 - per gap `worktree`, `worktree_gap_path_harvested`, `worktree_cleanup_status`
 - per gap `write_scope_violations`
+- per gap `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`
+- per gap `artifact_status`: artifact frontmatter status such as `aligned`, `gaps-found`, `blocked`, or `failed`
 - per gap `triage_drafts`, `created_fix_tasks`
 - `last_validation.results[].log`: relative path to captured stdout/stderr under `.ai/loop/validation/`
 
@@ -116,7 +120,7 @@ worker_qa_profile: repo-default
 ---
 ```
 
-`write_allow` is mandatory for implementation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems.
+`write_allow` is mandatory and non-empty for implementation and fix tasks unless Manager explicitly uses `--allow-no-write` for an exceptional no-edit task. Use `kind: research` for ordinary no-edit investigation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems.
 
 ## Worker Result
 
@@ -152,7 +156,9 @@ Allowed `status` values:
 
 Only `status: done` may set `merge_ready: true`.
 
-`merge_ready: true` requires `validation_recorded: true`. Keep validation fields flat; do not use nested YAML maps in frontmatter because `hloop` intentionally uses a stdlib-only parser.
+`merge_ready: true` requires `status: done`, `validation_recorded: true`, and non-empty `validation_commands` / `validation_results`. Keep validation fields flat; do not use nested YAML maps in frontmatter because `hloop` intentionally uses a stdlib-only parser.
+
+Write list fields as multiline lists. Do not use inline lists for commands or summaries that may contain commas.
 
 The result artifact must be committed on the Worker branch at `HEAD:.ai/loop/results/<task-id>/result.md`. `hloop worker harvest` rejects artifacts that exist only in the worktree or differ from the committed version.
 
@@ -204,6 +210,8 @@ Findings use fixed severities:
 - `P3`: nit or non-blocking cleanup
 
 Manager must triage every P0/P1 and any P2 that affects the mission done criteria.
+
+The review artifact frontmatter `status` is copied into `STATE.json.reviews.<id>.artifact_status`. Manager gate progress is tracked separately in `STATE.json.reviews.<id>.gate_status`; after harvest it is `reported`, and after Manager triage it is `triaged`. The legacy `STATE.json.reviews.<id>.status` mirrors the gate status for compatibility.
 
 Review artifacts should include:
 
@@ -257,6 +265,8 @@ Findings should classify each checked requirement as one of:
 - `needs-decision`
 
 Manager must triage every `missing`, `partial`, or `needs-decision` item that affects `MISSION.md` done criteria.
+
+The gap artifact frontmatter `status` is copied into `STATE.json.gaps.<id>.artifact_status`. Manager gate progress is tracked separately in `STATE.json.gaps.<id>.gate_status`; after harvest it is `reported`, and after Manager triage it is `triaged`. The legacy `STATE.json.gaps.<id>.status` mirrors the gate status for compatibility.
 
 Gap artifacts should include the same `## Fix Task Candidates` shape for missing or partial requirements that should become Worker fix tasks. Use `priority` instead of `severity` when that is more natural:
 

@@ -79,6 +79,7 @@ For each running Worker:
 For each running Gap Auditor:
 
 - read `gaps/<gap-id>.md`
+- treat artifact frontmatter `status` as `artifact_status`; use `gate_status` for Manager workflow progress
 - inspect live progress with `hloop gap watch <gap-id>` when Manager needs status before the artifact exists
 - expect the audit to take several minutes; wait patiently only after other safe Manager work is exhausted
 - while the audit is running, do not advance the integration branch being audited
@@ -93,6 +94,7 @@ For each running Gap Auditor:
 For each running Reviewer:
 
 - read `reviews/<review-id>.md`
+- treat artifact frontmatter `status` as `artifact_status`; use `gate_status` for Manager workflow progress
 - inspect live progress with `hloop reviewer watch <review-id>` when Manager needs status before the artifact exists
 - expect the review to take several minutes; wait patiently only after other safe Manager work is exhausted
 - while the review is running, do not advance the integration branch being reviewed
