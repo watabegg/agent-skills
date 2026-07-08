@@ -123,7 +123,9 @@ hloop conductor --json
 hloop doctor --sessions --json
 ```
 
-`conductor` is read-only. It inspects `STATE.json`, git branch/dirty state, known worktrees, artifacts, and Herdr pane status when `HERDR_ENV=1`. It returns non-zero when P0/P1 attention items exist unless `--no-fail` is passed. Typical findings are missing panes for running agents, Codex trust prompts, idle panes without artifacts, ready artifacts that should be harvested, review/gap artifacts that need triage, branch mismatches, and non-loop dirty files.
+`conductor` is read-only. It inspects `STATE.json`, git branch/dirty state, known worktrees, artifacts, and Herdr pane status when `HERDR_ENV=1`. It returns non-zero when P0/P1 attention items exist unless `--no-fail` is passed. Typical findings are missing panes for running agents, Codex trust prompts, idle panes without artifacts, ready artifacts that should be harvested, review/gap artifacts that need triage, branch mismatches, non-loop dirty files, unsafe sandbox values, dangerous Codex launch markers, non-hloop prompt paths, unharvested artifact states, untrusted Worker head markers, Manager-owned Worker result paths, and manual integration traces.
+
+Treat P0 conductor findings as unsafe to continue. In particular, `danger-full-access` or `dangerously-bypass-approvals-and-sandbox` in STATE or pane output means the agent must be stopped and recreated through `hloop` with `workspace-write` sandbox. Treat P1 trust findings as blockers for the affected task/gate until Manager has rerun, harvested, or documented the residual risk.
 
 `review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
 

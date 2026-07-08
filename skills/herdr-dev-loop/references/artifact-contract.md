@@ -62,6 +62,7 @@ Recommended optional fields:
 - `spec_sources`: original repo plan/spec files or directories the Gap Auditor should compare against implementation
 - per task/gap/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
 - per task/gap/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
+- per task/gap/review `sandbox`: expected `workspace-write` for hloop-started agents; other values are trust findings in `hloop conductor`
 - per review `worktree`, `worktree_review_path_harvested`, `worktree_cleanup_status`
 - per review `write_scope_violations`
 - per review `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`

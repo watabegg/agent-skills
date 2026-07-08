@@ -4,7 +4,7 @@ Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewe
 
 Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with `.ai/loop/LOCK`; Manager should not update `STATE.json`, start Worker/Reviewer/Gap Codex sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
 
-Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next.
+Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next. `conductor` also audits trust signals left in `STATE.json` and pane output, including unsafe sandbox values, dangerous Codex launch markers, non-hloop prompt paths, unharvested artifact states, untrusted Worker head markers such as `manager-working-tree` or `pending_code_commit`, Manager-owned Worker result paths, and manual integration traces.
 
 ## Phases
 
@@ -126,3 +126,5 @@ Do not dispatch new Workers while blocked.
 Waiting for a running Worker, Gap Auditor, or Reviewer is not itself a hard failure. Set `waiting_worker`, `waiting_gap`, or `waiting_review`, report the exact agent ids, and tick again later. Set `no_progress` only when no agent is running, no dependency can advance, and the next Manager action is unclear.
 
 When the phase is `no_progress` or a long-running loop appears stuck, run `hloop conductor --no-fail` before changing strategy. Treat its P0/P1 findings as the next concrete Manager action unless the finding is proven stale by disk state.
+
+Do not continue normal dispatch or merge work while `conductor` reports a P0 trust issue. Stop the affected pane if it is still running, restart the agent through `hloop`, or record the run as unsafe. Treat P1 trust issues as blockers for the affected task/gate until Manager has rerun, harvested, or explicitly recorded the residual risk.
