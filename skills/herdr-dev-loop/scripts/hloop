@@ -74,6 +74,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def filename_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{time.time_ns()}"
+
+
 def run_cmd(
     cmd: list[str],
     cwd: Path | None = None,
@@ -205,6 +209,8 @@ def retire_legacy_loop_lock(repo: Path) -> None:
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
     if command in {"init", "merge", "validate", "qa", "tick", "pump", "report"}:
+        return True
+    if command == "harvest":
         return True
     if command == "task":
         return getattr(args, "task_command", "") == "new"
@@ -413,6 +419,7 @@ def ensure_loop_dirs(repo: Path) -> None:
         "validation",
         "qa",
         "inbox/manager",
+        "inbox/pending",
         "inbox/user",
     ]:
         (loop_path(repo) / rel).mkdir(parents=True, exist_ok=True)
@@ -673,15 +680,107 @@ def manager_message_from_args(args: argparse.Namespace) -> tuple[str, str]:
     raise HLoopError("provide a message argument, --file, or stdin")
 
 
-def record_manager_message(target_state: dict[str, Any], source: str, message: str) -> None:
-    target_state.setdefault("manager_messages", []).append(
-        {
-            "at": now_iso(),
-            "source": source,
-            "bytes": len(message.encode("utf-8")),
-            "lines": len(message.splitlines()) or 1,
-        }
+def record_manager_message(
+    target_state: dict[str, Any],
+    source: str,
+    message: str,
+    *,
+    delivery_status: str = "sent",
+    delivery_error: str | None = None,
+    pending_path: str | None = None,
+) -> None:
+    entry = {
+        "at": now_iso(),
+        "source": source,
+        "bytes": len(message.encode("utf-8")),
+        "lines": len(message.splitlines()) or 1,
+        "delivery_status": delivery_status,
+    }
+    if delivery_error:
+        entry["delivery_error"] = delivery_error
+    if pending_path:
+        entry["pending_path"] = pending_path
+    target_state.setdefault("manager_messages", []).append(entry)
+
+
+def write_pending_manager_message(
+    repo: Path,
+    *,
+    role: str,
+    agent_id: str,
+    pane_id: str,
+    source: str,
+    message: str,
+    error: str,
+) -> Path:
+    rel = (
+        LOOP_DIR
+        / "inbox"
+        / "pending"
+        / f"{filename_timestamp()}-{slugify(agent_id, 24)}.md"
     )
+    body = (
+        "# Pending Manager Message\n\n"
+        f"- role: {role}\n"
+        f"- id: `{agent_id}`\n"
+        f"- pane_id: `{pane_id}`\n"
+        f"- source: `{source}`\n"
+        f"- recorded_at: `{now_iso()}`\n"
+        f"- delivery_error: `{error}`\n\n"
+        "## Message\n\n"
+        f"{message.rstrip()}\n"
+    )
+    write_text(repo / rel, body)
+    return rel
+
+
+def record_pending_manager_message(
+    repo: Path,
+    state: dict[str, Any],
+    agent_state: dict[str, Any],
+    *,
+    role: str,
+    agent_id: str,
+    pane_id: str,
+    source: str,
+    message: str,
+    error: Exception,
+) -> int:
+    detail = str(error)
+    pending_rel = write_pending_manager_message(
+        repo,
+        role=role,
+        agent_id=agent_id,
+        pane_id=pane_id,
+        source=source,
+        message=message,
+        error=detail,
+    )
+    pending_path = pending_rel.as_posix()
+    record_manager_message(
+        agent_state,
+        source,
+        message,
+        delivery_status="pending",
+        delivery_error=detail,
+        pending_path=pending_path,
+    )
+    agent_state["last_manager_message_error"] = detail
+    agent_state["last_pending_manager_message"] = pending_path
+    agent_state.setdefault("pending_manager_messages", []).append(
+        {"at": now_iso(), "source": source, "pending_path": pending_path, "error": detail}
+    )
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Recorded pending Manager message for {role} `{agent_id}` at `{pending_path}`; "
+        f"delivery failed: {detail}",
+    )
+    print(
+        f"manager message not delivered to {agent_id}: {detail}; pending file: {pending_path}",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def extract_agent_session_id(pane: dict[str, Any] | None) -> str | None:
@@ -879,7 +978,17 @@ def git_show(repo: Path, ref_path: str) -> str:
 def require_committed_result(worktree: Path, task_id: str, head_sha: str) -> str:
     rel = (LOOP_DIR / "results" / task_id / "result.md").as_posix()
     ref = f"{head_sha}:{rel}"
-    committed = git_show(worktree, ref)
+    try:
+        committed = git_show(worktree, ref)
+    except HLoopError as exc:
+        disk_path = worktree / rel
+        if disk_path.exists():
+            raise HLoopError(
+                "result artifact exists on disk but is not committed at worker HEAD: "
+                f"{rel}. Ask Worker {task_id} to commit the result artifact in `{worktree}` "
+                f"and rerun `hloop worker harvest {task_id}`."
+            ) from exc
+        raise
     disk = read_text(worktree / rel)
     if committed != disk:
         raise HLoopError(f"result artifact differs between worktree and committed HEAD: {rel}")
@@ -2566,6 +2675,25 @@ blocking_questions: []
         parsed_task.validation_minimum == ["L1", "local browser QA"],
         "task new did not preserve repeated --validation-minimum values",
     )
+    parsed_harvest = build_parser().parse_args(["harvest", "T001"])
+    check(parsed_harvest.command == "harvest", "top-level harvest command did not parse")
+    check(
+        normalize_validation_log_output("line with spaces  \nnext\t \r\n") == "line with spaces\nnext\n",
+        "validation log normalization did not trim trailing whitespace",
+    )
+    message_state: dict[str, Any] = {}
+    record_manager_message(
+        message_state,
+        "argv",
+        "hello",
+        delivery_status="pending",
+        delivery_error="Codex is still working",
+        pending_path=".ai/loop/inbox/pending/example.md",
+    )
+    check(
+        message_state.get("manager_messages", [{}])[-1].get("delivery_status") == "pending",
+        "manager message delivery status was not recorded",
+    )
 
     review_meta = parse_frontmatter_text(
         """---
@@ -3639,14 +3767,29 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     if not pane_id:
         raise HLoopError(f"worker has no pane_id: {task_id}")
     message, source = manager_message_from_args(args)
-    send_codex_tui_message(
-        pane_id,
-        message,
-        args.timeout_ms,
-        args.input_settle_ms,
-        args.submit_verify_ms,
-        args.submit_attempts,
-    )
+    if not message.strip():
+        raise HLoopError("manager message is empty")
+    try:
+        send_codex_tui_message(
+            pane_id,
+            message,
+            args.timeout_ms,
+            args.input_settle_ms,
+            args.submit_verify_ms,
+            args.submit_attempts,
+        )
+    except HLoopError as exc:
+        return record_pending_manager_message(
+            repo,
+            state,
+            task_state,
+            role="Worker",
+            agent_id=task_id,
+            pane_id=pane_id,
+            source=source,
+            message=message,
+            error=exc,
+        )
     record_manager_message(task_state, source, message)
     save_state(repo, state)
     journal(repo, f"Sent Manager message to Worker `{task_id}` in pane `{pane_id}` from {source}.")
@@ -3854,6 +3997,23 @@ def validation_log_rel(state: dict[str, Any], index: int) -> Path:
     return LOOP_DIR / "validation" / f"cycle-{cycle:04d}-{index:02d}.log"
 
 
+def normalize_validation_log_output(output: str) -> str:
+    if not output:
+        return ""
+    pieces: list[str] = []
+    for line in output.splitlines(keepends=True):
+        newline = ""
+        body = line
+        if line.endswith("\r\n"):
+            body = line[:-2]
+            newline = "\n"
+        elif line.endswith("\n") or line.endswith("\r"):
+            body = line[:-1]
+            newline = "\n"
+        pieces.append(body.rstrip() + newline)
+    return "".join(pieces)
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -3885,7 +4045,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             if not output.endswith("\n"):
                 sys.stdout.write("\n")
         log_rel = validation_log_rel(state, index)
-        write_text(repo / log_rel, output)
+        write_text(repo / log_rel, normalize_validation_log_output(output))
         result = "passed" if proc.returncode == 0 else f"failed:{proc.returncode}"
         results.append(
             {
@@ -4196,14 +4356,29 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     if not pane_id:
         raise HLoopError(f"reviewer has no pane_id: {review_id}")
     message, source = manager_message_from_args(args)
-    send_codex_tui_message(
-        pane_id,
-        message,
-        args.timeout_ms,
-        args.input_settle_ms,
-        args.submit_verify_ms,
-        args.submit_attempts,
-    )
+    if not message.strip():
+        raise HLoopError("manager message is empty")
+    try:
+        send_codex_tui_message(
+            pane_id,
+            message,
+            args.timeout_ms,
+            args.input_settle_ms,
+            args.submit_verify_ms,
+            args.submit_attempts,
+        )
+    except HLoopError as exc:
+        return record_pending_manager_message(
+            repo,
+            state,
+            review_state,
+            role="Reviewer",
+            agent_id=review_id,
+            pane_id=pane_id,
+            source=source,
+            message=message,
+            error=exc,
+        )
     record_manager_message(review_state, source, message)
     save_state(repo, state)
     journal(repo, f"Sent Manager message to Reviewer `{review_id}` in pane `{pane_id}` from {source}.")
@@ -4496,14 +4671,29 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     if not pane_id:
         raise HLoopError(f"gap auditor has no pane_id: {gap_id}")
     message, source = manager_message_from_args(args)
-    send_codex_tui_message(
-        pane_id,
-        message,
-        args.timeout_ms,
-        args.input_settle_ms,
-        args.submit_verify_ms,
-        args.submit_attempts,
-    )
+    if not message.strip():
+        raise HLoopError("manager message is empty")
+    try:
+        send_codex_tui_message(
+            pane_id,
+            message,
+            args.timeout_ms,
+            args.input_settle_ms,
+            args.submit_verify_ms,
+            args.submit_attempts,
+        )
+    except HLoopError as exc:
+        return record_pending_manager_message(
+            repo,
+            state,
+            gap_state,
+            role="Gap Auditor",
+            agent_id=gap_id,
+            pane_id=pane_id,
+            source=source,
+            message=message,
+            error=exc,
+        )
     record_manager_message(gap_state, source, message)
     save_state(repo, state)
     journal(repo, f"Sent Manager message to Gap Auditor `{gap_id}` in pane `{pane_id}` from {source}.")
@@ -5027,6 +5217,20 @@ def cmd_pump(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_harvest(args: argparse.Namespace) -> int:
+    agent_id = str(args.agent_id)
+    if agent_id.startswith("T"):
+        args.task_id = agent_id
+        return cmd_worker_harvest(args)
+    if agent_id.startswith("R"):
+        args.review_id = agent_id
+        return cmd_reviewer_harvest(args)
+    if agent_id.startswith("G"):
+        args.gap_id = agent_id
+        return cmd_gap_harvest(args)
+    raise HLoopError(f"cannot infer harvest target from id: {agent_id}; use T..., R..., or G...")
+
+
 def cmd_qa_record(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
@@ -5318,6 +5522,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--no-cleanup", action="store_true")
     validate.add_argument("--dry-run", action="store_true")
     validate.set_defaults(func=cmd_validate)
+
+    harvest = sub.add_parser("harvest", help="harvest a Worker/Reviewer/Gap artifact by id prefix")
+    harvest.add_argument("agent_id", help="T..., R..., or G... id")
+    harvest.add_argument("--keep-pane", action="store_true")
+    harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    harvest.set_defaults(func=cmd_harvest)
 
     qa = sub.add_parser("qa", help="manager final QA operations")
     qa_sub = qa.add_subparsers(dest="qa_command", required=True)

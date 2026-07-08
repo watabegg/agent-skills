@@ -21,6 +21,7 @@ All loop coordination is file-backed under `.ai/loop`.
   triage/
   validation/
   qa/
+  inbox/
   reports/
 ```
 
