@@ -54,7 +54,7 @@ When sending additional instructions to a running TUI, use `hloop worker message
 
 Inspect running agents with `hloop worker watch <task-id>`, `hloop gap watch <gap-id>`, or `hloop reviewer watch <review-id>`. Use direct `herdr pane read` only for debugging the helper itself.
 
-Use `hloop dashboard` for the Manager's one-screen view of phase, queues, running agents, panes, artifacts, and next actions. Use `hloop conductor` when investigating stuck sessions; it reports P0/P1 attention items such as missing panes, blocked Codex prompts, reported review/gap artifacts needing triage, non-loop dirty files, and branch mismatches. Add `--no-fail` when the command is informational and should not return non-zero.
+Use `hloop dashboard` for the Manager's one-screen view of phase, queues, running agents, panes, artifacts, and next actions. Use `hloop conductor` when investigating stuck sessions; it reports P0/P1 attention items such as missing panes, blocked Codex prompts, reported review/gap artifacts needing triage, non-loop dirty files, branch mismatches, unsafe sandbox values, non-hloop prompt paths, unharvested artifacts, untrusted Worker head markers, and manual integration traces. Add `--no-fail` when the command is informational and should not return non-zero.
 
 After a Worker, Gap Auditor, or Reviewer artifact is harvested, close its Herdr pane and archive its captured Codex session unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
 
@@ -151,7 +151,7 @@ Use `.ai/loop/PROFILE.md` to adapt the loop to product reality. `branch_strategy
 
 Assume Gap Auditor and Reviewer runs can take several minutes. Use `hloop gap watch <gap-id>` or `hloop reviewer watch <review-id>` to inspect the TUI pane. If an auditor or reviewer is still running, wait up to `gap_wait_ms` or `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting, continue Manager work that does not mutate the inspected integration head: refine tasks, prepare validation notes, harvest finished Workers, create fix tasks from already triaged findings, or dispatch non-overlapping queued Workers up to `max_workers`.
 
-Before manually intervening in a running loop, run `hloop conductor --no-fail`. If it reports a missing pane, blocked prompt, idle agent without artifact, ready artifact, or branch mismatch, resolve that explicit condition through the relevant `hloop ... watch`, `message`, `harvest`, `triage`, or branch command instead of replacing the loop with ad hoc Herdr/Codex commands.
+Before manually intervening in a running loop, run `hloop conductor --no-fail`. If it reports a missing pane, blocked prompt, idle agent without artifact, ready artifact, branch mismatch, unsafe sandbox, non-hloop prompt path, unharvested artifact, untrusted Worker head, or manual integration trace, resolve that explicit condition through the relevant `hloop ... watch`, `message`, `harvest`, `triage`, branch command, Worker rerun, or recorded blocker instead of replacing the loop with ad hoc Herdr/Codex commands.
 
 ## References
 

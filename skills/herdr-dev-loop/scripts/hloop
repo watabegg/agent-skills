@@ -57,6 +57,13 @@ DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
 REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
 GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+DANGEROUS_AGENT_MARKERS = (
+    "danger-full-access",
+    "dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass",
+    "bypass-approvals-and-sandbox",
+)
+SUSPICIOUS_WORKER_HEADS = {"manager-working-tree", "pending_code_commit"}
 
 
 class HLoopError(RuntimeError):
@@ -1048,6 +1055,8 @@ def pane_snapshot(
         signals.append("working-text")
     if "command not found" in text and "hloop" in text:
         signals.append("hloop-command-not-found")
+    if contains_dangerous_agent_marker(text):
+        signals.append("dangerous-agent-command")
     if include_output:
         snapshot["output_tail"] = text
     snapshot["signals"] = signals
@@ -1080,6 +1089,14 @@ def pane_issue_for_running(
             subject,
             f"{role} pane is waiting at the Codex trust prompt.",
             f"Inspect with `{watch_cmd}` and resolve the trust prompt before continuing.",
+        )
+    if "dangerous-agent-command" in signals:
+        return make_issue(
+            "P0",
+            "dangerous-agent-command",
+            subject,
+            f"{role} pane output contains a dangerous Codex launch marker.",
+            "Stop this pane and recreate the agent through hloop with workspace-write sandbox.",
         )
     if "press-enter" in signals:
         return make_issue(
@@ -1118,6 +1135,171 @@ def worktree_state(path_raw: Any) -> dict[str, Any]:
         "exists": path.exists(),
         "dirty_files": safe_porcelain_paths(path) if path.exists() else [],
     }
+
+
+def contains_dangerous_agent_marker(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(contains_dangerous_agent_marker(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(contains_dangerous_agent_marker(item) for item in value)
+    text = str(value or "").lower()
+    return any(marker in text for marker in DANGEROUS_AGENT_MARKERS)
+
+
+def expected_prompt_fragment(role: str, agent_id: str) -> str:
+    suffix = {"worker": "worker", "reviewer": "reviewer", "gap": "gap"}.get(role, role)
+    return f".ai/loop/prompts/{agent_id}.{suffix}.md"
+
+
+def prompt_matches_hloop_contract(role: str, agent_id: str, prompt_raw: Any) -> bool:
+    prompt = str(prompt_raw or "").replace("\\", "/")
+    return bool(prompt) and expected_prompt_fragment(role, agent_id) in prompt
+
+
+def path_under_repo_loop_results(repo: Path, path_raw: Any) -> bool:
+    if not path_raw:
+        return False
+    path = Path(str(path_raw))
+    if not path.is_absolute():
+        path = repo / path
+    try:
+        resolved = path.resolve()
+        results_root = (repo / LOOP_DIR / "results").resolve()
+    except OSError:
+        return False
+    return resolved == results_root or results_root in resolved.parents
+
+
+def agent_contract_issues(
+    repo: Path,
+    *,
+    role: str,
+    agent_id: str,
+    agent: dict[str, Any],
+) -> list[dict[str, str]]:
+    subject = f"{role}:{agent_id}"
+    issues: list[dict[str, str]] = []
+    status = str(agent.get("status") or "")
+    gate_status = agent_gate_status(agent)
+    active_status = status in {"running", "result_reported", "reported", "reported_unharvested"} or gate_status in {
+        "running",
+        "reported",
+        "reported_unharvested",
+        "paused_untriaged",
+    }
+
+    sandbox = str(agent.get("sandbox") or "")
+    if sandbox and sandbox != "workspace-write":
+        severity = "P0" if contains_dangerous_agent_marker(sandbox) else "P1"
+        issues.append(
+            make_issue(
+                severity,
+                "unsafe-agent-sandbox",
+                subject,
+                f"{role} state records non-standard sandbox `{sandbox}`.",
+                "Stop the agent if it is still running; restart through hloop so it uses workspace-write.",
+            )
+        )
+
+    command_like = {
+        key: agent.get(key)
+        for key in ("argv", "command", "runner_command", "launch_command", "codex_command")
+        if key in agent
+    }
+    if command_like and contains_dangerous_agent_marker(command_like):
+        issues.append(
+            make_issue(
+                "P0",
+                "dangerous-agent-command",
+                subject,
+                f"{role} state contains a dangerous Codex launch marker.",
+                "Stop the pane and recreate the agent with hloop; do not continue from this run.",
+            )
+        )
+
+    if active_status:
+        prompt = str(agent.get("prompt") or "")
+        if not prompt:
+            issues.append(
+                make_issue(
+                    "P1",
+                    "missing-hloop-prompt",
+                    subject,
+                    f"{role} is active but STATE.json has no hloop prompt path.",
+                    f"Use hloop {role if role != 'reviewer' else 'reviewer'} watch {agent_id}; restart through hloop if the pane was started manually.",
+                )
+            )
+        elif not prompt_matches_hloop_contract(role, agent_id, prompt):
+            issues.append(
+                make_issue(
+                    "P1",
+                    "non-hloop-prompt",
+                    subject,
+                    f"{role} prompt path does not match the hloop prompt contract: {prompt}",
+                    "Treat this as a suspected manual launch; harvest only if the artifact passes hloop validation, otherwise restart.",
+                )
+            )
+
+    state_fragments = [
+        str(agent.get("status") or ""),
+        str(agent.get("gate_status") or ""),
+        str(agent.get("artifact_status") or ""),
+    ]
+    if any("unharvested" in fragment for fragment in state_fragments):
+        issues.append(
+            make_issue(
+                "P1",
+                "unharvested-artifact-state",
+                subject,
+                f"{role} state records an unharvested artifact.",
+                f"Run the matching hloop harvest command or keep the loop paused until Manager intentionally resumes.",
+            )
+        )
+
+    if role == "worker":
+        head_sha = str(agent.get("head_sha") or "").lower()
+        if head_sha in SUSPICIOUS_WORKER_HEADS:
+            issues.append(
+                make_issue(
+                    "P1",
+                    "untrusted-worker-head",
+                    subject,
+                    f"Worker result uses non-commit head marker `{agent.get('head_sha')}`.",
+                    "Do not merge this task; rerun the Worker or record an environment blocker.",
+                )
+            )
+        integration_method = str(agent.get("integration_method") or "")
+        if "manual" in integration_method or integration_method.startswith("manager_"):
+            issues.append(
+                make_issue(
+                    "P1",
+                    "manual-worker-integration",
+                    subject,
+                    f"Worker state records manual integration method `{integration_method}`.",
+                    "Review this task before trusting final loop status; prefer hloop merge for future tasks.",
+                )
+            )
+        if normalize_bool(agent.get("merge_ready")) and not agent.get("committed_result_path"):
+            issues.append(
+                make_issue(
+                    "P1",
+                    "merge-ready-without-committed-result",
+                    subject,
+                    "Worker is merge-ready but STATE.json has no committed_result_path.",
+                    "Run hloop worker harvest again; do not merge until the result is committed at branch HEAD.",
+                )
+            )
+        if path_under_repo_loop_results(repo, agent.get("result_path")) and str(agent.get("worktree") or ""):
+            issues.append(
+                make_issue(
+                    "P1",
+                    "manager-owned-worker-result",
+                    subject,
+                    f"Worker result_path points at the Manager repo: {agent.get('result_path')}",
+                    "Treat this as a suspected Manager-edited result; rerun or re-harvest from the Worker worktree.",
+                )
+            )
+    return issues
 
 
 def collect_worker_inventory(
@@ -1167,6 +1349,7 @@ def collect_worker_inventory(
         else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
     )
     issues: list[dict[str, str]] = []
+    issues.extend(agent_contract_issues(repo, role="worker", agent_id=task_id, agent=task))
     if status == "running":
         if artifact["exists"]:
             issues.append(
@@ -1269,6 +1452,7 @@ def collect_gate_inventory(
         else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
     )
     issues: list[dict[str, str]] = []
+    issues.extend(agent_contract_issues(repo, role=role, agent_id=agent_id, agent=agent))
     gate_name = "review" if role == "reviewer" else "gap"
     if gate_status == "running":
         if artifact_state == "present":
@@ -2288,6 +2472,32 @@ gap_count: 0
     )
     check(str(gap_meta.get("status")) in GAP_ARTIFACT_STATUSES, "sample gap artifact status is invalid")
 
+    reliability_codes = {
+        item["code"]
+        for item in agent_contract_issues(
+            skill_root,
+            role="worker",
+            agent_id="T999",
+            agent={
+                "status": "result_reported",
+                "sandbox": "danger-full-access",
+                "prompt": "/tmp/manual-prompt.md",
+                "worktree": "/tmp/manual-worker",
+                "head_sha": "manager-working-tree",
+                "merge_ready": True,
+                "integration_method": "manager_manual_apply_after_worker_quota_failure",
+                "result_path": str(skill_root / LOOP_DIR / "results" / "T999" / "result.md"),
+            },
+        )
+    }
+    check("unsafe-agent-sandbox" in reliability_codes, "reliability audit missed unsafe sandbox")
+    check("non-hloop-prompt" in reliability_codes, "reliability audit missed non-hloop prompt")
+    check("untrusted-worker-head" in reliability_codes, "reliability audit missed untrusted Worker head")
+    check(
+        "merge-ready-without-committed-result" in reliability_codes,
+        "reliability audit missed missing committed result path",
+    )
+
     result = {"ok": not errors, "skill_root": str(skill_root), "errors": errors}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -3162,6 +3372,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "worktree": str(worktree),
             "prompt": str(worktree / prompt_rel),
             "runner": runner,
+            "sandbox": "workspace-write",
             "started_at": now_iso(),
         }
     )
