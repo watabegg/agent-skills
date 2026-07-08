@@ -56,7 +56,7 @@ Then run, at most, one material transition:
 
 Prefer a small number of obvious transitions over attempting to finish a goal in one tick.
 
-`pump` repeats this bounded tick order up to `--max-transitions`. It must stop when:
+`pump` repeats this bounded tick order up to `--max-transitions` and sleeps briefly between ticks by default so waiting phases can be polled instead of consuming the whole transition budget immediately. It must stop when:
 
 - a Gap Auditor or Reviewer artifact needs Manager triage
 - branch strategy requires Manager handoff before merge or publish
