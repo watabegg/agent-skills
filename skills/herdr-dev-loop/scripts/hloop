@@ -54,6 +54,7 @@ REVIEW_PROTOCOLS = {"native", "codex-review-multi-v2"}
 DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
+DEFAULT_PUMP_SLEEP_MS = 2_000
 REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
 GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -2677,6 +2678,8 @@ blocking_questions: []
     )
     parsed_harvest = build_parser().parse_args(["harvest", "T001"])
     check(parsed_harvest.command == "harvest", "top-level harvest command did not parse")
+    parsed_pump = build_parser().parse_args(["pump"])
+    check(parsed_pump.sleep_ms == DEFAULT_PUMP_SLEEP_MS, "pump sleep default drifted")
     check(
         normalize_validation_log_output("line with spaces  \nnext\t \r\n") == "line with spaces\nnext\n",
         "validation log normalization did not trim trailing whitespace",
@@ -5727,7 +5730,7 @@ def build_parser() -> argparse.ArgumentParser:
     pump.add_argument("--review-wait-ms", type=int)
     pump.add_argument("--gap-wait-ms", type=int)
     pump.add_argument("--wait", action="store_true", help="use configured review/gap wait times instead of forcing 0ms waits")
-    pump.add_argument("--sleep-ms", type=int, default=0)
+    pump.add_argument("--sleep-ms", type=int, default=DEFAULT_PUMP_SLEEP_MS)
     pump.add_argument("--dry-run", action="store_true")
     pump.add_argument("--stop-on-triage", dest="stop_on_triage", action="store_true", default=True)
     pump.add_argument("--no-stop-on-triage", dest="stop_on_triage", action="store_false")

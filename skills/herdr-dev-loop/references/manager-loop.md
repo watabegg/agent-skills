@@ -31,7 +31,7 @@ Use `tick --once` while inspecting a new repository or uncertain state. Use `pum
 hloop pump --max-transitions 20 --max-workers 3 --stop-on-triage
 ```
 
-`pump` repeatedly runs safe tick transitions. It stops at triage, blocked, done, or the transition limit. By default it keeps ticking through waiting phases so it can notice completed agents, start pending Reviewers/Gap Auditors, and dispatch non-overlapping queued Workers. Pass `--stop-on-waiting` when Manager intentionally wants to pause as soon as all currently safe transitions are exhausted. By default it does not wait for long-running Reviewers or Gap Auditors; pass `--wait` only when Manager intentionally wants to spend the configured wait budget.
+`pump` repeatedly runs safe tick transitions. It stops at triage, blocked, done, or the transition limit. By default it keeps ticking through waiting phases so it can notice completed agents, start pending Reviewers/Gap Auditors, and dispatch non-overlapping queued Workers. It sleeps briefly between ticks (`--sleep-ms`, default 2000) so waiting phases do not burn the transition budget instantly. Pass `--sleep-ms 0` only when an external scheduler will invoke `pump` again. Pass `--stop-on-waiting` when Manager intentionally wants to pause as soon as all currently safe transitions are exhausted. By default it does not wait for long-running Reviewers or Gap Auditors; pass `--wait` only when Manager intentionally wants to spend the configured wait budget.
 
 Before switching from `pump` to manual intervention, run:
 
