@@ -59,6 +59,21 @@ DEFAULT_WAIT_TIMEOUT_MS = 300_000
 DEFAULT_WAIT_POLL_MS = 5_000
 REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
 GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
+FIX_TASK_PRIORITIES = {"P0", "P1", "P2", "P3"}
+STRICT_MULTILINE_LIST_FIELDS = {
+    "acceptance",
+    "blocking_questions",
+    "changed_files",
+    "depends_on",
+    "evidence",
+    "review_lanes",
+    "spec_sources",
+    "task_ids",
+    "validation_commands",
+    "validation_results",
+    "write_allow",
+    "write_deny",
+}
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 DANGEROUS_AGENT_MARKERS = (
     "danger-full-access",
@@ -253,7 +268,7 @@ def journal(repo: Path, message: str) -> None:
     append_text(loop_path(repo) / "JOURNAL.md", f"\n## {now_iso()}\n\n{message}\n")
 
 
-def parse_scalar(raw: str) -> Any:
+def parse_scalar(raw: str, key: str | None = None) -> Any:
     value = raw.strip()
     if value == "":
         return ""
@@ -268,6 +283,8 @@ def parse_scalar(raw: str) -> Any:
         inner = value[1:-1].strip()
         if not inner:
             return []
+        if key in STRICT_MULTILINE_LIST_FIELDS:
+            raise HLoopError(f"{key}: inline list unsupported; use multiline list")
         return [parse_scalar(part.strip()) for part in inner.split(",")]
     if (value.startswith('"') and value.endswith('"')) or (
         value.startswith("'") and value.endswith("'")
@@ -303,7 +320,7 @@ def parse_frontmatter_text(text: str) -> dict[str, Any]:
             data[key] = []
             current_key = key
         else:
-            data[key] = parse_scalar(raw_value)
+            data[key] = parse_scalar(raw_value, key=key)
             current_key = None
     return data
 
@@ -376,12 +393,40 @@ def parse_simple_field_block(lines: list[str]) -> dict[str, Any]:
             data[key] = []
             current_key = key
         else:
-            data[key] = parse_scalar(raw_value)
+            data[key] = parse_scalar(raw_value, key=key)
             current_key = None
     return data
 
 
-def extract_fix_task_candidates(text: str, source_id: str) -> list[dict[str, Any]]:
+def reject_fix_task_candidate(title: str, reasons: list[str], raw: str = "") -> dict[str, Any]:
+    return {
+        "title": title or "untitled candidate",
+        "reasons": reasons,
+        "raw": raw,
+    }
+
+
+def validate_fix_task_candidate(candidate: dict[str, Any], data: dict[str, Any]) -> list[str]:
+    reasons = []
+    if not str(candidate.get("title") or "").strip():
+        reasons.append("title is missing")
+    if str(data.get("action") or "") not in {"fix_task", "fix-task"}:
+        reasons.append("action must be fix_task")
+    if str(candidate.get("kind") or "") not in {"fix", "implementation"}:
+        reasons.append("kind must be fix or implementation")
+    priority = str(candidate.get("priority") or "")
+    if priority not in FIX_TASK_PRIORITIES:
+        reasons.append("priority/severity must be one of P0, P1, P2, P3")
+    if not normalize_list(candidate.get("write_allow")):
+        reasons.append("write_allow is required")
+    if not normalize_list(candidate.get("acceptance")):
+        reasons.append("acceptance is required")
+    if not str(candidate.get("rationale") or "").strip():
+        reasons.append("rationale is required")
+    return reasons
+
+
+def extract_fix_task_candidates(text: str, source_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     lines = text.splitlines()
     in_section = False
     blocks: list[tuple[str, list[str]]] = []
@@ -408,27 +453,33 @@ def extract_fix_task_candidates(text: str, source_id: str) -> list[dict[str, Any
         blocks.append((current_title, current_lines))
 
     candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
     for title, block_lines in blocks:
-        data = parse_simple_field_block(block_lines)
-        action = str(data.get("action") or "fix_task")
-        if action not in {"fix_task", "fix-task"}:
+        try:
+            data = parse_simple_field_block(block_lines)
+        except HLoopError as exc:
+            rejected.append(reject_fix_task_candidate(title, [str(exc)], "\n".join(block_lines)))
             continue
+        action = str(data.get("action") or "")
         clean_title = re.sub(r"^FT\d+\s*:\s*", "", title).strip()
         candidate = {
             "title": str(data.get("title") or clean_title),
             "kind": str(data.get("kind") or "fix"),
-            "priority": str(data.get("priority") or data.get("severity") or "P1"),
+            "priority": str(data.get("priority") or data.get("severity") or ""),
             "source": str(data.get("source") or source_id),
             "source_finding": str(data.get("source_finding") or data.get("finding") or clean_title),
             "write_allow": normalize_list(data.get("write_allow")),
             "write_deny": normalize_list(data.get("write_deny")),
-            "acceptance": normalize_list(data.get("acceptance"))
-            or ["The referenced review/gap finding is fixed."],
+            "acceptance": normalize_list(data.get("acceptance")),
             "depends_on": normalize_list(data.get("depends_on")),
             "rationale": str(data.get("rationale") or data.get("reason") or ""),
         }
+        reasons = validate_fix_task_candidate(candidate, {**data, "action": action})
+        if reasons:
+            rejected.append(reject_fix_task_candidate(candidate["title"], reasons, "\n".join(block_lines)))
+            continue
         candidates.append(candidate)
-    return candidates
+    return candidates, rejected
 
 
 def ensure_loop_dirs(repo: Path) -> None:
@@ -990,11 +1041,29 @@ def normalize_int(value: Any, default: int) -> int:
         return default
 
 
+def parse_changed_files_name_status(text: str) -> list[str]:
+    paths: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if (status.startswith("R") or status.startswith("C")) and len(parts) >= 3:
+            paths.extend([parts[1], parts[2]])
+        elif len(parts) >= 2:
+            paths.append(parts[1])
+    return list(dict.fromkeys(normalize_match_path(path) for path in paths if path.strip()))
+
+
 def changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
     if not base_sha or not head_sha:
         return []
-    out = git(repo, ["diff", "--name-only", f"{base_sha}..{head_sha}"], check=False)
-    return [line for line in out.splitlines() if line.strip()]
+    out = git(
+        repo,
+        ["diff", "--name-status", "--find-renames", f"{base_sha}..{head_sha}"],
+        check=False,
+    )
+    return parse_changed_files_name_status(out)
 
 
 def git_show(repo: Path, ref_path: str) -> str:
@@ -1217,7 +1286,10 @@ def safe_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
         return {}, f"read-error:{exc}"
     if not text.strip():
         return {}, "empty"
-    return parse_frontmatter_text(text), "present"
+    try:
+        return parse_frontmatter_text(text), "present"
+    except HLoopError as exc:
+        return {}, f"frontmatter-error:{exc}"
 
 
 def safe_result_commit_state(worktree: Path, task_id: str, head_sha: str) -> str:
@@ -2389,7 +2461,8 @@ Output:
 - Include frontmatter: review_id, base, head, status: reported|blocked|failed.
 - If blocked or failed, still write the artifact with the concrete reason.
 - Include a `## Fix Task Candidates` section. For every finding that should become a Worker fix task, add:
-  `### FTNNN: <title>`, `action: fix_task`, `severity: P0|P1|P2|P3`, `write_allow:`, `acceptance:`, and `rationale:`.
+  `### FTNNN: <title>`, `action: fix_task`, `severity: P0|P1|P2|P3`, non-empty `write_allow:`, non-empty `acceptance:`, and non-empty `rationale:`.
+  Incomplete candidates are rejected by `hloop triage` and will not become tasks.
   If no fix task is needed, write `No fix task candidates.`
 
 Final terminal line:
@@ -2445,7 +2518,8 @@ Output:
 - Include frontmatter: gap_id, base, head, status: aligned|gaps-found|blocked|failed, spec_sources, gap_count.
 - If blocked or failed, still write the artifact with the concrete reason.
 - Include a `## Fix Task Candidates` section. For every missing or partial requirement that should become a Worker fix task, add:
-  `### FTNNN: <title>`, `action: fix_task`, `priority: P0|P1|P2|P3`, `write_allow:`, `acceptance:`, and `rationale:`.
+  `### FTNNN: <title>`, `action: fix_task`, `priority: P0|P1|P2|P3`, non-empty `write_allow:`, non-empty `acceptance:`, and non-empty `rationale:`.
+  Incomplete candidates are rejected by `hloop triage` and will not become tasks.
   If no fix task is needed, write `No fix task candidates.`
 
 Final terminal line:
@@ -2672,8 +2746,14 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
     result_schema = schemas.get("result.schema.json", {})
     task_schema = schemas.get("task.schema.json", {})
+    review_schema = schemas.get("review.schema.json", {})
+    gap_schema = schemas.get("gap.schema.json", {})
     check(schema_has_merge_ready_guard(result_schema), "result.schema.json lacks merge_ready guard")
     check(schema_has_write_allow_guard(task_schema), "task.schema.json lacks write_allow guard")
+    review_status_enum = set(normalize_list(review_schema.get("properties", {}).get("status", {}).get("enum")))
+    gap_status_enum = set(normalize_list(gap_schema.get("properties", {}).get("status", {}).get("enum")))
+    check(review_status_enum == REVIEW_ARTIFACT_STATUSES, "review.schema.json status enum drifted")
+    check(gap_status_enum == GAP_ARTIFACT_STATUSES, "gap.schema.json status enum drifted")
 
     result_meta = parse_frontmatter_text(
         """---
@@ -2700,9 +2780,25 @@ blocking_questions: []
         normalize_list(result_meta.get("validation_commands")),
         "sample result validation_commands did not parse as a list",
     )
+    inline_list_rejected = False
+    try:
+        parse_frontmatter_text(
+            """---
+validation_commands: ["npm test -- --grep foo,bar"]
+---
+"""
+        )
+    except HLoopError as exc:
+        inline_list_rejected = "inline list unsupported" in str(exc)
+    check(inline_list_rejected, "known list fields should reject non-empty inline lists")
     check(
         matches_any("app/[liveId]/page.tsx", ["app/[liveId]/**"]),
         "write_allow matcher does not treat bracket path segments literally",
+    )
+    check(
+        parse_changed_files_name_status("R100\told/path.ts\tnew/path.ts\nD\tgone.ts\n")
+        == ["old/path.ts", "new/path.ts", "gone.ts"],
+        "name-status changed file parser missed rename/delete paths",
     )
     parsed_task = build_parser().parse_args(
         [
@@ -2808,6 +2904,37 @@ checkpoint_mode: rollup
     )
     check(batch_meta.get("id") == "B001", "sample batch artifact id did not parse")
     check(normalize_list(batch_meta.get("task_ids")) == ["T001"], "sample batch task_ids did not parse")
+
+    valid_fix_candidates, rejected_fix_candidates = extract_fix_task_candidates(
+        """## Fix Task Candidates
+
+### FT001: Fix valid path
+action: fix_task
+priority: P1
+write_allow:
+  - src/example/**
+acceptance:
+  - Regression is fixed.
+rationale: The reviewed path can fail.
+
+### FT002: Missing required fields
+action: fix_task
+priority: P1
+acceptance:
+  - Something improves.
+""",
+        "R001",
+    )
+    check(len(valid_fix_candidates) == 1, "valid fix task candidate was not accepted")
+    check(len(rejected_fix_candidates) == 1, "invalid fix task candidate was not rejected")
+    draft_text = render_fix_task_draft(
+        "review",
+        "R001",
+        Path(".ai/loop/reviews/R001.md"),
+        valid_fix_candidates,
+        rejected_fix_candidates,
+    )
+    check("## Rejected Candidates" in draft_text, "triage draft did not include rejected candidates")
 
     reliability_codes = {
         item["code"]
@@ -5033,12 +5160,15 @@ def render_fix_task_draft(
     source_id: str,
     artifact_path: Path,
     candidates: list[dict[str, Any]],
+    rejected_candidates: list[dict[str, Any]] | None = None,
 ) -> str:
+    rejected_candidates = rejected_candidates or []
     fields = {
         "source_type": source_type,
         "source_id": source_id,
         "status": "draft",
         "candidate_count": len(candidates),
+        "rejected_candidate_count": len(rejected_candidates),
     }
     lines = [
         frontmatter(fields).rstrip(),
@@ -5046,10 +5176,11 @@ def render_fix_task_draft(
         f"# Fix Task Drafts For {source_id}",
         "",
         f"- Source artifact: `{artifact_path}`",
-        f"- Candidate count: {len(candidates)}",
+        f"- Valid candidate count: {len(candidates)}",
+        f"- Rejected candidate count: {len(rejected_candidates)}",
         "",
     ]
-    if not candidates:
+    if not candidates and not rejected_candidates:
         lines.extend(
             [
                 "No machine-readable fix task candidates were found.",
@@ -5060,48 +5191,71 @@ def render_fix_task_draft(
                 "- Close the gate as passed, accepted risk, decision needed, or fix tasks created.",
             ]
         )
-        return "\n".join(lines) + "\n"
-    lines.append("## Candidates")
-    lines.append("")
-    for index, candidate in enumerate(candidates, start=1):
+    elif not candidates:
         lines.extend(
             [
-                f"### F{index:03d}: {candidate['title']}",
+                "No valid fix task candidates were found. Inspect rejected candidates below before creating tasks manually.",
                 "",
-                f"- Priority: {candidate['priority']}",
-                f"- Source finding: {candidate['source_finding']}",
-                f"- Rationale: {candidate['rationale'] or 'TBD'}",
-                "- Write allow:",
-                *[f"  - `{item}`" for item in candidate["write_allow"]],
-                "- Acceptance:",
-                *[f"  - {item}" for item in candidate["acceptance"]],
-                "",
-                "Create command:",
-                "",
-                "```bash",
             ]
         )
-        cmd = [
-            "python3",
-            "<this-skill>/scripts/hloop",
-            "task",
-            "new",
-            candidate["title"],
-            "--kind",
-            candidate["kind"],
-            "--priority",
-            candidate["priority"],
-        ]
-        for item in candidate["write_allow"]:
-            cmd.extend(["--write-allow", item])
-        for item in candidate["write_deny"]:
-            cmd.extend(["--write-deny", item])
-        for item in candidate["acceptance"]:
-            cmd.extend(["--acceptance", item])
-        for item in candidate["depends_on"]:
-            cmd.extend(["--depends-on", item])
-        lines.append(shlex.join(cmd))
-        lines.extend(["```", ""])
+    else:
+        lines.append("## Candidates")
+        lines.append("")
+        for index, candidate in enumerate(candidates, start=1):
+            lines.extend(
+                [
+                    f"### F{index:03d}: {candidate['title']}",
+                    "",
+                    f"- Priority: {candidate['priority']}",
+                    f"- Source finding: {candidate['source_finding']}",
+                    f"- Rationale: {candidate['rationale']}",
+                    "- Write allow:",
+                    *[f"  - `{item}`" for item in candidate["write_allow"]],
+                    "- Acceptance:",
+                    *[f"  - {item}" for item in candidate["acceptance"]],
+                    "",
+                    "Create command:",
+                    "",
+                    "```bash",
+                ]
+            )
+            cmd = [
+                "python3",
+                "<this-skill>/scripts/hloop",
+                "task",
+                "new",
+                candidate["title"],
+                "--kind",
+                candidate["kind"],
+                "--priority",
+                candidate["priority"],
+            ]
+            for item in candidate["write_allow"]:
+                cmd.extend(["--write-allow", item])
+            for item in candidate["write_deny"]:
+                cmd.extend(["--write-deny", item])
+            for item in candidate["acceptance"]:
+                cmd.extend(["--acceptance", item])
+            for item in candidate["depends_on"]:
+                cmd.extend(["--depends-on", item])
+            lines.append(shlex.join(cmd))
+            lines.extend(["```", ""])
+    if rejected_candidates:
+        lines.append("## Rejected Candidates")
+        lines.append("")
+        for index, candidate in enumerate(rejected_candidates, start=1):
+            lines.extend(
+                [
+                    f"### X{index:03d}: {candidate['title']}",
+                    "",
+                    "Reasons:",
+                    *[f"- {reason}" for reason in normalize_list(candidate.get("reasons"))],
+                    "",
+                ]
+            )
+            raw = str(candidate.get("raw") or "").strip()
+            if raw:
+                lines.extend(["Raw block:", "", "```text", raw, "```", ""])
     return "\n".join(lines)
 
 
@@ -5130,9 +5284,15 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
     if not artifact_path.exists() or not read_text(artifact_path).strip():
         raise HLoopError(f"source artifact not found or empty: {artifact_path}")
     text = read_text(artifact_path)
-    candidates = extract_fix_task_candidates(text, source_id)
+    candidates, rejected_candidates = extract_fix_task_candidates(text, source_id)
     draft_path = triage_draft_file(repo, source_id)
-    draft = render_fix_task_draft(source_type, source_id, artifact_path, candidates)
+    draft = render_fix_task_draft(
+        source_type,
+        source_id,
+        artifact_path,
+        candidates,
+        rejected_candidates,
+    )
     if args.dry_run:
         print(draft)
         return 0
@@ -5142,6 +5302,10 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
         source_state["triage_drafts"].append(str(draft_path))
     created_task_ids: list[str] = []
     if args.create_tasks:
+        if rejected_candidates and not candidates:
+            raise HLoopError(
+                f"no valid fix task candidates for {source_id}; inspect rejected candidates in {draft_path}"
+            )
         existing_created = normalize_list(source_state.get("created_fix_tasks"))
         if existing_created:
             raise HLoopError(
@@ -5175,13 +5339,17 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
         state["phase"] = "dispatching"
     source_state["last_triaged_at"] = now_iso()
     source_state["fix_task_candidate_count"] = len(candidates)
+    source_state["rejected_fix_task_candidate_count"] = len(rejected_candidates)
     save_state(repo, state)
     journal(
         repo,
-        f"Triage draft for `{source_id}` wrote `{draft_path}` with {len(candidates)} candidate(s)"
+        f"Triage draft for `{source_id}` wrote `{draft_path}` with {len(candidates)} valid "
+        f"candidate(s) and {len(rejected_candidates)} rejected candidate(s)"
         + (f" and created tasks: {', '.join(created_task_ids)}" if created_task_ids else "."),
     )
     print(f"wrote {draft_path}")
+    if rejected_candidates:
+        print(f"rejected fix task candidates: {len(rejected_candidates)}")
     if created_task_ids:
         print("created fix tasks: " + ", ".join(created_task_ids))
     elif candidates:

@@ -65,6 +65,7 @@ Rules:
 Required output:
 - .ai/loop/gaps/G001.md
 - include `## Fix Task Candidates`; write `No fix task candidates.` when none are needed
+- each fix task candidate must include `action: fix_task`, `priority` or `severity`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 
 Final terminal line:
 HERDR_LOOP_GAP_DONE:G001:<aligned|gaps-found|blocked|failed>
@@ -99,6 +100,7 @@ Rules:
 Required output:
 - .ai/loop/reviews/R001.md
 - include `## Fix Task Candidates`; write `No fix task candidates.` when none are needed
+- each fix task candidate must include `action: fix_task`, `severity` or `priority`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 
 Final terminal line:
 HERDR_LOOP_REVIEW_DONE:R001:<reported|blocked|failed>

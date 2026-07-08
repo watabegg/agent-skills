@@ -146,6 +146,8 @@ P2 findings create a fix task, accepted risk, or follow-up depending on whether 
 
 P3 findings should not block completion unless the mission explicitly requires them.
 
+`hloop triage` separates valid and rejected Fix Task Candidates. Rejected candidates are written to the triage draft with reasons such as missing `write_allow`, `acceptance`, `rationale`, or invalid priority. Do not rerun with `--create-tasks` expecting rejected candidates to become tasks; either fix the source artifact/candidate block, create a task manually, or record why the finding is not actionable.
+
 Do not mark the loop done only because a review artifact exists. Manager must close the review gate after triage.
 
 Gap findings are not generic review findings. `missing`, `partial`, and `needs-decision` items that affect `MISSION.md` done criteria normally create a fix task or a decision. `obsolete-spec` items should update or explicitly retire the stale plan/spec source before closing the gap gate.

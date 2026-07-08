@@ -18,7 +18,7 @@ The Gap Auditor prompt must say:
 - verify each reported gap against code, generated artifacts, tests, or missing files
 - report plan/spec alignment gaps only; do not duplicate general code review
 - classify each requirement as `implemented`, `partial`, `missing`, `deferred`, `obsolete-spec`, or `needs-decision`
-- include `## Fix Task Candidates` with machine-readable task candidate blocks for missing or partial requirements that should become Worker fix tasks
+- include `## Fix Task Candidates` with machine-readable task candidate blocks for missing or partial requirements that should become Worker fix tasks; each candidate needs `action: fix_task`, `priority` or `severity`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 - after audit is complete, write only `gaps/<gap-id>.md`
 - print `HERDR_LOOP_GAP_DONE:<gap-id>:<aligned|gaps-found|blocked|failed>`
 
