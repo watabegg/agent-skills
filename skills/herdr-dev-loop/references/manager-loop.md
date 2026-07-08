@@ -50,7 +50,9 @@ hloop wait T001 --harvest --timeout-ms 300000
 
 This replaces ad hoc `sleep`, `watch`, and `test -f` polling. `wait` does not hold the loop lock while sleeping; with `--harvest` it takes the lock only for the final harvest transition.
 
-Use `hloop checkpoint --message "ai-loop: ..."` for Manager-owned `.ai/loop` commits. It stages only `.ai/loop` paths by default and excludes prompts and legacy lock files unless explicitly requested. Use `--force` only when intentionally recording ignored loop artifacts such as validation logs.
+Use `hloop batch start "<title>"` when a group of related tasks or review/gap fix tasks should appear as one readable local-history unit. It creates `.ai/loop/batches/BNNN.md` and sets `STATE.json.current_batch_id` unless `--no-current` is used. While a current batch exists, `hloop task new` and triage-created fix tasks attach to it by default.
+
+Use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` for Manager-owned `.ai/loop` commits. It stages only `.ai/loop` paths by default and excludes prompts and legacy lock files unless explicitly requested. `--rollup` amends only when HEAD is an unpushed hloop loop-state checkpoint for the same batch and contains no product paths; otherwise it creates a new checkpoint commit. Use `--force` only when intentionally recording ignored loop artifacts such as validation logs.
 
 ## Default Cadence
 
