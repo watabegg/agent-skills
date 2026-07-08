@@ -97,6 +97,31 @@ def git(repo: Path, args: list[str], check: bool = True) -> str:
     return (proc.stdout or "").strip()
 
 
+def command_error_detail(exc: BaseException) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        return stderr or stdout or str(exc)
+    return str(exc)
+
+
+def is_environment_git_error(detail: str) -> bool:
+    lower = detail.lower()
+    needles = [
+        "read-only file system",
+        "permission denied",
+        "unable to create",
+        "cannot lock",
+        ".lock",
+        "index.lock",
+        "orig_head.lock",
+        "would be overwritten by merge",
+        "no space left on device",
+        "input/output error",
+    ]
+    return any(needle in lower for needle in needles)
+
+
 def repo_root(path: Path) -> Path:
     proc = run_cmd(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
     if proc.returncode != 0:
@@ -106,6 +131,15 @@ def repo_root(path: Path) -> Path:
 
 def loop_path(repo: Path) -> Path:
     return repo / LOOP_DIR
+
+
+def repo_lock_path(repo: Path) -> Path:
+    proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--git-path", "hloop.lock"], check=False)
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "failed to resolve git lock path").strip())
+    raw = (proc.stdout or "").strip()
+    path = Path(raw)
+    return path if path.is_absolute() else (repo / path)
 
 
 def state_path(repo: Path) -> Path:
@@ -134,14 +168,38 @@ def append_text(path: Path, text: str) -> None:
 
 @contextmanager
 def loop_lock(repo: Path):
-    lock_path = loop_path(repo) / "LOCK"
+    lock_path = repo_lock_path(repo)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         try:
+            retire_legacy_loop_lock(repo)
             yield
         finally:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def retire_legacy_loop_lock(repo: Path) -> None:
+    """Best-effort cleanup for the old worktree-visible .ai/loop/LOCK file."""
+    legacy = loop_path(repo) / "LOCK"
+    if not legacy.exists() or not legacy.is_file():
+        return
+    tracked = run_cmd(
+        ["git", "-C", str(repo), "ls-files", "--error-unmatch", str(LOOP_DIR / "LOCK")],
+        check=False,
+    )
+    if tracked.returncode == 0:
+        return
+    try:
+        with legacy.open("r+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                if legacy.stat().st_size == 0:
+                    legacy.unlink()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except (BlockingIOError, OSError):
+        return
 
 
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
@@ -832,8 +890,39 @@ def result_validation_recorded(meta: dict[str, Any]) -> bool:
     return normalize_bool(meta.get("validation_recorded"))
 
 
+def escape_literal_brackets(pattern: str) -> str:
+    pieces = []
+    for char in pattern:
+        if char == "[":
+            pieces.append("[[]")
+        elif char == "]":
+            pieces.append("[]]")
+        else:
+            pieces.append(char)
+    return "".join(pieces)
+
+
+def normalize_match_path(value: str) -> str:
+    value = str(value).replace("\\", "/")
+    if value.startswith("./"):
+        return value[2:]
+    return value
+
+
+def path_matches_pattern(path: str, pattern: str) -> bool:
+    normalized_path = normalize_match_path(path)
+    normalized_pattern = normalize_match_path(pattern)
+    if fnmatch.fnmatchcase(normalized_path, normalized_pattern):
+        return True
+    escaped_pattern = escape_literal_brackets(normalized_pattern)
+    return escaped_pattern != normalized_pattern and fnmatch.fnmatchcase(
+        normalized_path,
+        escaped_pattern,
+    )
+
+
 def matches_any(path: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+    return any(path_matches_pattern(path, pattern) for pattern in patterns)
 
 
 def validate_change_scope(task_id: str, task_meta: dict[str, Any], files: list[str]) -> list[str]:
@@ -842,7 +931,7 @@ def validate_change_scope(task_id: str, task_meta: dict[str, Any], files: list[s
     result_pattern = f".ai/loop/results/{task_id}/**"
     violations = []
     for path in files:
-        allowed = matches_any(path, allow) or fnmatch.fnmatch(path, result_pattern)
+        allowed = matches_any(path, allow) or path_matches_pattern(path, result_pattern)
         denied = matches_any(path, deny)
         if not allowed or denied:
             suffix = "denied" if denied else "not allowed"
@@ -1605,10 +1694,21 @@ def collect_loop_inventory(
             issues.extend(item.get("issues", []))
     issues = sorted(issues, key=issue_sort_key)
     next_actions = []
-    for item in issues:
-        action = item.get("action")
+
+    def add_next_action(action: str) -> None:
         if action and action not in next_actions:
             next_actions.append(action)
+
+    for item in issues:
+        add_next_action(item.get("action", ""))
+    if state.get("needs_gap_check") and not pending_gap_exists(state):
+        add_next_action("hloop gap start")
+    if state.get("needs_review") and not pending_review_exists(state):
+        add_next_action("hloop reviewer start")
+    if last_validation_passed(state) and should_open_gap_gate(state):
+        add_next_action("hloop tick --once # open gap gate")
+    if last_validation_passed(state) and should_open_review_gate(state):
+        add_next_action("hloop tick --once # open review gate")
     running_workers = [item["id"] for item in workers if item.get("status") == "running"]
     running_reviewers = [item["id"] for item in reviewers if item.get("gate_status") == "running"]
     running_gaps = [item["id"] for item in gaps if item.get("gate_status") == "running"]
@@ -2445,6 +2545,27 @@ blocking_questions: []
         normalize_list(result_meta.get("validation_commands")),
         "sample result validation_commands did not parse as a list",
     )
+    check(
+        matches_any("app/[liveId]/page.tsx", ["app/[liveId]/**"]),
+        "write_allow matcher does not treat bracket path segments literally",
+    )
+    parsed_task = build_parser().parse_args(
+        [
+            "task",
+            "new",
+            "demo task",
+            "--write-allow",
+            "app/[liveId]/**",
+            "--validation-minimum",
+            "L1",
+            "--validation-minimum",
+            "local browser QA",
+        ]
+    )
+    check(
+        parsed_task.validation_minimum == ["L1", "local browser QA"],
+        "task new did not preserve repeated --validation-minimum values",
+    )
 
     review_meta = parse_frontmatter_text(
         """---
@@ -3051,6 +3172,12 @@ def cmd_task_new(args: argparse.Namespace) -> int:
     requested_worker_qa_profile = getattr(args, "worker_qa_profile", None) or getattr(
         args, "qa_profile", None
     )
+    validation_minimums = args.validation_minimum or ["L1"]
+    validation_minimum: str | list[str]
+    if len(validation_minimums) == 1:
+        validation_minimum = validation_minimums[0]
+    else:
+        validation_minimum = validation_minimums
     fields = {
         "id": task_id,
         "kind": args.kind,
@@ -3064,7 +3191,7 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         "write_allow": args.write_allow or [],
         "write_deny": args.write_deny or [],
         "acceptance": args.acceptance or ["Task acceptance criteria are satisfied."],
-        "validation_minimum": args.validation_minimum,
+        "validation_minimum": validation_minimum,
         "worker_protocol": args.worker_protocol or state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
         "worker_qa_profile": args_worker_qa_profile(args)
         if requested_worker_qa_profile
@@ -3126,6 +3253,35 @@ def default_gap_worktree(repo: Path, gap_id: str) -> Path:
     return repo.parent / f"{repo.name}.{gap_id.lower()}-gap"
 
 
+def cleanup_hloop_prompt_file(worktree: Path, agent_id: str, suffix: str) -> None:
+    prompt = worktree / LOOP_DIR / "prompts" / f"{agent_id}.{suffix}.md"
+    try:
+        if prompt.exists() or prompt.is_symlink():
+            prompt.unlink()
+        prompts_dir = prompt.parent
+        if prompts_dir.exists():
+            try:
+                prompts_dir.rmdir()
+            except OSError:
+                pass
+    except OSError as exc:
+        raise HLoopError(f"failed to remove generated prompt {prompt}: {exc}") from exc
+
+
+def record_worktree_cleanup_failure(
+    repo: Path,
+    agent_state: dict[str, Any],
+    label: str,
+    exc: BaseException,
+) -> None:
+    detail = command_error_detail(exc)
+    agent_state["worktree_cleanup_status"] = "failed"
+    agent_state["worktree_cleanup_error"] = detail
+    agent_state["worktree_cleanup_failed_at"] = now_iso()
+    journal(repo, f"Failed to remove {label} worktree: {detail}")
+    print(f"warning: failed to remove {label} worktree: {detail}", file=sys.stderr)
+
+
 def ensure_task_visible_in_worktree(worktree: Path, task_id: str) -> None:
     missing = [
         loop_path(worktree) / "MISSION.md",
@@ -3181,6 +3337,7 @@ def cleanup_review_worktree(
     review_state: dict[str, Any],
     *,
     dry_run: bool = False,
+    best_effort: bool = False,
 ) -> None:
     worktree_raw = review_state.get("worktree")
     if not worktree_raw:
@@ -3191,7 +3348,14 @@ def cleanup_review_worktree(
     if dry_run:
         print(f"DRY RUN git worktree remove --force {worktree}")
         return
-    git(repo, ["worktree", "remove", "--force", str(worktree)])
+    try:
+        cleanup_hloop_prompt_file(worktree, review_id, "reviewer")
+        git(repo, ["worktree", "remove", "--force", str(worktree)])
+    except (HLoopError, subprocess.CalledProcessError) as exc:
+        if best_effort:
+            record_worktree_cleanup_failure(repo, review_state, f"Reviewer {review_id}", exc)
+            return
+        raise
     review_state["worktree_cleanup_status"] = "removed"
     review_state["worktree_cleaned_at"] = now_iso()
 
@@ -3202,6 +3366,7 @@ def cleanup_gap_worktree(
     gap_state: dict[str, Any],
     *,
     dry_run: bool = False,
+    best_effort: bool = False,
 ) -> None:
     worktree_raw = gap_state.get("worktree")
     if not worktree_raw:
@@ -3212,7 +3377,14 @@ def cleanup_gap_worktree(
     if dry_run:
         print(f"DRY RUN git worktree remove --force {worktree}")
         return
-    git(repo, ["worktree", "remove", "--force", str(worktree)])
+    try:
+        cleanup_hloop_prompt_file(worktree, gap_id, "gap")
+        git(repo, ["worktree", "remove", "--force", str(worktree)])
+    except (HLoopError, subprocess.CalledProcessError) as exc:
+        if best_effort:
+            record_worktree_cleanup_failure(repo, gap_state, f"Gap Auditor {gap_id}", exc)
+            return
+        raise
     gap_state["worktree_cleanup_status"] = "removed"
     gap_state["worktree_cleaned_at"] = now_iso()
 
@@ -3590,6 +3762,21 @@ def cmd_merge(args: argparse.Namespace) -> int:
                 raise HLoopError(f"no commits to cherry-pick for {task_id}")
             git(repo, ["cherry-pick", *commits])
     except subprocess.CalledProcessError as exc:
+        detail = command_error_detail(exc)
+        if is_environment_git_error(detail):
+            task_state["status"] = "blocked_environment"
+            task_state["merge_error"] = detail
+            state["phase"] = "blocked_environment"
+            state["last_merge_error"] = {"task_id": task_id, "at": now_iso(), "reason": detail}
+            save_state(repo, state)
+            journal(repo, f"Merge for `{task_id}` was blocked by git/environment state: {detail}")
+            append_text(
+                loop_path(repo) / "USER_ACTION_REQUIRED.md",
+                f"\n## Merge environment blocker for {task_id}\n\n"
+                f"Git could not update the integration worktree for `{branch}`:\n\n"
+                f"```text\n{detail}\n```\n",
+            )
+            raise HLoopError(f"merge blocked by git/environment state for {task_id}: {detail}") from exc
         task_state["status"] = "blocked_merge_conflict"
         state["phase"] = "blocked_conflict"
         save_state(repo, state)
@@ -3616,20 +3803,33 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
-def cleanup_task(repo: Path, task_id: str, task_state: dict[str, Any], dry_run: bool = False) -> None:
+def cleanup_task(
+    repo: Path,
+    task_id: str,
+    task_state: dict[str, Any],
+    dry_run: bool = False,
+    best_effort: bool = False,
+) -> None:
     branch = task_state.get("branch")
     worktree_raw = task_state.get("worktree")
     worktree = Path(worktree_raw).resolve() if worktree_raw else default_worktree(repo, task_id)
-    if worktree.exists() and worktree != repo:
-        if dry_run:
-            print(f"DRY RUN git worktree remove {worktree}")
-        else:
-            git(repo, ["worktree", "remove", str(worktree)])
-    if branch and branch_exists(repo, branch):
-        if dry_run:
-            print(f"DRY RUN git branch -D {branch}")
-        else:
-            git(repo, ["branch", "-D", branch])
+    try:
+        if worktree.exists() and worktree != repo:
+            if dry_run:
+                print(f"DRY RUN git worktree remove {worktree}")
+            else:
+                cleanup_hloop_prompt_file(worktree, task_id, "worker")
+                git(repo, ["worktree", "remove", str(worktree)])
+        if branch and branch_exists(repo, branch):
+            if dry_run:
+                print(f"DRY RUN git branch -D {branch}")
+            else:
+                git(repo, ["branch", "-D", branch])
+    except (HLoopError, subprocess.CalledProcessError) as exc:
+        if best_effort:
+            record_worktree_cleanup_failure(repo, task_state, f"Worker {task_id}", exc)
+            return
+        raise
     if not dry_run:
         task_state["cleanup_pending"] = False
         task_state["cleanup_done"] = True
@@ -3646,7 +3846,7 @@ def cleanup_merged_tasks(repo: Path, state: dict[str, Any], dry_run: bool = Fals
                 session_cleanup=str(state.get("session_cleanup", "archive")),
                 dry_run=dry_run,
             )
-            cleanup_task(repo, task_id, task, dry_run=dry_run)
+            cleanup_task(repo, task_id, task, dry_run=dry_run, best_effort=True)
 
 
 def validation_log_rel(state: dict[str, Any], index: int) -> Path:
@@ -3731,7 +3931,8 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
-    worktree = Path(args.worktree).resolve() if args.worktree else default_review_worktree(repo, review_id)
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id)
     prompt = render_reviewer_prompt(review_id, base, head, state)
     prompt_rel = LOOP_DIR / "prompts" / f"{review_id}.reviewer.md"
     review_rel = LOOP_DIR / "reviews" / f"{review_id}.md"
@@ -3760,7 +3961,8 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
-    worktree = Path(args.worktree).resolve() if args.worktree else default_review_worktree(repo, review_id)
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id)
     prompt = render_reviewer_prompt(review_id, base, head, state)
     prompt_path = worktree / prompt_rel
     worktree_review_path = worktree / review_rel
@@ -3879,7 +4081,7 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
         )
         print(f"blocked {review_id}: reviewer changed files outside the review artifact")
         return 2
-    cleanup_review_worktree(repo, review_id, review_state)
+    cleanup_review_worktree(repo, review_id, review_state, best_effort=True)
     state["phase"] = "reviewing"
     save_state(repo, state)
     journal(repo, f"Harvested Reviewer `{review_id}`; Manager triage is required.")
@@ -3907,7 +4109,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
         keep_pane=getattr(args, "keep_pane", False),
         session_cleanup=session_cleanup_mode(args, state),
     )
-    cleanup_review_worktree(repo, review_id, review_state)
+    cleanup_review_worktree(repo, review_id, review_state, best_effort=True)
     review_state["status"] = "triaged"
     review_state["gate_status"] = "triaged"
     review_state["verdict"] = args.verdict
@@ -4019,7 +4221,8 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
-    worktree = Path(args.worktree).resolve() if args.worktree else default_gap_worktree(repo, gap_id)
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = Path(worktree_arg).resolve() if worktree_arg else default_gap_worktree(repo, gap_id)
     spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
         state.get("spec_sources")
     )
@@ -4051,7 +4254,8 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
-    worktree = Path(args.worktree).resolve() if args.worktree else default_gap_worktree(repo, gap_id)
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = Path(worktree_arg).resolve() if worktree_arg else default_gap_worktree(repo, gap_id)
     spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
         state.get("spec_sources")
     )
@@ -4175,7 +4379,7 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
         )
         print(f"blocked {gap_id}: gap auditor changed files outside the gap artifact")
         return 2
-    cleanup_gap_worktree(repo, gap_id, gap_state)
+    cleanup_gap_worktree(repo, gap_id, gap_state, best_effort=True)
     state["phase"] = "gap_checking"
     save_state(repo, state)
     journal(repo, f"Harvested Gap Auditor `{gap_id}`; Manager triage is required.")
@@ -4203,7 +4407,7 @@ def cmd_gap_close(args: argparse.Namespace) -> int:
         keep_pane=getattr(args, "keep_pane", False),
         session_cleanup=session_cleanup_mode(args, state),
     )
-    cleanup_gap_worktree(repo, gap_id, gap_state)
+    cleanup_gap_worktree(repo, gap_id, gap_state, best_effort=True)
     gap_state["status"] = "triaged"
     gap_state["gate_status"] = "triaged"
     gap_state["verdict"] = args.verdict
@@ -4481,7 +4685,7 @@ def cmd_triage_gap(args: argparse.Namespace) -> int:
 def write_sets_overlap(a: list[str], b: list[str]) -> bool:
     for left in a:
         for right in b:
-            if left == right or fnmatch.fnmatch(left, right) or fnmatch.fnmatch(right, left):
+            if left == right or path_matches_pattern(left, right) or path_matches_pattern(right, left):
                 return True
     return False
 
@@ -4594,6 +4798,31 @@ def cmd_tick(args: argparse.Namespace) -> int:
         print("review triage required")
         return 0
 
+    if (
+        state.get("needs_gap_check")
+        and int(state.get("max_gap_auditors", DEFAULT_MAX_GAP_AUDITORS)) > 0
+        and not pending_gap_exists(state)
+    ):
+        args.gap_id = None
+        args.base = None
+        args.head = None
+        args.spec_source = None
+        args.worktree = None
+        args.runner = args.gap_runner
+        return cmd_gap_start(args)
+
+    if (
+        state.get("needs_review")
+        and int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) > 0
+        and not pending_review_exists(state)
+    ):
+        args.review_id = None
+        args.base = None
+        args.head = None
+        args.worktree = None
+        args.runner = args.reviewer_runner
+        return cmd_reviewer_start(args)
+
     running_count = sum(1 for t in state.get("tasks", {}).values() if t.get("status") == "running")
     max_workers = args.max_workers or state.get("max_workers", DEFAULT_MAX_WORKERS)
     slots = max(0, max_workers - running_count)
@@ -4620,29 +4849,6 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if started:
         print(f"started workers: {', '.join(started)}")
         return 0
-
-    if (
-        state.get("needs_gap_check")
-        and int(state.get("max_gap_auditors", DEFAULT_MAX_GAP_AUDITORS)) > 0
-        and not pending_gap_exists(state)
-    ):
-        args.gap_id = None
-        args.base = None
-        args.head = None
-        args.spec_source = None
-        args.runner = args.gap_runner
-        return cmd_gap_start(args)
-
-    if (
-        state.get("needs_review")
-        and int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) > 0
-        and not pending_review_exists(state)
-    ):
-        args.review_id = None
-        args.base = None
-        args.head = None
-        args.runner = args.reviewer_runner
-        return cmd_reviewer_start(args)
 
     if state.get("needs_gap_check") and running_gap_exists(state):
         wait_ms = gap_wait_ms(args, state)
@@ -5041,7 +5247,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     task_new.add_argument("--write-deny", action="append")
     task_new.add_argument("--acceptance", action="append")
-    task_new.add_argument("--validation-minimum", default="L1")
+    task_new.add_argument("--validation-minimum", action="append")
     task_new.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS))
     task_new.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
     task_new.add_argument(

@@ -13,6 +13,12 @@
     "write_allow": {"type": "array", "items": {"type": "string"}},
     "write_deny": {"type": "array", "items": {"type": "string"}},
     "acceptance": {"type": "array", "items": {"type": "string"}},
+    "validation_minimum": {
+      "oneOf": [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string"}, "minItems": 1}
+      ]
+    },
     "worker_protocol": {"type": "string", "enum": ["native", "codex-impl"]},
     "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
     "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."}
