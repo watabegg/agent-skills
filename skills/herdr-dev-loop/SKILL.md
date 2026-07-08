@@ -18,21 +18,26 @@ Before starting or continuing a loop:
 3. After installing or updating this skill, run `python3 <this-skill>/scripts/hloop selftest`.
 4. Confirm `herdr`, `codex`, and `git` are available. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
 5. Read the current `.ai/loop/MISSION.md`, `.ai/loop/PLAN.md`, `.ai/loop/PROFILE.md`, `.ai/loop/STATE.json`, and `.ai/loop/DECISIONS.md` if they exist.
-6. Continue from disk state, not from thread memory.
+6. Run `python3 <this-skill>/scripts/hloop dashboard` or `conductor --no-fail` when resuming an existing loop so pane/worktree/artifact drift is visible before mutating state.
+7. Continue from disk state, not from thread memory.
 
 If `HERDR_ENV=1` is absent, stop and tell the user this skill requires Herdr.
+
+Use the absolute helper path when `hloop` is not installed on `PATH`. A missing bare `hloop` command is not a reason to recreate Worker, Reviewer, Gap Auditor, merge, validation, or triage behavior by hand.
 
 ## Quick Start
 
 Use the helper script instead of hand-typing pane prompts:
 
 ```bash
-python3 <this-skill>/scripts/hloop selftest
-python3 <this-skill>/scripts/hloop doctor
-python3 <this-skill>/scripts/hloop init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
-python3 <this-skill>/scripts/hloop task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
+HLOOP="python3 <this-skill>/scripts/hloop"
+$HLOOP selftest
+$HLOOP doctor
+$HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
+$HLOOP task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 git add .ai/loop && git commit -m "ai-loop: initialize goal"
-python3 <this-skill>/scripts/hloop pump --max-transitions 20 --max-workers 3
+$HLOOP dashboard
+$HLOOP pump --max-transitions 20 --max-workers 3
 ```
 
 Use `tick --once` for one material transition when inspecting a new repository. Use `pump` after the loop is stable; it repeatedly runs safe tick transitions until it reaches triage, blocked, done, or the transition limit. Add `--stop-on-waiting` when Manager wants to pause as soon as all currently safe transitions are exhausted.
@@ -41,9 +46,15 @@ The script is deliberately explicit. Use `--dry-run` on `worker start`, `gap sta
 
 Mutating `hloop` commands enforce their own preflight. `pump`, `tick`, `worker start`, `worker harvest`, `merge`, `validate`, `triage`, `gap start`, `gap harvest`, `reviewer start`, and `reviewer harvest` check the relevant Herdr environment, current branch, required commands, and non-loop dirty files before changing state.
 
+Treat every mutating `hloop` command as a serialized state transaction. The helper takes a `.ai/loop/LOCK`, but Manager should still avoid launching multiple mutating `hloop` commands in parallel. Parallelize reads, not loop-state writes.
+
 Worker, Gap Auditor, and Reviewer agents default to interactive Codex TUI panes so the Manager can inspect progress, add requirements, or interrupt them in Herdr. Gap Auditors and Reviewers run in detached worktrees with `workspace-write` sandbox so the final Markdown artifact can be written reliably; the prompt and harvest guard still forbid code edits. Override with `--runner exec` only when non-interactive work is intentionally preferred.
 
 When sending additional instructions to a running TUI, use `hloop worker message <task-id> --file <prompt.md>`, `hloop gap message <gap-id> --file <prompt.md>`, or `hloop reviewer message <review-id> --file <prompt.md>`. Do not send prompts directly with `herdr pane run` unless you have manually verified the pane is a ready Codex TUI. The helper blocks common mistakes: shell panes, pending Codex trust prompts, and busy Codex sessions. It sends via `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered; if the first Enter races the TUI, it retries.
+
+Inspect running agents with `hloop worker watch <task-id>`, `hloop gap watch <gap-id>`, or `hloop reviewer watch <review-id>`. Use direct `herdr pane read` only for debugging the helper itself.
+
+Use `hloop dashboard` for the Manager's one-screen view of phase, queues, running agents, panes, artifacts, and next actions. Use `hloop conductor` when investigating stuck sessions; it reports P0/P1 attention items such as missing panes, blocked Codex prompts, reported review/gap artifacts needing triage, non-loop dirty files, and branch mismatches. Add `--no-fail` when the command is informational and should not return non-zero.
 
 After a Worker, Gap Auditor, or Reviewer artifact is harvested, close its Herdr pane and archive its captured Codex session unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
 
@@ -94,6 +105,8 @@ Gap Auditor owns:
 
 Do not let Workers edit `STATE.json`, `MISSION.md`, `PLAN.md`, `PROFILE.md`, `DECISIONS.md`, other task files, or other result files.
 
+Do not let Manager edit a Worker result to turn `partial`, `blocked`, or `failed` into `done`. If a Worker cannot commit or reports `partial`, stop, record the blocker, rerun or create a fix task. Do not spoof `head_sha`, commit metadata, validation results, or QA status to pass a gate.
+
 ## Loop
 
 Run bounded ticks:
@@ -137,6 +150,8 @@ Default protocols are native to this skill:
 Use `.ai/loop/PROFILE.md` to adapt the loop to product reality. `branch_strategy: integration` enables the built-in integration-branch flow. `pr-per-task` and `custom` require Manager to record the exact handoff in `PLAN.md` and avoid assuming the default merge/publish steps. `worker_qa_profile` is the QA each Worker must record for its task; `manager_qa_profile` is the separate final QA gate Manager records in `qa/FINAL.md` after integration/review/gap gates.
 
 Assume Gap Auditor and Reviewer runs can take several minutes. Use `hloop gap watch <gap-id>` or `hloop reviewer watch <review-id>` to inspect the TUI pane. If an auditor or reviewer is still running, wait up to `gap_wait_ms` or `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting, continue Manager work that does not mutate the inspected integration head: refine tasks, prepare validation notes, harvest finished Workers, create fix tasks from already triaged findings, or dispatch non-overlapping queued Workers up to `max_workers`.
+
+Before manually intervening in a running loop, run `hloop conductor --no-fail`. If it reports a missing pane, blocked prompt, idle agent without artifact, ready artifact, or branch mismatch, resolve that explicit condition through the relevant `hloop ... watch`, `message`, `harvest`, `triage`, or branch command instead of replacing the loop with ad hoc Herdr/Codex commands.
 
 ## References
 

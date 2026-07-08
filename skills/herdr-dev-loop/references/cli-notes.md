@@ -4,6 +4,17 @@ These notes describe the local command assumptions used by `scripts/hloop`. Re-c
 
 `hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility skills; native HLoop Worker and Reviewer protocols do not require them. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
 
+`hloop` is not assumed to be installed on `PATH`. Prefer an explicit shell variable in every Manager session:
+
+```bash
+HLOOP="python3 /absolute/path/to/herdr-dev-loop/scripts/hloop"
+$HLOOP doctor
+```
+
+If bare `hloop` fails with `command not found`, keep using the absolute helper path. Do not switch to hand-written Herdr/Codex orchestration for loop mutations.
+
+Mutating helper commands take `.ai/loop/LOCK` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
+
 ## Herdr
 
 Required commands:
@@ -49,6 +60,7 @@ The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Revie
 Use this while a gap audit or review is running:
 
 ```bash
+python3 <skill>/scripts/hloop worker watch T001 --lines 120
 python3 <skill>/scripts/hloop gap watch G001 --lines 120
 python3 <skill>/scripts/hloop reviewer watch R001 --lines 120
 ```
@@ -90,6 +102,29 @@ hloop init ... --branch-strategy integration --worker-protocol native --review-p
 
 Run `hloop selftest` after updating or installing the skill. It does not require `HERDR_ENV=1`; it checks skill-local frontmatter, agent metadata, JSON schemas, sample artifact parsing, and required field drift between `artifact-contract.md` and `state.schema.json`.
 
+Use `dashboard` for the Manager's live status view:
+
+```bash
+hloop status
+hloop status --json
+hloop status --raw-state
+hloop dashboard
+hloop dashboard --json
+```
+
+`status --json` emits a loop inventory object with `loop`, `counts`, `workers`, `reviewers`, `gaps`, `issues`, and `next_actions`. Use `--raw-state` only when a consumer needs the literal `.ai/loop/STATE.json` document.
+
+Use `conductor` when a loop feels stuck or when resuming a long-running Herdr workspace:
+
+```bash
+hloop conductor
+hloop conductor --no-fail
+hloop conductor --json
+hloop doctor --sessions --json
+```
+
+`conductor` is read-only. It inspects `STATE.json`, git branch/dirty state, known worktrees, artifacts, and Herdr pane status when `HERDR_ENV=1`. It returns non-zero when P0/P1 attention items exist unless `--no-fail` is passed. Typical findings are missing panes for running agents, Codex trust prompts, idle panes without artifacts, ready artifacts that should be harvested, review/gap artifacts that need triage, branch mismatches, and non-loop dirty files.
+
 `review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
 
 Use `pump` for queue-drain behavior:
@@ -97,6 +132,8 @@ Use `pump` for queue-drain behavior:
 ```bash
 hloop pump --max-transitions 20 --max-workers 3 --stop-on-triage
 ```
+
+Use the same explicit `$HLOOP` variable when bare `hloop` is not on `PATH`.
 
 Use `triage` to turn machine-readable `Fix Task Candidates` into a Manager-readable draft, and only then create queued fix tasks:
 
