@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import fcntl
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,7 @@ DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
 REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
 GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
+ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
 
 class HLoopError(RuntimeError):
@@ -111,13 +114,44 @@ def read_text(path: Path) -> str:
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def append_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(text)
+
+
+@contextmanager
+def loop_lock(repo: Path):
+    lock_path = loop_path(repo) / "LOCK"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def command_requires_loop_lock(args: argparse.Namespace) -> bool:
+    command = getattr(args, "command", "")
+    if command in {"init", "merge", "validate", "qa", "tick", "pump", "report"}:
+        return True
+    if command == "task":
+        return getattr(args, "task_command", "") == "new"
+    if command == "worker":
+        return getattr(args, "worker_command", "") in {"start", "harvest", "message"}
+    if command == "reviewer":
+        return getattr(args, "reviewer_command", "") in {"start", "harvest", "close", "message"}
+    if command == "gap":
+        return getattr(args, "gap_command", "") in {"start", "harvest", "close", "message"}
+    if command == "triage":
+        return not bool(getattr(args, "dry_run", False))
+    return False
 
 
 def load_state(repo: Path) -> dict[str, Any]:
@@ -880,6 +914,582 @@ def preflight_loop(
     return state
 
 
+def make_issue(
+    severity: str,
+    code: str,
+    subject: str,
+    message: str,
+    action: str = "",
+) -> dict[str, str]:
+    return {
+        "severity": severity,
+        "code": code,
+        "subject": subject,
+        "message": message,
+        "action": action,
+    }
+
+
+def issue_sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
+    return (
+        ISSUE_SEVERITY_RANK.get(str(item.get("severity") or "P3"), 3),
+        str(item.get("subject") or ""),
+        str(item.get("code") or ""),
+    )
+
+
+def safe_current_branch(repo: Path) -> str:
+    try:
+        return current_branch(repo)
+    except HLoopError:
+        return ""
+
+
+def safe_short_sha(repo: Path, ref: str) -> str:
+    if not ref:
+        return ""
+    proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--short", ref], check=False)
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def safe_porcelain_paths(repo: Path) -> list[str]:
+    try:
+        return porcelain_paths(repo)
+    except HLoopError:
+        return []
+
+
+def safe_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.exists():
+        return {}, "missing"
+    try:
+        text = read_text(path)
+    except HLoopError as exc:
+        return {}, f"read-error:{exc}"
+    if not text.strip():
+        return {}, "empty"
+    return parse_frontmatter_text(text), "present"
+
+
+def safe_result_commit_state(worktree: Path, task_id: str, head_sha: str) -> str:
+    rel = (LOOP_DIR / "results" / task_id / "result.md").as_posix()
+    disk_path = worktree / rel
+    if not disk_path.exists():
+        return "missing"
+    resolved_head = head_sha
+    if not resolved_head or resolved_head == "HEAD":
+        proc = run_cmd(["git", "-C", str(worktree), "rev-parse", "HEAD"], check=False)
+        if proc.returncode != 0:
+            return "head-unreadable"
+        resolved_head = (proc.stdout or "").strip()
+    proc = run_cmd(["git", "-C", str(worktree), "show", f"{resolved_head}:{rel}"], check=False)
+    if proc.returncode != 0:
+        return "not-committed"
+    try:
+        disk = read_text(disk_path)
+    except HLoopError:
+        return "disk-unreadable"
+    return "committed" if (proc.stdout or "") == disk else "mismatch"
+
+
+def pane_marker(role: str, agent_id: str) -> str:
+    if role == "worker":
+        return f"HERDR_LOOP_TASK_DONE:{agent_id}:"
+    if role == "reviewer":
+        return f"HERDR_LOOP_REVIEW_DONE:{agent_id}:"
+    if role == "gap":
+        return f"HERDR_LOOP_GAP_DONE:{agent_id}:"
+    return ""
+
+
+def pane_snapshot(
+    pane_id: str,
+    *,
+    role: str,
+    agent_id: str,
+    lines: int = 80,
+    include_output: bool = False,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "pane_id": pane_id,
+        "available": False,
+        "present": False,
+        "signals": [],
+    }
+    if not pane_id:
+        snapshot["reason"] = "none"
+        return snapshot
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        snapshot["reason"] = "not-in-herdr"
+        return snapshot
+    snapshot["available"] = True
+    info = pane_info(pane_id)
+    if info is None:
+        snapshot["reason"] = "missing-or-closed"
+        return snapshot
+    snapshot["present"] = True
+    snapshot["agent"] = info.get("agent", "")
+    snapshot["agent_status"] = info.get("agent_status", "unknown")
+    session_id = extract_agent_session_id(info)
+    if session_id:
+        snapshot["codex_session_id"] = session_id
+    text = pane_text(pane_id, max(1, lines))
+    marker = pane_marker(role, agent_id)
+    signals: list[str] = []
+    if marker and marker in text:
+        signals.append("done-marker")
+    if "Do you trust the contents of this directory?" in text:
+        signals.append("trust-prompt")
+    if "Press enter to continue" in text:
+        signals.append("press-enter")
+    if "esc to interrupt" in text or "• Working" in text:
+        signals.append("working-text")
+    if "command not found" in text and "hloop" in text:
+        signals.append("hloop-command-not-found")
+    if include_output:
+        snapshot["output_tail"] = text
+    snapshot["signals"] = signals
+    return snapshot
+
+
+def pane_issue_for_running(
+    role: str,
+    agent_id: str,
+    pane: dict[str, Any],
+) -> dict[str, str] | None:
+    subject = f"{role}:{agent_id}"
+    pane_id = str(pane.get("pane_id") or "")
+    watch_cmd = f"hloop {role} watch {agent_id}" if role != "worker" else f"hloop worker watch {agent_id}"
+    if pane_id and pane.get("reason") == "not-in-herdr":
+        return None
+    if pane_id and not pane.get("present"):
+        return make_issue(
+            "P1",
+            "pane-missing",
+            subject,
+            f"Running {role} has no readable Herdr pane: {pane_id}",
+            f"Check artifact/worktree, then harvest or restart {agent_id}.",
+        )
+    signals = set(normalize_list(pane.get("signals")))
+    if "trust-prompt" in signals:
+        return make_issue(
+            "P1",
+            "codex-trust-prompt",
+            subject,
+            f"{role} pane is waiting at the Codex trust prompt.",
+            f"Inspect with `{watch_cmd}` and resolve the trust prompt before continuing.",
+        )
+    if "press-enter" in signals:
+        return make_issue(
+            "P2",
+            "codex-press-enter",
+            subject,
+            f"{role} pane appears to be waiting for Enter.",
+            f"Inspect with `{watch_cmd}` before sending follow-up instructions.",
+        )
+    status = str(pane.get("agent_status") or "")
+    if status in {"blocked", "error", "failed"}:
+        return make_issue(
+            "P1",
+            "agent-blocked",
+            subject,
+            f"{role} pane agent_status is `{status}`.",
+            f"Inspect with `{watch_cmd}` and send a Manager message or restart if needed.",
+        )
+    if status in {"idle", "done", "complete"}:
+        return make_issue(
+            "P2",
+            "agent-idle",
+            subject,
+            f"{role} pane is `{status}` but no artifact has been harvested yet.",
+            f"Inspect with `{watch_cmd}` and harvest if the artifact exists.",
+        )
+    return None
+
+
+def worktree_state(path_raw: Any) -> dict[str, Any]:
+    if not path_raw:
+        return {"path": "", "exists": False}
+    path = Path(str(path_raw)).resolve()
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "dirty_files": safe_porcelain_paths(path) if path.exists() else [],
+    }
+
+
+def collect_worker_inventory(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task: dict[str, Any],
+    *,
+    probe_panes: bool,
+    lines: int,
+    include_output: bool,
+) -> dict[str, Any]:
+    status = str(task.get("status") or "")
+    branch = str(task.get("branch") or "")
+    worktree_raw = task.get("worktree") or (
+        str(default_worktree(repo, task_id)) if status in {"running", "result_reported"} else ""
+    )
+    worktree = worktree_state(worktree_raw)
+    artifact_path = result_file(Path(worktree["path"]), task_id) if worktree["path"] else result_file(default_worktree(repo, task_id), task_id)
+    artifact_meta, artifact_state = safe_frontmatter(artifact_path)
+    artifact: dict[str, Any] = {
+        "path": str(artifact_path),
+        "state": artifact_state,
+        "exists": artifact_state == "present",
+        "status": str(artifact_meta.get("status") or task.get("result_status") or ""),
+        "merge_ready": normalize_bool(artifact_meta.get("merge_ready", task.get("merge_ready"))),
+        "validation_recorded": normalize_bool(
+            artifact_meta.get("validation_recorded", task.get("validation_recorded"))
+        ),
+    }
+    if worktree["exists"] and artifact["exists"]:
+        artifact["commit_state"] = safe_result_commit_state(
+            Path(worktree["path"]),
+            task_id,
+            str(artifact_meta.get("head_sha") or task.get("head_sha") or "HEAD"),
+        )
+    pane_id = str(task.get("pane_id") or "")
+    pane = (
+        pane_snapshot(
+            pane_id,
+            role="worker",
+            agent_id=task_id,
+            lines=lines,
+            include_output=include_output,
+        )
+        if probe_panes
+        else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
+    )
+    issues: list[dict[str, str]] = []
+    if status == "running":
+        if artifact["exists"]:
+            issues.append(
+                make_issue(
+                    "P2",
+                    "worker-result-ready",
+                    f"worker:{task_id}",
+                    f"Worker result artifact exists for running task {task_id}.",
+                    f"hloop worker harvest {task_id}",
+                )
+            )
+        else:
+            pane_issue = pane_issue_for_running("worker", task_id, pane)
+            if pane_issue:
+                issues.append(pane_issue)
+    if status == "result_reported":
+        if artifact.get("commit_state") in {"not-committed", "mismatch"}:
+            issues.append(
+                make_issue(
+                    "P1",
+                    "worker-result-not-committed",
+                    f"worker:{task_id}",
+                    f"Worker result commit state is `{artifact.get('commit_state')}`.",
+                    f"Ask Worker {task_id} to commit the result artifact before merge.",
+                )
+            )
+        elif artifact["merge_ready"]:
+            issues.append(
+                make_issue(
+                    "P2",
+                    "worker-merge-ready",
+                    f"worker:{task_id}",
+                    f"Worker {task_id} is merge-ready.",
+                    f"hloop merge {task_id}",
+                )
+            )
+        else:
+            issues.append(
+                make_issue(
+                    "P1",
+                    "worker-result-not-merge-ready",
+                    f"worker:{task_id}",
+                    f"Worker {task_id} reported a result that is not merge-ready.",
+                    "Create a fix task, rerun the Worker, or record the blocker.",
+                )
+            )
+    if status in {"partial", "blocked", "failed", "abandoned"}:
+        issues.append(
+            make_issue(
+                "P1",
+                "worker-terminal-not-merged",
+                f"worker:{task_id}",
+                f"Worker {task_id} ended with status `{status}`.",
+                "Create a fix task, rerun the Worker, or record the blocker.",
+            )
+        )
+    return {
+        "id": task_id,
+        "role": "worker",
+        "status": status,
+        "branch": branch,
+        "branch_exists": branch_exists(repo, branch) if branch else False,
+        "worktree": worktree,
+        "pane": pane,
+        "artifact": artifact,
+        "merge_ready": normalize_bool(task.get("merge_ready")),
+        "validation_recorded": normalize_bool(task.get("validation_recorded")),
+        "issues": issues,
+    }
+
+
+def collect_gate_inventory(
+    repo: Path,
+    agent_id: str,
+    agent: dict[str, Any],
+    *,
+    role: str,
+    probe_panes: bool,
+    lines: int,
+    include_output: bool,
+) -> dict[str, Any]:
+    status = str(agent.get("status") or "")
+    gate_status = agent_gate_status(agent)
+    artifact_path = (
+        review_artifact_path(repo, agent_id, agent)
+        if role == "reviewer"
+        else gap_artifact_path(repo, agent_id, agent)
+    )
+    artifact_meta, artifact_state = safe_frontmatter(artifact_path)
+    pane_id = str(agent.get("pane_id") or "")
+    pane = (
+        pane_snapshot(
+            pane_id,
+            role=role,
+            agent_id=agent_id,
+            lines=lines,
+            include_output=include_output,
+        )
+        if probe_panes
+        else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
+    )
+    issues: list[dict[str, str]] = []
+    gate_name = "review" if role == "reviewer" else "gap"
+    if gate_status == "running":
+        if artifact_state == "present":
+            issues.append(
+                make_issue(
+                    "P2",
+                    f"{gate_name}-artifact-ready",
+                    f"{role}:{agent_id}",
+                    f"{role} artifact exists and can be harvested.",
+                    f"hloop {gate_name if role == 'gap' else 'reviewer'} harvest {agent_id}",
+                )
+            )
+        else:
+            pane_issue = pane_issue_for_running(role, agent_id, pane)
+            if pane_issue:
+                issues.append(pane_issue)
+    if gate_status == "reported":
+        issues.append(
+            make_issue(
+                "P1",
+                f"{gate_name}-triage-required",
+                f"{role}:{agent_id}",
+                f"{role} {agent_id} has been harvested and needs Manager triage.",
+                f"hloop triage {gate_name} {agent_id}",
+            )
+        )
+    if gate_status == "blocked_write_scope":
+        issues.append(
+            make_issue(
+                "P1",
+                f"{gate_name}-write-scope-violation",
+                f"{role}:{agent_id}",
+                f"{role} {agent_id} changed files outside its artifact.",
+                "Inspect USER_ACTION_REQUIRED.md and the detached worktree before closing the gate.",
+            )
+        )
+    worktree = worktree_state(agent.get("worktree"))
+    return {
+        "id": agent_id,
+        "role": role,
+        "status": status,
+        "gate_status": gate_status,
+        "artifact_status": str(agent.get("artifact_status") or artifact_meta.get("status") or ""),
+        "base": str(agent.get("base") or ""),
+        "head": str(agent.get("head") or ""),
+        "worktree": worktree,
+        "pane": pane,
+        "artifact": {
+            "path": str(artifact_path),
+            "state": artifact_state,
+            "exists": artifact_state == "present",
+            "frontmatter": artifact_meta,
+        },
+        "issues": issues,
+    }
+
+
+def collect_loop_inventory(
+    repo: Path,
+    *,
+    probe_panes: bool = True,
+    lines: int = 80,
+    include_output: bool = False,
+) -> dict[str, Any]:
+    state = load_state(repo)
+    current = safe_current_branch(repo)
+    integration = str(state.get("integration_branch") or "")
+    base = str(state.get("base_branch") or "")
+    unsafe_dirty = unsafe_dirty_paths(repo, allow_loop_dirty=True)
+    issues: list[dict[str, str]] = []
+    if unsafe_dirty:
+        issues.append(
+            make_issue(
+                "P1",
+                "non-loop-dirty-files",
+                "repo",
+                "Working tree has non-loop dirty files: " + ", ".join(unsafe_dirty),
+                "Commit/stash/revert unrelated files before mutating the loop.",
+            )
+        )
+    if integration and current and current != integration:
+        issues.append(
+            make_issue(
+                "P1",
+                "integration-branch-mismatch",
+                "repo",
+                f"Current branch is `{current}`, expected integration branch `{integration}`.",
+                f"git switch {integration}",
+            )
+        )
+    if state.get("blocking_decisions"):
+        issues.append(
+            make_issue(
+                "P1",
+                "blocking-decisions",
+                "state",
+                "STATE.json contains blocking decisions.",
+                "Update DECISIONS.md and USER_ACTION_REQUIRED.md before dispatching new work.",
+            )
+        )
+    phase = str(state.get("phase") or "")
+    if phase in {"blocked_user_decision", "blocked_environment", "blocked_conflict", "failed_validation", "failed_manager_qa", "no_progress"}:
+        issues.append(
+            make_issue(
+                "P1",
+                "blocked-phase",
+                "state",
+                f"Loop phase is `{phase}`.",
+                "Inspect JOURNAL.md, USER_ACTION_REQUIRED.md, and hloop dashboard output.",
+            )
+        )
+    workers = [
+        collect_worker_inventory(
+            repo,
+            state,
+            task_id,
+            task,
+            probe_panes=probe_panes,
+            lines=lines,
+            include_output=include_output,
+        )
+        for task_id, task in state.get("tasks", {}).items()
+    ]
+    reviewers = [
+        collect_gate_inventory(
+            repo,
+            review_id,
+            review,
+            role="reviewer",
+            probe_panes=probe_panes,
+            lines=lines,
+            include_output=include_output,
+        )
+        for review_id, review in state.get("reviews", {}).items()
+    ]
+    gaps = [
+        collect_gate_inventory(
+            repo,
+            gap_id,
+            gap,
+            role="gap",
+            probe_panes=probe_panes,
+            lines=lines,
+            include_output=include_output,
+        )
+        for gap_id, gap in state.get("gaps", {}).items()
+    ]
+    for collection in (workers, reviewers, gaps):
+        for item in collection:
+            issues.extend(item.get("issues", []))
+    issues = sorted(issues, key=issue_sort_key)
+    next_actions = []
+    for item in issues:
+        action = item.get("action")
+        if action and action not in next_actions:
+            next_actions.append(action)
+    running_workers = [item["id"] for item in workers if item.get("status") == "running"]
+    running_reviewers = [item["id"] for item in reviewers if item.get("gate_status") == "running"]
+    running_gaps = [item["id"] for item in gaps if item.get("gate_status") == "running"]
+    inventory = {
+        "repo": str(repo),
+        "generated_at": now_iso(),
+        "loop": {
+            "goal_id": state.get("goal_id"),
+            "phase": phase,
+            "cycle": state.get("cycle", 0),
+            "base_branch": base,
+            "base_sha": safe_short_sha(repo, base),
+            "integration_branch": integration,
+            "integration_sha": safe_short_sha(repo, integration),
+            "current_branch": current,
+            "branch_strategy": state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY),
+            "worker_protocol": state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
+            "review_protocol": state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL),
+            "worker_qa_profile": state_worker_qa_profile(state),
+            "manager_qa_profile": state_manager_qa_profile(state),
+            "manager_qa_status": state.get("manager_qa_status", ""),
+            "needs_validation": normalize_bool(state.get("needs_validation")),
+            "needs_review": normalize_bool(state.get("needs_review")),
+            "needs_gap_check": normalize_bool(state.get("needs_gap_check")),
+            "review_queue": {
+                "count": normalize_int(state.get("unreviewed_merge_count"), 0),
+                "threshold": review_after_merges(state),
+            },
+            "gap_queue": {
+                "count": normalize_int(state.get("ungapped_merge_count"), 0),
+                "threshold": gap_after_merges(state),
+            },
+        },
+        "counts": {
+            "workers": len(workers),
+            "workers_running": len(running_workers),
+            "workers_queued": sum(1 for item in workers if item.get("status") == "queued"),
+            "workers_merge_ready": sum(
+                1 for item in workers if item.get("status") == "result_reported" and item.get("artifact", {}).get("merge_ready")
+            ),
+            "reviewers": len(reviewers),
+            "reviewers_running": len(running_reviewers),
+            "reviewers_reported": sum(1 for item in reviewers if item.get("gate_status") == "reported"),
+            "gaps": len(gaps),
+            "gaps_running": len(running_gaps),
+            "gaps_reported": sum(1 for item in gaps if item.get("gate_status") == "reported"),
+            "issues": len(issues),
+            "p0_p1_issues": sum(1 for item in issues if item.get("severity") in {"P0", "P1"}),
+        },
+        "workers": workers,
+        "reviewers": reviewers,
+        "gaps": gaps,
+        "issues": issues,
+        "next_actions": next_actions,
+        "herdr": {
+            "available": os.environ.get("HERDR_ENV") == "1" and command_exists("herdr"),
+            "HERDR_ENV": os.environ.get("HERDR_ENV"),
+            "HERDR_PANE_ID": os.environ.get("HERDR_PANE_ID"),
+            "HERDR_WORKSPACE_ID": os.environ.get("HERDR_WORKSPACE_ID"),
+        },
+        "state": state,
+    }
+    return inventory
+
+
 def validate_reviewer_worktree_scope(
     review_id: str,
     review_state: dict[str, Any],
@@ -1467,6 +2077,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             checks["current_pane_id"] = extract_pane_id(current)
         except HLoopError as exc:
             checks["herdr_error"] = str(exc)
+    if getattr(args, "sessions", False):
+        try:
+            checks["loop_inventory"] = collect_loop_inventory(
+                repo,
+                probe_panes=True,
+                lines=getattr(args, "session_lines", 80),
+                include_output=False,
+            )
+        except HLoopError as exc:
+            checks["warnings"].append(f"session inventory unavailable: {exc}")
     herdr_skill_ok = checks["skills"]["herdr"]["exists"] or not args.strict_skills
     ok = checks["HERDR_ENV"] == "1" and all(checks["commands"].values()) and herdr_skill_ok
     checks["ok"] = ok
@@ -1917,55 +2537,194 @@ None.
 
 def cmd_status(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
-    state = load_state(repo)
-    if args.json:
+    if getattr(args, "raw_state", False):
+        state = load_state(repo)
         print(json.dumps(state, ensure_ascii=False, indent=2))
         return 0
-    print(f"goal_id: {state.get('goal_id')}")
-    print(f"phase: {state.get('phase')}")
-    print(f"base: {state.get('base_branch')}")
-    print(f"integration: {state.get('integration_branch')}")
-    print(f"current_branch: {current_branch(repo)}")
-    print(f"branch_strategy: {state_value(state, 'branch_strategy', DEFAULT_BRANCH_STRATEGY)}")
-    print(f"worker_protocol: {state_value(state, 'worker_protocol', DEFAULT_WORKER_PROTOCOL)}")
-    print(f"review_protocol: {state_value(state, 'review_protocol', DEFAULT_REVIEW_PROTOCOL)}")
-    print(f"worker_qa_profile: {state_worker_qa_profile(state)}")
-    print(f"manager_qa_profile: {state_manager_qa_profile(state)}")
-    print(f"manager_qa_status: {state.get('manager_qa_status', '')}")
+    inventory = collect_loop_inventory(
+        repo,
+        probe_panes=not getattr(args, "no_pane_probe", False),
+        lines=getattr(args, "lines", 80),
+        include_output=False,
+    )
+    if args.json:
+        print(json.dumps(inventory, ensure_ascii=False, indent=2))
+        return 0
+    loop = inventory["loop"]
+    counts = inventory["counts"]
+    print(f"goal_id: {loop.get('goal_id')}")
+    print(f"phase: {loop.get('phase')}")
+    print(f"base: {loop.get('base_branch')} {loop.get('base_sha')}")
+    print(f"integration: {loop.get('integration_branch')} {loop.get('integration_sha')}")
+    print(f"current_branch: {loop.get('current_branch')}")
+    print(f"branch_strategy: {loop.get('branch_strategy')}")
+    print(f"worker_protocol: {loop.get('worker_protocol')}")
+    print(f"review_protocol: {loop.get('review_protocol')}")
+    print(f"worker_qa_profile: {loop.get('worker_qa_profile')}")
+    print(f"manager_qa_profile: {loop.get('manager_qa_profile')}")
+    print(f"manager_qa_status: {loop.get('manager_qa_status')}")
     print(
         "review_queue: "
-        f"{normalize_int(state.get('unreviewed_merge_count'), 0)}/"
-        f"{review_after_merges(state)}"
+        f"{loop.get('review_queue', {}).get('count')}/"
+        f"{loop.get('review_queue', {}).get('threshold')}"
     )
     print(
         "gap_queue: "
-        f"{normalize_int(state.get('ungapped_merge_count'), 0)}/"
-        f"{gap_after_merges(state)}"
+        f"{loop.get('gap_queue', {}).get('count')}/"
+        f"{loop.get('gap_queue', {}).get('threshold')}"
     )
-    print("tasks:")
-    for task_id, task in state.get("tasks", {}).items():
-        print(f"  {task_id}: {task.get('status')} {task.get('branch', '')}")
-    print("reviews:")
-    for review_id, review in state.get("reviews", {}).items():
-        pane = review.get("pane_id", "")
-        runner = review.get("runner", "")
-        worktree = review.get("worktree", "")
-        gate = agent_gate_status(review)
-        artifact = review.get("artifact_status", "")
-        suffix = f" artifact={artifact}" if artifact else ""
-        watch = f" watch: hloop reviewer watch {review_id}" if pane else ""
-        print(f"  {review_id}: gate={gate}{suffix} pane={pane} runner={runner} worktree={worktree}{watch}")
-    print("gaps:")
-    for gap_id, gap in state.get("gaps", {}).items():
-        pane = gap.get("pane_id", "")
-        runner = gap.get("runner", "")
-        worktree = gap.get("worktree", "")
-        gate = agent_gate_status(gap)
-        artifact = gap.get("artifact_status", "")
-        suffix = f" artifact={artifact}" if artifact else ""
-        watch = f" watch: hloop gap watch {gap_id}" if pane else ""
-        print(f"  {gap_id}: gate={gate}{suffix} pane={pane} runner={runner} worktree={worktree}{watch}")
+    print(
+        "agents: "
+        f"workers {counts.get('workers_running')}/{counts.get('workers')} running, "
+        f"reviewers {counts.get('reviewers_running')}/{counts.get('reviewers')} running, "
+        f"gaps {counts.get('gaps_running')}/{counts.get('gaps')} running"
+    )
+    print(f"issues: {counts.get('issues')} ({counts.get('p0_p1_issues')} P0/P1)")
+    for item in inventory["issues"][:10]:
+        print(
+            f"  {item.get('severity')} {item.get('subject')} "
+            f"{item.get('code')}: {item.get('message')}"
+        )
     return 0
+
+
+def item_agent_status(item: dict[str, Any]) -> str:
+    pane = item.get("pane", {})
+    if not isinstance(pane, dict):
+        return ""
+    if pane.get("present"):
+        return str(pane.get("agent_status") or "")
+    reason = pane.get("reason")
+    return f"pane:{reason}" if reason else ""
+
+
+def item_artifact_state(item: dict[str, Any]) -> str:
+    artifact = item.get("artifact", {})
+    if not isinstance(artifact, dict):
+        return ""
+    state = str(artifact.get("state") or "")
+    status = str(artifact.get("status") or artifact.get("artifact_status") or "")
+    if item.get("role") in {"reviewer", "gap"}:
+        status = str(item.get("artifact_status") or "")
+    commit_state = str(artifact.get("commit_state") or "")
+    parts = [part for part in [state, status, commit_state] if part]
+    return "/".join(parts)
+
+
+def print_agent_rows(title: str, items: list[dict[str, Any]]) -> None:
+    print(title + ":")
+    if not items:
+        print("  none")
+        return
+    for item in items:
+        agent_id = item.get("id")
+        role = item.get("role")
+        status = item.get("gate_status") or item.get("status")
+        pane_id = item.get("pane", {}).get("pane_id", "")
+        pane_status = item_agent_status(item)
+        artifact = item_artifact_state(item)
+        issue_count = len(item.get("issues", []))
+        suffix = f" issues={issue_count}" if issue_count else ""
+        print(
+            f"  {agent_id}: {role} status={status} pane={pane_id or '-'} "
+            f"agent={pane_status or '-'} artifact={artifact or '-'}{suffix}"
+        )
+
+
+def print_inventory_dashboard(inventory: dict[str, Any]) -> None:
+    loop = inventory["loop"]
+    counts = inventory["counts"]
+    print(f"HLoop dashboard: {loop.get('goal_id')} phase={loop.get('phase')} cycle={loop.get('cycle')}")
+    print(
+        f"repo={inventory.get('repo')} current={loop.get('current_branch')} "
+        f"integration={loop.get('integration_branch')}@{loop.get('integration_sha')}"
+    )
+    print(
+        "queues: "
+        f"review {loop.get('review_queue', {}).get('count')}/{loop.get('review_queue', {}).get('threshold')}, "
+        f"gap {loop.get('gap_queue', {}).get('count')}/{loop.get('gap_queue', {}).get('threshold')}, "
+        f"validation={'yes' if loop.get('needs_validation') else 'no'}"
+    )
+    print(
+        "counts: "
+        f"workers={counts.get('workers')} running={counts.get('workers_running')} "
+        f"queued={counts.get('workers_queued')} merge_ready={counts.get('workers_merge_ready')}; "
+        f"reviewers={counts.get('reviewers')} running={counts.get('reviewers_running')} reported={counts.get('reviewers_reported')}; "
+        f"gaps={counts.get('gaps')} running={counts.get('gaps_running')} reported={counts.get('gaps_reported')}"
+    )
+    print_agent_rows("Workers", inventory["workers"])
+    print_agent_rows("Reviewers", inventory["reviewers"])
+    print_agent_rows("Gaps", inventory["gaps"])
+    print("Issues:")
+    if not inventory["issues"]:
+        print("  none")
+    for item in inventory["issues"]:
+        print(
+            f"  {item.get('severity')} {item.get('subject')} "
+            f"{item.get('code')}: {item.get('message')}"
+        )
+        if item.get("action"):
+            print(f"    action: {item.get('action')}")
+    if inventory.get("next_actions"):
+        print("Next actions:")
+        for action in inventory["next_actions"]:
+            print(f"  - {action}")
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    inventory = collect_loop_inventory(
+        repo,
+        probe_panes=not args.no_pane_probe,
+        lines=args.lines,
+        include_output=args.include_output,
+    )
+    if args.json:
+        print(json.dumps(inventory, ensure_ascii=False, indent=2))
+        return 0
+    print_inventory_dashboard(inventory)
+    return 0
+
+
+def cmd_conductor(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    inventory = collect_loop_inventory(
+        repo,
+        probe_panes=not args.no_pane_probe,
+        lines=args.lines,
+        include_output=args.include_output,
+    )
+    blocking = [
+        item for item in inventory["issues"] if item.get("severity") in {"P0", "P1"}
+    ]
+    result = {
+        "ok": not blocking,
+        "blocking_issue_count": len(blocking),
+        "issues": inventory["issues"],
+        "next_actions": inventory["next_actions"],
+        "inventory": inventory,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"conductor: {'ok' if result['ok'] else 'attention'} "
+            f"({len(inventory['issues'])} issue(s), {len(blocking)} P0/P1)"
+        )
+        if inventory["issues"]:
+            print("issues:")
+            for item in inventory["issues"]:
+                print(
+                    f"  {item.get('severity')} {item.get('subject')} "
+                    f"{item.get('code')}: {item.get('message')}"
+                )
+                if item.get("action"):
+                    print(f"    action: {item.get('action')}")
+        if inventory["next_actions"]:
+            print("next actions:")
+            for action in inventory["next_actions"]:
+                print(f"  - {action}")
+    return 0 if args.no_fail or not blocking else 2
 
 
 def create_loop_task(
@@ -2065,8 +2824,8 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         require_integration_branch=True,
         mark_blocked=False,
     )
-    if args.kind == "implementation" and not args.write_allow and not args.allow_no_write:
-        raise HLoopError("implementation tasks require at least one --write-allow")
+    if args.kind in {"implementation", "fix"} and not args.write_allow and not args.allow_no_write:
+        raise HLoopError(f"{args.kind} tasks require at least one --write-allow")
     task_id = args.id or next_id("T", state.setdefault("tasks", {}))
     if task_id in state["tasks"]:
         raise HLoopError(f"task already exists: {task_id}")
@@ -2509,6 +3268,35 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     save_state(repo, state)
     journal(repo, f"Sent Manager message to Worker `{task_id}` in pane `{pane_id}` from {source}.")
     print(f"sent manager message to {task_id} in pane {pane_id}")
+    return 0
+
+
+def cmd_worker_watch(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not task_state:
+        raise HLoopError(f"unknown task: {task_id}")
+    pane_id = str(task_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"worker has no pane_id: {task_id}")
+    proc = run_cmd(
+        [
+            "herdr",
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            args.source,
+            "--lines",
+            str(args.lines),
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "").strip())
+    print(proc.stdout.rstrip())
     return 0
 
 
@@ -3954,6 +4742,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check local Herdr/Codex/skill dependencies")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--strict-skills", action="store_true")
+    doctor.add_argument("--sessions", action="store_true", help="include loop session inventory when STATE.json exists")
+    doctor.add_argument("--session-lines", type=int, default=80, help="pane output lines used by --sessions")
     doctor.set_defaults(func=cmd_doctor)
 
     selftest = sub.add_parser("selftest", help="lint skill-local schemas and artifact contracts")
@@ -4001,7 +4791,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show loop status")
     status.add_argument("--json", action="store_true")
+    status.add_argument("--raw-state", action="store_true", help="print STATE.json only")
+    status.add_argument("--lines", type=int, default=80, help="pane output lines used for status signals")
+    status.add_argument("--no-pane-probe", action="store_true", help="do not query Herdr pane state")
     status.set_defaults(func=cmd_status)
+
+    dashboard = sub.add_parser("dashboard", help="show a Manager dashboard for tasks, panes, gates, and issues")
+    dashboard.add_argument("--json", action="store_true")
+    dashboard.add_argument("--lines", type=int, default=80)
+    dashboard.add_argument("--include-output", action="store_true", help="include recent pane output in JSON")
+    dashboard.add_argument("--no-pane-probe", action="store_true", help="do not query Herdr pane state")
+    dashboard.set_defaults(func=cmd_dashboard)
+
+    conductor = sub.add_parser("conductor", help="detect stuck or attention-needed loop sessions")
+    conductor.add_argument("--json", action="store_true")
+    conductor.add_argument("--lines", type=int, default=120)
+    conductor.add_argument("--include-output", action="store_true", help="include recent pane output in JSON")
+    conductor.add_argument("--no-pane-probe", action="store_true", help="do not query Herdr pane state")
+    conductor.add_argument("--no-fail", action="store_true", help="return 0 even when P0/P1 issues are found")
+    conductor.set_defaults(func=cmd_conductor)
 
     task = sub.add_parser("task", help="task operations")
     task_sub = task.add_subparsers(dest="task_command", required=True)
@@ -4048,6 +4856,15 @@ def build_parser() -> argparse.ArgumentParser:
     worker_harvest.add_argument("--keep-pane", action="store_true")
     worker_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     worker_harvest.set_defaults(func=cmd_worker_harvest)
+    worker_watch = worker_sub.add_parser("watch")
+    worker_watch.add_argument("task_id")
+    worker_watch.add_argument("--lines", type=int, default=120)
+    worker_watch.add_argument(
+        "--source",
+        choices=["visible", "recent", "recent-unwrapped"],
+        default="recent-unwrapped",
+    )
+    worker_watch.set_defaults(func=cmd_worker_watch)
     worker_message = worker_sub.add_parser("message")
     worker_message.add_argument("task_id")
     worker_message.add_argument("message", nargs="?")
@@ -4300,6 +5117,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if command_requires_loop_lock(args):
+            repo = repo_root(Path(args.repo).resolve())
+            with loop_lock(repo):
+                return int(args.func(args))
         return int(args.func(args))
     except HLoopError as exc:
         print(f"hloop: {exc}", file=sys.stderr)

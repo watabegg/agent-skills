@@ -10,10 +10,18 @@ Manager owns integration and final judgment.
 4. Read `.ai/loop/PROFILE.md`.
 5. Read `.ai/loop/STATE.json`.
 6. Read `.ai/loop/DECISIONS.md`.
-7. Check current branch and branch strategy against `STATE.json` and `PROFILE.md`.
-8. Check `git status --short`.
+7. Run `hloop dashboard` to inspect phase, queues, pane ids, worktrees, artifacts, and next actions.
+8. Run `hloop conductor --no-fail` when resuming a long-running workspace or when the next action is unclear.
+9. Check current branch and branch strategy against `STATE.json` and `PROFILE.md`.
+10. Check `git status --short`.
 
 `hloop` enforces the same preflight for mutating commands. Treat a preflight failure as an environmental block, not as a reason to continue by hand.
+
+Use an explicit helper command such as `HLOOP="python3 /home/.../skills/herdr-dev-loop/scripts/hloop"` when bare `hloop` is not on `PATH`. A PATH miss for the convenience name is not a loop blocker and must not trigger manual state editing, manual worktree orchestration, or direct `codex exec` launches.
+
+Mutating `hloop` commands are serialized with `.ai/loop/LOCK`, but Manager should still treat them as transactions. Do not run `hloop task new`, `tick`, `pump`, `worker harvest`, `merge`, `validate`, `triage`, `gap`, or `reviewer` mutating commands in parallel. Parallelize reads and inspections only.
+
+`dashboard`, `status`, `conductor`, and `doctor --sessions` are read-only inspection commands. Prefer them over manually reading panes one by one when deciding the next Manager action.
 
 ## Pump Mode
 
@@ -24,6 +32,14 @@ hloop pump --max-transitions 20 --max-workers 3 --stop-on-triage
 ```
 
 `pump` repeatedly runs safe tick transitions. It stops at triage, blocked, done, or the transition limit. By default it keeps ticking through waiting phases so it can notice completed agents, start pending Reviewers/Gap Auditors, and dispatch non-overlapping queued Workers. Pass `--stop-on-waiting` when Manager intentionally wants to pause as soon as all currently safe transitions are exhausted. By default it does not wait for long-running Reviewers or Gap Auditors; pass `--wait` only when Manager intentionally wants to spend the configured wait budget.
+
+Before switching from `pump` to manual intervention, run:
+
+```bash
+hloop conductor --no-fail
+```
+
+Resolve the concrete finding it reports. Examples: use `hloop worker harvest` when a result artifact is ready, `hloop triage review` / `hloop triage gap` when a harvested gate needs triage, `hloop ... message` when a ready Codex TUI needs Manager input, or fix the branch/dirty-tree mismatch before the next mutation.
 
 ## Default Cadence
 
@@ -69,12 +85,15 @@ Do not send follow-ups directly with `herdr pane run` unless debugging the pane 
 For each running Worker:
 
 - check Herdr pane output only as a hint
+- inspect live progress with `hloop worker watch <task-id>` when Manager needs status before the artifact exists
 - prefer `results/<task-id>/result.md`
 - parse status and merge readiness
 - require the result artifact to be committed at Worker `HEAD`
 - compute actual changed files from git
 - compare changed files to `write_allow` and `write_deny`
 - after harvesting the result artifact, close the Worker pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
+
+Worker `partial`, `blocked`, `failed`, `abandoned`, `merge_ready: false`, missing validation, blocking questions, or uncommitted result artifacts are hard stops for that task. Manager must not edit the Worker result frontmatter to make it merge-ready, must not invent `head_sha` or commit metadata, and must not manually merge a task that `hloop merge` rejects. Create a fix task, rerun the Worker, or record an environment blocker instead.
 
 For each running Gap Auditor:
 

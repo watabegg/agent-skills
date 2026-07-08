@@ -164,6 +164,8 @@ The result artifact must be committed on the Worker branch at `HEAD:.ai/loop/res
 
 Use `head_sha: HEAD` when writing the artifact from the Worker branch. `hloop worker harvest` resolves it to the actual branch head; writing the exact commit SHA inside the same commit is not required.
 
+Manager must not edit a Worker result artifact to change task status, merge readiness, commit metadata, validation results, QA evidence, or blocking questions. If the Worker artifact is `partial`, `blocked`, `failed`, uncommitted, mismatched with `HEAD`, or otherwise rejected by `hloop worker harvest` / `hloop merge`, treat it as a task blocker and resolve it by rerunning the Worker, creating a fix task, or recording an environment blocker.
+
 ## Manager Final QA Artifact
 
 When `manager_qa_profile` is not `none`, Manager records final combined QA in `qa/FINAL.md`:
