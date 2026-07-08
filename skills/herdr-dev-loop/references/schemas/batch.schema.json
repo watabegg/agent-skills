@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Batch Frontmatter",
+  "type": "object",
+  "required": ["id", "title", "status", "task_ids", "checkpoint_mode"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^B[0-9]{3}$"},
+    "title": {"type": "string"},
+    "status": {"type": "string", "enum": ["active", "closed", "abandoned"]},
+    "task_ids": {"type": "array", "items": {"type": "string", "pattern": "^T[0-9]{3}$"}},
+    "started_at": {"type": "string"},
+    "closed_at": {"type": "string"},
+    "checkpoint_mode": {"type": "string", "enum": ["rollup"]},
+    "summary": {"type": "string"}
+  },
+  "additionalProperties": true
+}

@@ -34,8 +34,9 @@ HLOOP="python3 <this-skill>/scripts/hloop"
 $HLOOP selftest
 $HLOOP doctor
 $HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
+$HLOOP batch start "Initial implementation batch"
 $HLOOP task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
-git add .ai/loop && git commit -m "ai-loop: initialize goal"
+$HLOOP checkpoint --batch B001 --rollup --message "ai-loop(B001): initialize goal"
 $HLOOP dashboard
 $HLOOP pump --max-transitions 20 --max-workers 3
 ```
@@ -58,7 +59,9 @@ When Manager is only waiting for an artifact, prefer `hloop wait <task-id-or-gat
 
 Use `hloop dashboard` for the Manager's one-screen view of phase, queues, running agents, panes, artifacts, and next actions. Use `hloop conductor` when investigating stuck sessions; it reports P0/P1 attention items such as missing panes, blocked Codex prompts, reported review/gap artifacts needing triage, non-loop dirty files, branch mismatches, unsafe sandbox values, non-hloop prompt paths, unharvested artifacts, untrusted Worker head markers, and manual integration traces. Add `--no-fail` when the command is informational and should not return non-zero.
 
-Use `hloop checkpoint --message "ai-loop: ..."` to commit `.ai/loop` state updates without staging product files. Add `--force` only when intentionally committing ignored loop artifacts such as validation logs. Avoid hand-written `git add .ai/loop/... && git commit ...` unless debugging the helper itself.
+Use `hloop batch start "<batch title>"` to group several related tasks or fix tasks into a local-history unit larger than one Worker task and smaller than the whole mission. When a current batch exists, `hloop task new` and triage-created fix tasks attach to it by default. Use `hloop batch close --summary "..."` when the batch is finished.
+
+Use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` to commit `.ai/loop` state updates without staging product files. Rollup may amend only an unpushed HEAD commit that is already an hloop `.ai/loop` checkpoint for the same batch; otherwise it creates a new checkpoint commit. Add `--force` only when intentionally committing ignored loop artifacts such as validation logs. Avoid hand-written `git add .ai/loop/... && git commit ...` unless debugging the helper itself.
 
 After a Worker, Gap Auditor, or Reviewer artifact is harvested, close its Herdr pane and archive its captured Codex session unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
 
@@ -73,6 +76,7 @@ The durable state lives under `.ai/loop`:
 - `DECISIONS.md`: pending, accepted, and rejected specification decisions that cannot be answered from the original plan/spec alone
 - `USER_ACTION_REQUIRED.md`: blocking questions for the user
 - `tasks/*.md`: Worker task contracts
+- `batches/*.md`: Manager-owned task batches for readable loop-state checkpoint history
 - `results/<task-id>/result.md`: Worker completion artifacts
 - `gaps/*.md`: Gap Auditor plan/spec alignment artifacts
 - `reviews/*.md`: Reviewer artifacts

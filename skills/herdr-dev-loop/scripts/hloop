@@ -67,6 +67,10 @@ DANGEROUS_AGENT_MARKERS = (
     "bypass-approvals-and-sandbox",
 )
 SUSPICIOUS_WORKER_HEADS = {"manager-working-tree", "pending_code_commit"}
+BATCH_ID_RE = re.compile(r"^B[0-9]{3}$")
+CHECKPOINT_TRAILER_KIND = "HLoop-Checkpoint"
+CHECKPOINT_TRAILER_BATCH = "HLoop-Batch"
+CHECKPOINT_KIND_LOOP_STATE = "loop-state"
 
 
 class HLoopError(RuntimeError):
@@ -213,6 +217,8 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
     if command in {"init", "merge", "validate", "qa", "tick", "pump", "report", "checkpoint"}:
         return True
+    if command == "batch":
+        return getattr(args, "batch_command", "") in {"start", "assign", "close"}
     if command == "harvest":
         return True
     if command == "task":
@@ -304,6 +310,21 @@ def parse_frontmatter_text(text: str) -> dict[str, Any]:
 
 def read_frontmatter(path: Path) -> dict[str, Any]:
     return parse_frontmatter_text(read_text(path))
+
+
+def replace_frontmatter(path: Path, updates: dict[str, Any]) -> None:
+    text = read_text(path)
+    if not text.startswith("---\n"):
+        raise HLoopError(f"missing frontmatter: {path}")
+    end = text.find("\n---", 4)
+    if end == -1:
+        raise HLoopError(f"unterminated frontmatter: {path}")
+    meta = parse_frontmatter_text(text)
+    meta.update(updates)
+    rest = text[end + 4 :]
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    write_text(path, frontmatter(meta) + "\n" + rest)
 
 
 def yaml_scalar(value: Any) -> str:
@@ -413,6 +434,7 @@ def extract_fix_task_candidates(text: str, source_id: str) -> list[dict[str, Any
 def ensure_loop_dirs(repo: Path) -> None:
     for rel in [
         "tasks",
+        "batches",
         "results",
         "reviews",
         "gaps",
@@ -903,6 +925,10 @@ def check_herdr_env() -> None:
 
 def task_file(repo: Path, task_id: str) -> Path:
     return loop_path(repo) / "tasks" / f"{task_id}.md"
+
+
+def batch_file(repo: Path, batch_id: str) -> Path:
+    return loop_path(repo) / "batches" / f"{batch_id}.md"
 
 
 def result_file(worktree: Path, task_id: str) -> Path:
@@ -1857,6 +1883,7 @@ def collect_loop_inventory(
             "worker_qa_profile": state_worker_qa_profile(state),
             "manager_qa_profile": state_manager_qa_profile(state),
             "manager_qa_status": state.get("manager_qa_status", ""),
+            "current_batch_id": current_batch_id(state),
             "needs_validation": normalize_bool(state.get("needs_validation")),
             "needs_review": normalize_bool(state.get("needs_review")),
             "needs_gap_check": normalize_bool(state.get("needs_gap_check")),
@@ -1876,6 +1903,7 @@ def collect_loop_inventory(
             "workers_merge_ready": sum(
                 1 for item in workers if item.get("status") == "result_reported" and item.get("artifact", {}).get("merge_ready")
             ),
+            "batches": len(state_batches(state)),
             "reviewers": len(reviewers),
             "reviewers_running": len(running_reviewers),
             "reviewers_reported": sum(1 for item in reviewers if item.get("gate_status") == "reported"),
@@ -2699,6 +2727,12 @@ blocking_questions: []
     check(parsed_wait.timeout_ms == DEFAULT_WAIT_TIMEOUT_MS, "wait timeout default drifted")
     parsed_checkpoint = build_parser().parse_args(["checkpoint", "--message", "ai-loop: checkpoint"])
     check(parsed_checkpoint.command == "checkpoint", "checkpoint command did not parse")
+    parsed_rollup = build_parser().parse_args(
+        ["checkpoint", "--message", "ai-loop(B001): checkpoint", "--batch", "B001", "--rollup"]
+    )
+    check(parsed_rollup.batch == "B001" and parsed_rollup.rollup, "checkpoint rollup args did not parse")
+    parsed_batch = build_parser().parse_args(["batch", "start", "demo batch", "--id", "B001"])
+    check(parsed_batch.batch_command == "start", "batch start command did not parse")
     parsed_pump = build_parser().parse_args(["pump"])
     check(parsed_pump.sleep_ms == DEFAULT_PUMP_SLEEP_MS, "pump sleep default drifted")
     check(
@@ -2760,6 +2794,20 @@ gap_count: 0
 """
     )
     check(str(gap_meta.get("status")) in GAP_ARTIFACT_STATUSES, "sample gap artifact status is invalid")
+
+    batch_meta = parse_frontmatter_text(
+        """---
+id: B001
+title: Demo batch
+status: active
+task_ids:
+  - T001
+checkpoint_mode: rollup
+---
+"""
+    )
+    check(batch_meta.get("id") == "B001", "sample batch artifact id did not parse")
+    check(normalize_list(batch_meta.get("task_ids")) == ["T001"], "sample batch task_ids did not parse")
 
     reliability_codes = {
         item["code"]
@@ -2999,6 +3047,7 @@ None.
         "spec_sources": args.spec_source or [],
         "validation_commands": args.validation or [],
         "tasks": {},
+        "batches": {},
         "reviews": {},
         "gaps": {},
         "blocking_decisions": [],
@@ -3025,6 +3074,7 @@ None.
         old.setdefault("max_reviewers", args.max_reviewers)
         old.setdefault("max_gap_auditors", args.max_gap_auditors)
         old.setdefault("gaps", {})
+        old.setdefault("batches", {})
         save_state(repo, old)
         print(f"STATE.json already exists: {state_path(repo)}")
         return 0
@@ -3062,6 +3112,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"worker_qa_profile: {loop.get('worker_qa_profile')}")
     print(f"manager_qa_profile: {loop.get('manager_qa_profile')}")
     print(f"manager_qa_status: {loop.get('manager_qa_status')}")
+    print(f"current_batch_id: {loop.get('current_batch_id') or '-'}")
     print(
         "review_queue: "
         f"{loop.get('review_queue', {}).get('count')}/"
@@ -3153,6 +3204,7 @@ def print_inventory_dashboard(inventory: dict[str, Any]) -> None:
         f"gap {loop.get('gap_queue', {}).get('count')}/{loop.get('gap_queue', {}).get('threshold')}, "
         f"validation={'yes' if loop.get('needs_validation') else 'no'}"
     )
+    print(f"batch: current={loop.get('current_batch_id') or '-'} total={counts.get('batches')}")
     print(
         "counts: "
         f"workers={counts.get('workers')} running={counts.get('workers_running')} "
@@ -3235,6 +3287,207 @@ def cmd_conductor(args: argparse.Namespace) -> int:
     return 0 if args.no_fail or not blocking else 2
 
 
+def validate_batch_id(batch_id: str) -> str:
+    value = str(batch_id or "").strip()
+    if not BATCH_ID_RE.fullmatch(value):
+        raise HLoopError(f"invalid batch id: {batch_id}; expected BNNN")
+    return value
+
+
+def state_batches(state: dict[str, Any]) -> dict[str, Any]:
+    batches = state.setdefault("batches", {})
+    if not isinstance(batches, dict):
+        raise HLoopError("STATE.json batches must be an object")
+    return batches
+
+
+def current_batch_id(state: dict[str, Any]) -> str:
+    value = str(state.get("current_batch_id") or "")
+    return validate_batch_id(value) if value else ""
+
+
+def require_batch(state: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    batch_id = validate_batch_id(batch_id)
+    batches = state_batches(state)
+    batch = batches.get(batch_id)
+    if not isinstance(batch, dict):
+        raise HLoopError(f"unknown batch: {batch_id}")
+    return batch
+
+
+def batch_task_ids(state: dict[str, Any], batch_id: str) -> list[str]:
+    batch = require_batch(state, batch_id)
+    ids = list(normalize_list(batch.get("task_ids")))
+    for task_id, task_state in state.get("tasks", {}).items():
+        if isinstance(task_state, dict) and str(task_state.get("batch_id") or "") == batch_id:
+            ids.append(task_id)
+    return sorted(dict.fromkeys(ids))
+
+
+def write_batch_artifact(repo: Path, state: dict[str, Any], batch_id: str) -> None:
+    batch = require_batch(state, batch_id)
+    task_ids = batch_task_ids(state, batch_id)
+    batch["task_ids"] = task_ids
+    fields = {
+        "id": batch_id,
+        "title": str(batch.get("title") or batch_id),
+        "status": str(batch.get("status") or "active"),
+        "task_ids": task_ids,
+        "started_at": str(batch.get("started_at") or batch.get("created_at") or ""),
+        "closed_at": str(batch.get("closed_at") or ""),
+        "checkpoint_mode": str(batch.get("checkpoint_mode") or "rollup"),
+        "summary": str(batch.get("summary") or ""),
+    }
+    task_lines = [f"- {task_id}" for task_id in task_ids] or ["- No tasks assigned."]
+    body = f"""# Batch {batch_id}: {fields["title"]}
+
+## Purpose
+{fields["title"]}
+
+## Tasks
+{chr(10).join(task_lines)}
+
+## Commit Policy
+Use `hloop checkpoint --batch {batch_id} --rollup --message "ai-loop({batch_id}): ..."` for loop-state-only commits while this batch is active. Rollup may amend only an unpushed `.ai/loop` checkpoint commit for the same batch.
+
+## Summary
+{fields["summary"] or "TBD by Manager."}
+"""
+    write_text(batch_file(repo, batch_id), frontmatter(fields) + "\n" + body)
+
+
+def assign_tasks_to_batch(repo: Path, state: dict[str, Any], batch_id: str, task_ids: list[str]) -> None:
+    batch = require_batch(state, batch_id)
+    tasks = state.setdefault("tasks", {})
+    existing = set(normalize_list(batch.get("task_ids")))
+    for task_id in task_ids:
+        if task_id not in tasks:
+            raise HLoopError(f"unknown task: {task_id}")
+        task_state = tasks[task_id]
+        if not isinstance(task_state, dict):
+            raise HLoopError(f"task state must be an object: {task_id}")
+        task_state["batch_id"] = batch_id
+        task_path = task_file(repo, task_id)
+        if task_path.exists():
+            replace_frontmatter(task_path, {"batch_id": batch_id})
+        existing.add(task_id)
+    batch["task_ids"] = sorted(existing)
+
+
+def cmd_batch_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    batches = state_batches(state)
+    batch_id = validate_batch_id(args.id) if args.id else next_id("B", batches)
+    if batch_id in batches:
+        raise HLoopError(f"batch already exists: {batch_id}")
+    now = now_iso()
+    batches[batch_id] = {
+        "title": args.title,
+        "status": "active",
+        "task_ids": [],
+        "created_at": now,
+        "started_at": now,
+        "checkpoint_mode": "rollup",
+    }
+    if args.task:
+        assign_tasks_to_batch(repo, state, batch_id, args.task)
+    if not args.no_current:
+        state["current_batch_id"] = batch_id
+    write_batch_artifact(repo, state, batch_id)
+    save_state(repo, state)
+    journal(repo, f"Started batch `{batch_id}`: {args.title}")
+    print(f"started {batch_id}: {batch_file(repo, batch_id)}")
+    return 0
+
+
+def cmd_batch_assign(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    batch_id = validate_batch_id(args.batch_id)
+    require_batch(state, batch_id)
+    assign_tasks_to_batch(repo, state, batch_id, args.task_id)
+    write_batch_artifact(repo, state, batch_id)
+    save_state(repo, state)
+    journal(repo, f"Assigned tasks to batch `{batch_id}`: {', '.join(args.task_id)}")
+    print(f"assigned {len(args.task_id)} task(s) to {batch_id}")
+    return 0
+
+
+def cmd_batch_close(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    batch_id = validate_batch_id(args.batch_id or current_batch_id(state))
+    batch = require_batch(state, batch_id)
+    batch["status"] = args.status
+    batch["closed_at"] = now_iso()
+    batch["summary"] = args.summary
+    if current_batch_id(state) == batch_id:
+        state.pop("current_batch_id", None)
+    write_batch_artifact(repo, state, batch_id)
+    save_state(repo, state)
+    journal(repo, f"Closed batch `{batch_id}` as `{args.status}`: {args.summary}")
+    print(f"closed {batch_id}")
+    return 0
+
+
+def cmd_batch_list(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    current = current_batch_id(state)
+    rows = []
+    for batch_id, batch in sorted(state_batches(state).items()):
+        if not isinstance(batch, dict):
+            continue
+        rows.append(
+            {
+                "id": batch_id,
+                "status": batch.get("status", ""),
+                "title": batch.get("title", ""),
+                "task_ids": batch_task_ids(state, batch_id),
+                "current": batch_id == current,
+            }
+        )
+    if args.json:
+        print(json.dumps({"current_batch_id": current, "batches": rows}, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("no batches")
+        return 0
+    for row in rows:
+        marker = "*" if row["current"] else " "
+        tasks = ",".join(row["task_ids"]) or "-"
+        print(f"{marker} {row['id']} {row['status']} tasks={tasks} {row['title']}")
+    return 0
+
+
+def cmd_batch_show(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    batch_id = validate_batch_id(args.batch_id or current_batch_id(state))
+    batch = require_batch(state, batch_id)
+    payload = {
+        "id": batch_id,
+        "current": current_batch_id(state) == batch_id,
+        "artifact": str(batch_file(repo, batch_id)),
+        "state": batch,
+        "task_ids": batch_task_ids(state, batch_id),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"{batch_id}: {batch.get('status', '')} {batch.get('title', '')}")
+    print(f"artifact: {payload['artifact']}")
+    print(f"current: {'yes' if payload['current'] else 'no'}")
+    print("tasks: " + (", ".join(payload["task_ids"]) or "-"))
+    if batch.get("summary"):
+        print(f"summary: {batch.get('summary')}")
+    return 0
+
+
 def create_loop_task(
     repo: Path,
     state: dict[str, Any],
@@ -3249,6 +3502,7 @@ def create_loop_task(
     created_from: str,
     validation_minimum: str = "L1",
     branch: str | None = None,
+    batch_id: str | None = None,
     allow_no_write: bool = False,
 ) -> str:
     if kind == "implementation" and not write_allow and not allow_no_write:
@@ -3262,6 +3516,9 @@ def create_loop_task(
     if not branch_exists(repo, base_ref):
         raise HLoopError(f"base_ref does not exist: {base_ref}")
     base_sha = git(repo, ["rev-parse", base_ref])
+    resolved_batch_id = validate_batch_id(batch_id) if batch_id else current_batch_id(state)
+    if resolved_batch_id:
+        require_batch(state, resolved_batch_id)
     fields = {
         "id": task_id,
         "kind": kind,
@@ -3279,6 +3536,8 @@ def create_loop_task(
         "worker_protocol": state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
         "worker_qa_profile": state_worker_qa_profile(state),
     }
+    if resolved_batch_id:
+        fields["batch_id"] = resolved_batch_id
     body = f"""# Task {task_id}: {title}
 
 ## Goal
@@ -3321,6 +3580,13 @@ Use the HLoop Worker Protocol from `.ai/loop/PROFILE.md` and your rendered worke
         "worker_qa_profile": fields["worker_qa_profile"],
         "created_at": now_iso(),
     }
+    if resolved_batch_id:
+        state["tasks"][task_id]["batch_id"] = resolved_batch_id
+        batch = require_batch(state, resolved_batch_id)
+        batch["task_ids"] = sorted(
+            dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
+        )
+        write_batch_artifact(repo, state, resolved_batch_id)
     return task_id
 
 
@@ -3346,6 +3612,9 @@ def cmd_task_new(args: argparse.Namespace) -> int:
             "or create/switch to the integration branch before adding tasks."
         )
     base_sha = args.base_sha or git(repo, ["rev-parse", base_ref])
+    resolved_batch_id = validate_batch_id(args.batch_id) if args.batch_id else current_batch_id(state)
+    if resolved_batch_id:
+        require_batch(state, resolved_batch_id)
     requested_worker_qa_profile = getattr(args, "worker_qa_profile", None) or getattr(
         args, "qa_profile", None
     )
@@ -3374,6 +3643,8 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         if requested_worker_qa_profile
         else state_worker_qa_profile(state),
     }
+    if resolved_batch_id:
+        fields["batch_id"] = resolved_batch_id
     body = f"""# Task {task_id}: {args.title}
 
 ## Goal
@@ -3411,6 +3682,13 @@ Use the HLoop Worker Protocol from `.ai/loop/PROFILE.md` and your rendered worke
         "worker_qa_profile": fields["worker_qa_profile"],
         "created_at": now_iso(),
     }
+    if resolved_batch_id:
+        state["tasks"][task_id]["batch_id"] = resolved_batch_id
+        batch = require_batch(state, resolved_batch_id)
+        batch["task_ids"] = sorted(
+            dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
+        )
+        write_batch_artifact(repo, state, resolved_batch_id)
     state["phase"] = "dispatching"
     save_state(repo, state)
     journal(repo, f"Created task `{task_id}`: {args.title}")
@@ -5426,9 +5704,104 @@ def checkpoint_paths(repo: Path, args: argparse.Namespace) -> list[str]:
     return filtered
 
 
+def staged_paths(repo: Path) -> list[str]:
+    proc = run_cmd(["git", "-C", str(repo), "diff", "--cached", "--name-only"], check=False)
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "git diff --cached failed").strip())
+    return [normalize_match_path(line) for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def ensure_checkpoint_staged_scope(staged: list[str], allowed_paths: list[str]) -> None:
+    allowed = set(allowed_paths)
+    unexpected = [path for path in staged if path not in allowed]
+    if unexpected:
+        raise HLoopError(
+            "checkpoint refuses to commit already-staged paths outside its loop path set: "
+            + ", ".join(unexpected)
+        )
+
+
+def commit_message_has_trailer(message: str, key: str, value: str) -> bool:
+    expected = f"{key}: {value}"
+    return any(line.strip() == expected for line in message.splitlines())
+
+
+def checkpoint_commit_message(message: str, batch_id: str) -> str:
+    base = message.rstrip()
+    if not batch_id:
+        return base
+    trailers = [
+        f"{CHECKPOINT_TRAILER_KIND}: {CHECKPOINT_KIND_LOOP_STATE}",
+        f"{CHECKPOINT_TRAILER_BATCH}: {batch_id}",
+    ]
+    existing = {line.strip() for line in base.splitlines()}
+    missing = [line for line in trailers if line not in existing]
+    if not missing:
+        return base
+    separator = "\n\n" if base else ""
+    return base + separator + "\n".join(missing)
+
+
+def head_reachable_from_upstream(repo: Path) -> bool:
+    upstream = run_cmd(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        check=False,
+    )
+    if upstream.returncode != 0:
+        return False
+    ref = (upstream.stdout or "").strip()
+    return bool(ref) and is_ancestor(repo, "HEAD", ref)
+
+
+def head_changed_paths(repo: Path) -> list[str]:
+    proc = run_cmd(
+        ["git", "-C", str(repo), "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "git diff-tree failed").strip())
+    return [normalize_match_path(line) for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def checkpoint_amend_blocker(repo: Path, batch_id: str) -> str:
+    if not batch_id:
+        return "no batch id"
+    head = run_cmd(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"], check=False)
+    if head.returncode != 0:
+        return "repository has no HEAD commit"
+    message = git(repo, ["log", "-1", "--format=%B"])
+    if not commit_message_has_trailer(message, CHECKPOINT_TRAILER_KIND, CHECKPOINT_KIND_LOOP_STATE):
+        return "HEAD is not an hloop loop-state checkpoint"
+    if not commit_message_has_trailer(message, CHECKPOINT_TRAILER_BATCH, batch_id):
+        return f"HEAD checkpoint belongs to another batch, not {batch_id}"
+    if head_reachable_from_upstream(repo):
+        return "HEAD is already reachable from upstream"
+    loop_root = LOOP_DIR.as_posix()
+    loop_prefix = f"{loop_root}/"
+    non_loop = [
+        path for path in head_changed_paths(repo)
+        if path != loop_root and not path.startswith(loop_prefix)
+    ]
+    if non_loop:
+        return "HEAD checkpoint includes non-loop paths: " + ", ".join(non_loop)
+    return ""
+
+
+def resolve_checkpoint_batch_id(state: dict[str, Any], args: argparse.Namespace) -> str:
+    batch_id = validate_batch_id(args.batch) if args.batch else ""
+    if not batch_id and args.rollup:
+        batch_id = current_batch_id(state)
+    if batch_id:
+        require_batch(state, batch_id)
+    if args.rollup and not batch_id:
+        raise HLoopError("checkpoint --rollup requires --batch or an active current batch")
+    return batch_id
+
+
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
-    preflight_loop(repo, require_integration_branch=not args.no_branch_check, mark_blocked=False)
+    state = preflight_loop(repo, require_integration_branch=not args.no_branch_check, mark_blocked=False)
+    batch_id = resolve_checkpoint_batch_id(state, args)
     paths = checkpoint_paths(repo, args)
     if not paths:
         print("no .ai/loop changes to checkpoint")
@@ -5437,12 +5810,18 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
         print("DRY RUN checkpoint paths:")
         for path in paths:
             print(f"  {path}")
+        if batch_id:
+            print(f"DRY RUN checkpoint batch: {batch_id}")
+        if args.rollup:
+            blocker = checkpoint_amend_blocker(repo, batch_id)
+            print("DRY RUN rollup: " + ("would amend HEAD" if not blocker else f"would create new commit ({blocker})"))
         return 0
     add_cmd = ["git", "-C", str(repo), "add"]
     if args.force:
         add_cmd.append("-f")
     add_cmd.extend(["--", *paths])
     run_cmd(add_cmd, check=True)
+    ensure_checkpoint_staged_scope(staged_paths(repo), paths)
     diff_proc = run_cmd(
         ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", *paths],
         check=False,
@@ -5452,9 +5831,22 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     if diff_proc.returncode == 0:
         print("no staged .ai/loop changes to checkpoint")
         return 0
-    run_cmd(["git", "-C", str(repo), "commit", "-m", args.message], check=True, capture=False)
+    commit_message = checkpoint_commit_message(args.message, batch_id)
+    amend_blocker = checkpoint_amend_blocker(repo, batch_id) if args.rollup else "rollup disabled"
+    if args.rollup and not amend_blocker:
+        run_cmd(
+            ["git", "-C", str(repo), "commit", "--amend", "-m", commit_message],
+            check=True,
+            capture=False,
+        )
+        sha = git(repo, ["rev-parse", "--short", "HEAD"])
+        print(f"checkpoint amended {sha}")
+        return 0
+    run_cmd(["git", "-C", str(repo), "commit", "-m", commit_message], check=True, capture=False)
     sha = git(repo, ["rev-parse", "--short", "HEAD"])
     print(f"checkpoint committed {sha}")
+    if args.rollup and amend_blocker:
+        print(f"rollup started a new checkpoint: {amend_blocker}")
     return 0
 
 
@@ -5659,11 +6051,37 @@ def build_parser() -> argparse.ArgumentParser:
     conductor.add_argument("--no-fail", action="store_true", help="return 0 even when P0/P1 issues are found")
     conductor.set_defaults(func=cmd_conductor)
 
+    batch = sub.add_parser("batch", help="batch operations for grouping tasks and loop checkpoints")
+    batch_sub = batch.add_subparsers(dest="batch_command", required=True)
+    batch_start = batch_sub.add_parser("start", help="start a task batch")
+    batch_start.add_argument("title")
+    batch_start.add_argument("--id", help="batch id such as B001; defaults to the next id")
+    batch_start.add_argument("--task", action="append", help="existing task id to assign")
+    batch_start.add_argument("--no-current", action="store_true", help="do not make this the current batch")
+    batch_start.set_defaults(func=cmd_batch_start)
+    batch_assign = batch_sub.add_parser("assign", help="assign existing tasks to a batch")
+    batch_assign.add_argument("batch_id")
+    batch_assign.add_argument("task_id", nargs="+")
+    batch_assign.set_defaults(func=cmd_batch_assign)
+    batch_close = batch_sub.add_parser("close", help="close a batch")
+    batch_close.add_argument("batch_id", nargs="?")
+    batch_close.add_argument("--summary", required=True)
+    batch_close.add_argument("--status", choices=["closed", "abandoned"], default="closed")
+    batch_close.set_defaults(func=cmd_batch_close)
+    batch_list = batch_sub.add_parser("list", help="list batches")
+    batch_list.add_argument("--json", action="store_true")
+    batch_list.set_defaults(func=cmd_batch_list)
+    batch_show = batch_sub.add_parser("show", help="show one batch")
+    batch_show.add_argument("batch_id", nargs="?")
+    batch_show.add_argument("--json", action="store_true")
+    batch_show.set_defaults(func=cmd_batch_show)
+
     task = sub.add_parser("task", help="task operations")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     task_new = task_sub.add_parser("new", help="create a queued task")
     task_new.add_argument("title")
     task_new.add_argument("--id")
+    task_new.add_argument("--batch-id", help="batch id; defaults to the current active batch")
     task_new.add_argument("--kind", default="implementation")
     task_new.add_argument("--branch")
     task_new.add_argument("--base-ref")
@@ -5769,6 +6187,12 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint = sub.add_parser("checkpoint", help="commit .ai/loop state changes without staging product files")
     checkpoint.add_argument("--message", required=True)
     checkpoint.add_argument("--path", action="append", help="loop pathspec to include; defaults to .ai/loop")
+    checkpoint.add_argument("--batch", help="batch id to record in checkpoint trailers")
+    checkpoint.add_argument(
+        "--rollup",
+        action="store_true",
+        help="amend the previous unpushed loop-state checkpoint for the same batch when safe",
+    )
     checkpoint.add_argument("--include-prompts", action="store_true")
     checkpoint.add_argument("--include-lock", action="store_true")
     checkpoint.add_argument("--force", action="store_true", help="pass -f to git add for ignored loop artifacts")
