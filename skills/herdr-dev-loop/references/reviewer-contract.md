@@ -18,7 +18,7 @@ The Reviewer prompt must say:
 - distinguish newly introduced, diff-expanded pre-existing, and unrelated pre-existing issues
 - write no files while investigating
 - after review is complete, write only `reviews/<review-id>.md`
-- include `## Fix Task Candidates` with machine-readable task candidate blocks for findings that should become Worker fix tasks
+- include `## Fix Task Candidates` with machine-readable task candidate blocks for findings that should become Worker fix tasks; each candidate needs `action: fix_task`, `severity` or `priority`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 - print `HERDR_LOOP_REVIEW_DONE:<review-id>:<reported|blocked|failed>`
 
 ## HLoop Native Review Protocol

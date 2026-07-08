@@ -192,7 +192,7 @@ Only `status: done` may set `merge_ready: true`.
 
 `merge_ready: true` requires `status: done`, `validation_recorded: true`, and non-empty `validation_commands` / `validation_results`. Keep validation fields flat; do not use nested YAML maps in frontmatter because `hloop` intentionally uses a stdlib-only parser.
 
-Write list fields as multiline lists. Do not use inline lists for commands or summaries that may contain commas.
+Write non-empty list fields as multiline lists. `hloop` rejects non-empty inline lists for known list fields such as `validation_commands`, `validation_results`, `changed_files`, `blocking_questions`, `write_allow`, `write_deny`, `acceptance`, `depends_on`, and `spec_sources` because comma-splitting command strings is unsafe. Empty lists such as `blocking_questions: []` remain allowed.
 
 The result artifact must be committed on the Worker branch at `HEAD:.ai/loop/results/<task-id>/result.md`. `hloop worker harvest` rejects artifacts that exist only in the worktree or differ from the committed version.
 
@@ -249,7 +249,7 @@ Manager must triage every P0/P1 and any P2 that affects the mission done criteri
 
 The review artifact frontmatter `status` is copied into `STATE.json.reviews.<id>.artifact_status`. Manager gate progress is tracked separately in `STATE.json.reviews.<id>.gate_status`; after harvest it is `reported`, and after Manager triage it is `triaged`. The legacy `STATE.json.reviews.<id>.status` mirrors the gate status for compatibility.
 
-Review artifacts should include:
+Review artifacts should include `## Fix Task Candidates` blocks for findings that should become Worker fix tasks. Each candidate must include `action`, `severity` or `priority`, non-empty `write_allow`, non-empty `acceptance`, and non-empty `rationale`; otherwise `hloop triage` lists it under rejected candidates and does not create a task from it.
 
 ```md
 ## Fix Task Candidates
@@ -264,7 +264,7 @@ acceptance:
 rationale: The reviewed code path can fail when ...
 ```
 
-`hloop triage review R001` reads this section and writes `.ai/loop/triage/R001.fix-task-draft.md`. It creates queued tasks only when Manager reruns with `--create-tasks`.
+`hloop triage review R001` reads this section and writes `.ai/loop/triage/R001.fix-task-draft.md`, including rejected candidates and reasons when candidate blocks are incomplete. It creates queued tasks only from valid candidates when Manager reruns with `--create-tasks`.
 
 ## Gap Artifact
 
@@ -304,7 +304,7 @@ Manager must triage every `missing`, `partial`, or `needs-decision` item that af
 
 The gap artifact frontmatter `status` is copied into `STATE.json.gaps.<id>.artifact_status`. Manager gate progress is tracked separately in `STATE.json.gaps.<id>.gate_status`; after harvest it is `reported`, and after Manager triage it is `triaged`. The legacy `STATE.json.gaps.<id>.status` mirrors the gate status for compatibility.
 
-Gap artifacts should include the same `## Fix Task Candidates` shape for missing or partial requirements that should become Worker fix tasks. Use `priority` instead of `severity` when that is more natural:
+Gap artifacts should include the same `## Fix Task Candidates` shape for missing or partial requirements that should become Worker fix tasks. Use `priority` instead of `severity` when that is more natural. Each candidate must include `action`, `priority` or `severity`, non-empty `write_allow`, non-empty `acceptance`, and non-empty `rationale`:
 
 ```md
 ## Fix Task Candidates
