@@ -19,7 +19,7 @@ Manager owns integration and final judgment.
 
 Use an explicit helper command such as `HLOOP="python3 /home/.../skills/herdr-dev-loop/scripts/hloop"` when bare `hloop` is not on `PATH`. A PATH miss for the convenience name is not a loop blocker and must not trigger manual state editing, manual worktree orchestration, or direct `codex exec` launches.
 
-Mutating `hloop` commands are serialized with `.ai/loop/LOCK`, but Manager should still treat them as transactions. Do not run `hloop task new`, `tick`, `pump`, `worker harvest`, `merge`, `validate`, `triage`, `gap`, or `reviewer` mutating commands in parallel. Parallelize reads and inspections only.
+Mutating `hloop` commands are serialized with the repo-local Git lock from `git rev-parse --git-path hloop.lock`, but Manager should still treat them as transactions. Do not run `hloop task new`, `tick`, `pump`, `worker harvest`, `merge`, `validate`, `triage`, `gap`, or `reviewer` mutating commands in parallel. Parallelize reads and inspections only.
 
 `dashboard`, `status`, `conductor`, and `doctor --sessions` are read-only inspection commands. Prefer them over manually reading panes one by one when deciding the next Manager action.
 

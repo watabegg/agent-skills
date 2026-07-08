@@ -2,7 +2,7 @@
 
 Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewer coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, and QA strategy.
 
-Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with `.ai/loop/LOCK`; Manager should not update `STATE.json`, start Worker/Reviewer/Gap Codex sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
+Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with a repo-local Git lock (`git rev-parse --git-path hloop.lock`); Manager should not update `STATE.json`, start Worker/Reviewer/Gap Codex sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
 
 Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next. `conductor` also audits trust signals left in `STATE.json` and pane output, including unsafe sandbox values, dangerous Codex launch markers, non-hloop prompt paths, unharvested artifact states, untrusted Worker head markers such as `manager-working-tree` or `pending_code_commit`, Manager-owned Worker result paths, and manual integration traces.
 
@@ -47,9 +47,9 @@ Then run, at most, one material transition:
 3. merge one ready Worker when no Gap Auditor or Reviewer is currently reading the integration branch
 4. validate integration
 5. require Manager triage for harvested Gap Auditor or Reviewer artifacts
-6. dispatch queued Workers in a batch up to the safe worker limit
-7. start one Gap Auditor when validation passes and the gap gate is open
-8. start one Reviewer when validation passes and the review gate is open
+6. start one Gap Auditor when validation passes and the gap gate is open
+7. start one Reviewer when validation passes and the review gate is open
+8. dispatch queued Workers in a batch up to the safe worker limit
 9. wait for a running Gap Auditor or Reviewer only after no other safe transition is available
 10. require Manager final QA when `manager_qa_profile` is not `none`
 11. generate a final report
@@ -98,9 +98,9 @@ While a Gap Auditor or Reviewer is running:
 - wait up to `gap_wait_ms` or `review_wait_ms` when there is no other safe work
 - tick again later if the wait times out
 
-When the gap artifact appears, harvest it from the detached gap worktree, verify the Gap Auditor changed no files except the gap artifact, close the Gap Auditor pane, archive the captured Codex session, remove the gap worktree, and require Manager triage before closing the gap gate.
+When the gap artifact appears, harvest it from the detached gap worktree, verify the Gap Auditor changed no files except the gap artifact, close the Gap Auditor pane, archive the captured Codex session, remove the gap worktree, and require Manager triage before closing the gap gate. Worktree cleanup is best-effort after harvest; if filesystem permissions prevent removal, record the cleanup failure in `STATE.json` and continue gate triage.
 
-When the review artifact appears, harvest it from the detached review worktree, verify the Reviewer changed no files except the review artifact, close the Reviewer pane, archive the captured Codex session, remove the review worktree, and require Manager triage before closing the review gate.
+When the review artifact appears, harvest it from the detached review worktree, verify the Reviewer changed no files except the review artifact, close the Reviewer pane, archive the captured Codex session, remove the review worktree, and require Manager triage before closing the review gate. Worktree cleanup is best-effort after harvest; if filesystem permissions prevent removal, record the cleanup failure in `STATE.json` and continue gate triage.
 
 For Reviewers and Gap Auditors, artifact frontmatter status and Manager gate status are separate. `artifact_status` stores the artifact's reported result, while `gate_status` tracks Manager workflow progress such as `running`, `reported`, or `triaged`. The legacy per-agent `status` field mirrors `gate_status` for compatibility.
 
