@@ -78,7 +78,7 @@ hloop gap message G001 --file .ai/loop/inbox/manager/G001-followup.md
 hloop reviewer message R001 --file .ai/loop/inbox/manager/R001-followup.md
 ```
 
-Do not send follow-ups directly with `herdr pane run` unless debugging the pane itself. `hloop ... message` refuses to send when the target pane is not Codex, is showing the trust prompt, or is still working. It then uses `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered before reporting success.
+Do not send follow-ups directly with `herdr pane run` unless debugging the pane itself. `hloop ... message` refuses to send when the target pane is not Codex, is showing the trust prompt, or is still working. It then uses `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered before reporting success. If delivery fails after Manager wrote a follow-up, `hloop` records the undelivered message under `.ai/loop/inbox/pending/` and marks it in the target state; retry that pending file when the pane is ready instead of reconstructing the instruction from memory.
 
 ## Harvest Rules
 

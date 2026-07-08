@@ -57,6 +57,8 @@ codex exec --sandbox workspace-write --output-last-message .ai/loop/reviews/R001
 
 The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Reviewers. Worker default is TUI. Gap Auditor and Reviewer default are also TUI, but run in detached worktrees so the Manager can monitor progress and each agent can write only the final Markdown artifact. `hloop gap harvest` and `hloop reviewer harvest` copy the artifact back to the Manager repo and block if the detached worktree changed any other file.
 
+Use `hloop harvest <id>` when the id prefix is already known. It delegates `T...` to Worker harvest, `R...` to Reviewer harvest, and `G...` to Gap Auditor harvest.
+
 Use this while a gap audit or review is running:
 
 ```bash
@@ -82,6 +84,8 @@ Avoid direct `herdr pane run <pane> "<prompt>"` for Manager follow-ups. Empirica
 - `herdr wait output --match <marker>` can match the echoed prompt text before Codex has answered
 
 `hloop ... message` checks that the pane is a Codex TUI, rejects trust prompts and working sessions, then uses `pane send-text`, waits until the prompt is visible, pauses before `pane send-keys Enter`, and verifies that Codex started working or answered. If verification fails because the prompt stayed typed, it retries Enter. Tune with `--input-settle-ms`, `--submit-verify-ms`, and `--submit-attempts` only after inspecting the pane. For long or multi-line instructions, prefer `--file` to avoid shell quoting issues.
+
+If delivery fails, the command returns non-zero and records the undelivered message under `.ai/loop/inbox/pending/` plus the target's `manager_messages` state. Retry that file when `hloop ... watch` shows the pane is ready.
 
 Codex saved sessions can be archived after pane cleanup:
 
