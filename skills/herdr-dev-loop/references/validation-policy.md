@@ -50,7 +50,7 @@ Pick commands from current repository evidence:
 - CI workflow files
 - README or project docs
 
-Record exact commands and results in Worker result artifacts and in `STATE.json.last_validation`. Integration validation must also capture stdout/stderr under `.ai/loop/validation/` and record the relative log path in `STATE.json.last_validation.results[].log`.
+Record exact commands and results in Worker result artifacts and in `STATE.json.last_validation`. Integration validation must also capture stdout/stderr under `.ai/loop/validation/` and record the relative log path in `STATE.json.last_validation.results[].log`. `hloop validate` preserves the live console output but trims trailing whitespace from saved validation logs so `.ai/loop/validation/*.log` does not create `git diff --check` noise.
 
 Record Worker QA evidence paths, preview URLs, staging URLs, screenshots, seeded data cleanup, or blockers in the Worker result artifact when they apply. Record Manager final QA evidence in `qa/FINAL.md` and the final report. Do not force browser QA for every repository; choose the product-appropriate QA surface from PROFILE and PLAN.
 
