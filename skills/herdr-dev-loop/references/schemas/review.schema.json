@@ -7,7 +7,7 @@
     "review_id": {"type": "string", "pattern": "^R[0-9]{3}$"},
     "base": {"type": "string"},
     "head": {"type": "string"},
-    "status": {"enum": ["running", "reported", "blocked", "failed"]}
+    "status": {"enum": ["reported", "blocked", "failed"]}
   },
   "additionalProperties": true
 }
