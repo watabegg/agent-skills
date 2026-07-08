@@ -13,7 +13,7 @@ $HLOOP doctor
 
 If bare `hloop` fails with `command not found`, keep using the absolute helper path. Do not switch to hand-written Herdr/Codex orchestration for loop mutations.
 
-Mutating helper commands take `.ai/loop/LOCK` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
+Mutating helper commands take the repo-local Git lock from `git rev-parse --git-path hloop.lock` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
 ## Herdr
 

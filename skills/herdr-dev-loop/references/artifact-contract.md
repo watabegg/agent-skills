@@ -62,13 +62,14 @@ Recommended optional fields:
 - `spec_sources`: original repo plan/spec files or directories the Gap Auditor should compare against implementation
 - per task/gap/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
 - per task/gap/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
+- per task/gap/review `worktree_cleanup_status`, `worktree_cleanup_error`, `worktree_cleanup_failed_at`
 - per task/gap/review `sandbox`: expected `workspace-write` for hloop-started agents; other values are trust findings in `hloop conductor`
-- per review `worktree`, `worktree_review_path_harvested`, `worktree_cleanup_status`
+- per review `worktree`, `worktree_review_path_harvested`
 - per review `write_scope_violations`
 - per review `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`
 - per review `artifact_status`: artifact frontmatter status such as `reported`, `blocked`, or `failed`
 - per review `triage_drafts`, `created_fix_tasks`
-- per gap `worktree`, `worktree_gap_path_harvested`, `worktree_cleanup_status`
+- per gap `worktree`, `worktree_gap_path_harvested`
 - per gap `write_scope_violations`
 - per gap `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`
 - per gap `artifact_status`: artifact frontmatter status such as `aligned`, `gaps-found`, `blocked`, or `failed`
@@ -121,7 +122,7 @@ worker_qa_profile: repo-default
 ---
 ```
 
-`write_allow` is mandatory and non-empty for implementation and fix tasks unless Manager explicitly uses `--allow-no-write` for an exceptional no-edit task. Use `kind: research` for ordinary no-edit investigation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems.
+`write_allow` is mandatory and non-empty for implementation and fix tasks unless Manager explicitly uses `--allow-no-write` for an exceptional no-edit task. Use `kind: research` for ordinary no-edit investigation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems. `validation_minimum` may be a single level such as `L1` or a multiline list when the task needs multiple explicit validation requirements.
 
 ## Worker Result
 

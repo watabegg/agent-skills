@@ -46,7 +46,7 @@ The script is deliberately explicit. Use `--dry-run` on `worker start`, `gap sta
 
 Mutating `hloop` commands enforce their own preflight. `pump`, `tick`, `worker start`, `worker harvest`, `merge`, `validate`, `triage`, `gap start`, `gap harvest`, `reviewer start`, and `reviewer harvest` check the relevant Herdr environment, current branch, required commands, and non-loop dirty files before changing state.
 
-Treat every mutating `hloop` command as a serialized state transaction. The helper takes a `.ai/loop/LOCK`, but Manager should still avoid launching multiple mutating `hloop` commands in parallel. Parallelize reads, not loop-state writes.
+Treat every mutating `hloop` command as a serialized state transaction. The helper takes a repo-local Git lock (`git rev-parse --git-path hloop.lock`), but Manager should still avoid launching multiple mutating `hloop` commands in parallel. Parallelize reads, not loop-state writes.
 
 Worker, Gap Auditor, and Reviewer agents default to interactive Codex TUI panes so the Manager can inspect progress, add requirements, or interrupt them in Herdr. Gap Auditors and Reviewers run in detached worktrees with `workspace-write` sandbox so the final Markdown artifact can be written reliably; the prompt and harvest guard still forbid code edits. Override with `--runner exec` only when non-interactive work is intentionally preferred.
 
@@ -129,9 +129,9 @@ Each tick or pump transition must:
 4. Integrate at most one Worker branch according to `PROFILE.md`; built-in automation defaults to squash merge into the integration branch.
 5. Run integration validation.
 6. Triage harvested Gap Auditor or Reviewer artifacts before starting more work from stale assumptions.
-7. Dispatch queued implementation or fix Workers up to `max_workers` when `write_allow` patterns do not overlap.
-8. Start or harvest a Gap Auditor when the gap gate is open; default frequency is lower than review (`gap_after_merges: 3`).
-9. Start or harvest a Reviewer when the review gate is open; default frequency is high (`review_after_merges: 1`).
+7. Start a Gap Auditor when the gap gate is open; default frequency is lower than review (`gap_after_merges: 3`).
+8. Start a Reviewer when the review gate is open; default frequency is high (`review_after_merges: 1`).
+9. Dispatch queued implementation or fix Workers up to `max_workers` when `write_allow` patterns do not overlap.
 10. Triage gap/review findings into fix tasks, decisions, accepted risk, stale-spec updates, or false positives.
 11. Stop if done, blocked, or unsafe.
 
