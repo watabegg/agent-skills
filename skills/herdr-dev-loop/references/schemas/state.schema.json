@@ -19,6 +19,7 @@
     "max_reviewers",
     "max_gap_auditors",
     "tasks",
+    "batches",
     "reviews",
     "gaps",
     "blocking_decisions"
@@ -50,7 +51,9 @@
     "reviewer_runner": {"type": "string", "enum": ["tui", "exec"]},
     "gap_runner": {"type": "string", "enum": ["tui", "exec"]},
     "spec_sources": {"type": "array", "items": {"type": "string"}},
+    "current_batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
     "tasks": {"type": "object"},
+    "batches": {"type": "object"},
     "reviews": {"type": "object"},
     "gaps": {"type": "object"},
     "blocking_decisions": {"type": "array", "items": {"type": "string"}}

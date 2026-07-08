@@ -14,6 +14,7 @@ All loop coordination is file-backed under `.ai/loop`.
   DECISIONS.md
   USER_ACTION_REQUIRED.md
   tasks/
+  batches/
   results/
   gaps/
   reviews/
@@ -45,6 +46,7 @@ Required top-level fields:
 - `max_reviewers`
 - `max_gap_auditors`
 - `tasks`
+- `batches`
 - `reviews`
 - `gaps`
 - `blocking_decisions`
@@ -61,6 +63,7 @@ Recommended optional fields:
 - `unreviewed_merge_count`: integration merges not yet covered by a closed review gate
 - `ungapped_merge_count`: integration merges not yet covered by a closed gap gate
 - `spec_sources`: original repo plan/spec files or directories the Gap Auditor should compare against implementation
+- `current_batch_id`: active `Bxxx` task batch for rolling loop-state checkpoint commits
 - per task/gap/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
 - per task/gap/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
 - per task/gap/review `worktree_cleanup_status`, `worktree_cleanup_error`, `worktree_cleanup_failed_at`
@@ -109,6 +112,7 @@ branch: ai/example/T001-login
 base_ref: ai/example/integration
 base_sha: abc123
 priority: P1
+batch_id: B001
 depends_on: []
 write_allow:
   - src/auth/**
@@ -124,6 +128,33 @@ worker_qa_profile: repo-default
 ```
 
 `write_allow` is mandatory and non-empty for implementation and fix tasks unless Manager explicitly uses `--allow-no-write` for an exceptional no-edit task. Use `kind: research` for ordinary no-edit investigation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems. `validation_minimum` may be a single level such as `L1` or a multiline list when the task needs multiple explicit validation requirements.
+
+## Batch File
+
+Each batch is `batches/BNNN.md` and groups related implementation and fix tasks into a readable local-history unit. A batch is smaller than `MISSION.md` / `PLAN.md` and larger than an individual task.
+
+```md
+---
+id: B001
+title: Booking review fixes
+status: active
+task_ids:
+  - T001
+  - T002
+started_at: 2026-07-09T00:00:00+00:00
+closed_at: ""
+checkpoint_mode: rollup
+summary: ""
+---
+```
+
+Allowed `status` values:
+
+- `active`: Manager may attach newly created tasks and loop-state checkpoints to this batch.
+- `closed`: the batch is complete and should no longer receive new tasks unless Manager explicitly reopens or assigns them.
+- `abandoned`: the batch is intentionally stopped.
+
+When `STATE.json.current_batch_id` is set, `hloop task new` and triage-created fix tasks attach to that batch by default. `hloop checkpoint --batch BNNN --rollup` records loop-state-only `.ai/loop` changes with `HLoop-Checkpoint: loop-state` and `HLoop-Batch: BNNN` trailers. Rollup may amend only the current unpushed HEAD commit when that HEAD commit is a `.ai/loop`-only checkpoint for the same batch.
 
 ## Worker Result
 

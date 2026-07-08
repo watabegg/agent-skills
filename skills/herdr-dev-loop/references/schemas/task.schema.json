@@ -10,6 +10,7 @@
     "branch": {"type": "string"},
     "base_ref": {"type": "string"},
     "base_sha": {"type": "string"},
+    "batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
     "write_allow": {"type": "array", "items": {"type": "string"}},
     "write_deny": {"type": "array", "items": {"type": "string"}},
     "acceptance": {"type": "array", "items": {"type": "string"}},
