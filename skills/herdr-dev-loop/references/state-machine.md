@@ -2,6 +2,10 @@
 
 Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewer coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, and QA strategy.
 
+Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with `.ai/loop/LOCK`; Manager should not update `STATE.json`, start Worker/Reviewer/Gap Codex sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
+
+Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next.
+
 ## Phases
 
 - `initialized`: `.ai/loop` exists and the integration branch is known.
@@ -109,6 +113,7 @@ Set a blocked or failed phase and stop when:
 - `STATE.json` is unreadable or contradicts the current branch.
 - a pending decision has `Blocking: true`.
 - a Worker result is missing required fields.
+- a Worker result reports `partial`, `blocked`, `failed`, `abandoned`, `merge_ready: false`, blocking questions, or missing validation.
 - a Worker changed files outside its allowed scope.
 - a merge conflict appears.
 - validation fails.
@@ -119,3 +124,5 @@ Set a blocked or failed phase and stop when:
 Do not dispatch new Workers while blocked.
 
 Waiting for a running Worker, Gap Auditor, or Reviewer is not itself a hard failure. Set `waiting_worker`, `waiting_gap`, or `waiting_review`, report the exact agent ids, and tick again later. Set `no_progress` only when no agent is running, no dependency can advance, and the next Manager action is unclear.
+
+When the phase is `no_progress` or a long-running loop appears stuck, run `hloop conductor --no-fail` before changing strategy. Treat its P0/P1 findings as the next concrete Manager action unless the finding is proven stale by disk state.
