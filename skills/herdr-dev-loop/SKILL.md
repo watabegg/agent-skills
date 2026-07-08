@@ -54,7 +54,11 @@ When sending additional instructions to a running TUI, use `hloop worker message
 
 Inspect running agents with `hloop worker watch <task-id>`, `hloop gap watch <gap-id>`, or `hloop reviewer watch <review-id>`. Use direct `herdr pane read` only for debugging the helper itself.
 
+When Manager is only waiting for an artifact, prefer `hloop wait <task-id-or-gate-id> --harvest` or `hloop wait next --harvest` over hand-written `sleep`, `watch`, and `test -f` polling loops. Use `--timeout-ms`, `--poll-ms`, and `--quiet` to tune long waits.
+
 Use `hloop dashboard` for the Manager's one-screen view of phase, queues, running agents, panes, artifacts, and next actions. Use `hloop conductor` when investigating stuck sessions; it reports P0/P1 attention items such as missing panes, blocked Codex prompts, reported review/gap artifacts needing triage, non-loop dirty files, branch mismatches, unsafe sandbox values, non-hloop prompt paths, unharvested artifacts, untrusted Worker head markers, and manual integration traces. Add `--no-fail` when the command is informational and should not return non-zero.
+
+Use `hloop checkpoint --message "ai-loop: ..."` to commit `.ai/loop` state updates without staging product files. Add `--force` only when intentionally committing ignored loop artifacts such as validation logs. Avoid hand-written `git add .ai/loop/... && git commit ...` unless debugging the helper itself.
 
 After a Worker, Gap Auditor, or Reviewer artifact is harvested, close its Herdr pane and archive its captured Codex session unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
 

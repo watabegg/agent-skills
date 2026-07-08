@@ -55,6 +55,8 @@ DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
 DEFAULT_PUMP_SLEEP_MS = 2_000
+DEFAULT_WAIT_TIMEOUT_MS = 300_000
+DEFAULT_WAIT_POLL_MS = 5_000
 REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
 GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -209,7 +211,7 @@ def retire_legacy_loop_lock(repo: Path) -> None:
 
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
-    if command in {"init", "merge", "validate", "qa", "tick", "pump", "report"}:
+    if command in {"init", "merge", "validate", "qa", "tick", "pump", "report", "checkpoint"}:
         return True
     if command == "harvest":
         return True
@@ -1054,9 +1056,12 @@ def porcelain_paths(repo: Path) -> list[str]:
         ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
         check=False,
     )
-    out = proc.stdout or ""
+    return parse_porcelain_paths(proc.stdout or "")
+
+
+def parse_porcelain_paths(text: str) -> list[str]:
     paths = []
-    for line in out.splitlines():
+    for line in text.splitlines():
         if not line:
             continue
         path = line[3:] if len(line) > 3 else ""
@@ -1065,6 +1070,16 @@ def porcelain_paths(repo: Path) -> list[str]:
         if path:
             paths.append(path)
     return paths
+
+
+def porcelain_paths_for(repo: Path, pathspec: str) -> list[str]:
+    proc = run_cmd(
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all", "--", pathspec],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "").strip())
+    return parse_porcelain_paths(proc.stdout or "")
 
 
 def unsafe_dirty_paths(repo: Path, *, allow_loop_dirty: bool = True) -> list[str]:
@@ -1528,6 +1543,7 @@ def collect_worker_inventory(
         "validation_recorded": normalize_bool(
             artifact_meta.get("validation_recorded", task.get("validation_recorded"))
         ),
+        "committed_path": str(task.get("committed_result_path") or ""),
     }
     if worktree["exists"] and artifact["exists"]:
         artifact["commit_state"] = safe_result_commit_state(
@@ -1616,6 +1632,7 @@ def collect_worker_inventory(
         "artifact": artifact,
         "merge_ready": normalize_bool(task.get("merge_ready")),
         "validation_recorded": normalize_bool(task.get("validation_recorded")),
+        "cleanup_done": normalize_bool(task.get("cleanup_done")),
         "issues": issues,
     }
 
@@ -2678,6 +2695,10 @@ blocking_questions: []
     )
     parsed_harvest = build_parser().parse_args(["harvest", "T001"])
     check(parsed_harvest.command == "harvest", "top-level harvest command did not parse")
+    parsed_wait = build_parser().parse_args(["wait", "next"])
+    check(parsed_wait.timeout_ms == DEFAULT_WAIT_TIMEOUT_MS, "wait timeout default drifted")
+    parsed_checkpoint = build_parser().parse_args(["checkpoint", "--message", "ai-loop: checkpoint"])
+    check(parsed_checkpoint.command == "checkpoint", "checkpoint command did not parse")
     parsed_pump = build_parser().parse_args(["pump"])
     check(parsed_pump.sleep_ms == DEFAULT_PUMP_SLEEP_MS, "pump sleep default drifted")
     check(
@@ -2696,6 +2717,22 @@ blocking_questions: []
     check(
         message_state.get("manager_messages", [{}])[-1].get("delivery_status") == "pending",
         "manager message delivery status was not recorded",
+    )
+    check(
+        item_artifact_state(
+            {
+                "role": "worker",
+                "status": "merged",
+                "cleanup_done": True,
+                "artifact": {
+                    "state": "missing",
+                    "status": "done",
+                    "committed_path": ".ai/loop/results/T001/result.md",
+                },
+            }
+        )
+        == "cleaned/done/committed",
+        "merged cleaned Worker artifact display is misleading",
     )
 
     review_meta = parse_frontmatter_text(
@@ -3069,6 +3106,15 @@ def item_artifact_state(item: dict[str, Any]) -> str:
     if item.get("role") in {"reviewer", "gap"}:
         status = str(item.get("artifact_status") or "")
     commit_state = str(artifact.get("commit_state") or "")
+    if (
+        item.get("role") == "worker"
+        and item.get("status") == "merged"
+        and state == "missing"
+        and status
+    ):
+        state = "cleaned" if item.get("cleanup_done") else "state"
+        if artifact.get("committed_path") and not commit_state:
+            commit_state = "committed"
     parts = [part for part in [state, status, commit_state] if part]
     return "/".join(parts)
 
@@ -5234,6 +5280,184 @@ def cmd_harvest(args: argparse.Namespace) -> int:
     raise HLoopError(f"cannot infer harvest target from id: {agent_id}; use T..., R..., or G...")
 
 
+def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict[str, Any]]:
+    if agent_id.startswith("T"):
+        agent = state.get("tasks", {}).get(agent_id)
+        if agent:
+            return "worker", agent
+    if agent_id.startswith("R"):
+        agent = state.get("reviews", {}).get(agent_id)
+        if agent:
+            return "reviewer", agent
+    if agent_id.startswith("G"):
+        agent = state.get("gaps", {}).get(agent_id)
+        if agent:
+            return "gap", agent
+    raise HLoopError(f"unknown agent id: {agent_id}")
+
+
+def running_agent_ids(state: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    ids.extend(
+        task_id
+        for task_id, task in state.get("tasks", {}).items()
+        if task.get("status") == "running"
+    )
+    ids.extend(
+        review_id
+        for review_id, review in state.get("reviews", {}).items()
+        if agent_gate_status(review) == "running"
+    )
+    ids.extend(
+        gap_id
+        for gap_id, gap in state.get("gaps", {}).items()
+        if agent_gate_status(gap) == "running"
+    )
+    return ids
+
+
+def agent_artifact_path(repo: Path, agent_id: str, role: str, agent: dict[str, Any]) -> Path:
+    if role == "worker":
+        worktree = Path(agent.get("worktree") or default_worktree(repo, agent_id)).resolve()
+        return result_file(worktree, agent_id)
+    if role == "reviewer":
+        return review_artifact_path(repo, agent_id, agent)
+    if role == "gap":
+        return gap_artifact_path(repo, agent_id, agent)
+    raise HLoopError(f"unsupported agent role: {role}")
+
+
+def artifact_ready(path: Path) -> bool:
+    return path.exists() and path.is_file() and bool(read_text(path).strip())
+
+
+def agent_wait_status(repo: Path, state: dict[str, Any], agent_id: str) -> dict[str, Any]:
+    role, agent = resolve_agent_state(state, agent_id)
+    path = agent_artifact_path(repo, agent_id, role, agent)
+    pane_id = str(agent.get("pane_id") or "")
+    pane_status = ""
+    if pane_id and os.environ.get("HERDR_ENV") == "1" and command_exists("herdr"):
+        info = pane_info(pane_id)
+        if info is not None:
+            pane_status = str(info.get("agent_status") or "")
+        else:
+            pane_status = "missing-or-closed"
+    status = agent_gate_status(agent) if role in {"reviewer", "gap"} else str(agent.get("status") or "")
+    return {
+        "id": agent_id,
+        "role": role,
+        "status": status,
+        "pane_id": pane_id,
+        "pane_status": pane_status,
+        "artifact_path": path,
+        "artifact_ready": artifact_ready(path),
+    }
+
+
+def wait_targets(state: dict[str, Any], target: str) -> list[str]:
+    if target == "next":
+        return running_agent_ids(state)
+    return [target]
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    timeout_ms = max(0, int(args.timeout_ms))
+    poll_ms = max(250, int(args.poll_ms))
+    deadline = time.monotonic() + timeout_ms / 1000
+    last_statuses: list[dict[str, Any]] = []
+    while True:
+        state = load_state(repo)
+        targets = wait_targets(state, str(args.target))
+        if not targets:
+            print("no running agents to wait for")
+            return 2
+        last_statuses = [agent_wait_status(repo, state, agent_id) for agent_id in targets]
+        ready = [item for item in last_statuses if item["artifact_ready"]]
+        if ready:
+            item = ready[0]
+            artifact = item["artifact_path"]
+            print(f"ready {item['id']} ({item['role']}): {artifact}")
+            if args.harvest:
+                harvest_args = argparse.Namespace(**vars(args))
+                harvest_args.agent_id = item["id"]
+                with loop_lock(repo):
+                    return cmd_harvest(harvest_args)
+            print(f"harvest with: hloop harvest {item['id']}")
+            return 0
+        if time.monotonic() >= deadline:
+            print(f"timeout waiting for artifact: {args.target}")
+            for item in last_statuses:
+                pane_suffix = f" pane={item['pane_status']}" if item.get("pane_status") else ""
+                print(
+                    f"  {item['id']}: {item['role']} status={item['status']}{pane_suffix} "
+                    f"artifact={item['artifact_path']}"
+                )
+            return 1
+        if not args.quiet:
+            summary = ", ".join(
+                f"{item['id']}:{item['status']}"
+                + (f"/{item['pane_status']}" if item.get("pane_status") else "")
+                for item in last_statuses
+            )
+            print(f"waiting for artifact ({summary})")
+        time.sleep(poll_ms / 1000)
+
+
+def checkpoint_paths(repo: Path, args: argparse.Namespace) -> list[str]:
+    if args.path:
+        paths: list[str] = []
+        for pathspec in args.path:
+            paths.extend(porcelain_paths_for(repo, pathspec))
+    else:
+        paths = porcelain_paths_for(repo, LOOP_DIR.as_posix())
+    filtered = []
+    loop_root = LOOP_DIR.as_posix()
+    loop_prefix = f"{loop_root}/"
+    for path in dict.fromkeys(paths):
+        normalized = normalize_match_path(path)
+        if normalized != loop_root and not normalized.startswith(loop_prefix):
+            raise HLoopError(f"checkpoint refuses non-loop path: {normalized}")
+        if normalized == (LOOP_DIR / "LOCK").as_posix() and not args.include_lock:
+            continue
+        if normalized.startswith((LOOP_DIR / "prompts").as_posix() + "/") and not args.include_prompts:
+            continue
+        filtered.append(normalized)
+    return filtered
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    preflight_loop(repo, require_integration_branch=not args.no_branch_check, mark_blocked=False)
+    paths = checkpoint_paths(repo, args)
+    if not paths:
+        print("no .ai/loop changes to checkpoint")
+        return 0
+    if args.dry_run:
+        print("DRY RUN checkpoint paths:")
+        for path in paths:
+            print(f"  {path}")
+        return 0
+    add_cmd = ["git", "-C", str(repo), "add"]
+    if args.force:
+        add_cmd.append("-f")
+    add_cmd.extend(["--", *paths])
+    run_cmd(add_cmd, check=True)
+    diff_proc = run_cmd(
+        ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", *paths],
+        check=False,
+    )
+    if diff_proc.returncode not in {0, 1}:
+        raise HLoopError((diff_proc.stderr or diff_proc.stdout or "git diff --cached failed").strip())
+    if diff_proc.returncode == 0:
+        print("no staged .ai/loop changes to checkpoint")
+        return 0
+    run_cmd(["git", "-C", str(repo), "commit", "-m", args.message], check=True, capture=False)
+    sha = git(repo, ["rev-parse", "--short", "HEAD"])
+    print(f"checkpoint committed {sha}")
+    return 0
+
+
 def cmd_qa_record(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
@@ -5531,6 +5755,26 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--keep-pane", action="store_true")
     harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     harvest.set_defaults(func=cmd_harvest)
+
+    wait = sub.add_parser("wait", help="wait for a Worker/Reviewer/Gap artifact to become ready")
+    wait.add_argument("target", help="T..., R..., G..., or next")
+    wait.add_argument("--timeout-ms", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
+    wait.add_argument("--poll-ms", type=int, default=DEFAULT_WAIT_POLL_MS)
+    wait.add_argument("--harvest", action="store_true", help="harvest the ready artifact before returning")
+    wait.add_argument("--keep-pane", action="store_true")
+    wait.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    wait.add_argument("--quiet", action="store_true")
+    wait.set_defaults(func=cmd_wait)
+
+    checkpoint = sub.add_parser("checkpoint", help="commit .ai/loop state changes without staging product files")
+    checkpoint.add_argument("--message", required=True)
+    checkpoint.add_argument("--path", action="append", help="loop pathspec to include; defaults to .ai/loop")
+    checkpoint.add_argument("--include-prompts", action="store_true")
+    checkpoint.add_argument("--include-lock", action="store_true")
+    checkpoint.add_argument("--force", action="store_true", help="pass -f to git add for ignored loop artifacts")
+    checkpoint.add_argument("--no-branch-check", action="store_true")
+    checkpoint.add_argument("--dry-run", action="store_true")
+    checkpoint.set_defaults(func=cmd_checkpoint)
 
     qa = sub.add_parser("qa", help="manager final QA operations")
     qa_sub = qa.add_subparsers(dest="qa_command", required=True)

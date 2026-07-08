@@ -67,6 +67,15 @@ python3 <skill>/scripts/hloop gap watch G001 --lines 120
 python3 <skill>/scripts/hloop reviewer watch R001 --lines 120
 ```
 
+Use this instead of hand-written polling when Manager is waiting for the next artifact:
+
+```bash
+python3 <skill>/scripts/hloop wait next --harvest --timeout-ms 300000
+python3 <skill>/scripts/hloop wait T001 --harvest --timeout-ms 300000
+```
+
+`wait` checks Worker result artifacts, Reviewer artifacts, and Gap Auditor artifacts. It returns when an artifact is present and non-empty, or returns non-zero on timeout with the last known agent and pane status. It sleeps without holding the loop lock; `--harvest` locks only for the harvest step.
+
 Use the helper to send additional Manager instructions into a TUI:
 
 ```bash
@@ -138,6 +147,8 @@ Use `pump` for queue-drain behavior:
 ```bash
 hloop pump --max-transitions 20 --max-workers 3 --stop-on-triage
 ```
+
+Use `hloop checkpoint --message "ai-loop: ..."` to commit Manager-owned `.ai/loop` changes without accidentally staging product files. By default it excludes `.ai/loop/prompts/` and `.ai/loop/LOCK`; pass `--include-prompts` or `--include-lock` only for deliberate debugging artifacts.
 
 Use the same explicit `$HLOOP` variable when bare `hloop` is not on `PATH`.
 
