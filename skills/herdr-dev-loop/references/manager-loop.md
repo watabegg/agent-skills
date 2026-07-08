@@ -41,6 +41,17 @@ hloop conductor --no-fail
 
 Resolve the concrete finding it reports. Examples: use `hloop worker harvest` when a result artifact is ready, `hloop triage review` / `hloop triage gap` when a harvested gate needs triage, `hloop ... message` when a ready Codex TUI needs Manager input, or fix the branch/dirty-tree mismatch before the next mutation.
 
+When the only useful action is waiting for a Worker, Reviewer, or Gap Auditor artifact, prefer:
+
+```bash
+hloop wait next --harvest --timeout-ms 300000
+hloop wait T001 --harvest --timeout-ms 300000
+```
+
+This replaces ad hoc `sleep`, `watch`, and `test -f` polling. `wait` does not hold the loop lock while sleeping; with `--harvest` it takes the lock only for the final harvest transition.
+
+Use `hloop checkpoint --message "ai-loop: ..."` for Manager-owned `.ai/loop` commits. It stages only `.ai/loop` paths by default and excludes prompts and legacy lock files unless explicitly requested. Use `--force` only when intentionally recording ignored loop artifacts such as validation logs.
+
 ## Default Cadence
 
 Keep the loop active by default:
