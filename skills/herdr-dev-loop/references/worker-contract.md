@@ -2,7 +2,7 @@
 
 Worker receives one task and one worktree.
 
-Default runner: interactive Codex TUI. This keeps the Worker visible in Herdr so the Manager can add requirements, inspect progress, or interrupt the Worker before it finishes. Use `--runner exec` only for well-bounded automation tasks that should complete without interaction.
+Default runner: interactive role-agent TUI. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md`, task frontmatter, or `hloop worker start`. This keeps the Worker visible in Herdr so the Manager can add requirements, inspect progress, or interrupt the Worker before it finishes. Use `--runner exec` only for well-bounded automation tasks that should complete without interaction.
 
 The Worker prompt must say:
 

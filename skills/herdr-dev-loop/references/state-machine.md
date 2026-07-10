@@ -1,8 +1,8 @@
 # State Machine
 
-Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, or Reviewer coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, and QA strategy.
+Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, Reviewer, or Advisor coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, QA, and agent backend strategy.
 
-Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with a repo-local Git lock (`git rev-parse --git-path hloop.lock`); Manager should not update `STATE.json`, start Worker/Reviewer/Gap Codex sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
+Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with a repo-local Git lock (`git rev-parse --git-path hloop.lock`); Manager should not update `STATE.json`, start Worker/Reviewer/Gap/Advisor sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
 
 Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next. `conductor` also audits trust signals left in `STATE.json` and pane output, including unsafe sandbox values, dangerous Codex launch markers, non-hloop prompt paths, unharvested artifact states, untrusted Worker head markers such as `manager-working-tree` or `pending_code_commit`, Manager-owned Worker result paths, and manual integration traces.
 
@@ -18,6 +18,7 @@ Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --se
 - `validating`: Manager is running integration validation.
 - `gap_checking`: Gap Auditor is running or its artifact is being triaged.
 - `reviewing`: Reviewer is running or its artifact is being triaged.
+- `advising`: explicit Advisor consultation is requested, running, or awaiting Manager review.
 - `manager_qa`: Manager final QA is required before completion.
 - `waiting_worker`: Workers are still running and no result artifact is ready.
 - `waiting_gap`: a Gap Auditor is still running after the bounded wait.
@@ -42,8 +43,8 @@ Each tick starts by reading:
 
 Then run, at most, one material transition:
 
-1. harvest completed Workers, Gap Auditors, or Reviewers
-2. close any harvested Worker/Gap Auditor/Reviewer pane and archive the captured Codex session unless inspection is explicitly requested
+1. harvest completed Workers, Gap Auditors, Reviewers, or explicitly started Advisors
+2. close any harvested Worker/Gap Auditor/Reviewer/Advisor pane and clean up provider sessions when supported unless inspection is explicitly requested
 3. merge one ready Worker when no Gap Auditor or Reviewer is currently reading the integration branch
 4. validate integration
 5. require Manager triage for harvested Gap Auditor or Reviewer artifacts
@@ -78,10 +79,13 @@ Defaults are intentionally active:
 - `branch_strategy: integration`
 - `worker_protocol: native`
 - `review_protocol: native`
+- role agent providers/models: Codex `auto` by default
 - `worker_qa_profile: repo-default`
 - `manager_qa_profile: none`
 
 Reviewer should normally run after each validated integration advance. Gap Auditor is lower frequency and should run every three validated merges, or before final completion if no fresh gap audit covers the latest integration state.
+
+Advisor has no default cadence. Manager may explicitly create an Advisor request when review/gap findings require another model's reasoning but do not require user input.
 
 ## Gap And Reviewer Wait Behavior
 
@@ -98,11 +102,13 @@ While a Gap Auditor or Reviewer is running:
 - wait up to `gap_wait_ms` or `review_wait_ms` when there is no other safe work
 - tick again later if the wait times out
 
-When the gap artifact appears, harvest it from the detached gap worktree, verify the Gap Auditor changed no files except the gap artifact, close the Gap Auditor pane, archive the captured Codex session, remove the gap worktree, and require Manager triage before closing the gap gate. Worktree cleanup is best-effort after harvest; if filesystem permissions prevent removal, record the cleanup failure in `STATE.json` and continue gate triage.
+When the gap artifact appears, harvest it from the detached gap worktree, verify the Gap Auditor changed no files except the gap artifact, close the Gap Auditor pane, clean up provider session state when supported, remove the gap worktree, and require Manager triage before closing the gap gate. Worktree cleanup is best-effort after harvest; if filesystem permissions prevent removal, record the cleanup failure in `STATE.json` and continue gate triage.
 
-When the review artifact appears, harvest it from the detached review worktree, verify the Reviewer changed no files except the review artifact, close the Reviewer pane, archive the captured Codex session, remove the review worktree, and require Manager triage before closing the review gate. Worktree cleanup is best-effort after harvest; if filesystem permissions prevent removal, record the cleanup failure in `STATE.json` and continue gate triage.
+When the review artifact appears, harvest it from the detached review worktree, verify the Reviewer changed no files except the review artifact, close the Reviewer pane, clean up provider session state when supported, remove the review worktree, and require Manager triage before closing the review gate. Worktree cleanup is best-effort after harvest; if filesystem permissions prevent removal, record the cleanup failure in `STATE.json` and continue gate triage.
 
 For Reviewers and Gap Auditors, artifact frontmatter status and Manager gate status are separate. `artifact_status` stores the artifact's reported result, while `gate_status` tracks Manager workflow progress such as `running`, `reported`, or `triaged`. The legacy per-agent `status` field mirrors `gate_status` for compatibility.
+
+For Advisors, participant artifacts are harvested into `.ai/loop/advice/`. Advisor outputs never close review/gap gates by themselves; Manager records the accepted recommendation in `DECISIONS.md`, accepted-risk notes, or fix tasks, then closes the advice request.
 
 ## Stop Conditions
 
@@ -123,7 +129,7 @@ Set a blocked or failed phase and stop when:
 
 Do not dispatch new Workers while blocked.
 
-Waiting for a running Worker, Gap Auditor, or Reviewer is not itself a hard failure. Set `waiting_worker`, `waiting_gap`, or `waiting_review`, report the exact agent ids, and tick again later. Set `no_progress` only when no agent is running, no dependency can advance, and the next Manager action is unclear.
+Waiting for a running Worker, Gap Auditor, Reviewer, or explicit Advisor is not itself a hard failure. Set `waiting_worker`, `waiting_gap`, or `waiting_review` for automatic loop lanes, report the exact agent ids, and tick again later. Advisor waits are Manager-directed through `hloop advisor watch`, `hloop wait`, or `hloop harvest`. Set `no_progress` only when no agent is running, no dependency can advance, and the next Manager action is unclear.
 
 When the phase is `no_progress` or a long-running loop appears stuck, run `hloop conductor --no-fail` before changing strategy. Treat its P0/P1 findings as the next concrete Manager action unless the finding is proven stale by disk state.
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "Herdr Dev Loop"
-  short_description: "Herdr上で実装・Gap検査・レビュー・最終QAをprofile付きで運用する"
-  default_prompt: "Use $herdr-dev-loop to initialize and pump a bounded, profile-driven Herdr-managed Manager/Worker/Gap Auditor/Reviewer development loop for this goal."
+  short_description: "Herdr上で実装・Gap検査・レビュー・相談役をagent backend profile付きで運用する"
+  default_prompt: "Use $herdr-dev-loop to initialize and pump a bounded, profile-driven Herdr-managed Manager/Worker/Gap Auditor/Reviewer development loop for this goal, with explicit Advisor consultation only when requested."

@@ -5,11 +5,12 @@
   "required": ["id", "kind", "status", "branch", "base_ref", "base_sha", "write_allow", "acceptance"],
   "properties": {
     "id": {"type": "string", "pattern": "^T[0-9]{3}$"},
-    "kind": {"type": "string"},
-    "status": {"type": "string"},
+    "kind": {"type": "string", "enum": ["implementation", "fix", "research"]},
+    "status": {"type": "string", "enum": ["queued", "running", "result_reported", "merged", "done", "partial", "blocked", "failed", "abandoned", "failed_validation"]},
     "branch": {"type": "string"},
     "base_ref": {"type": "string"},
     "base_sha": {"type": "string"},
+    "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
     "batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
     "write_allow": {"type": "array", "items": {"type": "string"}},
     "write_deny": {"type": "array", "items": {"type": "string"}},
@@ -21,6 +22,8 @@
       ]
     },
     "worker_protocol": {"type": "string", "enum": ["native", "codex-impl"]},
+    "worker_agent_provider": {"type": "string", "enum": ["codex", "claude"]},
+    "worker_agent_model": {"type": "string"},
     "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
     "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."}
   },
