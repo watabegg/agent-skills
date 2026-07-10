@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Herdr Dev Loop helper.
 
-This script keeps the Herdr/Codex multi-agent loop file-backed and bounded.
+This script keeps the Herdr-managed multi-agent loop file-backed and bounded.
 It intentionally avoids non-stdlib dependencies so it can run inside arbitrary
 repositories.
 """
@@ -40,6 +40,11 @@ DEFAULT_WORKER_QA_PROFILE = "repo-default"
 DEFAULT_MANAGER_QA_PROFILE = "none"
 DEFAULT_WORKER_PROTOCOL = "native"
 DEFAULT_REVIEW_PROTOCOL = "native"
+DEFAULT_AGENT_PROVIDER = "codex"
+DEFAULT_AGENT_MODEL = "auto"
+DEFAULT_ADVISOR_ENABLED = False
+DEFAULT_ADVISOR_MODE = "single"
+DEFAULT_ADVISOR_MAX_ROUNDS = 2
 DEFAULT_REVIEW_LANES = [
     "integration-contract",
     "correctness",
@@ -51,6 +56,17 @@ QA_PROFILES = {"repo-default", "local", "staging", "preview", "none", "custom"}
 MANAGER_QA_PASSING_STATUSES = {"passed", "accepted-risk", "not-required"}
 WORKER_PROTOCOLS = {"native", "codex-impl"}
 REVIEW_PROTOCOLS = {"native", "codex-review-multi-v2"}
+AGENT_PROVIDERS = {"codex", "claude"}
+AGENT_RUNNERS = {"tui", "exec"}
+ADVISOR_MODES = {"single", "dialogue"}
+ADVISOR_ARTIFACT_STATUSES = {"advised", "blocked", "failed"}
+ADVISOR_VERDICTS = {
+    "decision-recorded",
+    "fix-tasks-created",
+    "accepted-risk",
+    "no-action",
+    "blocked",
+}
 DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
@@ -66,7 +82,9 @@ STRICT_MULTILINE_LIST_FIELDS = {
     "changed_files",
     "depends_on",
     "evidence",
+    "participants",
     "review_lanes",
+    "source_refs",
     "spec_sources",
     "task_ids",
     "validation_commands",
@@ -78,7 +96,10 @@ ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 DANGEROUS_AGENT_MARKERS = (
     "danger-full-access",
     "dangerously-bypass-approvals-and-sandbox",
+    "dangerously-skip-permissions",
     "--dangerously-bypass",
+    "--allow-dangerously-skip-permissions",
+    "bypassPermissions",
     "bypass-approvals-and-sandbox",
 )
 SUSPICIOUS_WORKER_HEADS = {"manager-working-tree", "pending_code_commit"}
@@ -184,6 +205,11 @@ def write_text(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def ensure_worktree_parent_dirs(worktree: Path, *relative_paths: Path) -> None:
+    for relative_path in relative_paths:
+        (worktree / relative_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 def append_text(path: Path, text: str) -> None:
@@ -489,6 +515,7 @@ def ensure_loop_dirs(repo: Path) -> None:
         "results",
         "reviews",
         "gaps",
+        "advice",
         "prompts",
         "reports",
         "triage",
@@ -627,6 +654,31 @@ def codex_tui_blocker(pane: dict[str, Any] | None, text: str) -> str | None:
     return None
 
 
+def agent_tui_blocker(provider: str, pane: dict[str, Any] | None, text: str) -> str | None:
+    provider = normalize_agent_provider(provider)
+    if provider == "codex":
+        return codex_tui_blocker(pane, text)
+    if pane is None:
+        return "pane is missing or closed"
+    pane_agent = str(pane.get("agent") or "")
+    if pane_agent and pane_agent not in {provider, "shell"}:
+        return f"pane is not a {provider} TUI"
+    trust_markers = (
+        "Do you trust the contents of this directory?",
+        "Do you trust the files in this folder?",
+        "Press enter to continue",
+    )
+    if any(marker in text for marker in trust_markers):
+        return f"{provider} trust prompt is pending"
+    status = str(pane.get("agent_status") or "unknown")
+    working_markers = ("esc to interrupt", "• Working", "Working…", "Working...")
+    if status == "working" or any(marker in text for marker in working_markers):
+        return f"{provider} is still working"
+    if status in {"blocked", "unknown"}:
+        return f"{provider} is not ready: agent_status={status}"
+    return None
+
+
 def message_anchors(message: str) -> list[str]:
     anchors: list[str] = []
     for line in message.splitlines():
@@ -656,18 +708,37 @@ def codex_output_after_message(message: str, text: str) -> bool:
     return "\n• " in after
 
 
+def agent_output_after_message(provider: str, message: str, text: str) -> bool:
+    provider = normalize_agent_provider(provider)
+    if provider == "codex":
+        return codex_output_after_message(message, text)
+    anchors = message_anchors(message)
+    if not anchors:
+        return False
+    index = text.rfind(anchors[-1])
+    if index < 0:
+        return False
+    after = text[index + len(anchors[-1]) :]
+    return bool(after.strip())
+
+
 def wait_codex_tui_ready(pane_id: str, timeout_ms: int) -> tuple[dict[str, Any], str]:
+    return wait_agent_tui_ready("codex", pane_id, timeout_ms)
+
+
+def wait_agent_tui_ready(provider: str, pane_id: str, timeout_ms: int) -> tuple[dict[str, Any], str]:
+    provider = normalize_agent_provider(provider)
     deadline = time.monotonic() + max(0, timeout_ms) / 1000
-    last_blocker = "Codex TUI did not become ready"
+    last_blocker = f"{provider} TUI did not become ready"
     while True:
         pane = pane_info(pane_id)
         text = pane_text(pane_id)
-        blocker = codex_tui_blocker(pane, text)
+        blocker = agent_tui_blocker(provider, pane, text)
         if blocker is None and pane is not None:
             return pane, text
         last_blocker = blocker or last_blocker
         if time.monotonic() >= deadline:
-            raise HLoopError(f"Codex TUI is not ready for manager message: {last_blocker}")
+            raise HLoopError(f"{provider} TUI is not ready for manager message: {last_blocker}")
         time.sleep(0.5)
 
 
@@ -683,6 +754,7 @@ def wait_manager_message_visible(pane_id: str, message: str, timeout_ms: int) ->
 
 
 def manager_message_submitted(
+    provider: str,
     pane_id: str,
     message: str,
     typed_snapshot: str,
@@ -697,7 +769,7 @@ def manager_message_submitted(
         session_id = extract_agent_session_id(pane)
         if status in {"working", "blocked"} or "esc to interrupt" in text or "• Working" in text:
             return True
-        if codex_output_after_message(message, text):
+        if agent_output_after_message(provider, message, text):
             return True
         if session_id and session_id != initial_session_id and text != typed_snapshot:
             return True
@@ -714,10 +786,31 @@ def send_codex_tui_message(
     submit_verify_ms: int,
     submit_attempts: int,
 ) -> None:
+    send_agent_tui_message(
+        "codex",
+        pane_id,
+        message,
+        timeout_ms,
+        input_settle_ms,
+        submit_verify_ms,
+        submit_attempts,
+    )
+
+
+def send_agent_tui_message(
+    provider: str,
+    pane_id: str,
+    message: str,
+    timeout_ms: int,
+    input_settle_ms: int,
+    submit_verify_ms: int,
+    submit_attempts: int,
+) -> None:
+    provider = normalize_agent_provider(provider)
     if not message.strip():
         raise HLoopError("manager message is empty")
     check_herdr_env()
-    initial_pane, _ = wait_codex_tui_ready(pane_id, timeout_ms)
+    initial_pane, _ = wait_agent_tui_ready(provider, pane_id, timeout_ms)
     initial_session_id = extract_agent_session_id(initial_pane)
     run_cmd(["herdr", "pane", "send-text", pane_id, message], check=True, capture=True)
     typed_snapshot = wait_manager_message_visible(
@@ -731,6 +824,7 @@ def send_codex_tui_message(
     for attempt in range(attempts):
         run_cmd(["herdr", "pane", "send-keys", pane_id, "Enter"], check=True, capture=True)
         if manager_message_submitted(
+            provider,
             pane_id,
             message,
             typed_snapshot,
@@ -897,6 +991,15 @@ def cleanup_codex_session(session_id: str, mode: str) -> tuple[bool, str]:
     return False, message or f"codex {mode} failed"
 
 
+def cleanup_agent_session(provider: str, session_id: str, mode: str) -> tuple[bool, str]:
+    provider = normalize_agent_provider(provider)
+    if provider == "codex":
+        return cleanup_codex_session(session_id, mode)
+    if mode == "none":
+        return True, "skipped"
+    return True, f"skipped:{provider}-session-cleanup-unsupported"
+
+
 def cleanup_completed_agent_pane(
     repo: Path,
     agent_state: dict[str, Any],
@@ -926,15 +1029,19 @@ def cleanup_completed_agent_pane(
         agent_state["pane_cleanup_status"] = "already-closed"
         return
     session_id = extract_agent_session_id(pane)
+    provider = str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER)
     if session_id:
-        agent_state["codex_session_id"] = session_id
+        agent_state["agent_session_id"] = session_id
+        agent_state["agent_session_provider"] = provider
+        if normalize_agent_provider(provider) == "codex":
+            agent_state["codex_session_id"] = session_id
     if keep_pane:
         agent_state["pane_cleanup_status"] = "kept"
         return
     if dry_run:
         print(f"DRY RUN herdr pane close {pane_id}")
         if session_id and session_cleanup != "none":
-            print(f"DRY RUN codex {session_cleanup} {session_id}")
+            print(f"DRY RUN {provider} session cleanup {session_cleanup} {session_id}")
         return
     proc = run_cmd(["herdr", "pane", "close", pane_id], check=False)
     if proc.returncode == 0:
@@ -948,14 +1055,20 @@ def cleanup_completed_agent_pane(
         journal(repo, f"Failed to close `{label}` pane `{pane_id}`: {message}")
         return
     if session_id:
-        ok, detail = cleanup_codex_session(session_id, session_cleanup)
-        agent_state["codex_session_cleanup"] = detail
+        ok, detail = cleanup_agent_session(provider, session_id, session_cleanup)
+        agent_state["agent_session_cleanup"] = detail
+        if normalize_agent_provider(provider) == "codex":
+            agent_state["codex_session_cleanup"] = detail
         if ok:
-            agent_state["codex_session_cleaned_at"] = now_iso()
-            journal(repo, f"Codex session `{session_id}` for `{label}` cleanup: {detail}.")
+            agent_state["agent_session_cleaned_at"] = now_iso()
+            if normalize_agent_provider(provider) == "codex":
+                agent_state["codex_session_cleaned_at"] = agent_state["agent_session_cleaned_at"]
+            journal(repo, f"{provider} session `{session_id}` for `{label}` cleanup: {detail}.")
         else:
-            agent_state["codex_session_cleanup_error"] = detail
-            journal(repo, f"Failed Codex session cleanup for `{label}` session `{session_id}`: {detail}")
+            agent_state["agent_session_cleanup_error"] = detail
+            if normalize_agent_provider(provider) == "codex":
+                agent_state["codex_session_cleanup_error"] = detail
+            journal(repo, f"Failed {provider} session cleanup for `{label}` session `{session_id}`: {detail}")
 
 
 def current_pane_id() -> str:
@@ -994,6 +1107,12 @@ def gap_file(repo: Path, gap_id: str) -> Path:
     return loop_path(repo) / "gaps" / f"{gap_id}.md"
 
 
+def advice_file(repo: Path, advice_id: str, participant_id: str | None = None) -> Path:
+    if participant_id:
+        return loop_path(repo) / "advice" / f"{advice_id}-{participant_id}.md"
+    return loop_path(repo) / "advice" / f"{advice_id}.md"
+
+
 def prompt_file(repo: Path, name: str) -> Path:
     return loop_path(repo) / "prompts" / name
 
@@ -1006,6 +1125,11 @@ def review_artifact_path(repo: Path, review_id: str, review: dict[str, Any]) -> 
 def gap_artifact_path(repo: Path, gap_id: str, gap: dict[str, Any]) -> Path:
     path = gap.get("worktree_gap_path") or gap.get("gap_path")
     return Path(path) if path else gap_file(repo, gap_id)
+
+
+def advice_artifact_path(repo: Path, advice_id: str, participant: dict[str, Any]) -> Path:
+    path = participant.get("worktree_advice_path") or participant.get("advice_path")
+    return Path(path) if path else advice_file(repo, advice_id, str(participant.get("participant_id") or "P1"))
 
 
 def triage_draft_file(repo: Path, source_id: str) -> Path:
@@ -1022,6 +1146,82 @@ def normalize_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v) for v in value]
     return [str(value)]
+
+
+def normalize_agent_provider(value: Any, default: str = DEFAULT_AGENT_PROVIDER) -> str:
+    provider = str(value or default or DEFAULT_AGENT_PROVIDER).strip().lower()
+    if provider not in AGENT_PROVIDERS:
+        raise HLoopError(
+            f"unsupported agent provider `{provider}`; expected one of: {', '.join(sorted(AGENT_PROVIDERS))}"
+        )
+    return provider
+
+
+def normalize_agent_model(value: Any) -> str:
+    model = str(value or DEFAULT_AGENT_MODEL).strip()
+    return model or DEFAULT_AGENT_MODEL
+
+
+def role_state_prefix(role: str) -> str:
+    if role == "reviewer":
+        return "reviewer"
+    if role == "gap":
+        return "gap"
+    if role == "advisor":
+        return "advisor"
+    return "worker"
+
+
+def role_agent_config(
+    state: dict[str, Any],
+    role: str,
+    *,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    overrides = overrides or {}
+    prefix = role_state_prefix(role)
+    provider = normalize_agent_provider(
+        overrides.get("agent_provider")
+        or overrides.get("provider")
+        or overrides.get(f"{prefix}_agent_provider")
+        or overrides.get(f"{prefix}_provider")
+        or state.get(f"{prefix}_agent_provider")
+        or state.get(f"{prefix}_provider")
+        or DEFAULT_AGENT_PROVIDER
+    )
+    model = normalize_agent_model(
+        overrides.get("agent_model")
+        or overrides.get("model")
+        or overrides.get(f"{prefix}_agent_model")
+        or overrides.get(f"{prefix}_model")
+        or state.get(f"{prefix}_agent_model")
+        or state.get(f"{prefix}_model")
+        or DEFAULT_AGENT_MODEL
+    )
+    fallback = str(
+        overrides.get("fallback_provider")
+        or state.get(f"{prefix}_fallback_provider")
+        or DEFAULT_AGENT_PROVIDER
+    ).strip().lower()
+    if fallback and fallback not in AGENT_PROVIDERS:
+        raise HLoopError(
+            f"unsupported fallback provider `{fallback}`; expected one of: {', '.join(sorted(AGENT_PROVIDERS))}"
+        )
+    return {"provider": provider, "model": model, "fallback_provider": fallback}
+
+
+def require_agent_provider_available(provider: str) -> None:
+    provider = normalize_agent_provider(provider)
+    if not command_exists(provider):
+        raise HLoopError(f"{provider} command not found")
+
+
+def agent_display(config: dict[str, str]) -> str:
+    model = config.get("model") or DEFAULT_AGENT_MODEL
+    provider = config.get("provider") or DEFAULT_AGENT_PROVIDER
+    if model == DEFAULT_AGENT_MODEL:
+        return provider
+    return f"{provider}:{model}"
 
 
 def normalize_bool(value: Any) -> bool:
@@ -1197,6 +1397,7 @@ def preflight_loop(
     *,
     require_herdr: bool = False,
     require_codex: bool = False,
+    require_agent_provider: str | None = None,
     require_integration_branch: bool = False,
     allow_loop_dirty: bool = True,
     mark_blocked: bool = True,
@@ -1217,6 +1418,10 @@ def preflight_loop(
             fail("herdr command not found")
     if require_codex and not command_exists("codex"):
         fail("codex command not found")
+    if require_agent_provider:
+        provider = normalize_agent_provider(require_agent_provider)
+        if not command_exists(provider):
+            fail(f"{provider} command not found")
     if require_integration_branch:
         expected = str(state.get("integration_branch") or "")
         actual = current_branch(repo)
@@ -1320,6 +1525,9 @@ def pane_marker(role: str, agent_id: str) -> str:
         return f"HERDR_LOOP_REVIEW_DONE:{agent_id}:"
     if role == "gap":
         return f"HERDR_LOOP_GAP_DONE:{agent_id}:"
+    if role == "advisor":
+        advice_id, participant_id = split_advice_target(agent_id)
+        return f"HERDR_LOOP_ADVICE_DONE:{advice_id}:{participant_id}:"
     return ""
 
 
@@ -1353,6 +1561,7 @@ def pane_snapshot(
     snapshot["agent_status"] = info.get("agent_status", "unknown")
     session_id = extract_agent_session_id(info)
     if session_id:
+        snapshot["agent_session_id"] = session_id
         snapshot["codex_session_id"] = session_id
     text = pane_text(pane_id, max(1, lines))
     marker = pane_marker(role, agent_id)
@@ -1360,6 +1569,8 @@ def pane_snapshot(
     if marker and marker in text:
         signals.append("done-marker")
     if "Do you trust the contents of this directory?" in text:
+        signals.append("trust-prompt")
+    if "Do you trust the files in this folder?" in text:
         signals.append("trust-prompt")
     if "Press enter to continue" in text:
         signals.append("press-enter")
@@ -1459,6 +1670,9 @@ def contains_dangerous_agent_marker(value: Any) -> bool:
 
 
 def expected_prompt_fragment(role: str, agent_id: str) -> str:
+    if role == "advisor":
+        advice_id, participant_id = split_advice_target(agent_id)
+        return f".ai/loop/prompts/{advice_id}-{participant_id}.advisor.md"
     suffix = {"worker": "worker", "reviewer": "reviewer", "gap": "gap"}.get(role, role)
     return f".ai/loop/prompts/{agent_id}.{suffix}.md"
 
@@ -1824,6 +2038,86 @@ def collect_gate_inventory(
     }
 
 
+def collect_advice_inventory(
+    repo: Path,
+    advice_id: str,
+    advice: dict[str, Any],
+    *,
+    probe_panes: bool,
+    lines: int,
+    include_output: bool,
+) -> list[dict[str, Any]]:
+    items = []
+    for participant in advice.get("participants", []):
+        participant_id = str(participant.get("participant_id") or "P1")
+        combined_id = f"{advice_id}/{participant_id}"
+        status = str(participant.get("status") or "")
+        gate_status = agent_gate_status(participant)
+        artifact_path = advice_artifact_path(repo, advice_id, participant)
+        artifact_meta, artifact_state = safe_frontmatter(artifact_path)
+        pane_id = str(participant.get("pane_id") or "")
+        pane = (
+            pane_snapshot(
+                pane_id,
+                role="advisor",
+                agent_id=combined_id,
+                lines=lines,
+                include_output=include_output,
+            )
+            if probe_panes
+            else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
+        )
+        issues: list[dict[str, str]] = []
+        issues.extend(agent_contract_issues(repo, role="advisor", agent_id=combined_id, agent=participant))
+        if gate_status == "running":
+            if artifact_state == "present":
+                issues.append(
+                    make_issue(
+                        "P2",
+                        "advisor-artifact-ready",
+                        f"advisor:{combined_id}",
+                        f"Advisor artifact exists and can be harvested.",
+                        f"hloop harvest {combined_id}",
+                    )
+                )
+            else:
+                pane_issue = pane_issue_for_running("advisor", combined_id, pane)
+                if pane_issue:
+                    issues.append(pane_issue)
+        if gate_status == "reported":
+            issues.append(
+                make_issue(
+                    "P2",
+                    "advisor-manager-review-required",
+                    f"advisor:{combined_id}",
+                    f"Advisor {combined_id} has been harvested and needs Manager review.",
+                    f"hloop advisor close {advice_id} --verdict <verdict> --reason ...",
+                )
+            )
+        items.append(
+            {
+                "id": combined_id,
+                "role": "advisor",
+                "status": status,
+                "gate_status": gate_status,
+                "artifact_status": str(participant.get("artifact_status") or artifact_meta.get("status") or ""),
+                "provider": str(participant.get("agent_provider") or participant.get("provider") or ""),
+                "model": str(participant.get("agent_model") or participant.get("model") or ""),
+                "topic": str(advice.get("topic") or ""),
+                "worktree": worktree_state(participant.get("worktree")),
+                "pane": pane,
+                "artifact": {
+                    "path": str(artifact_path),
+                    "state": artifact_state,
+                    "exists": artifact_state == "present",
+                    "frontmatter": artifact_meta,
+                },
+                "issues": issues,
+            }
+        )
+    return items
+
+
 def collect_loop_inventory(
     repo: Path,
     *,
@@ -1914,7 +2208,20 @@ def collect_loop_inventory(
         )
         for gap_id, gap in state.get("gaps", {}).items()
     ]
-    for collection in (workers, reviewers, gaps):
+    advisors = []
+    for advice_id, advice in state.get("advice", {}).items():
+        if isinstance(advice, dict):
+            advisors.extend(
+                collect_advice_inventory(
+                    repo,
+                    advice_id,
+                    advice,
+                    probe_panes=probe_panes,
+                    lines=lines,
+                    include_output=include_output,
+                )
+            )
+    for collection in (workers, reviewers, gaps, advisors):
         for item in collection:
             issues.extend(item.get("issues", []))
     issues = sorted(issues, key=issue_sort_key)
@@ -1937,6 +2244,7 @@ def collect_loop_inventory(
     running_workers = [item["id"] for item in workers if item.get("status") == "running"]
     running_reviewers = [item["id"] for item in reviewers if item.get("gate_status") == "running"]
     running_gaps = [item["id"] for item in gaps if item.get("gate_status") == "running"]
+    running_advisors = [item["id"] for item in advisors if item.get("gate_status") == "running"]
     inventory = {
         "repo": str(repo),
         "generated_at": now_iso(),
@@ -1982,12 +2290,16 @@ def collect_loop_inventory(
             "gaps": len(gaps),
             "gaps_running": len(running_gaps),
             "gaps_reported": sum(1 for item in gaps if item.get("gate_status") == "reported"),
+            "advisors": len(advisors),
+            "advisors_running": len(running_advisors),
+            "advisors_reported": sum(1 for item in advisors if item.get("gate_status") == "reported"),
             "issues": len(issues),
             "p0_p1_issues": sum(1 for item in issues if item.get("severity") in {"P0", "P1"}),
         },
         "workers": workers,
         "reviewers": reviewers,
         "gaps": gaps,
+        "advisors": advisors,
         "issues": issues,
         "next_actions": next_actions,
         "herdr": {
@@ -2030,6 +2342,26 @@ def validate_gap_worktree_scope(
         str((LOOP_DIR / "prompts" / f"{gap_id}.gap.md").as_posix()),
     }
     baseline = set(normalize_list(gap_state.get("baseline_dirty_files")))
+    violations = []
+    for path in porcelain_paths(worktree):
+        if path in baseline:
+            continue
+        if path not in allowed:
+            violations.append(path)
+    return violations
+
+
+def validate_advisor_worktree_scope(
+    advice_id: str,
+    participant: dict[str, Any],
+    worktree: Path,
+) -> list[str]:
+    participant_id = str(participant.get("participant_id") or "P1")
+    allowed = {
+        str((LOOP_DIR / "advice" / f"{advice_id}-{participant_id}.md").as_posix()),
+        str((LOOP_DIR / "prompts" / f"{advice_id}-{participant_id}.advisor.md").as_posix()),
+    }
+    baseline = set(normalize_list(participant.get("baseline_dirty_files")))
     violations = []
     for path in porcelain_paths(worktree):
         if path in baseline:
@@ -2328,6 +2660,114 @@ Do not invoke a generic multi-review skill unless PROFILE.md or the task explici
 """
 
 
+def parse_participant_spec(spec: str) -> dict[str, str]:
+    raw = str(spec or "").strip()
+    if not raw:
+        raise HLoopError("advisor participant spec is empty")
+    if ":" in raw:
+        provider, model = raw.split(":", 1)
+    else:
+        provider, model = raw, DEFAULT_AGENT_MODEL
+    return {
+        "provider": normalize_agent_provider(provider),
+        "model": normalize_agent_model(model),
+    }
+
+
+def advisor_participants_from_args(args: argparse.Namespace, state: dict[str, Any]) -> list[dict[str, Any]]:
+    specs = normalize_list(getattr(args, "participant", None))
+    if not specs:
+        config = role_agent_config(state, "advisor")
+        specs = [f"{config['provider']}:{config['model']}"]
+    participants = []
+    for index, spec in enumerate(specs, start=1):
+        parsed = parse_participant_spec(spec)
+        participants.append(
+            {
+                "participant_id": f"P{index}",
+                "provider": parsed["provider"],
+                "model": parsed["model"],
+                "status": "queued",
+            }
+        )
+    return participants
+
+
+def render_advisor_prompt(
+    advice_id: str,
+    participant: dict[str, Any],
+    advice_state: dict[str, Any],
+    state: dict[str, Any],
+    output_rel: Path,
+) -> str:
+    participant_id = str(participant.get("participant_id") or "P1")
+    provider = str(participant.get("provider") or DEFAULT_AGENT_PROVIDER)
+    model = str(participant.get("model") or DEFAULT_AGENT_MODEL)
+    topic = str(advice_state.get("topic") or "")
+    mode = str(advice_state.get("mode") or DEFAULT_ADVISOR_MODE)
+    max_rounds = advisor_max_rounds(state, advice_state)
+    dialogue_round = int(participant.get("dialogue_round") or (1 if mode == "dialogue" else 0))
+    sources = normalize_list(advice_state.get("source_refs"))
+    source_lines = "\n".join(f"- {item}" for item in sources) or "- No specific source artifact was provided."
+    peer_paths = [
+        str(item.get("advice_path"))
+        for item in advice_state.get("participants", [])
+        if item.get("participant_id") != participant_id and item.get("advice_path")
+    ]
+    peer_lines = "\n".join(f"- {item}" for item in peer_paths) or "- No peer advice artifact is available yet."
+    return f"""You are Advisor {advice_id}/{participant_id}.
+
+You are an opt-in consultation agent for the HLoop Manager.
+
+Agent backend:
+- provider: {provider}
+- model: {model}
+
+Consultation mode: {mode}
+Dialogue round: {dialogue_round}
+Dialogue max rounds: {max_rounds}
+
+Topic:
+{topic}
+
+Read first:
+- .ai/loop/MISSION.md
+- .ai/loop/PLAN.md
+- .ai/loop/PROFILE.md
+- .ai/loop/DECISIONS.md
+- .ai/loop/STATE.json
+
+Source artifacts or code references:
+{source_lines}
+
+Peer advice artifacts for bounded cross-model dialogue:
+{peer_lines}
+
+Rules:
+- Do not edit code.
+- Do not modify Manager-owned loop files other than your required advice artifact.
+- Do not create tasks, close review/gap gates, or make final decisions.
+- You may recommend a fix strategy, a better specification shape, accepted-risk rationale, or a decision record.
+- If the choice requires user preference, product policy, external approval, secrets, or production risk acceptance, say that Manager must ask the user.
+- If the choice can be resolved from repository evidence, plan/spec sources, and existing decisions, give a concrete recommendation.
+- In dialogue mode, address peer advice directly when present; otherwise produce an independent first-round memo.
+- Do not continue open-ended debate; Manager enforces the dialogue max rounds.
+
+Required output:
+- Write only {output_rel.as_posix()}.
+- Include frontmatter: advice_id, participant_id, provider, model, status: advised|blocked|failed.
+- Include sections:
+  - ## Recommendation
+  - ## Reasoning
+  - ## Tradeoffs
+  - ## Suggested Manager Action
+  - ## User Escalation Needed
+
+Final terminal line:
+HERDR_LOOP_ADVICE_DONE:{advice_id}:{participant_id}:<advised|blocked|failed>
+"""
+
+
 def render_worker_prompt(
     task_id: str,
     task_meta: dict[str, Any],
@@ -2345,6 +2785,7 @@ def render_worker_prompt(
     )
     branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
     base_ref = str(task_meta.get("base_ref") or "the integration branch")
+    agent_config = role_agent_config(state, "worker", overrides=task_meta)
     protocol = worker_protocol_text(worker_protocol, worker_qa_profile, base_ref)
     return f"""You are Worker {task_id}.
 
@@ -2365,6 +2806,7 @@ Loop profile:
 - Branch strategy: {branch_strategy}
 - Worker protocol: {worker_protocol}
 - Worker QA profile: {worker_qa_profile}
+- Agent backend: {agent_display(agent_config)}
 
 {protocol}
 
@@ -2402,6 +2844,7 @@ def render_reviewer_prompt(
     base_branch: str,
     integration_branch: str,
     state: dict[str, Any],
+    agent_config: dict[str, str] | None = None,
 ) -> str:
     review_protocol = state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
     if review_protocol not in REVIEW_PROTOCOLS:
@@ -2410,6 +2853,7 @@ def render_reviewer_prompt(
     manager_qa_profile = state_manager_qa_profile(state)
     branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
     lanes = state_list(state, "review_lanes", DEFAULT_REVIEW_LANES)
+    agent_config = agent_config or role_agent_config(state, "reviewer")
     protocol = review_protocol_text(
         review_protocol,
         lanes,
@@ -2441,6 +2885,7 @@ Review profile:
 - Manager final QA profile: {manager_qa_profile}
 - Review protocol: {review_protocol}
 - Review lanes: {", ".join(lanes)}
+- Agent backend: {agent_display(agent_config)}
 
 {protocol}
 
@@ -2475,7 +2920,10 @@ def render_gap_prompt(
     base_branch: str,
     integration_branch: str,
     spec_sources: list[str],
+    state: dict[str, Any] | None = None,
+    agent_config: dict[str, str] | None = None,
 ) -> str:
+    agent_config = agent_config or role_agent_config(state or {}, "gap")
     if spec_sources:
         source_lines = "\n".join(f"- {item}" for item in spec_sources)
     else:
@@ -2489,6 +2937,7 @@ Purpose:
 Compare:
 - base branch: {base_branch}
 - integration branch: {integration_branch}
+- Agent backend: {agent_display(agent_config)}
 
 You are running in a detached gap-audit worktree. Treat the target as read-only during investigation.
 
@@ -2551,6 +3000,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "git": command_exists("git"),
             "herdr": command_exists("herdr"),
             "codex": command_exists("codex"),
+            "claude": command_exists("claude"),
         },
         "skills": {
             "herdr": str(herdr_skill or herdr_skill_candidates[0]),
@@ -2582,6 +3032,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if command_exists("codex"):
         proc = run_cmd(["codex", "--version"], check=False)
         checks["codex_version"] = (proc.stdout or proc.stderr).strip()
+    if command_exists("claude"):
+        proc = run_cmd(["claude", "--version"], check=False)
+        checks["claude_version"] = (proc.stdout or proc.stderr).strip()
     if command_exists("herdr") and os.environ.get("HERDR_ENV") == "1":
         status_proc = run_cmd(["herdr", "status"], check=False)
         checks["herdr_status"] = (status_proc.stdout or status_proc.stderr).strip()
@@ -2601,7 +3054,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         except HLoopError as exc:
             checks["warnings"].append(f"session inventory unavailable: {exc}")
     herdr_skill_ok = checks["skills"]["herdr"]["exists"] or not args.strict_skills
-    ok = checks["HERDR_ENV"] == "1" and all(checks["commands"].values()) and herdr_skill_ok
+    required_commands_ok = checks["commands"]["git"] and checks["commands"]["herdr"] and checks["commands"]["codex"]
+    ok = checks["HERDR_ENV"] == "1" and required_commands_ok and herdr_skill_ok
     checks["ok"] = ok
     if args.json:
         print(json.dumps(checks, ensure_ascii=False, indent=2))
@@ -2748,12 +3202,15 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     task_schema = schemas.get("task.schema.json", {})
     review_schema = schemas.get("review.schema.json", {})
     gap_schema = schemas.get("gap.schema.json", {})
+    advice_schema = schemas.get("advice.schema.json", {})
     check(schema_has_merge_ready_guard(result_schema), "result.schema.json lacks merge_ready guard")
     check(schema_has_write_allow_guard(task_schema), "task.schema.json lacks write_allow guard")
     review_status_enum = set(normalize_list(review_schema.get("properties", {}).get("status", {}).get("enum")))
     gap_status_enum = set(normalize_list(gap_schema.get("properties", {}).get("status", {}).get("enum")))
+    advice_status_enum = set(normalize_list(advice_schema.get("properties", {}).get("status", {}).get("enum")))
     check(review_status_enum == REVIEW_ARTIFACT_STATUSES, "review.schema.json status enum drifted")
     check(gap_status_enum == GAP_ARTIFACT_STATUSES, "gap.schema.json status enum drifted")
+    check(advice_status_enum == ADVISOR_ARTIFACT_STATUSES, "advice.schema.json status enum drifted")
 
     result_meta = parse_frontmatter_text(
         """---
@@ -2829,6 +3286,147 @@ validation_commands: ["npm test -- --grep foo,bar"]
     check(parsed_rollup.batch == "B001" and parsed_rollup.rollup, "checkpoint rollup args did not parse")
     parsed_batch = build_parser().parse_args(["batch", "start", "demo batch", "--id", "B001"])
     check(parsed_batch.batch_command == "start", "batch start command did not parse")
+    parsed_mixed_init = build_parser().parse_args(
+        [
+            "init",
+            "--goal",
+            "demo",
+            "--reviewer-agent-provider",
+            "claude",
+            "--reviewer-agent-model",
+            "opus",
+            "--advisor-enabled",
+            "--advisor-mode",
+            "dialogue",
+        ]
+    )
+    check(parsed_mixed_init.reviewer_agent_provider == "claude", "init reviewer agent provider did not parse")
+    parsed_advisor = build_parser().parse_args(
+        [
+            "advisor",
+            "request",
+            "--topic",
+            "choose fix strategy",
+            "--mode",
+            "dialogue",
+            "--participant",
+            "codex:auto",
+            "--participant",
+            "claude:opus",
+        ]
+    )
+    check(parsed_advisor.advisor_command == "request", "advisor request command did not parse")
+    check(
+        parse_participant_spec("claude:opus") == {"provider": "claude", "model": "opus"},
+        "advisor participant parser drifted",
+    )
+    worker_prompt = render_worker_prompt(
+        "T001",
+        {
+            "worker_protocol": "native",
+            "worker_qa_profile": "none",
+            "base_ref": "main",
+            "worker_agent_provider": "claude",
+            "worker_agent_model": "opus",
+        },
+        Path("/tmp/hloop-worker"),
+        "ai/demo/T001",
+        {
+            "branch_strategy": "integration",
+            "worker_protocol": "native",
+            "worker_qa_profile": "none",
+            "worker_agent_provider": "codex",
+            "worker_agent_model": "auto",
+        },
+    )
+    check(
+        "- Agent backend: claude:opus" in worker_prompt,
+        "worker prompt ignored task-level worker agent backend override",
+    )
+    review_override_prompt = render_reviewer_prompt(
+        "R999",
+        "main",
+        "ai/demo/integration",
+        {
+            "reviewer_agent_provider": "claude",
+            "reviewer_agent_model": "opus",
+            "worker_qa_profile": "none",
+            "manager_qa_profile": "none",
+            "branch_strategy": "integration",
+            "review_protocol": "native",
+            "review_lanes": DEFAULT_REVIEW_LANES,
+        },
+        agent_config={"provider": "codex", "model": "auto", "fallback_provider": "codex"},
+    )
+    check(
+        "- Agent backend: codex" in review_override_prompt,
+        "reviewer prompt ignored start-level agent backend override",
+    )
+    gap_override_prompt = render_gap_prompt(
+        "G999",
+        "main",
+        "ai/demo/integration",
+        ["spec/demo.md"],
+        {"gap_agent_provider": "claude", "gap_agent_model": "opus"},
+        agent_config={"provider": "codex", "model": "auto", "fallback_provider": "codex"},
+    )
+    check(
+        "- Agent backend: codex" in gap_override_prompt,
+        "gap prompt ignored start-level agent backend override",
+    )
+    advisor_state = {"advisor_max_rounds": 2}
+    peer_advice = {
+        "mode": "dialogue",
+        "max_rounds": 2,
+        "topic": "compare fix strategy",
+        "participants": [
+            {
+                "participant_id": "P1",
+                "provider": "codex",
+                "model": "auto",
+                "advice_path": ".ai/loop/advice/A001-P1.md",
+            },
+            {"participant_id": "P2", "provider": "claude", "model": "opus"},
+        ],
+    }
+    peer_participant = peer_advice["participants"][1]
+    prepare_advisor_dialogue_start(advisor_state, peer_advice, peer_participant)
+    peer_prompt = render_advisor_prompt(
+        "A001",
+        peer_participant,
+        peer_advice,
+        advisor_state,
+        Path(".ai/loop/advice/A001-P2.md"),
+    )
+    check(
+        ".ai/loop/advice/A001-P1.md" in peer_prompt and "Dialogue max rounds: 2" in peer_prompt,
+        "advisor dialogue prompt did not include peer artifact and round bound",
+    )
+    limit_participant = {
+        "participant_id": "P1",
+        "manager_messages": [{"delivery_status": "sent"}],
+    }
+    advisor_limit_rejected = False
+    try:
+        enforce_advisor_message_round_limit(
+            advisor_state,
+            {"mode": "dialogue", "max_rounds": 2},
+            limit_participant,
+        )
+    except HLoopError as exc:
+        advisor_limit_rejected = "follow-up limit reached" in str(exc)
+    check(advisor_limit_rejected, "advisor dialogue follow-up limit was not enforced")
+    check(
+        "claude --print" in agent_command_for_prompt(
+            provider="claude",
+            model="opus",
+            runner="exec",
+            sandbox="workspace-write",
+            prompt_rel=Path(".ai/loop/prompts/A001-P1.advisor.md"),
+            output_rel=Path(".ai/loop/advice/A001-P1.md"),
+        ),
+        "claude exec command rendering drifted",
+    )
     parsed_pump = build_parser().parse_args(["pump"])
     check(parsed_pump.sleep_ms == DEFAULT_PUMP_SLEEP_MS, "pump sleep default drifted")
     check(
@@ -2983,6 +3581,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     manager_qa_profile = str(
         getattr(args, "manager_qa_profile", None) or DEFAULT_MANAGER_QA_PROFILE
     )
+    worker_agent_provider = normalize_agent_provider(getattr(args, "worker_agent_provider", None))
+    worker_agent_model = normalize_agent_model(getattr(args, "worker_agent_model", None))
+    reviewer_agent_provider = normalize_agent_provider(getattr(args, "reviewer_agent_provider", None))
+    reviewer_agent_model = normalize_agent_model(getattr(args, "reviewer_agent_model", None))
+    gap_agent_provider = normalize_agent_provider(getattr(args, "gap_agent_provider", None))
+    gap_agent_model = normalize_agent_model(getattr(args, "gap_agent_model", None))
+    advisor_agent_provider = normalize_agent_provider(getattr(args, "advisor_agent_provider", None))
+    advisor_agent_model = normalize_agent_model(getattr(args, "advisor_agent_model", None))
+    advisor_enabled = normalize_bool(getattr(args, "advisor_enabled", DEFAULT_ADVISOR_ENABLED))
+    advisor_mode = str(getattr(args, "advisor_mode", DEFAULT_ADVISOR_MODE) or DEFAULT_ADVISOR_MODE)
     if args.create_branch:
         if branch_exists(repo, integration):
             git(repo, ["switch", integration])
@@ -3062,6 +3670,20 @@ Manager-owned project profile for branch strategy, implementation protocol, revi
 
 ## Review Lanes
 {chr(10).join(f"- {item}" for item in lanes)}
+
+## Agent Backends
+
+- Worker default: provider `{worker_agent_provider}`, model `{worker_agent_model}`
+- Reviewer default: provider `{reviewer_agent_provider}`, model `{reviewer_agent_model}`
+- Gap Auditor default: provider `{gap_agent_provider}`, model `{gap_agent_model}`
+- Advisor default: provider `{advisor_agent_provider}`, model `{advisor_agent_model}`
+
+Codex is the default fallback provider for every role. Use role-specific provider/model settings when the Manager intentionally wants Claude, Codex, or a mixed model review strategy. Manager is always the agent currently using this skill; hloop only spawns subordinate role agents.
+
+Advisor is opt-in only. It must not run from pump/tick unless Manager explicitly starts an advice request.
+
+Advisor enabled: `{str(advisor_enabled).lower()}`
+Advisor mode: `{advisor_mode}`
 
 ## Worker QA Profile
 {worker_qa_profile}
@@ -3156,6 +3778,17 @@ None.
         "manager_qa_status": "not-required" if manager_qa_profile == "none" else "pending",
         "worker_protocol": args.worker_protocol,
         "review_protocol": args.review_protocol,
+        "worker_agent_provider": worker_agent_provider,
+        "worker_agent_model": worker_agent_model,
+        "reviewer_agent_provider": reviewer_agent_provider,
+        "reviewer_agent_model": reviewer_agent_model,
+        "gap_agent_provider": gap_agent_provider,
+        "gap_agent_model": gap_agent_model,
+        "advisor_enabled": advisor_enabled,
+        "advisor_mode": advisor_mode,
+        "advisor_max_rounds": getattr(args, "advisor_max_rounds", DEFAULT_ADVISOR_MAX_ROUNDS),
+        "advisor_agent_provider": advisor_agent_provider,
+        "advisor_agent_model": advisor_agent_model,
         "review_lanes": args.review_lane or DEFAULT_REVIEW_LANES,
         "worker_runner": args.worker_runner,
         "reviewer_runner": args.reviewer_runner,
@@ -3177,6 +3810,7 @@ None.
         "batches": {},
         "reviews": {},
         "gaps": {},
+        "advice": {},
         "blocking_decisions": [],
         "created_at": now_iso(),
     }
@@ -3192,6 +3826,18 @@ None.
         )
         old.setdefault("worker_protocol", args.worker_protocol)
         old.setdefault("review_protocol", args.review_protocol)
+        old.setdefault("worker_agent_provider", worker_agent_provider)
+        old.setdefault("worker_agent_model", worker_agent_model)
+        old.setdefault("reviewer_agent_provider", reviewer_agent_provider)
+        old.setdefault("reviewer_agent_model", reviewer_agent_model)
+        old.setdefault("gap_agent_provider", gap_agent_provider)
+        old.setdefault("gap_agent_model", gap_agent_model)
+        old.setdefault("advisor_enabled", advisor_enabled)
+        old.setdefault("advisor_mode", advisor_mode)
+        old.setdefault("advisor_max_rounds", getattr(args, "advisor_max_rounds", DEFAULT_ADVISOR_MAX_ROUNDS))
+        old.setdefault("advisor_agent_provider", advisor_agent_provider)
+        old.setdefault("advisor_agent_model", advisor_agent_model)
+        old.setdefault("advice", {})
         old.setdefault("review_lanes", args.review_lane or DEFAULT_REVIEW_LANES)
         old.setdefault("review_after_merges", args.review_after_merges)
         old.setdefault("gap_after_merges", args.gap_after_merges)
@@ -3337,11 +3983,13 @@ def print_inventory_dashboard(inventory: dict[str, Any]) -> None:
         f"workers={counts.get('workers')} running={counts.get('workers_running')} "
         f"queued={counts.get('workers_queued')} merge_ready={counts.get('workers_merge_ready')}; "
         f"reviewers={counts.get('reviewers')} running={counts.get('reviewers_running')} reported={counts.get('reviewers_reported')}; "
-        f"gaps={counts.get('gaps')} running={counts.get('gaps_running')} reported={counts.get('gaps_reported')}"
+        f"gaps={counts.get('gaps')} running={counts.get('gaps_running')} reported={counts.get('gaps_reported')}; "
+        f"advisors={counts.get('advisors')} running={counts.get('advisors_running')} reported={counts.get('advisors_reported')}"
     )
     print_agent_rows("Workers", inventory["workers"])
     print_agent_rows("Reviewers", inventory["reviewers"])
     print_agent_rows("Gaps", inventory["gaps"])
+    print_agent_rows("Advisors", inventory.get("advisors", []))
     print("Issues:")
     if not inventory["issues"]:
         print("  none")
@@ -3630,6 +4278,8 @@ def create_loop_task(
     validation_minimum: str = "L1",
     branch: str | None = None,
     batch_id: str | None = None,
+    worker_agent_provider: str | None = None,
+    worker_agent_model: str | None = None,
     allow_no_write: bool = False,
 ) -> str:
     if kind == "implementation" and not write_allow and not allow_no_write:
@@ -3662,6 +4312,12 @@ def create_loop_task(
         "validation_minimum": validation_minimum,
         "worker_protocol": state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
         "worker_qa_profile": state_worker_qa_profile(state),
+        "worker_agent_provider": normalize_agent_provider(
+            worker_agent_provider or state.get("worker_agent_provider") or DEFAULT_AGENT_PROVIDER
+        ),
+        "worker_agent_model": normalize_agent_model(
+            worker_agent_model or state.get("worker_agent_model") or DEFAULT_AGENT_MODEL
+        ),
     }
     if resolved_batch_id:
         fields["batch_id"] = resolved_batch_id
@@ -3705,6 +4361,8 @@ Use the HLoop Worker Protocol from `.ai/loop/PROFILE.md` and your rendered worke
         "created_from": created_from,
         "worker_protocol": fields["worker_protocol"],
         "worker_qa_profile": fields["worker_qa_profile"],
+        "agent_provider": fields["worker_agent_provider"],
+        "agent_model": fields["worker_agent_model"],
         "created_at": now_iso(),
     }
     if resolved_batch_id:
@@ -3769,6 +4427,16 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         "worker_qa_profile": args_worker_qa_profile(args)
         if requested_worker_qa_profile
         else state_worker_qa_profile(state),
+        "worker_agent_provider": normalize_agent_provider(
+            getattr(args, "worker_agent_provider", None)
+            or state.get("worker_agent_provider")
+            or DEFAULT_AGENT_PROVIDER
+        ),
+        "worker_agent_model": normalize_agent_model(
+            getattr(args, "worker_agent_model", None)
+            or state.get("worker_agent_model")
+            or DEFAULT_AGENT_MODEL
+        ),
     }
     if resolved_batch_id:
         fields["batch_id"] = resolved_batch_id
@@ -3807,6 +4475,8 @@ Use the HLoop Worker Protocol from `.ai/loop/PROFILE.md` and your rendered worke
         "depends_on": fields["depends_on"],
         "worker_protocol": fields["worker_protocol"],
         "worker_qa_profile": fields["worker_qa_profile"],
+        "agent_provider": fields["worker_agent_provider"],
+        "agent_model": fields["worker_agent_model"],
         "created_at": now_iso(),
     }
     if resolved_batch_id:
@@ -3833,6 +4503,10 @@ def default_review_worktree(repo: Path, review_id: str) -> Path:
 
 def default_gap_worktree(repo: Path, gap_id: str) -> Path:
     return repo.parent / f"{repo.name}.{gap_id.lower()}-gap"
+
+
+def default_advisor_worktree(repo: Path, advice_id: str, participant_id: str) -> Path:
+    return repo.parent / f"{repo.name}.{advice_id.lower()}-{participant_id.lower()}-advisor"
 
 
 def cleanup_hloop_prompt_file(worktree: Path, agent_id: str, suffix: str) -> None:
@@ -3913,6 +4587,22 @@ def ensure_gap_visible_in_worktree(worktree: Path) -> None:
         )
 
 
+def ensure_advisor_visible_in_worktree(worktree: Path) -> None:
+    missing = [
+        loop_path(worktree) / "MISSION.md",
+        loop_path(worktree) / "PLAN.md",
+        loop_path(worktree) / "PROFILE.md",
+        loop_path(worktree) / "DECISIONS.md",
+    ]
+    absent = [str(path) for path in missing if not path.exists()]
+    if absent:
+        raise HLoopError(
+            "advisor worktree does not contain required .ai/loop files. "
+            "Commit Manager-owned .ai/loop changes on the integration branch first. "
+            f"Missing: {', '.join(absent)}"
+        )
+
+
 def cleanup_review_worktree(
     repo: Path,
     review_id: str,
@@ -3971,6 +4661,36 @@ def cleanup_gap_worktree(
     gap_state["worktree_cleaned_at"] = now_iso()
 
 
+def cleanup_advisor_worktree(
+    repo: Path,
+    advice_id: str,
+    participant: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    best_effort: bool = False,
+) -> None:
+    worktree_raw = participant.get("worktree")
+    if not worktree_raw:
+        return
+    worktree = Path(worktree_raw).resolve()
+    if not worktree.exists() or worktree == repo or participant.get("worktree_cleaned_at"):
+        return
+    participant_id = str(participant.get("participant_id") or "P1")
+    if dry_run:
+        print(f"DRY RUN git worktree remove --force {worktree}")
+        return
+    try:
+        cleanup_hloop_prompt_file(worktree, f"{advice_id}-{participant_id}", "advisor")
+        git(repo, ["worktree", "remove", "--force", str(worktree)])
+    except (HLoopError, subprocess.CalledProcessError) as exc:
+        if best_effort:
+            record_worktree_cleanup_failure(repo, participant, f"Advisor {advice_id}/{participant_id}", exc)
+            return
+        raise
+    participant["worktree_cleanup_status"] = "removed"
+    participant["worktree_cleaned_at"] = now_iso()
+
+
 def start_pane_launcher(
     *,
     manager_pane: str,
@@ -4016,14 +4736,38 @@ def codex_command_for_prompt(
     prompt_rel: Path,
     output_rel: Path | None = None,
 ) -> str:
+    return agent_command_for_prompt(
+        provider="codex",
+        model=DEFAULT_AGENT_MODEL,
+        runner=runner,
+        sandbox=sandbox,
+        prompt_rel=prompt_rel,
+        output_rel=output_rel,
+    )
+
+
+def agent_command_for_prompt(
+    *,
+    provider: str,
+    model: str,
+    runner: str,
+    sandbox: str,
+    prompt_rel: Path,
+    output_rel: Path | None = None,
+) -> str:
+    provider = normalize_agent_provider(provider)
+    model = normalize_agent_model(model)
     prompt_ref = shlex.quote(str(prompt_rel))
-    if runner == "exec":
-        parts = ["codex", "exec", "--sandbox", sandbox]
-        if output_rel is not None:
-            parts.extend(["--output-last-message", str(output_rel)])
-        parts.append("-")
-        return f"{shlex.join(parts)} < {prompt_ref}"
-    if runner == "tui":
+    if runner not in AGENT_RUNNERS:
+        raise HLoopError(f"unsupported runner: {runner}")
+    if provider == "codex":
+        model_args = [] if model == DEFAULT_AGENT_MODEL else ["--model", model]
+        if runner == "exec":
+            parts = ["codex", "exec", "--sandbox", sandbox, *model_args]
+            if output_rel is not None:
+                parts.extend(["--output-last-message", str(output_rel)])
+            parts.append("-")
+            return f"{shlex.join(parts)} < {prompt_ref}"
         parts = [
             "codex",
             "--sandbox",
@@ -4031,9 +4775,32 @@ def codex_command_for_prompt(
             "--ask-for-approval",
             "never",
             "--no-alt-screen",
+            *model_args,
         ]
         return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
-    raise HLoopError(f"unsupported runner: {runner}")
+    if provider == "claude":
+        model_args = [] if model == DEFAULT_AGENT_MODEL else ["--model", model]
+        if runner == "exec":
+            parts = [
+                "claude",
+                "--print",
+                "--permission-mode",
+                "acceptEdits",
+                *model_args,
+            ]
+            command = f"{shlex.join(parts)} < {prompt_ref}"
+            if output_rel is not None:
+                command = f"{command} > {shlex.quote(str(output_rel))}"
+            return command
+        parts = [
+            "claude",
+            "--permission-mode",
+            "acceptEdits",
+            "--ax-screen-reader",
+            *model_args,
+        ]
+        return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
+    raise HLoopError(f"unsupported agent provider: {provider}")
 
 
 def cmd_worker_start(args: argparse.Namespace) -> int:
@@ -4046,6 +4813,10 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     if task_state.get("status") not in {"queued", "failed_validation"}:
         raise HLoopError(f"task is not startable: {task_id} status={task_state.get('status')}")
     task_meta = read_frontmatter(task_file(repo, task_id))
+    if getattr(args, "agent_provider", None):
+        task_meta["agent_provider"] = args.agent_provider
+    if getattr(args, "agent_model", None):
+        task_meta["agent_model"] = args.agent_model
     branch = task_state.get("branch") or task_meta["branch"]
     integration = state["integration_branch"]
     current_base_sha = git(repo, ["rev-parse", integration])
@@ -4057,9 +4828,18 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
     prompt_rel = LOOP_DIR / "prompts" / f"{task_id}.worker.md"
     runner = args.runner or state.get("worker_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "worker",
+        overrides={
+            **task_meta,
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add {worktree} -b {branch} {integration}")
@@ -4069,7 +4849,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_codex=True,
+        require_agent_provider=agent_config["provider"],
         require_integration_branch=True,
     )
     task_state = state.get("tasks", {}).get(task_id)
@@ -4078,6 +4858,10 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     if task_state.get("status") not in {"queued", "failed_validation"}:
         raise HLoopError(f"task is not startable: {task_id} status={task_state.get('status')}")
     task_meta = read_frontmatter(task_file(repo, task_id))
+    if getattr(args, "agent_provider", None):
+        task_meta["agent_provider"] = args.agent_provider
+    if getattr(args, "agent_model", None):
+        task_meta["agent_model"] = args.agent_model
     branch = task_state.get("branch") or task_meta["branch"]
     integration = state["integration_branch"]
     current_base_sha = git(repo, ["rev-parse", integration])
@@ -4088,9 +4872,18 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id)
     prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
     runner = args.runner or state.get("worker_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "worker",
+        overrides={
+            **task_meta,
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
     )
     if not branch_exists(repo, integration):
         raise HLoopError(
@@ -4103,6 +4896,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
         else:
             git(repo, ["worktree", "add", str(worktree), "-b", branch, integration])
     ensure_task_visible_in_worktree(worktree, task_id)
+    ensure_worktree_parent_dirs(worktree, prompt_rel, LOOP_DIR / "results" / task_id / "result.md")
     write_text(worktree / prompt_rel, prompt)
     if args.launcher == "agent":
         pane_id = start_agent_launcher(
@@ -4126,6 +4920,9 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "worktree": str(worktree),
             "prompt": str(worktree / prompt_rel),
             "runner": runner,
+            "agent_provider": agent_config["provider"],
+            "agent_model": agent_config["model"],
+            "fallback_provider": agent_config["fallback_provider"],
             "sandbox": "workspace-write",
             "started_at": now_iso(),
         }
@@ -4224,7 +5021,8 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     if not message.strip():
         raise HLoopError("manager message is empty")
     try:
-        send_codex_tui_message(
+        send_agent_tui_message(
+            str(task_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
             pane_id,
             message,
             args.timeout_ms,
@@ -4547,16 +5345,24 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     head_sha = git(repo, ["rev-parse", head])
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id)
-    prompt = render_reviewer_prompt(review_id, base, head, state)
     prompt_rel = LOOP_DIR / "prompts" / f"{review_id}.reviewer.md"
     review_rel = LOOP_DIR / "reviews" / f"{review_id}.md"
     prompt_path = worktree / prompt_rel
     worktree_review_path = worktree / review_rel
     review_path = review_file(repo, review_id)
     runner = args.runner or state.get("reviewer_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "reviewer",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
+    prompt = render_reviewer_prompt(review_id, base, head, state, agent_config=agent_config)
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
@@ -4566,7 +5372,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_codex=True,
+        require_agent_provider=agent_config["provider"],
         require_integration_branch=True,
     )
     if review_id in state["reviews"]:
@@ -4577,18 +5383,27 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     head_sha = git(repo, ["rev-parse", head])
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id)
-    prompt = render_reviewer_prompt(review_id, base, head, state)
     prompt_path = worktree / prompt_rel
     worktree_review_path = worktree / review_rel
     review_path = review_file(repo, review_id)
     runner = args.runner or state.get("reviewer_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "reviewer",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
+    prompt = render_reviewer_prompt(review_id, base, head, state, agent_config=agent_config)
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
     )
     if not worktree.exists():
         git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
     ensure_review_visible_in_worktree(worktree)
+    ensure_worktree_parent_dirs(worktree, prompt_rel, review_rel)
     write_text(prompt_path, prompt)
     baseline_dirty = porcelain_paths(worktree)
     if args.launcher == "agent":
@@ -4615,6 +5430,9 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "head_sha": head_sha,
         "pane_id": pane_id,
         "runner": runner,
+        "agent_provider": agent_config["provider"],
+        "agent_model": agent_config["model"],
+        "fallback_provider": agent_config["fallback_provider"],
         "sandbox": "workspace-write",
         "worktree": str(worktree),
         "prompt": str(prompt_path),
@@ -4813,7 +5631,8 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     if not message.strip():
         raise HLoopError("manager message is empty")
     try:
-        send_codex_tui_message(
+        send_agent_tui_message(
+            str(review_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
             pane_id,
             message,
             args.timeout_ms,
@@ -4855,16 +5674,24 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
         state.get("spec_sources")
     )
-    prompt = render_gap_prompt(gap_id, base, head, spec_sources)
     prompt_rel = LOOP_DIR / "prompts" / f"{gap_id}.gap.md"
     gap_rel = LOOP_DIR / "gaps" / f"{gap_id}.md"
     prompt_path = worktree / prompt_rel
     worktree_gap_path = worktree / gap_rel
     final_gap_path = gap_file(repo, gap_id)
     runner = args.runner or state.get("gap_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "gap",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
+    prompt = render_gap_prompt(gap_id, base, head, spec_sources, state, agent_config=agent_config)
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
@@ -4874,7 +5701,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_codex=True,
+        require_agent_provider=agent_config["provider"],
         require_integration_branch=True,
     )
     if gap_id in state.setdefault("gaps", {}):
@@ -4888,18 +5715,27 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
         state.get("spec_sources")
     )
-    prompt = render_gap_prompt(gap_id, base, head, spec_sources)
     prompt_path = worktree / prompt_rel
     worktree_gap_path = worktree / gap_rel
     final_gap_path = gap_file(repo, gap_id)
     runner = args.runner or state.get("gap_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "gap",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
+    prompt = render_gap_prompt(gap_id, base, head, spec_sources, state, agent_config=agent_config)
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{codex_command_for_prompt(runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
     )
     if not worktree.exists():
         git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
     ensure_gap_visible_in_worktree(worktree)
+    ensure_worktree_parent_dirs(worktree, prompt_rel, gap_rel)
     write_text(prompt_path, prompt)
     baseline_dirty = porcelain_paths(worktree)
     if args.launcher == "agent":
@@ -4927,6 +5763,9 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "spec_sources": spec_sources,
         "pane_id": pane_id,
         "runner": runner,
+        "agent_provider": agent_config["provider"],
+        "agent_model": agent_config["model"],
+        "fallback_provider": agent_config["fallback_provider"],
         "sandbox": "workspace-write",
         "worktree": str(worktree),
         "prompt": str(prompt_path),
@@ -5128,7 +5967,8 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     if not message.strip():
         raise HLoopError("manager message is empty")
     try:
-        send_codex_tui_message(
+        send_agent_tui_message(
+            str(gap_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
             pane_id,
             message,
             args.timeout_ms,
@@ -5152,6 +5992,443 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     save_state(repo, state)
     journal(repo, f"Sent Manager message to Gap Auditor `{gap_id}` in pane `{pane_id}` from {source}.")
     print(f"sent manager message to {gap_id} in pane {pane_id}")
+    return 0
+
+
+def require_advice_state(state: dict[str, Any], advice_id: str) -> dict[str, Any]:
+    advice = state.setdefault("advice", {}).get(advice_id)
+    if not isinstance(advice, dict):
+        raise HLoopError(f"unknown advice request: {advice_id}")
+    return advice
+
+
+def find_advisor_participant(advice_state: dict[str, Any], participant_id: str) -> dict[str, Any]:
+    for participant in advice_state.get("participants", []):
+        if str(participant.get("participant_id") or "") == participant_id:
+            return participant
+    raise HLoopError(f"unknown advisor participant: {participant_id}")
+
+
+def normalize_advisor_max_rounds(value: Any) -> int:
+    try:
+        rounds = int(value or DEFAULT_ADVISOR_MAX_ROUNDS)
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"invalid advisor max rounds: {value}") from exc
+    if rounds < 1:
+        raise HLoopError("advisor max rounds must be at least 1")
+    return rounds
+
+
+def advisor_max_rounds(state: dict[str, Any], advice_state: dict[str, Any]) -> int:
+    return normalize_advisor_max_rounds(
+        advice_state.get("max_rounds")
+        or state.get("advisor_max_rounds")
+        or DEFAULT_ADVISOR_MAX_ROUNDS
+    )
+
+
+def advisor_dialogue_mode(advice_state: dict[str, Any]) -> bool:
+    return str(advice_state.get("mode") or DEFAULT_ADVISOR_MODE) == "dialogue"
+
+
+def advisor_delivered_followup_count(participant: dict[str, Any]) -> int:
+    return sum(
+        1
+        for item in participant.get("manager_messages", [])
+        if str(item.get("delivery_status") or "sent") == "sent"
+    )
+
+
+def prepare_advisor_dialogue_start(
+    state: dict[str, Any],
+    advice_state: dict[str, Any],
+    participant: dict[str, Any],
+) -> None:
+    max_rounds = advisor_max_rounds(state, advice_state)
+    advice_state["max_rounds"] = max_rounds
+    participant["dialogue_max_rounds"] = max_rounds
+    if advisor_dialogue_mode(advice_state):
+        current_round = int(participant.get("dialogue_round") or 0)
+        if current_round >= max_rounds and participant.get("status") != "failed":
+            raise HLoopError(
+                f"advisor dialogue round limit reached for {participant.get('participant_id')}: "
+                f"{current_round}/{max_rounds}"
+            )
+        participant["dialogue_round"] = max(1, current_round)
+
+
+def enforce_advisor_message_round_limit(
+    state: dict[str, Any],
+    advice_state: dict[str, Any],
+    participant: dict[str, Any],
+) -> tuple[int, int]:
+    max_rounds = advisor_max_rounds(state, advice_state)
+    advice_state["max_rounds"] = max_rounds
+    participant["dialogue_max_rounds"] = max_rounds
+    if not advisor_dialogue_mode(advice_state):
+        return advisor_delivered_followup_count(participant), max_rounds
+    followups = advisor_delivered_followup_count(participant)
+    allowed_followups = max_rounds - 1
+    if followups >= allowed_followups:
+        raise HLoopError(
+            f"advisor dialogue follow-up limit reached for {participant.get('participant_id')}: "
+            f"{followups}/{allowed_followups} delivered follow-up(s), max_rounds={max_rounds}"
+        )
+    return followups, max_rounds
+
+
+def cmd_advisor_request(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    advice_id = args.advice_id or next_id("A", state.setdefault("advice", {}))
+    if advice_id in state.setdefault("advice", {}):
+        raise HLoopError(f"advice request already exists: {advice_id}")
+    mode = args.mode or state.get("advisor_mode") or DEFAULT_ADVISOR_MODE
+    if mode not in ADVISOR_MODES:
+        raise HLoopError(f"unsupported advisor mode: {mode}")
+    max_rounds = normalize_advisor_max_rounds(
+        getattr(args, "max_rounds", None)
+        or state.get("advisor_max_rounds")
+        or DEFAULT_ADVISOR_MAX_ROUNDS
+    )
+    participants = advisor_participants_from_args(args, state)
+    if mode == "dialogue" and len(participants) < 2:
+        fallback = DEFAULT_AGENT_PROVIDER
+        primary = participants[0]["provider"]
+        if primary == fallback and command_exists("claude"):
+            fallback = "claude"
+        participants.append(
+            {
+                "participant_id": "P2",
+                "provider": fallback,
+                "model": DEFAULT_AGENT_MODEL,
+                "status": "queued",
+            }
+        )
+    for participant in participants:
+        participant["dialogue_round"] = 0
+        participant["dialogue_max_rounds"] = max_rounds
+    advice_state = {
+        "status": "requested",
+        "gate_status": "requested",
+        "topic": args.topic,
+        "mode": mode,
+        "max_rounds": max_rounds,
+        "source_refs": args.source or [],
+        "participants": participants,
+        "created_at": now_iso(),
+    }
+    state["advice"][advice_id] = advice_state
+    write_text(
+        advice_file(repo, advice_id),
+        frontmatter(
+            {
+                "advice_id": advice_id,
+                "status": "requested",
+                "mode": mode,
+                "max_rounds": max_rounds,
+                "participants": [
+                    f"{item['participant_id']}:{item['provider']}:{item['model']}"
+                    for item in participants
+                ],
+                "source_refs": args.source or [],
+            }
+        )
+        + f"\n# Advice Request {advice_id}\n\n## Topic\n{args.topic}\n",
+    )
+    state["phase"] = "advising"
+    save_state(repo, state)
+    journal(repo, f"Created Advisor request `{advice_id}`: {args.topic}")
+    print(f"created {advice_id}: {advice_file(repo, advice_id)}")
+    return 0
+
+
+def cmd_advisor_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    advice_id = args.advice_id
+    advice_state = require_advice_state(state, advice_id)
+    participant_id = args.participant_id
+    participant = find_advisor_participant(advice_state, participant_id)
+    if participant.get("status") not in {"queued", "failed"}:
+        raise HLoopError(
+            f"advisor participant is not startable: {advice_id}/{participant_id} status={participant.get('status')}"
+        )
+    base = args.base or state["base_branch"]
+    head = args.head or state["integration_branch"]
+    head_sha = git(repo, ["rev-parse", head])
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = (
+        Path(worktree_arg).resolve()
+        if worktree_arg
+        else default_advisor_worktree(repo, advice_id, participant_id)
+    )
+    prompt_rel = LOOP_DIR / "prompts" / f"{advice_id}-{participant_id}.advisor.md"
+    advice_rel = LOOP_DIR / "advice" / f"{advice_id}-{participant_id}.md"
+    prompt_path = worktree / prompt_rel
+    worktree_advice_path = worktree / advice_rel
+    final_path = advice_file(repo, advice_id, participant_id)
+    runner = args.runner or state.get("advisor_runner", "tui")
+    agent_config = role_agent_config(
+        state,
+        "advisor",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None) or participant.get("provider"),
+            "agent_model": getattr(args, "agent_model", None) or participant.get("model"),
+        },
+    )
+    participant["provider"] = agent_config["provider"]
+    participant["model"] = agent_config["model"]
+    prepare_advisor_dialogue_start(state, advice_state, participant)
+    prompt = render_advisor_prompt(advice_id, participant, advice_state, state, advice_rel)
+    command = (
+        f"cd {shlex.quote(str(worktree))} && "
+        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=advice_rel if runner == 'exec' else None)}"
+    )
+    if args.dry_run:
+        print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
+        print(f"DRY RUN prompt: {prompt_path}")
+        print(f"DRY RUN {args.launcher}/{runner} command: {command}")
+        return 0
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_agent_provider=agent_config["provider"],
+        require_integration_branch=True,
+    )
+    advice_state = require_advice_state(state, advice_id)
+    participant = find_advisor_participant(advice_state, participant_id)
+    participant["provider"] = agent_config["provider"]
+    participant["model"] = agent_config["model"]
+    prepare_advisor_dialogue_start(state, advice_state, participant)
+    if not worktree.exists():
+        git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+    ensure_advisor_visible_in_worktree(worktree)
+    ensure_worktree_parent_dirs(worktree, prompt_rel, advice_rel)
+    write_text(prompt_path, prompt)
+    baseline_dirty = porcelain_paths(worktree)
+    if args.launcher == "agent":
+        pane_id = start_agent_launcher(
+            name=f"hloop-{state['goal_id']}-{advice_id}-{participant_id}-advisor",
+            direction=args.direction,
+            cwd=worktree,
+            command=command,
+        )
+    else:
+        manager_pane = args.manager_pane or current_pane_id()
+        pane_id = start_pane_launcher(
+            manager_pane=manager_pane,
+            direction=args.direction,
+            cwd=worktree,
+            command=command,
+        )
+    participant.update(
+        {
+            "status": "running",
+            "gate_status": "running",
+            "base": base,
+            "head": head,
+            "head_sha": head_sha,
+            "pane_id": pane_id,
+            "runner": runner,
+            "agent_provider": agent_config["provider"],
+            "agent_model": agent_config["model"],
+            "fallback_provider": agent_config["fallback_provider"],
+            "sandbox": "workspace-write",
+            "worktree": str(worktree),
+            "prompt": str(prompt_path),
+            "advice_path": str(final_path),
+            "worktree_advice_path": str(worktree_advice_path),
+            "baseline_dirty_files": baseline_dirty,
+            "started_at": now_iso(),
+        }
+    )
+    advice_state["status"] = "running"
+    advice_state["gate_status"] = "running"
+    state["phase"] = "advising"
+    save_state(repo, state)
+    journal(repo, f"Started Advisor `{advice_id}/{participant_id}` in pane `{pane_id}` and worktree `{worktree}`.")
+    print(f"started {advice_id}/{participant_id} in pane {pane_id}")
+    return 0
+
+
+def cmd_advisor_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_herdr=True, require_integration_branch=True)
+    advice_id = args.advice_id
+    participant_id = args.participant_id
+    advice_state = require_advice_state(state, advice_id)
+    participant = find_advisor_participant(advice_state, participant_id)
+    path = advice_artifact_path(repo, advice_id, participant)
+    if not path.exists() or not read_text(path).strip():
+        raise HLoopError(f"advisor artifact not found or empty: {path}")
+    meta = read_frontmatter(path)
+    artifact_status = str(meta.get("status") or "")
+    if artifact_status not in ADVISOR_ARTIFACT_STATUSES:
+        raise HLoopError(f"invalid advisor artifact status in {path}: {artifact_status}")
+    final_path = advice_file(repo, advice_id, participant_id)
+    if path.resolve() != final_path.resolve():
+        write_text(final_path, read_text(path))
+        participant["worktree_advice_path_harvested"] = str(path)
+        participant.pop("worktree_advice_path", None)
+    violations: list[str] = []
+    worktree_raw = participant.get("worktree")
+    if worktree_raw:
+        worktree = Path(worktree_raw).resolve()
+        if worktree.exists():
+            violations = validate_advisor_worktree_scope(advice_id, participant, worktree)
+    participant["write_scope_violations"] = violations
+    participant["advice_path"] = str(final_path)
+    participant["status"] = "reported"
+    participant["gate_status"] = "reported"
+    participant["artifact_status"] = artifact_status
+    participant["harvested_at"] = now_iso()
+    cleanup_completed_agent_pane(
+        repo,
+        participant,
+        label=f"Advisor {advice_id}/{participant_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    if violations:
+        participant["status"] = "blocked_write_scope"
+        participant["gate_status"] = "blocked_write_scope"
+        advice_state["status"] = "blocked_write_scope"
+        advice_state["gate_status"] = "blocked_write_scope"
+        state["phase"] = "blocked_conflict"
+        save_state(repo, state)
+        append_text(
+            loop_path(repo) / "USER_ACTION_REQUIRED.md",
+            f"\n## Advisor write-scope violation for {advice_id}/{participant_id}\n\n"
+            f"Advisor artifact was copied to `{final_path}` but the worktree has unexpected changes:\n"
+            + "\n".join(f"- {item}" for item in violations)
+            + "\n",
+        )
+        print(f"blocked {advice_id}/{participant_id}: advisor changed files outside the advice artifact")
+        return 2
+    cleanup_advisor_worktree(repo, advice_id, participant, best_effort=True)
+    if all(str(item.get("gate_status") or item.get("status")) == "reported" for item in advice_state.get("participants", [])):
+        advice_state["status"] = "reported"
+        advice_state["gate_status"] = "reported"
+    state["phase"] = "advising"
+    save_state(repo, state)
+    journal(repo, f"Harvested Advisor `{advice_id}/{participant_id}`; Manager review is required.")
+    print(f"harvested {advice_id}/{participant_id}; close with `hloop advisor close {advice_id} --verdict <verdict>`")
+    return 0
+
+
+def cmd_advisor_close(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_herdr=True, require_integration_branch=True)
+    advice_state = require_advice_state(state, args.advice_id)
+    if str(advice_state.get("gate_status") or advice_state.get("status")) != "reported":
+        raise HLoopError(
+            f"advice request is not ready for close: {args.advice_id}; "
+            "harvest participant artifacts before closing"
+        )
+    advice_state["status"] = "triaged"
+    advice_state["gate_status"] = "triaged"
+    advice_state["verdict"] = args.verdict
+    advice_state["triage_reason"] = args.reason
+    advice_state["triaged_at"] = now_iso()
+    state["phase"] = "dispatching"
+    save_state(repo, state)
+    journal(repo, f"Closed Advisor request `{args.advice_id}` with verdict `{args.verdict}`: {args.reason}")
+    print(f"closed {args.advice_id}: {args.verdict}")
+    return 0
+
+
+def cmd_advisor_watch(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    advice_state = require_advice_state(state, args.advice_id)
+    participant = find_advisor_participant(advice_state, args.participant_id)
+    pane_id = str(participant.get("pane_id") or "")
+    print(f"advice: {args.advice_id}/{args.participant_id}")
+    print(f"status: {participant.get('status')}")
+    print(f"gate_status: {agent_gate_status(participant)}")
+    print(f"artifact_status: {participant.get('artifact_status', '')}")
+    print(f"agent: {agent_display({'provider': str(participant.get('agent_provider') or participant.get('provider') or DEFAULT_AGENT_PROVIDER), 'model': str(participant.get('agent_model') or participant.get('model') or DEFAULT_AGENT_MODEL)})}")
+    print(f"worktree: {participant.get('worktree', '')}")
+    print(f"artifact: {advice_artifact_path(repo, args.advice_id, participant)}")
+    if not pane_id:
+        print("pane: none")
+        return 0
+    print(f"pane: {pane_id}")
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        print("pane output unavailable: not inside Herdr")
+        return 0
+    info = pane_info(pane_id)
+    if info is None:
+        print("pane output unavailable: pane is closed or missing")
+        return 0
+    print(f"agent_status: {info.get('agent_status', 'unknown')}")
+    proc = run_cmd(
+        [
+            "herdr",
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            args.source,
+            "--lines",
+            str(args.lines),
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError((proc.stderr or proc.stdout or "").strip())
+    print(proc.stdout.rstrip())
+    return 0
+
+
+def cmd_advisor_message(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_herdr=True, require_integration_branch=True)
+    advice_state = require_advice_state(state, args.advice_id)
+    participant = find_advisor_participant(advice_state, args.participant_id)
+    if agent_gate_status(participant) != "running":
+        raise HLoopError(
+            f"advisor is not running: {args.advice_id}/{args.participant_id} status={participant.get('status')}"
+        )
+    pane_id = str(participant.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"advisor has no pane_id: {args.advice_id}/{args.participant_id}")
+    message, source = manager_message_from_args(args)
+    followups_before, max_rounds = enforce_advisor_message_round_limit(
+        state, advice_state, participant
+    )
+    try:
+        send_agent_tui_message(
+            str(participant.get("agent_provider") or participant.get("provider") or DEFAULT_AGENT_PROVIDER),
+            pane_id,
+            message,
+            args.timeout_ms,
+            args.input_settle_ms,
+            args.submit_verify_ms,
+            args.submit_attempts,
+        )
+    except HLoopError as exc:
+        return record_pending_manager_message(
+            repo,
+            state,
+            participant,
+            role="Advisor",
+            agent_id=f"{args.advice_id}/{args.participant_id}",
+            pane_id=pane_id,
+            source=source,
+            message=message,
+            error=exc,
+        )
+    record_manager_message(participant, source, message)
+    participant["advisor_followup_count"] = followups_before + 1
+    participant["dialogue_max_rounds"] = max_rounds
+    if advisor_dialogue_mode(advice_state):
+        participant["dialogue_round"] = min(max_rounds, 2 + followups_before)
+    save_state(repo, state)
+    journal(repo, f"Sent Manager message to Advisor `{args.advice_id}/{args.participant_id}` in pane `{pane_id}` from {source}.")
+    print(f"sent manager message to {args.advice_id}/{args.participant_id} in pane {pane_id}")
     return 0
 
 
@@ -5401,7 +6678,6 @@ def cmd_tick(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_codex=True,
         require_integration_branch=True,
         mark_blocked=not args.dry_run,
     )
@@ -5494,6 +6770,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.spec_source = None
         args.worktree = None
         args.runner = args.gap_runner
+        args.agent_provider = getattr(args, "gap_agent_provider", None)
+        args.agent_model = getattr(args, "gap_agent_model", None)
         return cmd_gap_start(args)
 
     if (
@@ -5506,6 +6784,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.head = None
         args.worktree = None
         args.runner = args.reviewer_runner
+        args.agent_provider = getattr(args, "reviewer_agent_provider", None)
+        args.agent_model = getattr(args, "reviewer_agent_model", None)
         return cmd_reviewer_start(args)
 
     running_count = sum(1 for t in state.get("tasks", {}).values() if t.get("status") == "running")
@@ -5526,6 +6806,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.task_id = task_id
         args.worktree = None
         args.runner = args.worker_runner
+        args.agent_provider = getattr(args, "worker_agent_provider", None)
+        args.agent_model = getattr(args, "worker_agent_model", None)
         rc = cmd_worker_start(args)
         if rc != 0:
             return rc
@@ -5723,7 +7005,22 @@ def cmd_harvest(args: argparse.Namespace) -> int:
     if agent_id.startswith("G"):
         args.gap_id = agent_id
         return cmd_gap_harvest(args)
-    raise HLoopError(f"cannot infer harvest target from id: {agent_id}; use T..., R..., or G...")
+    if agent_id.startswith("A"):
+        advice_id, participant_id = split_advice_target(agent_id, getattr(args, "participant_id", None))
+        args.advice_id = advice_id
+        args.participant_id = participant_id
+        return cmd_advisor_harvest(args)
+    raise HLoopError(f"cannot infer harvest target from id: {agent_id}; use T..., R..., G..., or A...")
+
+
+def split_advice_target(agent_id: str, participant_id: str | None = None) -> tuple[str, str]:
+    if "/" in agent_id:
+        advice_id, participant = agent_id.split("/", 1)
+        return advice_id, participant or "P1"
+    if ":" in agent_id:
+        advice_id, participant = agent_id.split(":", 1)
+        return advice_id, participant or "P1"
+    return agent_id, participant_id or "P1"
 
 
 def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict[str, Any]]:
@@ -5739,6 +7036,11 @@ def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict
         agent = state.get("gaps", {}).get(agent_id)
         if agent:
             return "gap", agent
+    if agent_id.startswith("A"):
+        advice_id, participant_id = split_advice_target(agent_id)
+        advice = state.get("advice", {}).get(advice_id)
+        if isinstance(advice, dict):
+            return "advisor", find_advisor_participant(advice, participant_id)
     raise HLoopError(f"unknown agent id: {agent_id}")
 
 
@@ -5759,6 +7061,12 @@ def running_agent_ids(state: dict[str, Any]) -> list[str]:
         for gap_id, gap in state.get("gaps", {}).items()
         if agent_gate_status(gap) == "running"
     )
+    for advice_id, advice in state.get("advice", {}).items():
+        if not isinstance(advice, dict):
+            continue
+        for participant in advice.get("participants", []):
+            if agent_gate_status(participant) == "running":
+                ids.append(f"{advice_id}/{participant.get('participant_id', 'P1')}")
     return ids
 
 
@@ -5770,6 +7078,9 @@ def agent_artifact_path(repo: Path, agent_id: str, role: str, agent: dict[str, A
         return review_artifact_path(repo, agent_id, agent)
     if role == "gap":
         return gap_artifact_path(repo, agent_id, agent)
+    if role == "advisor":
+        advice_id, participant_id = split_advice_target(agent_id)
+        return advice_artifact_path(repo, advice_id, {**agent, "participant_id": participant_id})
     raise HLoopError(f"unsupported agent role: {role}")
 
 
@@ -5788,7 +7099,7 @@ def agent_wait_status(repo: Path, state: dict[str, Any], agent_id: str) -> dict[
             pane_status = str(info.get("agent_status") or "")
         else:
             pane_status = "missing-or-closed"
-    status = agent_gate_status(agent) if role in {"reviewer", "gap"} else str(agent.get("status") or "")
+    status = agent_gate_status(agent) if role in {"reviewer", "gap", "advisor"} else str(agent.get("status") or "")
     return {
         "id": agent_id,
         "role": role,
@@ -6096,6 +7407,10 @@ def cmd_report(args: argparse.Namespace) -> int:
         f"- Branch strategy: {state_value(state, 'branch_strategy', DEFAULT_BRANCH_STRATEGY)}",
         f"- Worker protocol: {state_value(state, 'worker_protocol', DEFAULT_WORKER_PROTOCOL)}",
         f"- Review protocol: {state_value(state, 'review_protocol', DEFAULT_REVIEW_PROTOCOL)}",
+        f"- Worker agent: {agent_display(role_agent_config(state, 'worker'))}",
+        f"- Reviewer agent: {agent_display(role_agent_config(state, 'reviewer'))}",
+        f"- Gap Auditor agent: {agent_display(role_agent_config(state, 'gap'))}",
+        f"- Advisor agent: {agent_display(role_agent_config(state, 'advisor'))}",
         f"- Worker QA profile: {state_worker_qa_profile(state)}",
         f"- Manager final QA profile: {state_manager_qa_profile(state)}",
         f"- Manager final QA status: {state.get('manager_qa_status', '')}",
@@ -6117,6 +7432,17 @@ def cmd_report(args: argparse.Namespace) -> int:
         artifact_status = gap.get("artifact_status", "")
         suffix = f" ({artifact_status})" if artifact_status else ""
         lines.append(f"- {gap_id}: {agent_gate_status(gap)}{suffix}")
+    lines.extend(["", "## Advice"])
+    for advice_id, advice in state.get("advice", {}).items():
+        if not isinstance(advice, dict):
+            continue
+        lines.append(f"- {advice_id}: {advice.get('gate_status', advice.get('status', ''))} {advice.get('verdict', '')}".rstrip())
+        for participant in advice.get("participants", []):
+            participant_id = participant.get("participant_id", "P1")
+            lines.append(
+                f"  - {participant_id}: {agent_gate_status(participant)} "
+                f"{agent_display({'provider': str(participant.get('agent_provider') or participant.get('provider') or DEFAULT_AGENT_PROVIDER), 'model': str(participant.get('agent_model') or participant.get('model') or DEFAULT_AGENT_MODEL)})}"
+            )
     lines.extend(["", "## Validation"])
     for item in state.get("last_validation", {}).get("results", []):
         lines.append(f"- `{item.get('command')}`: {item.get('result')}")
@@ -6137,7 +7463,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hloop",
-        description="File-backed Herdr/Codex Manager loop helper.",
+        description="File-backed Herdr multi-agent Manager loop helper.",
         epilog=(
             "Safe first run: python3 /path/to/herdr-dev-loop/scripts/hloop "
             "--repo /path/to/repo init --goal-id demo --goal '...' "
@@ -6147,7 +7473,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=".", help="repository path")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    doctor = sub.add_parser("doctor", help="check local Herdr/Codex/skill dependencies")
+    doctor = sub.add_parser("doctor", help="check local Herdr/agent/skill dependencies")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--strict-skills", action="store_true")
     doctor.add_argument("--sessions", action="store_true", help="include loop session inventory when STATE.json exists")
@@ -6178,6 +7504,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS), default=DEFAULT_WORKER_PROTOCOL)
     init.add_argument("--review-protocol", choices=sorted(REVIEW_PROTOCOLS), default=DEFAULT_REVIEW_PROTOCOL)
+    init.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
+    init.add_argument("--worker-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
+    init.add_argument("--reviewer-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
+    init.add_argument("--gap-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--advisor-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
+    init.add_argument("--advisor-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--advisor-enabled", action="store_true")
+    init.add_argument("--advisor-mode", choices=sorted(ADVISOR_MODES), default=DEFAULT_ADVISOR_MODE)
+    init.add_argument("--advisor-max-rounds", type=int, default=DEFAULT_ADVISOR_MAX_ROUNDS)
     init.add_argument("--review-lane", action="append")
     init.add_argument("--worker-runner", choices=["tui", "exec"], default="tui")
     init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="tui")
@@ -6266,6 +7603,8 @@ def build_parser() -> argparse.ArgumentParser:
     task_new.add_argument("--acceptance", action="append")
     task_new.add_argument("--validation-minimum", action="append")
     task_new.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS))
+    task_new.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    task_new.add_argument("--worker-agent-model")
     task_new.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
     task_new.add_argument(
         "--qa-profile",
@@ -6283,6 +7622,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker_start.add_argument("--direction", choices=["right", "down"], default="right")
     worker_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
     worker_start.add_argument("--runner", choices=["tui", "exec"])
+    worker_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
+    worker_start.add_argument("--agent-model")
     worker_start.add_argument("--dry-run", action="store_true")
     worker_start.set_defaults(func=cmd_worker_start)
     worker_harvest = worker_sub.add_parser("harvest")
@@ -6336,13 +7677,14 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--dry-run", action="store_true")
     validate.set_defaults(func=cmd_validate)
 
-    harvest = sub.add_parser("harvest", help="harvest a Worker/Reviewer/Gap artifact by id prefix")
-    harvest.add_argument("agent_id", help="T..., R..., or G... id")
+    harvest = sub.add_parser("harvest", help="harvest a Worker/Reviewer/Gap/Advisor artifact by id prefix")
+    harvest.add_argument("agent_id", help="T..., R..., G..., A..., or A.../P... id")
+    harvest.add_argument("--participant-id", default="P1", help="Advisor participant id when harvesting A... without /P...")
     harvest.add_argument("--keep-pane", action="store_true")
     harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     harvest.set_defaults(func=cmd_harvest)
 
-    wait = sub.add_parser("wait", help="wait for a Worker/Reviewer/Gap artifact to become ready")
+    wait = sub.add_parser("wait", help="wait for a Worker/Reviewer/Gap/Advisor artifact to become ready")
     wait.add_argument("target", help="T..., R..., G..., or next")
     wait.add_argument("--timeout-ms", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
     wait.add_argument("--poll-ms", type=int, default=DEFAULT_WAIT_POLL_MS)
@@ -6393,6 +7735,8 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_start.add_argument("--direction", choices=["right", "down"], default="down")
     reviewer_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
     reviewer_start.add_argument("--runner", choices=["exec", "tui"])
+    reviewer_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
+    reviewer_start.add_argument("--agent-model")
     reviewer_start.add_argument("--dry-run", action="store_true")
     reviewer_start.set_defaults(func=cmd_reviewer_start)
     reviewer_harvest = reviewer_sub.add_parser("harvest")
@@ -6457,6 +7801,8 @@ def build_parser() -> argparse.ArgumentParser:
     gap_start.add_argument("--direction", choices=["right", "down"], default="down")
     gap_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
     gap_start.add_argument("--runner", choices=["exec", "tui"])
+    gap_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
+    gap_start.add_argument("--agent-model")
     gap_start.add_argument("--dry-run", action="store_true")
     gap_start.set_defaults(func=cmd_gap_start)
     gap_harvest = gap_sub.add_parser("harvest")
@@ -6516,6 +7862,81 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gap_message.set_defaults(func=cmd_gap_message)
 
+    advisor = sub.add_parser("advisor", help="explicit opt-in consultation advisor operations")
+    advisor_sub = advisor.add_subparsers(dest="advisor_command", required=True)
+    advisor_request = advisor_sub.add_parser("request", help="create an Advisor consultation request")
+    advisor_request.add_argument("--advice-id")
+    advisor_request.add_argument("--topic", required=True)
+    advisor_request.add_argument("--mode", choices=sorted(ADVISOR_MODES), default=DEFAULT_ADVISOR_MODE)
+    advisor_request.add_argument("--max-rounds", type=int, help="maximum dialogue rounds; default comes from PROFILE/STATE")
+    advisor_request.add_argument(
+        "--participant",
+        action="append",
+        help="provider:model participant, e.g. codex:auto or claude:opus; repeat for dialogue",
+    )
+    advisor_request.add_argument("--source", action="append", help="review/gap/task/code reference for the consultation")
+    advisor_request.set_defaults(func=cmd_advisor_request)
+    advisor_start = advisor_sub.add_parser("start", help="start one Advisor participant")
+    advisor_start.add_argument("advice_id")
+    advisor_start.add_argument("--participant-id", default="P1")
+    advisor_start.add_argument("--base")
+    advisor_start.add_argument("--head")
+    advisor_start.add_argument("--worktree")
+    advisor_start.add_argument("--manager-pane")
+    advisor_start.add_argument("--direction", choices=["right", "down"], default="down")
+    advisor_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    advisor_start.add_argument("--runner", choices=["exec", "tui"])
+    advisor_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
+    advisor_start.add_argument("--agent-model")
+    advisor_start.add_argument("--dry-run", action="store_true")
+    advisor_start.set_defaults(func=cmd_advisor_start)
+    advisor_harvest = advisor_sub.add_parser("harvest", help="harvest one Advisor participant artifact")
+    advisor_harvest.add_argument("advice_id")
+    advisor_harvest.add_argument("--participant-id", default="P1")
+    advisor_harvest.add_argument("--keep-pane", action="store_true")
+    advisor_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    advisor_harvest.set_defaults(func=cmd_advisor_harvest)
+    advisor_close = advisor_sub.add_parser("close", help="close an Advisor consultation after Manager review")
+    advisor_close.add_argument("advice_id")
+    advisor_close.add_argument("--verdict", choices=sorted(ADVISOR_VERDICTS), required=True)
+    advisor_close.add_argument("--reason", required=True)
+    advisor_close.set_defaults(func=cmd_advisor_close)
+    advisor_watch = advisor_sub.add_parser("watch")
+    advisor_watch.add_argument("advice_id")
+    advisor_watch.add_argument("--participant-id", default="P1")
+    advisor_watch.add_argument("--lines", type=int, default=120)
+    advisor_watch.add_argument(
+        "--source",
+        choices=["visible", "recent", "recent-unwrapped"],
+        default="recent-unwrapped",
+    )
+    advisor_watch.set_defaults(func=cmd_advisor_watch)
+    advisor_message = advisor_sub.add_parser("message")
+    advisor_message.add_argument("advice_id")
+    advisor_message.add_argument("message", nargs="?")
+    advisor_message.add_argument("--participant-id", default="P1")
+    advisor_message.add_argument("--file")
+    advisor_message.add_argument("--timeout-ms", type=int, default=30_000)
+    advisor_message.add_argument(
+        "--input-settle-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+        help="delay between send-text visibility and Enter",
+    )
+    advisor_message.add_argument(
+        "--submit-verify-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+        help="time to wait for agent to start working or answer after Enter",
+    )
+    advisor_message.add_argument(
+        "--submit-attempts",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
+        help="Enter retry count when the message remains typed but unsubmitted",
+    )
+    advisor_message.set_defaults(func=cmd_advisor_message)
+
     triage = sub.add_parser("triage", help="generate or create fix tasks from review/gap artifacts")
     triage_sub = triage.add_subparsers(dest="triage_command", required=True)
     triage_review = triage_sub.add_parser("review")
@@ -6540,6 +7961,12 @@ def build_parser() -> argparse.ArgumentParser:
     tick.add_argument("--worker-runner", choices=["tui", "exec"])
     tick.add_argument("--reviewer-runner", choices=["exec", "tui"])
     tick.add_argument("--gap-runner", choices=["exec", "tui"])
+    tick.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    tick.add_argument("--worker-agent-model")
+    tick.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    tick.add_argument("--reviewer-agent-model")
+    tick.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    tick.add_argument("--gap-agent-model")
     tick.add_argument("--keep-pane", action="store_true")
     tick.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     tick.add_argument("--review-wait-ms", type=int)
@@ -6561,6 +7988,12 @@ def build_parser() -> argparse.ArgumentParser:
     pump.add_argument("--worker-runner", choices=["tui", "exec"])
     pump.add_argument("--reviewer-runner", choices=["exec", "tui"])
     pump.add_argument("--gap-runner", choices=["exec", "tui"])
+    pump.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    pump.add_argument("--worker-agent-model")
+    pump.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    pump.add_argument("--reviewer-agent-model")
+    pump.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    pump.add_argument("--gap-agent-model")
     pump.add_argument("--keep-pane", action="store_true")
     pump.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     pump.add_argument("--review-wait-ms", type=int)

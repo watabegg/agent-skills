@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Advisor Frontmatter",
+  "type": "object",
+  "required": ["advice_id", "participant_id", "provider", "model", "status"],
+  "properties": {
+    "advice_id": {"type": "string", "pattern": "^A[0-9]{3}$"},
+    "participant_id": {"type": "string", "pattern": "^P[0-9]+$"},
+    "provider": {"type": "string", "enum": ["codex", "claude"]},
+    "model": {"type": "string"},
+    "status": {"type": "string", "enum": ["advised", "blocked", "failed"]}
+  },
+  "additionalProperties": true
+}

@@ -18,6 +18,18 @@ Use these examples when the user wants `/goal` to choose branch strategy, review
 
 The deprecated `qa_profile` CLI flag is treated as `worker_qa_profile` only.
 
+## Agent Backend Split
+
+Agent backend selection is separate from protocol selection.
+
+- `worker_protocol` and `review_protocol` choose the HLoop behavior contract.
+- `worker_agent_provider`, `reviewer_agent_provider`, `gap_agent_provider`, and `advisor_agent_provider` choose the CLI provider (`codex` or `claude`).
+- `worker_agent_model`, `reviewer_agent_model`, `gap_agent_model`, and `advisor_agent_model` choose the provider model, or `auto` for CLI default.
+- Codex remains the default fallback for every role.
+- Manager is always the agent currently using this skill; hloop only spawns subordinate role agents.
+
+Advisor is opt-in only. It does not run from `tick` or `pump`.
+
 ## `/goal` Example: Integration Branch With Local Worker QA And No Final QA
 
 ```text
@@ -53,6 +65,69 @@ Expected behavior:
 - Validation runs after each merge.
 - Reviewer checks code behavior plus task/result/validation/Worker QA evidence.
 - Gap Auditor periodically checks original plan/spec coverage against the integration head.
+
+## `/goal` Example: Mixed Codex/Claude Agents With Advisor Disabled
+
+```text
+/goal Implement <feature> with Codex Workers, Claude review, and Codex gap checks.
+
+Use $herdr-dev-loop.
+
+Loop profile:
+- branch_strategy: integration
+- worker_protocol: native
+- review_protocol: native
+- worker_agent_provider: codex
+- worker_agent_model: auto
+- reviewer_agent_provider: claude
+- reviewer_agent_model: opus
+- gap_agent_provider: codex
+- gap_agent_model: auto
+- advisor_enabled: false
+- worker_qa_profile: none
+- manager_qa_profile: none
+
+Review/GAP requirements:
+- Run Reviewer after each validated integration advance.
+- Run Gap Auditor before final completion.
+- Do not run Manager final QA.
+```
+
+Expected Manager setup:
+
+```bash
+hloop init ... --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider claude --reviewer-agent-model opus --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile none --manager-qa-profile none
+```
+
+## `/goal` Example: Explicit Cross-Model Advisor
+
+```text
+/goal Implement <feature>. Use Advisor only if review/gap findings leave a non-user-blocking specification or fix-strategy choice.
+
+Use $herdr-dev-loop.
+
+Loop profile:
+- advisor_enabled: true
+- advisor_mode: dialogue
+- advisor_agent_provider: claude
+- advisor_agent_model: opus
+
+Advisor policy:
+- Do not start Advisor automatically.
+- When needed, create a dialogue request with one Codex participant and one Claude participant.
+- Manager must record the accepted recommendation in DECISIONS.md or create fix tasks; Advisor cannot close gates.
+```
+
+Expected Advisor usage:
+
+```bash
+hloop advisor request --topic "Choose fix strategy for R001 auth edge case" --mode dialogue --participant codex:auto --participant claude:opus --source reviews/R001.md
+hloop advisor start A001 --participant-id P1
+hloop advisor harvest A001 --participant-id P1
+hloop advisor start A001 --participant-id P2
+hloop advisor harvest A001 --participant-id P2
+hloop advisor close A001 --verdict decision-recorded --reason "Recorded chosen approach in DECISIONS.md"
+```
 
 ## `/goal` Example: PR Per Task With Preview Final QA
 

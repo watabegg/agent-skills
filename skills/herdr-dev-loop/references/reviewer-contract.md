@@ -2,7 +2,7 @@
 
 Reviewer compares the integration result against the base branch and the loop artifacts. Reviewer is a Manager gate, not a generic review bot.
 
-Default runner: interactive Codex TUI in a detached review worktree. Use this so Manager can monitor progress and the Reviewer can reliably write the final Markdown artifact.
+Default runner: interactive role-agent TUI in a detached review worktree. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md` or `hloop reviewer start`. Use this so Manager can monitor progress and the Reviewer can reliably write the final Markdown artifact.
 
 Reviewer TUI uses `workspace-write` sandbox because the final report must be written. Treat the codebase as read-only during investigation. The only permitted write is `.ai/loop/reviews/<review-id>.md` after review is complete. `hloop reviewer harvest` validates the review worktree and blocks if any other file changed.
 
@@ -102,4 +102,4 @@ python3 <this-skill>/scripts/hloop triage review R001
 
 Add `--create-tasks` only after Manager approves the generated draft.
 
-After harvesting the review artifact, Manager should close the Reviewer Herdr pane and archive the captured Codex session. Keep the pane only when Manager needs to inspect the live transcript.
+After harvesting the review artifact, Manager should close the Reviewer Herdr pane and clean up provider session state when supported. Keep the pane only when Manager needs to inspect the live transcript.
