@@ -39,7 +39,7 @@ Before switching from `pump` to manual intervention, run:
 hloop conductor --no-fail
 ```
 
-Resolve the concrete finding it reports. Examples: use `hloop worker harvest` when a result artifact is ready, `hloop triage review` / `hloop triage gap` when a harvested gate needs triage, `hloop ... message` when a ready Codex TUI needs Manager input, or fix the branch/dirty-tree mismatch before the next mutation.
+Resolve the concrete finding it reports. Examples: use `hloop worker harvest` when a result artifact is ready, `hloop triage review` / `hloop triage gap` when a harvested gate needs triage, `hloop ... message` when a ready role-agent TUI needs Manager input, or fix the branch/dirty-tree mismatch before the next mutation.
 
 When the only useful action is waiting for a Worker, Reviewer, or Gap Auditor artifact, prefer:
 
@@ -71,15 +71,29 @@ Use `.ai/loop/PROFILE.md` as the Manager-owned policy layer. It decides:
 - branch strategy: default `integration`, or product-specific `pr-per-task` / `custom`
 - Worker protocol: default `native`, or compatibility `codex-impl`
 - Reviewer protocol: default `native`, or compatibility `codex-review-multi-v2`
+- Worker / Reviewer / Gap Auditor / Advisor agent provider and model
 - review lanes
 - Worker QA profile
 - Manager final QA profile
+- Advisor policy: disabled by default; explicit request only
 
 If `branch_strategy` is `pr-per-task` or `custom`, update `PLAN.md` with the exact merge, PR, release, and QA handoff before dispatching Workers. `hloop` can still coordinate tasks, panes, artifacts, review, gap checks, and triage, but Manager must not silently apply the default integration-branch assumptions.
 
 When a Worker is merge-ready under a non-`integration` branch strategy, `tick` / `pump` stop in `branch_handoff`. Manager then follows `PROFILE.md` and `PLAN.md` for the product-specific PR, release branch, or manual merge path before continuing.
 
 When Gap Auditor or Reviewer findings are actionable, create fix-task drafts with `hloop triage gap <gap-id>` or `hloop triage review <review-id>`. Review the draft, then rerun with `--create-tasks` when the tasks are acceptable. Close the gate with `fix-tasks-created`. Those fix Workers join the next dispatch phase. After the fix tasks merge and validation passes, the review/gap counters drive the next audit cycle.
+
+When a review/gap finding raises a hard implementation strategy or specification-shaping question that does not require user input, Manager may create an explicit Advisor request:
+
+```bash
+hloop advisor request --topic "..." --mode dialogue --participant codex:auto --participant claude:opus --source reviews/R001.md
+hloop advisor start A001 --participant-id P1
+hloop advisor harvest A001 --participant-id P1
+hloop advisor start A001 --participant-id P2
+hloop advisor harvest A001 --participant-id P2
+```
+
+Advisor cannot close gates, create tasks, merge, or edit code. Manager must record the accepted recommendation in `DECISIONS.md`, accepted risk notes, or fix tasks, then close the request with `hloop advisor close`.
 
 ## TUI Follow-Up Messages
 
@@ -89,6 +103,7 @@ When Manager needs to add requirements or clarify scope for a running Worker or 
 hloop worker message T001 --file .ai/loop/inbox/manager/T001-followup.md
 hloop gap message G001 --file .ai/loop/inbox/manager/G001-followup.md
 hloop reviewer message R001 --file .ai/loop/inbox/manager/R001-followup.md
+hloop advisor message A001 --participant-id P1 --file .ai/loop/inbox/manager/A001-P1-followup.md
 ```
 
 Do not send follow-ups directly with `herdr pane run` unless debugging the pane itself. `hloop ... message` refuses to send when the target pane is not Codex, is showing the trust prompt, or is still working. It then uses `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered before reporting success. If delivery fails after Manager wrote a follow-up, `hloop` records the undelivered message under `.ai/loop/inbox/pending/` and marks it in the target state; retry that pending file when the pane is ready instead of reconstructing the instruction from memory.
@@ -104,7 +119,7 @@ For each running Worker:
 - require the result artifact to be committed at Worker `HEAD`
 - compute actual changed files from git
 - compare changed files to `write_allow` and `write_deny`
-- after harvesting the result artifact, close the Worker pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
+- after harvesting the result artifact, close the Worker pane and clean up provider session state when supported unless `--keep-pane` is needed for inspection
 
 Worker `partial`, `blocked`, `failed`, `abandoned`, `merge_ready: false`, missing validation, blocking questions, or uncommitted result artifacts are hard stops for that task. Manager must not edit the Worker result frontmatter to make it merge-ready, must not invent `head_sha` or commit metadata, and must not manually merge a task that `hloop merge` rejects. Create a fix task, rerun the Worker, or record an environment blocker instead.
 
@@ -119,7 +134,7 @@ For each running Gap Auditor:
 - treat the gap worktree as disposable; harvest copies `.ai/loop/gaps/<gap-id>.md` back to the Manager repo and removes the worktree when no write-scope violation occurred
 - triage gaps into fix task, decision, accepted risk, stale-spec update, or false positive
 - never ask Gap Auditor to edit code
-- after harvesting the gap artifact, close the Gap Auditor pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
+- after harvesting the gap artifact, close the Gap Auditor pane and clean up provider session state when supported unless `--keep-pane` is needed for inspection
 - generate fix-task drafts with `hloop triage gap <gap-id>` before closing as `fix-tasks-created`
 - close the gap gate with `hloop gap close <gap-id> --verdict <aligned|accepted-risk|fix-tasks-created|decision-needed|stale-spec-updated|blocked>`
 
@@ -134,7 +149,7 @@ For each running Reviewer:
 - treat the review worktree as disposable; harvest copies `.ai/loop/reviews/<review-id>.md` back to the Manager repo and removes the worktree when no write-scope violation occurred
 - triage findings into fix task, decision, accepted risk, or false positive
 - never ask Reviewer to edit code
-- after harvesting the review artifact, close the Reviewer pane and archive the captured Codex session unless `--keep-pane` is needed for inspection
+- after harvesting the review artifact, close the Reviewer pane and clean up provider session state when supported unless `--keep-pane` is needed for inspection
 - generate fix-task drafts with `hloop triage review <review-id>` before closing as `fix-tasks-created`
 - close the review gate with `hloop reviewer close <review-id> --verdict <passed|accepted-risk|fix-tasks-created>`
 
@@ -184,7 +199,9 @@ When done, generate `reports/FINAL.md` with:
 - Manager final QA profile, status, and artifact
 - validation log paths from `.ai/loop/validation/`
 - branch strategy, Worker QA profile, and Manager final QA profile
+- role agent providers/models
 - gap status
 - review status
+- advice status when Advisor was used
 - accepted risks
 - remaining follow-ups

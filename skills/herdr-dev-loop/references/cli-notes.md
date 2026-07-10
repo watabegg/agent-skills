@@ -1,8 +1,8 @@
 # CLI Notes
 
-These notes describe the local command assumptions used by `scripts/hloop`. Re-check with `hloop doctor` because Herdr and Codex CLI can change.
+These notes describe the local command assumptions used by `scripts/hloop`. Re-check with `hloop doctor` because Herdr, Codex CLI, and Claude Code CLI can change.
 
-`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility skills; native HLoop Worker and Reviewer protocols do not require them. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
+`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements because Codex is the default fallback provider. It reports `claude` when available and role starts require Claude only when that role selects `--*-agent-provider claude`. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility skills; native HLoop Worker and Reviewer protocols do not require them. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
 
 `hloop` is not assumed to be installed on `PATH`. Prefer an explicit shell variable in every Manager session:
 
@@ -11,7 +11,7 @@ HLOOP="python3 /absolute/path/to/herdr-dev-loop/scripts/hloop"
 $HLOOP doctor
 ```
 
-If bare `hloop` fails with `command not found`, keep using the absolute helper path. Do not switch to hand-written Herdr/Codex orchestration for loop mutations.
+If bare `hloop` fails with `command not found`, keep using the absolute helper path. Do not switch to hand-written Herdr/Codex/Claude orchestration for loop mutations.
 
 Mutating helper commands take the repo-local Git lock from `git rev-parse --git-path hloop.lock` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
@@ -38,9 +38,9 @@ Herdr pane ids are not durable and may not use the old `1-3` shape. Parse ids fr
 
 When available, prefer environment-provided `HERDR_PANE_ID`, `HERDR_WORKSPACE_ID`, and `HERDR_TAB_ID` for the current Manager context. Some Herdr `--current` subcommands can refer to the UI-focused pane, so pass explicit ids after preflight.
 
-`herdr agent start` is useful for named Worker/Gap Auditor/Reviewer agents. `hloop` supports a pane launcher and an agent launcher; use `--dry-run` before relying on a launcher in a new Herdr version.
+`herdr agent start` is useful for named Worker/Gap Auditor/Reviewer/Advisor agents. `hloop` supports a pane launcher and an agent launcher; use `--dry-run` before relying on a launcher in a new Herdr version.
 
-After `hloop worker harvest`, `hloop gap harvest`, or `hloop reviewer harvest`, the helper closes the completed pane by default. Use `--keep-pane` only when the Manager needs to inspect the live transcript.
+After `hloop worker harvest`, `hloop gap harvest`, `hloop reviewer harvest`, or `hloop advisor harvest`, the helper closes the completed pane by default. Use `--keep-pane` only when the Manager needs to inspect the live transcript.
 
 ## Codex CLI
 
@@ -57,7 +57,21 @@ codex exec --sandbox workspace-write --output-last-message .ai/loop/reviews/R001
 
 The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Reviewers. Worker default is TUI. Gap Auditor and Reviewer default are also TUI, but run in detached worktrees so the Manager can monitor progress and each agent can write only the final Markdown artifact. `hloop gap harvest` and `hloop reviewer harvest` copy the artifact back to the Manager repo and block if the detached worktree changed any other file.
 
-Use `hloop harvest <id>` when the id prefix is already known. It delegates `T...` to Worker harvest, `R...` to Reviewer harvest, and `G...` to Gap Auditor harvest.
+## Claude Code CLI
+
+Required command shape when a role selects `--*-agent-provider claude`:
+
+```bash
+claude --permission-mode acceptEdits --ax-screen-reader "$(cat .ai/loop/prompts/T001.worker.md)"
+claude --print --permission-mode acceptEdits --model opus < .ai/loop/prompts/R001.reviewer.md > .ai/loop/reviews/R001.md
+claude --print --permission-mode acceptEdits --model opus < .ai/loop/prompts/A001-P1.advisor.md > .ai/loop/advice/A001-P1.md
+```
+
+Claude does not use Codex's `--sandbox` flag. hloop still isolates Reviewer, Gap Auditor, and Advisor writes through detached worktrees and harvest-time write-scope validation. Claude session archive/delete is not attempted; hloop records provider session cleanup as skipped when the provider does not support Codex-style session cleanup.
+
+## Harvest And Wait
+
+Use `hloop harvest <id>` when the id prefix is already known. It delegates `T...` to Worker harvest, `R...` to Reviewer harvest, `G...` to Gap Auditor harvest, and `A.../P...` to Advisor participant harvest.
 
 Use this while a gap audit or review is running:
 
@@ -65,6 +79,7 @@ Use this while a gap audit or review is running:
 python3 <skill>/scripts/hloop worker watch T001 --lines 120
 python3 <skill>/scripts/hloop gap watch G001 --lines 120
 python3 <skill>/scripts/hloop reviewer watch R001 --lines 120
+python3 <skill>/scripts/hloop advisor watch A001 --participant-id P1 --lines 120
 ```
 
 Use this instead of hand-written polling when Manager is waiting for the next artifact:
@@ -74,7 +89,7 @@ python3 <skill>/scripts/hloop wait next --harvest --timeout-ms 300000
 python3 <skill>/scripts/hloop wait T001 --harvest --timeout-ms 300000
 ```
 
-`wait` checks Worker result artifacts, Reviewer artifacts, and Gap Auditor artifacts. It returns when an artifact is present and non-empty, or returns non-zero on timeout with the last known agent and pane status. It sleeps without holding the loop lock; `--harvest` locks only for the harvest step.
+`wait` checks Worker result artifacts, Reviewer artifacts, Gap Auditor artifacts, and Advisor participant artifacts. It returns when an artifact is present and non-empty, or returns non-zero on timeout with the last known agent and pane status. It sleeps without holding the loop lock; `--harvest` locks only for the harvest step.
 
 Use the helper to send additional Manager instructions into a TUI:
 
@@ -82,6 +97,7 @@ Use the helper to send additional Manager instructions into a TUI:
 python3 <skill>/scripts/hloop worker message T001 --file .ai/loop/inbox/manager/T001-followup.md
 python3 <skill>/scripts/hloop gap message G001 --file .ai/loop/inbox/manager/G001-followup.md
 python3 <skill>/scripts/hloop reviewer message R001 --file .ai/loop/inbox/manager/R001-followup.md
+python3 <skill>/scripts/hloop advisor message A001 --participant-id P1 --file .ai/loop/inbox/manager/A001-P1-followup.md
 ```
 
 Avoid direct `herdr pane run <pane> "<prompt>"` for Manager follow-ups. Empirical failure modes in Herdr 0.7.1 / Codex CLI 0.142.5:
@@ -92,7 +108,7 @@ Avoid direct `herdr pane run <pane> "<prompt>"` for Manager follow-ups. Empirica
 - sending `send-text` and `Enter` back-to-back can leave the prompt typed but not submitted
 - `herdr wait output --match <marker>` can match the echoed prompt text before Codex has answered
 
-`hloop ... message` checks that the pane is a Codex TUI, rejects trust prompts and working sessions, then uses `pane send-text`, waits until the prompt is visible, pauses before `pane send-keys Enter`, and verifies that Codex started working or answered. If verification fails because the prompt stayed typed, it retries Enter. Tune with `--input-settle-ms`, `--submit-verify-ms`, and `--submit-attempts` only after inspecting the pane. For long or multi-line instructions, prefer `--file` to avoid shell quoting issues.
+`hloop ... message` checks that the pane is a role-agent TUI, rejects trust prompts and working sessions, then uses `pane send-text`, waits until the prompt is visible, pauses before `pane send-keys Enter`, and verifies that the provider agent started working or answered. If verification fails because the prompt stayed typed, it retries Enter. Tune with `--input-settle-ms`, `--submit-verify-ms`, and `--submit-attempts` only after inspecting the pane. For long or multi-line instructions, prefer `--file` to avoid shell quoting issues.
 
 If delivery fails, the command returns non-zero and records the undelivered message under `.ai/loop/inbox/pending/` plus the target's `manager_messages` state. Retry that file when `hloop ... watch` shows the pane is ready.
 

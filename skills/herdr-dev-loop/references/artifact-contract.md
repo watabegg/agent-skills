@@ -18,6 +18,7 @@ All loop coordination is file-backed under `.ai/loop`.
   results/
   gaps/
   reviews/
+  advice/
   prompts/
   triage/
   validation/
@@ -40,6 +41,12 @@ Required top-level fields:
 - `manager_qa_status`
 - `worker_protocol`
 - `review_protocol`
+- `worker_agent_provider`
+- `worker_agent_model`
+- `reviewer_agent_provider`
+- `reviewer_agent_model`
+- `gap_agent_provider`
+- `gap_agent_model`
 - `review_lanes`
 - `cycle`
 - `max_workers`
@@ -49,6 +56,7 @@ Required top-level fields:
 - `batches`
 - `reviews`
 - `gaps`
+- `advice`
 - `blocking_decisions`
 
 Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pane id.
@@ -64,10 +72,12 @@ Recommended optional fields:
 - `ungapped_merge_count`: integration merges not yet covered by a closed gap gate
 - `spec_sources`: original repo plan/spec files or directories the Gap Auditor should compare against implementation
 - `current_batch_id`: active `Bxxx` task batch for rolling loop-state checkpoint commits
-- per task/gap/review `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
-- per task/gap/review `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error`
-- per task/gap/review `worktree_cleanup_status`, `worktree_cleanup_error`, `worktree_cleanup_failed_at`
-- per task/gap/review `sandbox`: expected `workspace-write` for hloop-started agents; other values are trust findings in `hloop conductor`
+- per task/gap/review/advisor `pane_closed_at`, `pane_cleanup_status`, `pane_cleanup_error`
+- per task/gap/review/advisor `agent_session_id`, `agent_session_provider`, `agent_session_cleanup`, `agent_session_cleanup_error`
+- per task/gap/review/advisor legacy Codex fields `codex_session_id`, `codex_session_cleanup`, `codex_session_cleanup_error` when the provider is Codex
+- per task/gap/review/advisor `worktree_cleanup_status`, `worktree_cleanup_error`, `worktree_cleanup_failed_at`
+- per task/gap/review/advisor `sandbox`: expected `workspace-write` for hloop-started agents; other values are trust findings in `hloop conductor`
+- per task/review/gap/advisor `agent_provider`, `agent_model`, and `fallback_provider`
 - per review `worktree`, `worktree_review_path_harvested`
 - per review `write_scope_violations`
 - per review `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`
@@ -78,6 +88,8 @@ Recommended optional fields:
 - per gap `gate_status`: Manager gate status such as `running`, `reported`, `triaged`, or `blocked_write_scope`
 - per gap `artifact_status`: artifact frontmatter status such as `aligned`, `gaps-found`, `blocked`, or `failed`
 - per gap `triage_drafts`, `created_fix_tasks`
+- per advice `mode`, `source_refs`, `participants`, `gate_status`, and `verdict`
+- per advisor participant `provider`, `model`, `worktree`, `worktree_advice_path_harvested`, `artifact_status`, `write_scope_violations`
 - `last_validation.results[].log`: relative path to captured stdout/stderr under `.ai/loop/validation/`
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
@@ -89,6 +101,8 @@ Do not keep completed agent pane transcripts as durable state. Harvest artifacts
 - branch strategy: `integration`, `pr-per-task`, or `custom`
 - Worker protocol: `native` or `codex-impl`
 - Reviewer protocol: `native` or `codex-review-multi-v2`
+- Worker / Reviewer / Gap Auditor / Advisor agent provider: `codex` or `claude`
+- Worker / Reviewer / Gap Auditor / Advisor agent model: provider-specific model name, or `auto`
 - review lanes
 - Worker QA profile: `repo-default`, `local`, `staging`, `preview`, `custom`, or `none`
 - Manager final QA profile: `repo-default`, `local`, `staging`, `preview`, `custom`, or `none`
@@ -98,6 +112,8 @@ When `branch_strategy` is not `integration`, Manager must record the concrete me
 Reviewer artifacts are written in a detached review worktree first, then copied back to the Manager repo during harvest. The review worktree may use `workspace-write`, but only `.ai/loop/reviews/<review-id>.md` is an allowed Reviewer write.
 
 Gap Auditor artifacts are written in a detached gap worktree first, then copied back to the Manager repo during harvest. The gap worktree may use `workspace-write`, but only `.ai/loop/gaps/<gap-id>.md` is an allowed Gap Auditor write.
+
+Advisor artifacts are written in detached advisor worktrees first, then copied back to the Manager repo during harvest. Advisor worktrees may write only `.ai/loop/advice/<advice-id>-<participant-id>.md`. Advisors are never started automatically by `tick` or `pump`; Manager must explicitly create and start an advice request.
 
 ## Task File
 
@@ -124,10 +140,14 @@ acceptance:
 validation_minimum: L1
 worker_protocol: native
 worker_qa_profile: repo-default
+worker_agent_provider: codex
+worker_agent_model: auto
 ---
 ```
 
 `write_allow` is mandatory and non-empty for implementation and fix tasks unless Manager explicitly uses `--allow-no-write` for an exceptional no-edit task. Use `kind: research` for ordinary no-edit investigation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems. `validation_minimum` may be a single level such as `L1` or a multiline list when the task needs multiple explicit validation requirements.
+
+`worker_agent_provider` and `worker_agent_model` optionally override the default Worker backend from `PROFILE.md` for a single task.
 
 ## Batch File
 
@@ -318,6 +338,52 @@ acceptance:
   - The plan requirement is implemented.
 rationale: The plan requires X, but the integration branch only implements Y.
 ```
+
+## Advisor Artifacts
+
+Advisor is an explicit consultation role. Manager creates a request only when a non-user-blocking specification or fix-strategy judgment benefits from another model or cross-model comparison.
+
+The request summary is `advice/ANNN.md`:
+
+```md
+---
+advice_id: A001
+status: requested
+mode: dialogue
+max_rounds: 2
+participants:
+  - "P1:codex:auto"
+  - "P2:claude:opus"
+source_refs:
+  - reviews/R001.md
+---
+
+# Advice Request A001
+```
+
+Each participant writes `advice/ANNN-PN.md`:
+
+```md
+---
+advice_id: A001
+participant_id: P1
+provider: claude
+model: opus
+status: advised
+---
+
+# Advice A001/P1
+```
+
+Allowed participant `status` values:
+
+- `advised`: the participant produced a usable recommendation
+- `blocked`: the participant needs Manager/user information before advising
+- `failed`: the participant failed operationally
+
+In dialogue mode, `max_rounds` bounds each participant's initial prompt plus delivered Manager follow-up messages. The default is `2`, allowing one delivered `hloop advisor message` follow-up per participant. Additional follow-ups are rejected by `hloop`.
+
+Advisor outputs are not decisions. Manager must harvest participant artifacts and then close the request with `hloop advisor close A001 --verdict <decision-recorded|fix-tasks-created|accepted-risk|no-action|blocked> --reason ...` after recording any accepted decision, fix task, accepted risk, or user escalation in the appropriate Manager-owned artifact.
 
 ## Triage Draft
 
