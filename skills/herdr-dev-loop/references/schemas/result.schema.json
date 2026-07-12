@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Worker Result Frontmatter",
   "type": "object",
-  "required": ["task_id", "run_id", "skill_version", "status", "merge_ready", "branch", "head_sha", "base_sha", "changed_files", "validation_recorded", "blocking_questions"],
+  "required": ["task_id", "run_id", "skill_version", "attempt_id", "status", "merge_ready", "branch", "head_sha", "base_sha", "changed_files", "validation_recorded", "blocking_questions"],
   "properties": {
     "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
     "run_id": {"type": "string"},
     "skill_version": {"type": "string"},
+    "attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
     "status": {"enum": ["done", "partial", "blocked", "failed", "abandoned"]},
     "merge_ready": {"type": "boolean"},
     "branch": {"type": "string"},

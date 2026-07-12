@@ -36,11 +36,12 @@ HLOOP="python3 <this-skill>/scripts/hloop --namespace <namespace>"
 $HLOOP version
 $HLOOP selftest
 $HLOOP doctor
-$HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --persistence local-only --worktree-root ../wt/<goal-id> --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider codex --reviewer-agent-model auto --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
+$HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --persistence local-only --worktree-root ../wt/<goal-id> --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider codex --reviewer-agent-model auto --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --validation-command '<repo test command>' --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
 $HLOOP batch start "Initial implementation batch"
 $HLOOP task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 $HLOOP dashboard
 $HLOOP pump --max-transitions 20 --max-workers 3
+$HLOOP finish
 ```
 
 Use `tick --once` for one material transition when inspecting a new repository. Use `pump` after the loop is stable; it repeatedly runs safe tick transitions until it reaches triage, blocked, done, or the transition limit. Add `--stop-on-waiting` when Manager wants to pause as soon as all currently safe transitions are exhausted.
@@ -71,9 +72,11 @@ When `init --force` replaces a loop, the previous tree is archived below `.ai/he
 
 `local-only` is the default persistence mode. Manager state is copied into role worktrees without requiring public branch history, and squash merge unstages namespaced loop artifacts before the product commit. Use `branch-history` only when the repository intentionally versions loop artifacts.
 
-Recover artifact-less or failed roles with `hloop agent abort <id> --reason ...` and `hloop agent requeue <id> --reason ...`. Cleanup refuses to discard product changes unless Manager explicitly adds `--force-cleanup`.
+Recover artifact-less or failed roles with `hloop agent abort <id> --reason ...` and `hloop agent requeue <id> --reason ...`. Each start has an attempt id and immutable Worker base; requeue archives the prior attempt and any clean unmerged branch before creating a new attempt. Cleanup refuses to discard product changes unless Manager explicitly adds `--force-cleanup`.
 
-Repository-specific worktree setup commands may be passed repeatedly with `init --worktree-setup-command`. Every outcome is appended to `.ai/herdr-dev-loop/experience/worktree-setup.json`. Curate reusable defaults with `hloop experience recommend --command ...`; a later `init` reuses recommended commands when no explicit setup command is supplied.
+For a loop created by an older runtime, run `hloop migrate --dry-run` and then `hloop migrate --apply` before continuing. `pump` may reach `ready_to_finish`, but it never marks the loop done; run `hloop finish` to recheck validation, review, gap, Manager QA, cleanup, merge, agent, and checkout gates against the current integration SHA.
+
+Repository-specific worktree setup commands may be passed repeatedly with role-specific `init --worker-setup-command`, `--reviewer-setup-command`, `--gap-setup-command`, and `--advisor-setup-command`. The legacy `--worktree-setup-command` is Worker-only. Every outcome is appended to `.ai/herdr-dev-loop/experience/worktree-setup.json`. Curate reusable Worker defaults with `hloop experience recommend --command ...`; a later `init` reuses recommended commands when no explicit Worker setup command is supplied.
 
 With `branch-history` persistence, use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` to commit namespaced loop state without staging product files. `local-only` does not require checkpoints for role visibility. Avoid hand-written Git staging unless debugging the helper itself.
 

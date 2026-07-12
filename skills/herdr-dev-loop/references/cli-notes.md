@@ -23,6 +23,8 @@ $HLOOP namespaces
 
 `namespaces` lists coexisting loops and reports `.ai/loop` only as `legacy ignored`. `agent abort` and `agent requeue` recover roles that exited without artifacts. `experience show` and `experience recommend` expose the repo-local worktree setup history below `.ai/herdr-dev-loop/experience/`.
 
+Use `migrate --dry-run` and then `migrate --apply` for pre-0.4 state. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
+
 Mutating helper commands take the repo-local Git lock from `git rev-parse --git-path hloop.lock` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
 ## Herdr
@@ -65,7 +67,7 @@ codex --sandbox workspace-write --ask-for-approval never --no-alt-screen "$(cat 
 codex exec --sandbox workspace-write --output-last-message .ai/herdr-dev-loop/loops/<namespace>/reviews/R001.md - < .ai/herdr-dev-loop/loops/<namespace>/prompts/R001.reviewer.md
 ```
 
-The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Reviewers. Worker default is TUI. Gap Auditor and Reviewer default are also TUI, but run in detached worktrees so the Manager can monitor progress and each agent can write only the final Markdown artifact. `hloop gap harvest` and `hloop reviewer harvest` copy the artifact back to the Manager repo and block if the detached worktree changed any other file.
+The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Reviewers, passes the repository Git common directory through `--add-dir`, and maps role effort to `model_reasoning_effort`. Worker default is TUI. Gap Auditor and Reviewer default are also TUI, but run in detached worktrees so the Manager can monitor progress and each agent can write only the final Markdown artifact. `hloop gap harvest` and `hloop reviewer harvest` copy the artifact back to the Manager repo and block if the detached worktree changed any other file.
 
 `init --worktree-root <path>` stores one worktree root in `STATE.json`. Relative paths resolve from the Manager repository. Worker paths use `<root>/Txxx`; the other roles use their IDs below the same root. Without this option, the legacy sibling naming remains in effect.
 
@@ -78,12 +80,14 @@ The helper uses `--sandbox workspace-write` for Workers, Gap Auditors, and Revie
 Required command shape when a role selects `--*-agent-provider claude`:
 
 ```bash
-claude --permission-mode acceptEdits --ax-screen-reader "$(cat .ai/herdr-dev-loop/loops/<namespace>/prompts/T001.worker.md)"
-claude --print --permission-mode acceptEdits --model opus < .ai/herdr-dev-loop/loops/<namespace>/prompts/R001.reviewer.md > .ai/herdr-dev-loop/loops/<namespace>/reviews/R001.md
-claude --print --permission-mode acceptEdits --model opus < .ai/herdr-dev-loop/loops/<namespace>/prompts/A001-P1.advisor.md > .ai/herdr-dev-loop/loops/<namespace>/advice/A001-P1.md
+claude --permission-mode auto --ax-screen-reader "$(cat .ai/herdr-dev-loop/loops/<namespace>/prompts/T001.worker.md)"
+claude --print --permission-mode auto --model opus --effort high < .ai/herdr-dev-loop/loops/<namespace>/prompts/R001.reviewer.md > .ai/herdr-dev-loop/loops/<namespace>/reviews/R001.md
+claude --print --permission-mode auto --model opus < .ai/herdr-dev-loop/loops/<namespace>/prompts/A001-P1.advisor.md > .ai/herdr-dev-loop/loops/<namespace>/advice/A001-P1.md
 ```
 
 Claude does not use Codex's `--sandbox` flag. hloop still isolates Reviewer, Gap Auditor, and Advisor writes through detached worktrees and harvest-time write-scope validation. Claude session archive/delete is not attempted; hloop records provider session cleanup as skipped when the provider does not support Codex-style session cleanup.
+
+Validation has no implicit `git diff --check` fallback. Configure at least one real command with `init --validation-command ...` or `validation configure --command ...`. A merge conflict remains an explicit transaction: use `merge <task-id> --abort`, `--retry`, or, after resolving and staging only allowed files, `--continue`.
 
 ## Harvest And Wait
 
