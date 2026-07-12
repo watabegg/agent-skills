@@ -34,21 +34,22 @@ Skillを使うManagerは、ほかの調査や変更より先に `$HLOOP version`
 新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
 
 ```text
-herdr-dev-loop 0.3.0 / namespace <namespace> を使用します（loop_skill_version: 0.3.0, run_id: 20260712T...-goal）
+herdr-dev-loop 0.4.0 / namespace <namespace> を使用します（loop_skill_version: 0.4.0, run_id: 20260712T...-goal）
 ```
 
 `hloop namespaces` は同居するloopを列挙し、旧 `.ai/loop` が存在する場合は `legacy ignored` と表示します。
 
 ## 永続化とworktree初期化経験
 
-既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。
+既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。0.3.xのstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。
 
 worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
 
 ```bash
 $HLOOP init ... \
-  --worktree-setup-command 'pnpm install --frozen-lockfile' \
-  --worktree-setup-command 'pnpm generate'
+  --worker-setup-command 'pnpm install --frozen-lockfile' \
+  --worker-setup-command 'pnpm generate' \
+  --reviewer-setup-command 'pnpm install --frozen-lockfile'
 ```
 
 実行結果はnamespace外の `.ai/herdr-dev-loop/experience/worktree-setup.json` に最大200件蓄積されます。保存するのはcommand、成否、return code、所要時間、role/run識別子だけで、stdout/stderrは秘密値混入を避けるため保存しません。成功した経験を次回の既定値にする場合は次を使います。

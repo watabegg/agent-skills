@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +49,11 @@ DEFAULT_WORKER_PROTOCOL = "native"
 DEFAULT_REVIEW_PROTOCOL = "native"
 DEFAULT_AGENT_PROVIDER = "codex"
 DEFAULT_AGENT_MODEL = "auto"
+DEFAULT_AGENT_EFFORT = "auto"
+DEFAULT_CLAUDE_PERMISSION_MODE = "auto"
+STATE_FORMAT_VERSION = 2
+DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MIN_FREE_INODES = 50_000
 DEFAULT_ADVISOR_ENABLED = False
 DEFAULT_ADVISOR_MODE = "single"
 DEFAULT_ADVISOR_MAX_ROUNDS = 2
@@ -257,6 +264,90 @@ def state_persistence(state: dict[str, Any]) -> str:
     return value if value in {"local-only", "branch-history"} else "branch-history"
 
 
+def setup_commands_for_role(state: dict[str, Any], role: str) -> list[str]:
+    role_key = f"{role_state_prefix(role)}_setup_commands"
+    if role_key in state:
+        return normalize_list(state.get(role_key))
+    # 0.3 compatibility: the old shared setup contract becomes Worker-only.
+    return normalize_list(state.get("worktree_setup_commands")) if role == "worker" else []
+
+
+def unsafe_setup_command(command: str) -> str:
+    lowered = command.lower()
+    markers = (
+        ".claude",
+        ".codex",
+        "claude.md",
+        "agents.md",
+        "bypasspermissions",
+        "dangerously-skip-permissions",
+        "dangerously-bypass",
+        "permission-mode",
+    )
+    return next((marker for marker in markers if marker in lowered), "")
+
+
+def storage_paths(repo: Path, state: dict[str, Any]) -> list[Path]:
+    candidates = [repo, Path(os.environ.get("TMPDIR") or "/tmp")]
+    raw_root = str(state.get("worktree_root") or "")
+    if raw_root:
+        candidates.append(Path(raw_root))
+    result: list[Path] = []
+    for candidate in candidates:
+        path = candidate.resolve()
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        if path.exists() and path not in result:
+            result.append(path)
+    return result
+
+
+def storage_preflight(repo: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    required_bytes = normalize_int(state.get("min_free_bytes"), DEFAULT_MIN_FREE_BYTES)
+    required_inodes = normalize_int(state.get("min_free_inodes"), DEFAULT_MIN_FREE_INODES)
+    snapshots: list[dict[str, Any]] = []
+    seen_devices: set[int] = set()
+    for path in storage_paths(repo, state):
+        stats = os.statvfs(path)
+        device = path.stat().st_dev
+        if device in seen_devices:
+            continue
+        seen_devices.add(device)
+        free_bytes = stats.f_bavail * stats.f_frsize
+        free_inodes = stats.f_favail
+        item = {
+            "path": str(path),
+            "device": device,
+            "free_bytes": free_bytes,
+            "free_inodes": free_inodes,
+            "required_bytes": required_bytes,
+            "required_inodes": required_inodes,
+        }
+        snapshots.append(item)
+        if required_bytes and free_bytes < required_bytes:
+            raise HLoopError(
+                f"disk preflight failed for {path}: free bytes {free_bytes} < {required_bytes}"
+            )
+        if required_inodes and free_inodes < required_inodes:
+            raise HLoopError(
+                f"disk preflight failed for {path}: free inodes {free_inodes} < {required_inodes}"
+            )
+        probe = path / f".hloop-write-probe-{os.getpid()}-{time.time_ns()}"
+        try:
+            with probe.open("wb") as fh:
+                fh.write(b"hloop\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            raise HLoopError(f"disk write probe failed for {path}: {exc}") from exc
+        finally:
+            try:
+                probe.unlink()
+            except FileNotFoundError:
+                pass
+    return snapshots
+
+
 def ensure_local_only_git_excludes(repo: Path) -> None:
     git_common = run_cmd(
         ["git", "-C", str(repo), "rev-parse", "--git-common-dir"], check=False
@@ -303,11 +394,16 @@ def run_worktree_setup_commands(
     role: str,
     agent_id: str,
 ) -> None:
-    commands = normalize_list(state.get("worktree_setup_commands"))
+    commands = setup_commands_for_role(state, role)
     if not commands:
         return
     experience = load_worktree_experience(repo)
     for command in commands:
+        marker = unsafe_setup_command(command)
+        if marker:
+            raise HLoopError(
+                f"unsafe worktree setup command for {role} {agent_id}: contains `{marker}`"
+            )
         started = time.monotonic()
         proc = run_cmd(["bash", "-lc", command], cwd=worktree, check=False)
         record = {
@@ -411,6 +507,77 @@ def cmd_namespace_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def migrated_state(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
+    if normalize_int(state.get("state_format_version"), 1) >= STATE_FORMAT_VERSION:
+        return dict(state)
+    running = running_agent_ids(state)
+    if running:
+        raise HLoopError(
+            "cannot migrate while role agents are running; abort them first: " + ", ".join(running)
+        )
+    if state.get("active_merge"):
+        raise HLoopError("cannot migrate while a merge transaction is active")
+    for task_id, task in state.get("tasks", {}).items():
+        worktree_raw = str(task.get("worktree") or "")
+        if worktree_raw and Path(worktree_raw).exists() and product_dirty_paths_for_agent(Path(worktree_raw)):
+            raise HLoopError(f"cannot migrate dirty role worktree: {task_id}")
+    result = json.loads(json.dumps(state))
+    result["state_format_version"] = STATE_FORMAT_VERSION
+    result["migrated_from_skill_version"] = str(state.get("skill_version") or "unversioned")
+    result["skill_version"] = SKILL_VERSION
+    result.setdefault("worker_setup_commands", normalize_list(state.get("worktree_setup_commands")))
+    result.setdefault("reviewer_setup_commands", [])
+    result.setdefault("gap_setup_commands", [])
+    result.setdefault("advisor_setup_commands", [])
+    result.setdefault("min_free_bytes", DEFAULT_MIN_FREE_BYTES)
+    result.setdefault("min_free_inodes", DEFAULT_MIN_FREE_INODES)
+    for prefix in ("worker", "reviewer", "gap", "advisor"):
+        result.setdefault(f"{prefix}_agent_effort", DEFAULT_AGENT_EFFORT)
+        result.setdefault(f"{prefix}_claude_permission_mode", DEFAULT_CLAUDE_PERMISSION_MODE)
+    for task in result.get("tasks", {}).values():
+        task.setdefault("attempt_no", 0)
+        task.setdefault("attempts", [])
+        if task.get("base_sha"):
+            task.setdefault("worker_base_sha", task.get("base_sha"))
+        if task.get("status") == "queued":
+            task["skill_version"] = SKILL_VERSION
+    result["needs_validation"] = bool(result.get("tasks"))
+    result["needs_review"] = bool(result.get("reviews"))
+    result["needs_gap_check"] = bool(result.get("gaps"))
+    result["manager_qa_status"] = (
+        "not-required" if state_manager_qa_profile(result) == "none" else "pending"
+    )
+    result["phase"] = "dispatching"
+    return result
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    updated = migrated_state(repo, state)
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "from_format": state.get("state_format_version", 1),
+                    "to_format": updated.get("state_format_version"),
+                    "from_skill_version": state.get("skill_version", "unversioned"),
+                    "to_skill_version": updated.get("skill_version"),
+                    "run_id_preserved": state.get("run_id") == updated.get("run_id"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    backup = loop_path(repo) / "migration" / f"STATE.v{state.get('state_format_version', 1)}.{filename_timestamp()}.json"
+    write_text(backup, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    save_state(repo, updated)
+    journal(repo, f"Migrated state format to `{STATE_FORMAT_VERSION}` with backup `{backup.relative_to(repo)}`.")
+    print(f"migrated state format to {STATE_FORMAT_VERSION}; backup: {backup}")
+    return 0
+
+
 def repo_lock_path(repo: Path) -> Path:
     proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--git-path", "hloop.lock"], check=False)
     if proc.returncode != 0:
@@ -487,7 +654,7 @@ def retire_legacy_loop_lock(repo: Path) -> None:
 
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
-    if command in {"init", "merge", "validate", "qa", "tick", "pump", "report", "checkpoint"}:
+    if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish"}:
         return True
     if command == "batch":
         return getattr(args, "batch_command", "") in {"start", "assign", "close"}
@@ -1097,6 +1264,7 @@ def send_agent_tui_message(
     provider = normalize_agent_provider(provider)
     if not message.strip():
         raise HLoopError("manager message is empty")
+    _, message = manager_message_envelope(state, task_id, task_state, message)
     check_herdr_env()
     initial_pane, _ = wait_agent_tui_ready(provider, pane_id, timeout_ms)
     initial_session_id = extract_agent_session_id(initial_pane)
@@ -1138,6 +1306,20 @@ def manager_message_from_args(args: argparse.Namespace) -> tuple[str, str]:
     raise HLoopError("provide a message argument, --file, or stdin")
 
 
+def manager_message_envelope(
+    state: dict[str, Any], agent_id: str, agent: dict[str, Any], message: str
+) -> tuple[str, str]:
+    message_id = str(uuid.uuid4())
+    run_id = str(state.get("run_id") or "")
+    attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
+    ack = f"HERDR_LOOP_MESSAGE_ACK:{run_id}:{agent_id}:{attempt_id}:{message_id}"
+    body = (
+        f"Manager message id: {message_id}\n"
+        f"Before acting, print exactly: {ack}\n\n{message.rstrip()}\n"
+    )
+    return message_id, body
+
+
 def record_manager_message(
     target_state: dict[str, Any],
     source: str,
@@ -1154,6 +1336,9 @@ def record_manager_message(
         "lines": len(message.splitlines()) or 1,
         "delivery_status": delivery_status,
     }
+    match = re.search(r"Manager message id: ([0-9a-f-]{36})", message)
+    if match:
+        entry["message_id"] = match.group(1)
     if delivery_error:
         entry["delivery_error"] = delivery_error
     if pending_path:
@@ -1315,6 +1500,8 @@ def cleanup_completed_agent_pane(
     if pane is None:
         agent_state["pane_closed_at"] = now_iso()
         agent_state["pane_cleanup_status"] = "already-closed"
+        agent_state["closed_pane_id"] = pane_id
+        agent_state.pop("pane_id", None)
         return
     session_id = extract_agent_session_id(pane)
     provider = str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER)
@@ -1335,6 +1522,8 @@ def cleanup_completed_agent_pane(
     if proc.returncode == 0:
         agent_state["pane_closed_at"] = now_iso()
         agent_state["pane_cleanup_status"] = "closed"
+        agent_state["closed_pane_id"] = pane_id
+        agent_state.pop("pane_id", None)
         journal(repo, f"Closed `{label}` pane `{pane_id}` after harvesting its artifact.")
     else:
         message = (proc.stderr or proc.stdout or "").strip()
@@ -1450,6 +1639,11 @@ def normalize_agent_model(value: Any) -> str:
     return model or DEFAULT_AGENT_MODEL
 
 
+def normalize_agent_effort(value: Any) -> str:
+    effort = str(value or DEFAULT_AGENT_EFFORT).strip().lower()
+    return effort or DEFAULT_AGENT_EFFORT
+
+
 def role_state_prefix(role: str) -> str:
     if role == "reviewer":
         return "reviewer"
@@ -1495,7 +1689,18 @@ def role_agent_config(
         raise HLoopError(
             f"unsupported fallback provider `{fallback}`; expected one of: {', '.join(sorted(AGENT_PROVIDERS))}"
         )
-    return {"provider": provider, "model": model, "fallback_provider": fallback}
+    effort = normalize_agent_effort(
+        overrides.get("agent_effort")
+        or overrides.get(f"{prefix}_agent_effort")
+        or state.get(f"{prefix}_agent_effort")
+    )
+    permission_mode = str(
+        overrides.get("claude_permission_mode")
+        or overrides.get(f"{prefix}_claude_permission_mode")
+        or state.get(f"{prefix}_claude_permission_mode")
+        or DEFAULT_CLAUDE_PERMISSION_MODE
+    ).strip()
+    return {"provider": provider, "model": model, "effort": effort, "claude_permission_mode": permission_mode, "fallback_provider": fallback}
 
 
 def require_agent_provider_available(provider: str) -> None:
@@ -1756,6 +1961,12 @@ def preflight_loop(
             mark_blocked_environment(repo, state, reason)
         raise HLoopError(reason)
 
+    if normalize_int(state.get("state_format_version"), 1) < STATE_FORMAT_VERSION:
+        fail(
+            f"state migration required: format={state.get('state_format_version', 1)} "
+            f"runtime={STATE_FORMAT_VERSION}; run `hloop migrate --dry-run` then `hloop migrate --apply`"
+        )
+
     if not command_exists("git"):
         fail("git command not found")
     if require_herdr:
@@ -1763,6 +1974,13 @@ def preflight_loop(
             fail("HERDR_ENV=1 is required")
         if not command_exists("herdr"):
             fail("herdr command not found")
+        try:
+            state["last_storage_preflight"] = {
+                "at": now_iso(),
+                "filesystems": storage_preflight(repo, state),
+            }
+        except HLoopError as exc:
+            fail(str(exc))
     if require_codex and not command_exists("codex"):
         fail("codex command not found")
     if require_agent_provider:
@@ -1876,6 +2094,21 @@ def pane_marker(role: str, agent_id: str) -> str:
         advice_id, participant_id = split_advice_target(agent_id)
         return f"HERDR_LOOP_ADVICE_DONE:{advice_id}:{participant_id}:"
     return ""
+
+
+def terminal_status_from_text(
+    text: str,
+    *,
+    run_id: str,
+    agent_id: str,
+    attempt_id: str,
+) -> str:
+    pattern = re.compile(
+        rf"HERDR_LOOP_ROLE_DONE:{re.escape(run_id)}:{re.escape(agent_id)}:"
+        rf"{re.escape(attempt_id)}:(done|reported|aligned|gaps-found|blocked|failed|partial)"
+    )
+    matches = pattern.findall(text)
+    return matches[-1] if matches else ""
 
 
 def pane_snapshot(
@@ -2224,7 +2457,7 @@ def collect_worker_inventory(
             lines=lines,
             include_output=include_output,
         )
-        if probe_panes
+        if probe_panes and status == "running" and pane_id
         else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
     )
     issues: list[dict[str, str]] = []
@@ -2332,7 +2565,7 @@ def collect_gate_inventory(
             lines=lines,
             include_output=include_output,
         )
-        if probe_panes
+        if probe_panes and gate_status == "running" and pane_id
         else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
     )
     issues: list[dict[str, str]] = []
@@ -2426,7 +2659,7 @@ def collect_advice_inventory(
                 lines=lines,
                 include_output=include_output,
             )
-            if probe_panes
+            if probe_panes and gate_status == "running" and pane_id
             else {"pane_id": pane_id, "available": False, "present": False, "reason": "not-probed"}
         )
         issues: list[dict[str, str]] = []
@@ -2745,7 +2978,11 @@ def all_tasks_merged(state: dict[str, Any]) -> bool:
 
 def last_validation_passed(state: dict[str, Any]) -> bool:
     results = state.get("last_validation", {}).get("results", [])
-    return bool(results) and all(item.get("result") == "passed" for item in results)
+    target = str(state.get("completion_target_sha") or state.get("integration_head_sha") or "")
+    recorded = str(state.get("last_validation", {}).get("head_sha") or "")
+    return bool(results) and (not target or recorded == target) and all(
+        item.get("result") == "passed" for item in results
+    )
 
 
 def running_review_exists(state: dict[str, Any]) -> bool:
@@ -2788,7 +3025,12 @@ def review_gate_passed(state: dict[str, Any]) -> bool:
     if state.get("needs_review"):
         return False
     reviews = state.get("reviews", {})
-    return any(agent_gate_status(review) == "triaged" for review in reviews.values())
+    target = str(state.get("completion_target_sha") or state.get("integration_head_sha") or "")
+    return any(
+        agent_gate_status(review) == "triaged"
+        and (not target or str(review.get("closed_head_sha") or review.get("head_sha") or "") == target)
+        for review in reviews.values()
+    )
 
 
 def gap_gate_passed(state: dict[str, Any]) -> bool:
@@ -2797,7 +3039,12 @@ def gap_gate_passed(state: dict[str, Any]) -> bool:
     if state.get("needs_gap_check"):
         return False
     gaps = state.get("gaps", {})
-    return any(agent_gate_status(gap) == "triaged" for gap in gaps.values())
+    target = str(state.get("completion_target_sha") or state.get("integration_head_sha") or "")
+    return any(
+        agent_gate_status(gap) == "triaged"
+        and (not target or str(gap.get("closed_head_sha") or gap.get("head_sha") or "") == target)
+        for gap in gaps.values()
+    )
 
 
 def review_after_merges(state: dict[str, Any]) -> int:
@@ -2954,7 +3201,10 @@ def manager_qa_required(state: dict[str, Any]) -> bool:
 def manager_qa_passed(state: dict[str, Any]) -> bool:
     if not manager_qa_required(state):
         return True
-    return str(state.get("manager_qa_status") or "") in MANAGER_QA_PASSING_STATUSES
+    target = str(state.get("completion_target_sha") or state.get("integration_head_sha") or "")
+    return str(state.get("manager_qa_status") or "") in MANAGER_QA_PASSING_STATUSES and (
+        not target or str(state.get("manager_qa_head_sha") or "") == target
+    )
 
 
 def state_list(state: dict[str, Any], key: str, default: list[str]) -> list[str]:
@@ -3226,7 +3476,7 @@ Before finishing:
 - Ensure no unrelated changes.
 
 Final terminal line:
-HERDR_LOOP_TASK_DONE:{task_id}:<done|blocked|failed|partial>
+HERDR_LOOP_ROLE_DONE:{str(state.get("run_id") or "")}:{task_id}:{str(task_meta.get("attempt_id") or "")}:<done|blocked|failed|partial>
 """
 
 
@@ -3306,7 +3556,7 @@ Output:
   If no fix task is needed, write `No fix task candidates.`
 
 Final terminal line:
-HERDR_LOOP_REVIEW_DONE:{review_id}:<reported|blocked|failed>
+HERDR_LOOP_ROLE_DONE:{str(state.get("run_id") or "")}:{review_id}:{review_id}-A001:<reported|blocked|failed>
 """
 
 
@@ -3371,7 +3621,7 @@ Output:
   If no fix task is needed, write `No fix task candidates.`
 
 Final terminal line:
-HERDR_LOOP_GAP_DONE:{gap_id}:<aligned|gaps-found|blocked|failed>
+HERDR_LOOP_ROLE_DONE:{str((state or {}).get("run_id") or "")}:{gap_id}:{gap_id}-A001:<aligned|gaps-found|blocked|failed>
 """
 
 
@@ -4172,6 +4422,20 @@ def cmd_init(args: argparse.Namespace) -> int:
     setup_commands = args.worktree_setup_command or normalize_list(
         experience.get("recommended_commands")
     )
+    worker_setup_commands = args.worker_setup_command or setup_commands
+    reviewer_setup_commands = args.reviewer_setup_command or []
+    gap_setup_commands = args.gap_setup_command or []
+    advisor_setup_commands = args.advisor_setup_command or []
+    for role, commands in (
+        ("worker", worker_setup_commands),
+        ("reviewer", reviewer_setup_commands),
+        ("gap", gap_setup_commands),
+        ("advisor", advisor_setup_commands),
+    ):
+        for command in commands:
+            marker = unsafe_setup_command(command)
+            if marker:
+                raise HLoopError(f"unsafe {role} setup command: contains `{marker}`")
     if args.persistence == "local-only":
         ensure_local_only_git_excludes(repo)
     worker_qa_profile = args_worker_qa_profile(args)
@@ -4386,13 +4650,20 @@ None.
     if not journal_path.exists():
         write_text(journal_path, "# Journal\n")
     state = {
+        "state_format_version": STATE_FORMAT_VERSION,
         "goal_id": goal_id,
         "run_id": run_id,
         "skill_version": SKILL_VERSION,
         "namespace": LOOP_NAMESPACE,
         "loop_path": LOOP_DIR.as_posix(),
         "persistence": args.persistence,
-        "worktree_setup_commands": setup_commands,
+        "worktree_setup_commands": worker_setup_commands,
+        "worker_setup_commands": worker_setup_commands,
+        "reviewer_setup_commands": reviewer_setup_commands,
+        "gap_setup_commands": gap_setup_commands,
+        "advisor_setup_commands": advisor_setup_commands,
+        "min_free_bytes": args.min_free_bytes,
+        "min_free_inodes": args.min_free_inodes,
         "phase": "initialized",
         "base_branch": base,
         "integration_branch": integration,
@@ -4406,15 +4677,23 @@ None.
         "review_protocol": args.review_protocol,
         "worker_agent_provider": worker_agent_provider,
         "worker_agent_model": worker_agent_model,
+        "worker_agent_effort": args.worker_agent_effort,
+        "worker_claude_permission_mode": args.worker_claude_permission_mode,
         "reviewer_agent_provider": reviewer_agent_provider,
         "reviewer_agent_model": reviewer_agent_model,
+        "reviewer_agent_effort": args.reviewer_agent_effort,
+        "reviewer_claude_permission_mode": args.reviewer_claude_permission_mode,
         "gap_agent_provider": gap_agent_provider,
         "gap_agent_model": gap_agent_model,
+        "gap_agent_effort": args.gap_agent_effort,
+        "gap_claude_permission_mode": args.gap_claude_permission_mode,
         "advisor_enabled": advisor_enabled,
         "advisor_mode": advisor_mode,
         "advisor_max_rounds": getattr(args, "advisor_max_rounds", DEFAULT_ADVISOR_MAX_ROUNDS),
         "advisor_agent_provider": advisor_agent_provider,
         "advisor_agent_model": advisor_agent_model,
+        "advisor_agent_effort": args.advisor_agent_effort,
+        "advisor_claude_permission_mode": args.advisor_claude_permission_mode,
         "review_lanes": args.review_lane or DEFAULT_REVIEW_LANES,
         "worker_runner": args.worker_runner,
         "reviewer_runner": args.reviewer_runner,
@@ -5218,13 +5497,24 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
     meta = read_frontmatter(task_file(repo, task_id))
     if str(meta.get("id") or "") != task_id:
         raise HLoopError(f"task file mismatch for {task_id}")
     branch = current_branch(repo)
-    expected_branch = str(meta.get("branch") or "")
+    expected_branch = str(task_state.get("branch") or meta.get("branch") or "")
     if expected_branch and branch != expected_branch:
         raise HLoopError(f"Worker branch mismatch: expected {expected_branch}, got {branch}")
+    expected_worktree = str(task_state.get("worktree") or "")
+    if expected_worktree and repo.resolve() != Path(expected_worktree).resolve():
+        raise HLoopError(
+            f"worker finalize must run in the active attempt worktree: expected {expected_worktree}, got {repo}"
+        )
+    status = str(args.status)
+    if str(task_state.get("result_status") or "") in {"blocked", "failed", "partial"} and status == "done":
+        raise HLoopError("a terminal blocked/failed/partial attempt must be requeued before status done")
     result_rel = LOOP_DIR / "results" / task_id / "result.md"
     dirty = [path for path in porcelain_paths(repo) if path != result_rel.as_posix()]
     if dirty:
@@ -5232,7 +5522,6 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
             "worker finalize requires product changes to be committed first; dirty paths: "
             + ", ".join(dirty)
         )
-    status = str(args.status)
     validation_commands = args.validation_command or []
     validation_results = args.validation_result or []
     blocking_questions = args.blocking_question or []
@@ -5242,7 +5531,7 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     merge_ready = status == "done" and validation_recorded and not blocking_questions
     if status == "done" and not validation_recorded:
         raise HLoopError("status done requires at least one validation command and result")
-    base_ref = str(meta.get("base_ref") or state.get("integration_branch") or "")
+    base_ref = str(task_state.get("base_ref") or meta.get("base_ref") or state.get("integration_branch") or "")
     if not base_ref:
         raise HLoopError(f"task base_ref is missing: {task_id}")
     base_proc = run_cmd(
@@ -5250,7 +5539,11 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     )
     if base_proc.returncode != 0 or not (base_proc.stdout or "").strip():
         raise HLoopError(f"cannot resolve Worker branch point against {base_ref}")
-    base_sha = (base_proc.stdout or "").strip()
+    base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
+    if not base_sha:
+        base_sha = (base_proc.stdout or "").strip()
+    if not is_ancestor(repo, base_sha, "HEAD"):
+        raise HLoopError(f"active attempt base is not an ancestor of HEAD: {base_sha}")
     head_sha = git(repo, ["rev-parse", "HEAD"])
     files = changed_files(repo, base_sha, head_sha)
     files = list(dict.fromkeys([*files, result_rel.as_posix()]))
@@ -5261,6 +5554,7 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         "task_id": task_id,
         "run_id": str(state.get("run_id") or meta.get("run_id") or ""),
         "skill_version": SKILL_VERSION,
+        "attempt_id": str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""),
         "status": status,
         "merge_ready": merge_ready,
         "branch": branch,
@@ -5293,7 +5587,9 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         elif staged.returncode != 0:
             raise HLoopError("failed to inspect staged result artifact")
     print(f"finalized {task_id}: status={status} merge_ready={str(merge_ready).lower()}")
-    print(f"HERDR_LOOP_TASK_DONE:{task_id}:{status}")
+    print(
+        f"HERDR_LOOP_ROLE_DONE:{fields['run_id']}:{task_id}:{fields['attempt_id']}:{status}"
+    )
     return 0
 
 
@@ -5436,6 +5732,11 @@ def prepare_role_worktree(
 ) -> None:
     copy_local_loop_snapshot(repo, worktree, state)
     run_worktree_setup_commands(repo, worktree, state, role=role, agent_id=agent_id)
+
+
+def git_common_dir(worktree: Path) -> Path:
+    raw = git(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    return Path(raw).resolve()
 
 
 def rollback_failed_role_start(
@@ -5614,6 +5915,9 @@ def agent_command_for_prompt(
     sandbox: str,
     prompt_rel: Path,
     output_rel: Path | None = None,
+    effort: str = DEFAULT_AGENT_EFFORT,
+    writable_dirs: list[Path] | None = None,
+    claude_permission_mode: str = DEFAULT_CLAUDE_PERMISSION_MODE,
 ) -> str:
     provider = normalize_agent_provider(provider)
     model = normalize_agent_model(model)
@@ -5622,8 +5926,10 @@ def agent_command_for_prompt(
         raise HLoopError(f"unsupported runner: {runner}")
     if provider == "codex":
         model_args = [] if model == DEFAULT_AGENT_MODEL else ["--model", model]
+        effort_args = [] if effort == DEFAULT_AGENT_EFFORT else ["-c", f"model_reasoning_effort={effort}"]
+        writable_args = [item for path in (writable_dirs or []) for item in ("--add-dir", str(path))]
         if runner == "exec":
-            parts = ["codex", "exec", "--sandbox", sandbox, *model_args]
+            parts = ["codex", "exec", "--sandbox", sandbox, *model_args, *effort_args, *writable_args]
             if output_rel is not None:
                 parts.extend(["--output-last-message", str(output_rel)])
             parts.append("-")
@@ -5636,6 +5942,8 @@ def agent_command_for_prompt(
             "never",
             "--no-alt-screen",
             *model_args,
+            *effort_args,
+            *writable_args,
         ]
         return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
     if provider == "claude":
@@ -5645,9 +5953,11 @@ def agent_command_for_prompt(
                 "claude",
                 "--print",
                 "--permission-mode",
-                "acceptEdits",
+                claude_permission_mode,
                 *model_args,
             ]
+            if effort != DEFAULT_AGENT_EFFORT:
+                parts.extend(["--effort", effort])
             command = f"{shlex.join(parts)} < {prompt_ref}"
             if output_rel is not None:
                 command = f"{command} > {shlex.quote(str(output_rel))}"
@@ -5655,12 +5965,61 @@ def agent_command_for_prompt(
         parts = [
             "claude",
             "--permission-mode",
-            "acceptEdits",
+            claude_permission_mode,
             "--ax-screen-reader",
             *model_args,
         ]
+        if effort != DEFAULT_AGENT_EFFORT:
+            parts.extend(["--effort", effort])
         return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
     raise HLoopError(f"unsupported agent provider: {provider}")
+
+
+def role_agent_command(
+    repo: Path,
+    config: dict[str, str],
+    *,
+    runner: str,
+    prompt_rel: Path,
+    output_rel: Path | None = None,
+) -> str:
+    writable = [git_common_dir(repo)] if config["provider"] == "codex" else []
+    return agent_command_for_prompt(
+        provider=config["provider"],
+        model=config["model"],
+        runner=runner,
+        sandbox="workspace-write",
+        prompt_rel=prompt_rel,
+        output_rel=output_rel,
+        effort=config.get("effort", DEFAULT_AGENT_EFFORT),
+        writable_dirs=writable,
+        claude_permission_mode=config.get(
+            "claude_permission_mode", DEFAULT_CLAUDE_PERMISSION_MODE
+        ),
+    )
+
+
+def ensure_worker_attempt(
+    task_id: str,
+    task_state: dict[str, Any],
+    task_meta: dict[str, Any],
+    integration: str,
+    current_base_sha: str,
+) -> tuple[str, str]:
+    if not task_state.get("active_attempt_id"):
+        attempt_no = normalize_int(task_state.get("attempt_no"), 0) + 1
+        task_state["attempt_no"] = attempt_no
+        task_state["active_attempt_id"] = f"{task_id}-A{attempt_no:03d}"
+        task_state["worker_base_sha"] = current_base_sha
+        task_state["base_sha"] = current_base_sha
+    task_state["base_ref"] = integration
+    base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
+    if not base_sha:
+        raise HLoopError(f"worker base is missing for {task_id}")
+    task_meta["base_ref"] = integration
+    task_meta["base_sha"] = base_sha
+    task_meta["attempt_id"] = task_state["active_attempt_id"]
+    return str(task_state["active_attempt_id"]), base_sha
 
 
 def cmd_worker_start(args: argparse.Namespace) -> int:
@@ -5678,12 +6037,10 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     if getattr(args, "agent_model", None):
         task_meta["agent_model"] = args.agent_model
     branch = task_state.get("branch") or task_meta["branch"]
+    task_state.setdefault("root_branch", branch)
     integration = state["integration_branch"]
     current_base_sha = git(repo, ["rev-parse", integration])
-    task_state["base_ref"] = integration
-    task_state["base_sha"] = current_base_sha
-    task_meta["base_ref"] = integration
-    task_meta["base_sha"] = current_base_sha
+    ensure_worker_attempt(task_id, task_state, task_meta, integration, current_base_sha)
     require_role_snapshot(repo, state, integration, worker_snapshot_paths(task_id))
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id, state)
     prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
@@ -5700,7 +6057,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add {worktree} -b {branch} {integration}")
@@ -5724,12 +6081,12 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     if getattr(args, "agent_model", None):
         task_meta["agent_model"] = args.agent_model
     branch = task_state.get("branch") or task_meta["branch"]
+    task_state.setdefault("root_branch", branch)
     integration = state["integration_branch"]
     current_base_sha = git(repo, ["rev-parse", integration])
-    task_state["base_ref"] = integration
-    task_state["base_sha"] = current_base_sha
-    task_meta["base_ref"] = integration
-    task_meta["base_sha"] = current_base_sha
+    attempt_id, worker_base_sha = ensure_worker_attempt(
+        task_id, task_state, task_meta, integration, current_base_sha
+    )
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id, state)
     prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
     runner = args.runner or state.get("worker_runner", "tui")
@@ -5744,7 +6101,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel)}"
     )
     if not branch_exists(repo, integration):
         raise HLoopError(
@@ -5752,6 +6109,8 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "Run `hloop init --create-branch` or create it before starting Workers."
         )
     require_role_snapshot(repo, state, integration, worker_snapshot_paths(task_id))
+    task_state["worktree"] = str(worktree)
+    save_state(repo, state)
     branch_preexisting = branch_exists(repo, branch)
     worktree_preexisting = worktree.exists()
     if not worktree_preexisting:
@@ -5797,6 +6156,10 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "runner": runner,
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
+            "agent_effort": agent_config["effort"],
+            "claude_permission_mode": agent_config["claude_permission_mode"],
+            "attempt_id": attempt_id,
+            "worker_base_sha": worker_base_sha,
             "fallback_provider": agent_config["fallback_provider"],
             "skill_version": SKILL_VERSION,
             "sandbox": "workspace-write",
@@ -5899,6 +6262,7 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
+    _, message = manager_message_envelope(state, review_id, review_state, message)
     try:
         send_agent_tui_message(
             str(task_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -5957,10 +6321,77 @@ def cmd_worker_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def complete_merge_state(repo: Path, state: dict[str, Any], task_id: str, mode: str) -> None:
+    task_state = state["tasks"][task_id]
+    task_state["status"] = "merged"
+    task_state["merged_at"] = now_iso()
+    task_state["merge_mode"] = mode
+    task_state["cleanup_pending"] = True
+    task_state.pop("merge_error", None)
+    state.pop("active_merge", None)
+    state.pop("last_merge_error", None)
+    state["needs_validation"] = True
+    state["last_merged_task"] = task_id
+    state["unreviewed_merge_count"] = normalize_int(state.get("unreviewed_merge_count"), 0) + 1
+    state["ungapped_merge_count"] = normalize_int(state.get("ungapped_merge_count"), 0) + 1
+    if manager_qa_required(state):
+        state["manager_qa_status"] = "pending"
+        state.pop("manager_qa_head_sha", None)
+    state["phase"] = "validating"
+    save_state(repo, state)
+    journal(repo, f"Merged Worker `{task_id}` from `{task_state.get('branch', '')}`.")
+
+
+def cmd_merge_abort(repo: Path, state: dict[str, Any], task_id: str) -> int:
+    active = state.get("active_merge") or {}
+    if str(active.get("task_id") or "") != task_id:
+        raise HLoopError(f"no active merge transaction for {task_id}")
+    pre_head = str(active.get("pre_merge_head") or "")
+    if not pre_head:
+        raise HLoopError(f"merge transaction lacks pre_merge_head for {task_id}")
+    git(repo, ["reset", "--merge", pre_head])
+    state["tasks"][task_id]["status"] = "result_reported"
+    state["tasks"][task_id].pop("merge_error", None)
+    state.pop("active_merge", None)
+    state["phase"] = "dispatching"
+    save_state(repo, state)
+    journal(repo, f"Aborted merge transaction for `{task_id}` and restored `{pre_head}`.")
+    print(f"aborted merge {task_id}")
+    return 0
+
+
+def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
+    active = state.get("active_merge") or {}
+    if str(active.get("task_id") or "") != task_id:
+        raise HLoopError(f"no active merge transaction for {task_id}")
+    unmerged = git(repo, ["diff", "--name-only", "--diff-filter=U"])
+    if unmerged.strip():
+        raise HLoopError("merge still has unresolved paths: " + ", ".join(unmerged.splitlines()))
+    staged = git(repo, ["diff", "--cached", "--name-only"]).splitlines()
+    violations = validate_change_scope(task_id, state["tasks"][task_id], staged)
+    if violations:
+        raise HLoopError("write-scope violations after conflict resolution: " + "; ".join(violations))
+    if not staged:
+        raise HLoopError("merge continue has no staged changes")
+    mode = str(active.get("mode") or state.get("merge_mode") or "squash")
+    git(repo, ["commit", "-m", f"ai-loop({task_id}): {mode} {state['tasks'][task_id]['branch']}"])
+    complete_merge_state(repo, state, task_id, mode)
+    print(f"continued merge {task_id}")
+    return 0
+
+
 def cmd_merge(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
     task_id = args.task_id
+    if getattr(args, "abort", False):
+        return cmd_merge_abort(repo, state, task_id)
+    if getattr(args, "continue_merge", False):
+        return cmd_merge_continue(repo, state, task_id)
+    if getattr(args, "retry", False):
+        if state.get("active_merge"):
+            cmd_merge_abort(repo, state, task_id)
+            state = preflight_loop(repo, require_integration_branch=True)
     task_state = state.get("tasks", {}).get(task_id)
     if not task_state:
         raise HLoopError(f"unknown task: {task_id}")
@@ -5988,24 +6419,23 @@ def cmd_merge(args: argparse.Namespace) -> int:
         )
     rel_result = (LOOP_DIR / "results" / task_id / "result.md").as_posix()
     git_show(repo, f"{actual_head}:{rel_result}")
-    base_sha = str(task_state.get("base_sha") or "")
+    base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
     if not base_sha:
         raise HLoopError(f"manager base_sha is missing for {task_id}")
     reported_base_sha = str(task_state.get("reported_base_sha") or "")
     if reported_base_sha and reported_base_sha != base_sha:
-        if is_ancestor(repo, reported_base_sha, base_sha):
-            task_state["reported_base_sha_was_ancestor"] = True
-            task_state["reported_base_sha_note"] = (
-                "Worker reported an older base that is an ancestor of the Manager base."
-            )
-        else:
-            if not args.dry_run:
-                task_state["status"] = "blocked_base_mismatch"
-                state["phase"] = "blocked_conflict"
-                save_state(repo, state)
-            raise HLoopError(
-                f"worker base mismatch for {task_id}: result={reported_base_sha} manager={base_sha}"
-            )
+        if not args.dry_run:
+            task_state["status"] = "blocked_base_mismatch"
+            state["phase"] = "blocked_conflict"
+            save_state(repo, state)
+        raise HLoopError(
+            f"worker base mismatch for {task_id}: result={reported_base_sha} attempt={base_sha}"
+        )
+    if not is_ancestor(repo, base_sha, actual_head):
+        raise HLoopError(f"worker base is not an ancestor of Worker head for {task_id}")
+    integration_head = git(repo, ["rev-parse", str(state["integration_branch"])])
+    if not is_ancestor(repo, base_sha, integration_head):
+        raise HLoopError(f"worker base is not an ancestor of integration head for {task_id}")
     files = changed_files(repo, base_sha, actual_head)
     task_state["head_sha"] = actual_head
     task_state["changed_files"] = files
@@ -6025,6 +6455,17 @@ def cmd_merge(args: argparse.Namespace) -> int:
             commits = git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"])
             print(f"DRY RUN git cherry-pick {' '.join(commits.splitlines())}")
         return 0
+    state["active_merge"] = {
+        "task_id": task_id,
+        "attempt_id": task_state.get("active_attempt_id") or task_state.get("attempt_id"),
+        "branch": branch,
+        "worker_head": actual_head,
+        "worker_base_sha": base_sha,
+        "pre_merge_head": git(repo, ["rev-parse", "HEAD"]),
+        "mode": mode,
+        "started_at": now_iso(),
+    }
+    save_state(repo, state)
     try:
         staged = run_cmd(["git", "-C", str(repo), "diff", "--cached", "--quiet"], check=False)
         if staged.returncode != 0:
@@ -6071,19 +6512,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             f"\n## Merge conflict for {task_id}\n\nResolve or abort the merge for `{branch}`.\n",
         )
         raise exc
-    task_state["status"] = "merged"
-    task_state["merged_at"] = now_iso()
-    task_state["merge_mode"] = mode
-    task_state["cleanup_pending"] = True
-    state["needs_validation"] = True
-    state["last_merged_task"] = task_id
-    state["unreviewed_merge_count"] = normalize_int(state.get("unreviewed_merge_count"), 0) + 1
-    state["ungapped_merge_count"] = normalize_int(state.get("ungapped_merge_count"), 0) + 1
-    if manager_qa_required(state):
-        state["manager_qa_status"] = "pending"
-    state["phase"] = "validating"
-    save_state(repo, state)
-    journal(repo, f"Merged Worker `{task_id}` from `{branch}`.")
+    complete_merge_state(repo, state, task_id, mode)
     print(f"merged {task_id}")
     return 0
 
@@ -6164,9 +6593,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
         require_integration_branch=True,
         mark_blocked=not args.dry_run,
     )
-    commands = getattr(args, "validation_command", None) or state.get("validation_commands") or [
-        "git diff --check"
-    ]
+    commands = getattr(args, "validation_command", None) or state.get("validation_commands") or []
+    if not commands:
+        raise HLoopError(
+            "integration validation is not configured; use `hloop validation configure --command ...`"
+        )
+    head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
+    state["integration_head_sha"] = head_sha
+    state["completion_target_sha"] = head_sha
     results = []
     failed = False
     for index, command in enumerate(commands, start=1):
@@ -6188,7 +6622,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
             if not output.endswith("\n"):
                 sys.stdout.write("\n")
         log_rel = validation_log_rel(state, index)
-        write_text(repo / log_rel, normalize_validation_log_output(output))
+        completed_at = now_iso()
+        header = (
+            f"command: {command}\nhead_sha: {head_sha}\ncompleted_at: {completed_at}\n"
+            f"returncode: {proc.returncode}\n\n"
+        )
+        write_text(repo / log_rel, header + normalize_validation_log_output(output))
         result = "passed" if proc.returncode == 0 else f"failed:{proc.returncode}"
         results.append(
             {
@@ -6202,7 +6641,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             failed = True
             break
     if not args.dry_run:
-        state["last_validation"] = {"at": now_iso(), "results": results}
+        state["last_validation"] = {"at": now_iso(), "head_sha": head_sha, "results": results}
         state["needs_validation"] = failed
         if failed:
             state["phase"] = "failed_validation"
@@ -6222,6 +6661,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
         save_state(repo, state)
         journal(repo, f"Validation results: {results}")
     return 1 if failed else 0
+
+
+def cmd_validation_configure(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    commands = normalize_list(args.validation_command)
+    if not commands:
+        raise HLoopError("provide at least one --command")
+    state["validation_commands"] = commands
+    save_state(repo, state)
+    journal(repo, f"Configured integration validation commands: {commands}")
+    print("configured integration validation")
+    return 0
 
 
 def cmd_reviewer_start(args: argparse.Namespace) -> int:
@@ -6256,7 +6708,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
@@ -6295,7 +6747,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
     )
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_preexisting = worktree.exists()
@@ -6338,6 +6790,9 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "runner": runner,
         "agent_provider": agent_config["provider"],
         "agent_model": agent_config["model"],
+        "agent_effort": agent_config["effort"],
+        "claude_permission_mode": agent_config["claude_permission_mode"],
+        "attempt_id": f"{review_id}-A001",
         "fallback_provider": agent_config["fallback_provider"],
         "skill_version": SKILL_VERSION,
         "sandbox": "workspace-write",
@@ -6457,6 +6912,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
     review_state["verdict"] = args.verdict
     review_state["triage_reason"] = args.reason
     review_state["triaged_at"] = now_iso()
+    review_state["closed_head_sha"] = review_state.get("head_sha")
     if args.verdict == "blocked":
         state["needs_review"] = True
         state["phase"] = "blocked_user_decision"
@@ -6540,6 +6996,7 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
+    _, message = manager_message_envelope(state, gap_id, gap_state, message)
     try:
         send_agent_tui_message(
             str(review_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -6604,7 +7061,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
@@ -6645,7 +7102,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
     )
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_preexisting = worktree.exists()
@@ -6689,6 +7146,9 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "runner": runner,
         "agent_provider": agent_config["provider"],
         "agent_model": agent_config["model"],
+        "agent_effort": agent_config["effort"],
+        "claude_permission_mode": agent_config["claude_permission_mode"],
+        "attempt_id": f"{gap_id}-A001",
         "fallback_provider": agent_config["fallback_provider"],
         "skill_version": SKILL_VERSION,
         "sandbox": "workspace-write",
@@ -6809,6 +7269,7 @@ def cmd_gap_close(args: argparse.Namespace) -> int:
     gap_state["verdict"] = args.verdict
     gap_state["triage_reason"] = args.reason
     gap_state["triaged_at"] = now_iso()
+    gap_state["closed_head_sha"] = gap_state.get("head_sha")
     if args.verdict in {"blocked", "decision-needed"}:
         state["needs_gap_check"] = True
         state["phase"] = "blocked_user_decision"
@@ -6892,6 +7353,9 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     if not pane_id:
         raise HLoopError(f"gap auditor has no pane_id: {gap_id}")
     message, source = manager_message_from_args(args)
+    _, message = manager_message_envelope(
+        state, f"{args.advice_id}/{args.participant_id}", participant, message
+    )
     if not message.strip():
         raise HLoopError("manager message is empty")
     try:
@@ -7115,7 +7579,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{agent_command_for_prompt(provider=agent_config['provider'], model=agent_config['model'], runner=runner, sandbox='workspace-write', prompt_rel=prompt_rel, output_rel=advice_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=advice_rel if runner == 'exec' else None)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
@@ -7176,6 +7640,9 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             "runner": runner,
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
+            "agent_effort": agent_config["effort"],
+            "claude_permission_mode": agent_config["claude_permission_mode"],
+            "attempt_id": f"{advice_id}-{participant_id}-A001",
             "fallback_provider": agent_config["fallback_provider"],
             "skill_version": SKILL_VERSION,
             "sandbox": "workspace-write",
@@ -7627,6 +8094,17 @@ def cmd_tick(args: argparse.Namespace) -> int:
         require_integration_branch=True,
         mark_blocked=not args.dry_run,
     )
+    if str(state.get("phase") or "") == "paused":
+        print("loop is paused; run `hloop resume` before tick/pump")
+        return 0
+    if not normalize_list(state.get("validation_commands")) and any(
+        task.get("status") == "queued"
+        and str(task.get("kind") or "implementation") in {"implementation", "fix"}
+        for task in state.get("tasks", {}).values()
+    ):
+        raise HLoopError(
+            "integration validation is not configured; use `hloop validation configure --command ...`"
+        )
     if not args.dry_run:
         state["cycle"] = int(state.get("cycle", 0)) + 1
         save_state(repo, state)
@@ -7843,11 +8321,11 @@ def cmd_tick(args: argparse.Namespace) -> int:
             )
             return 0
         if args.dry_run:
-            print("DRY RUN done: all tasks merged, validation passed, gap/review/manager QA gates closed")
+            print("DRY RUN ready_to_finish: all completion gates are closed")
             return 0
-        state["phase"] = "done"
+        state["phase"] = "ready_to_finish"
         save_state(repo, state)
-        print("done: all tasks merged")
+        print("ready to finish: run `hloop finish`")
         return 0
 
     running_workers = [
@@ -7886,6 +8364,12 @@ def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[s
         return (f"phase is {phase}", 2)
     if phase == "done":
         return ("loop is done", 0)
+    if phase == "ready_to_finish":
+        return ("loop is ready; run hloop finish", 0)
+    if phase == "paused":
+        return ("loop is paused", 0)
+    if phase == "blocked_agent":
+        return ("an agent terminated without an artifact", 2)
     if phase == "branch_handoff":
         return ("branch handoff required", 0)
     if phase == "manager_qa":
@@ -8058,6 +8542,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
     lifecycle_status = str(agent.get("gate_status") or agent.get("status") or "")
     if lifecycle_status in {"merged", "triaged", "closed"}:
         raise HLoopError(f"cannot requeue completed {role} {args.agent_id}: {lifecycle_status}")
+    previous = json.loads(json.dumps(agent))
     cleanup_completed_agent_pane(
         repo,
         agent,
@@ -8071,22 +8556,64 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
         "previous_status": agent.get("status"),
         "reason": args.reason,
         "at": now_iso(),
-        "worktree": agent.get("worktree"),
-        "pane_id": agent.get("pane_id"),
+        "attempt_id": previous.get("attempt_id") or previous.get("active_attempt_id"),
+        "attempt_no": previous.get("attempt_no"),
+        "branch": previous.get("branch"),
+        "worker_base_sha": previous.get("worker_base_sha") or previous.get("base_sha"),
+        "head_sha": previous.get("head_sha"),
+        "worktree": previous.get("worktree"),
+        "pane_id": previous.get("pane_id"),
     }
     state.setdefault("agent_attempt_history", []).append(history)
+    agent.setdefault("attempts", []).append(history)
     if role == "worker":
+        old_branch = str(previous.get("branch") or "")
+        root_branch = str(previous.get("root_branch") or old_branch)
+        if old_branch and branch_exists(repo, old_branch):
+            integration = str(state.get("integration_branch") or "")
+            old_head = git(repo, ["rev-parse", old_branch])
+            integrated = bool(integration) and is_ancestor(repo, old_head, integration)
+            if not integrated:
+                archive_branch = (
+                    f"{old_branch}-archive-a{normalize_int(previous.get('attempt_no'), 0):03d}-"
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                )
+                git(repo, ["branch", "-m", old_branch, archive_branch])
+                history["archived_branch"] = archive_branch
+            else:
+                git(repo, ["branch", "-D", old_branch])
+        next_attempt = normalize_int(previous.get("attempt_no"), 0) + 1
         for key in (
             "pane_id",
+            "pane_closed_at",
+            "pane_cleanup_status",
+            "pane_cleanup_error",
             "prompt",
             "worktree",
+            "worktree_cleaned_at",
+            "worktree_cleanup_status",
             "started_at",
             "result_status",
             "merge_ready",
             "artifact",
             "head_sha",
+            "active_attempt_id",
+            "attempt_id",
+            "worker_base_sha",
+            "base_sha",
+            "reported_base_sha",
+            "reported_base_sha_was_ancestor",
+            "reported_base_sha_note",
+            "agent_session_id",
+            "codex_session_id",
+            "agent_session_cleanup",
+            "codex_session_cleanup",
+            "manager_messages",
+            "pending_manager_messages",
         ):
             agent.pop(key, None)
+        agent["root_branch"] = root_branch
+        agent["branch"] = f"{root_branch}-a{next_attempt:03d}"
         agent["status"] = "queued"
         agent["requeued_at"] = now_iso()
         agent["requeue_reason"] = args.reason
@@ -8242,10 +8769,20 @@ def agent_wait_status(repo: Path, state: dict[str, Any], agent_id: str) -> dict[
     path = agent_artifact_path(repo, state, agent_id, role, agent)
     pane_id = str(agent.get("pane_id") or "")
     pane_status = ""
+    terminal_status = ""
     if pane_id and os.environ.get("HERDR_ENV") == "1" and command_exists("herdr"):
         info = pane_info(pane_id)
         if info is not None:
             pane_status = str(info.get("agent_status") or "")
+            try:
+                terminal_status = terminal_status_from_text(
+                    pane_text(pane_id, 120),
+                    run_id=str(state.get("run_id") or ""),
+                    agent_id=agent_id,
+                    attempt_id=str(agent.get("attempt_id") or agent.get("active_attempt_id") or ""),
+                )
+            except HLoopError:
+                terminal_status = ""
         else:
             pane_status = "missing-or-closed"
     status = agent_gate_status(agent) if role in {"reviewer", "gap", "advisor"} else str(agent.get("status") or "")
@@ -8256,6 +8793,8 @@ def agent_wait_status(repo: Path, state: dict[str, Any], agent_id: str) -> dict[
         "status": status,
         "pane_id": pane_id,
         "pane_status": pane_status,
+        "terminal_status": terminal_status,
+        "terminal_without_artifact": bool(terminal_status and not ready),
         "artifact_path": path,
         "artifact_ready": ready,
         "readiness_reason": readiness_reason,
@@ -8293,6 +8832,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
                     return cmd_harvest(harvest_args)
             print(f"harvest with: hloop harvest {item['id']}")
             return 0
+        terminal = [item for item in last_statuses if item.get("terminal_without_artifact")]
+        if terminal:
+            item = terminal[0]
+            print(
+                f"terminal without artifact: {item['id']} status={item['terminal_status']}; "
+                f"run `hloop agent abort {item['id']} --reason ...` then requeue",
+                file=sys.stderr,
+            )
+            return 2
         if time.monotonic() >= deadline:
             print(f"timeout waiting for artifact: {args.target}")
             for item in last_statuses:
@@ -8514,6 +9062,9 @@ def cmd_qa_record(args: argparse.Namespace) -> int:
     previous_phase = str(state.get("phase") or "")
     previous_qa_status = str(state.get("manager_qa_status") or "")
     profile = str(args.profile or state_manager_qa_profile(state))
+    head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
+    state["integration_head_sha"] = head_sha
+    state["completion_target_sha"] = head_sha
     if profile == "none" and args.status == "skipped":
         recorded_status = "not-required"
     else:
@@ -8530,6 +9081,7 @@ def cmd_qa_record(args: argparse.Namespace) -> int:
         "status": recorded_status,
         "recorded_at": now_iso(),
         "summary": args.summary,
+        "head_sha": head_sha,
         "evidence": evidence,
     }
     lines = [
@@ -8551,6 +9103,7 @@ def cmd_qa_record(args: argparse.Namespace) -> int:
     write_text(path, frontmatter(fields) + "\n" + "\n".join(lines) + "\n")
     state["manager_qa_status"] = recorded_status
     state["manager_qa_recorded_at"] = fields["recorded_at"]
+    state["manager_qa_head_sha"] = head_sha
     state["manager_qa_artifact"] = str(path.relative_to(repo))
     if recorded_status in {"passed", "accepted-risk", "not-required"}:
         if previous_phase in {"manager_qa", "failed_manager_qa"} or previous_qa_status in {
@@ -8558,7 +9111,7 @@ def cmd_qa_record(args: argparse.Namespace) -> int:
             "blocked",
             "failed",
         }:
-            state["phase"] = "dispatching"
+            state["phase"] = "ready_to_finish" if all_tasks_merged(state) else "dispatching"
     elif recorded_status == "blocked":
         state["phase"] = "blocked_environment"
         append_text(
@@ -8570,6 +9123,92 @@ def cmd_qa_record(args: argparse.Namespace) -> int:
     save_state(repo, state)
     journal(repo, f"Recorded Manager final QA `{recorded_status}` for profile `{profile}`: {args.summary}")
     print(path)
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    if str(state.get("phase") or "") == "done":
+        raise HLoopError("cannot pause a completed loop")
+    state["phase"] = "paused"
+    state["pause_reason"] = args.reason
+    state["paused_at"] = now_iso()
+    save_state(repo, state)
+    journal(repo, f"Paused loop: {args.reason}")
+    print("paused")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    if str(state.get("phase") or "") != "paused":
+        raise HLoopError(f"loop is not paused: {state.get('phase')}")
+    if unsafe_dirty_paths(repo):
+        raise HLoopError("cannot resume with non-loop dirty files")
+    state["phase"] = "dispatching"
+    state["resumed_at"] = now_iso()
+    state.pop("pause_reason", None)
+    save_state(repo, state)
+    journal(repo, "Resumed loop after preflight.")
+    print("resumed")
+    return 0
+
+
+def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    target = git(repo, ["rev-parse", str(state["integration_branch"])])
+    state["integration_head_sha"] = target
+    state["completion_target_sha"] = target
+    if not all_tasks_merged(state):
+        errors.append("not all tasks are merged")
+    if running_agent_ids(state):
+        errors.append("role agents are still running")
+    if unsafe_dirty_paths(repo):
+        errors.append("Manager checkout has non-loop dirty files")
+    if not last_validation_passed(state):
+        errors.append("current completion target lacks passing validation")
+    if not review_gate_passed(state):
+        errors.append("current completion target lacks a closed review gate")
+    if not gap_gate_passed(state):
+        errors.append("current completion target lacks a closed gap gate")
+    if not manager_qa_passed(state):
+        errors.append("current completion target lacks passing Manager QA")
+    cleanup_pending = [
+        task_id
+        for task_id, task in state.get("tasks", {}).items()
+        if task.get("cleanup_pending") or task.get("worktree_cleanup_status") == "failed"
+    ]
+    if cleanup_pending:
+        errors.append("cleanup is unresolved: " + ", ".join(cleanup_pending))
+    if state.get("active_merge"):
+        errors.append("a merge transaction is active")
+    return errors
+
+
+def cmd_finish(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True)
+    target = git(repo, ["rev-parse", str(state["integration_branch"])])
+    if str(state.get("phase") or "") == "done":
+        if str(state.get("final_target_sha") or "") == target:
+            print(f"already finished at {target}")
+            return 0
+        raise HLoopError("loop was finished at a different target")
+    errors = completion_errors(repo, state)
+    if errors:
+        state["phase"] = "ready_to_finish" if not errors else state.get("phase", "dispatching")
+        save_state(repo, state)
+        raise HLoopError("cannot finish: " + "; ".join(errors))
+    state["phase"] = "done"
+    state["final_target_sha"] = target
+    state["finished_at"] = now_iso()
+    save_state(repo, state)
+    journal(repo, f"Finished loop at `{target}` after all completion gates passed.")
+    report_args = argparse.Namespace(**vars(args))
+    cmd_report(report_args)
+    print(f"finished at {target}")
     return 0
 
 
@@ -8677,6 +9316,20 @@ def build_parser() -> argparse.ArgumentParser:
     selftest.add_argument("--json", action="store_true")
     selftest.set_defaults(func=cmd_selftest)
 
+    migrate = sub.add_parser("migrate", help="migrate an older namespaced STATE.json")
+    migrate_mode = migrate.add_mutually_exclusive_group()
+    migrate_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the migration summary without writing (default)",
+    )
+    migrate_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the migrated state after creating a backup",
+    )
+    migrate.set_defaults(func=cmd_migrate)
+
     init = sub.add_parser("init", help="initialize one namespaced loop")
     init.add_argument("--goal-id")
     init.add_argument("--goal", required=True)
@@ -8702,12 +9355,20 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--review-protocol", choices=sorted(REVIEW_PROTOCOLS), default=DEFAULT_REVIEW_PROTOCOL)
     init.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
     init.add_argument("--worker-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--worker-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--worker-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
     init.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
     init.add_argument("--reviewer-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--reviewer-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--reviewer-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
     init.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
     init.add_argument("--gap-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--gap-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--gap-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
     init.add_argument("--advisor-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
     init.add_argument("--advisor-agent-model", default=DEFAULT_AGENT_MODEL)
+    init.add_argument("--advisor-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--advisor-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
     init.add_argument("--advisor-enabled", action="store_true")
     init.add_argument("--advisor-mode", choices=sorted(ADVISOR_MODES), default=DEFAULT_ADVISOR_MODE)
     init.add_argument("--advisor-max-rounds", type=int, default=DEFAULT_ADVISOR_MAX_ROUNDS)
@@ -8720,7 +9381,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--gap-wait-ms", type=int, default=DEFAULT_GAP_WAIT_MS)
     init.add_argument("--review-after-merges", type=int, default=DEFAULT_REVIEW_AFTER_MERGES)
     init.add_argument("--gap-after-merges", type=int, default=DEFAULT_GAP_AFTER_MERGES)
-    init.add_argument("--validation", action="append")
+    init.add_argument("--validation", "--validation-command", dest="validation", action="append")
     init.add_argument("--spec-source", action="append")
     init.add_argument(
         "--persistence",
@@ -8731,8 +9392,14 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worktree-setup-command",
         action="append",
-        help="repository-specific command run in every newly created role worktree",
+        help="legacy Worker-only setup command; prefer --worker-setup-command",
     )
+    init.add_argument("--worker-setup-command", action="append")
+    init.add_argument("--reviewer-setup-command", action="append")
+    init.add_argument("--gap-setup-command", action="append")
+    init.add_argument("--advisor-setup-command", action="append")
+    init.add_argument("--min-free-bytes", type=int, default=DEFAULT_MIN_FREE_BYTES)
+    init.add_argument("--min-free-inodes", type=int, default=DEFAULT_MIN_FREE_INODES)
     init.add_argument(
         "--create-branch",
         action="store_true",
@@ -8929,6 +9596,10 @@ def build_parser() -> argparse.ArgumentParser:
     merge = sub.add_parser("merge", help="merge a Worker task")
     merge.add_argument("task_id")
     merge.add_argument("--mode", choices=["squash", "cherry-pick"])
+    merge_actions = merge.add_mutually_exclusive_group()
+    merge_actions.add_argument("--abort", action="store_true", help="abort the recorded merge transaction")
+    merge_actions.add_argument("--continue", dest="continue_merge", action="store_true", help="continue after resolving the recorded conflict")
+    merge_actions.add_argument("--retry", action="store_true", help="abort the recorded transaction and retry cleanly")
     merge.add_argument("--dry-run", action="store_true")
     merge.set_defaults(func=cmd_merge)
 
@@ -8937,6 +9608,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--no-cleanup", action="store_true")
     validate.add_argument("--dry-run", action="store_true")
     validate.set_defaults(func=cmd_validate)
+
+    validation = sub.add_parser("validation", help="configure integration validation")
+    validation_sub = validation.add_subparsers(dest="validation_command_name", required=True)
+    validation_configure = validation_sub.add_parser("configure")
+    validation_configure.add_argument("--command", dest="validation_command", action="append", required=True)
+    validation_configure.set_defaults(func=cmd_validation_configure)
 
     harvest = sub.add_parser("harvest", help="harvest a Worker/Reviewer/Gap/Advisor artifact by id prefix")
     harvest.add_argument("agent_id", help="T..., R..., G..., A..., or A.../P... id")
@@ -8984,6 +9661,16 @@ def build_parser() -> argparse.ArgumentParser:
     qa_record.add_argument("--evidence", action="append")
     qa_record.add_argument("--notes")
     qa_record.set_defaults(func=cmd_qa_record)
+
+    pause = sub.add_parser("pause", help="pause dispatch, merge, and gate creation")
+    pause.add_argument("--reason", required=True)
+    pause.set_defaults(func=cmd_pause)
+
+    resume = sub.add_parser("resume", help="resume a paused loop after preflight")
+    resume.set_defaults(func=cmd_resume)
+
+    finish = sub.add_parser("finish", help="mark done only after all current-head gates pass")
+    finish.set_defaults(func=cmd_finish)
 
     reviewer = sub.add_parser("reviewer", help="reviewer operations")
     reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
