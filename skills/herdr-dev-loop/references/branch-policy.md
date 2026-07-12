@@ -10,7 +10,9 @@ main or master
        -> ai/<goal-id>/T003-review-fix
 ```
 
-The selected strategy lives in `.ai/loop/PROFILE.md` and `STATE.json.branch_strategy`.
+The selected strategy lives in `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md` and `STATE.json.branch_strategy`.
+
+Persistence is independent of branch strategy. `local-only` keeps namespaced loop artifacts in local `.ai` state, copies the snapshot into role worktrees, requires squash integration, and removes loop paths from the squash index before committing product changes. `branch-history` retains the older committed-snapshot contract.
 
 Supported strategy labels:
 
@@ -53,7 +55,7 @@ For `pr-per-task` or `custom`, rewrite these rules in `PLAN.md` before dispatchi
 Before merge, require:
 
 - result artifact exists
-- result artifact is committed at `HEAD:.ai/loop/results/<task-id>/result.md`
+- result artifact is committed at `HEAD:.ai/herdr-dev-loop/loops/<namespace>/results/<task-id>/result.md`
 - result `status: done`
 - result `merge_ready: true`
 - result `head_sha` matches the Worker branch head

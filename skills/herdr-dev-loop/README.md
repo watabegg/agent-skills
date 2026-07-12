@@ -1,6 +1,6 @@
 # herdr-dev-loop の使い方
 
-`herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/loop` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
+`herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/herdr-dev-loop/loops/<namespace>` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
 
 このREADMEは運用の入口です。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)、[`/goal`のプロファイル例](references/profile-examples.md)を参照してください。
 
@@ -14,16 +14,62 @@ herdr --help
 git status --short --branch
 ```
 
-既存ループを再開するときは、スレッドの記憶ではなくリポジトリ上の `.ai/loop` を基準にします。
+既存ループを再開するときは、スレッドの記憶ではなくリポジトリ上の `.ai/herdr-dev-loop/loops/<namespace>` を基準にします。namespaceは省略せず、セッション中の全コマンドで同じ値を使います。旧 `.ai/loop` は古い別形式として無視され、自動移行もされません。
 
 ```bash
-HLOOP="python3 /home/watabegg/.codex/skills/herdr-dev-loop/scripts/hloop"
+HLOOP="python3 /home/watabegg/.codex/skills/herdr-dev-loop/scripts/hloop --namespace <namespace>"
+$HLOOP namespaces
+$HLOOP version
 $HLOOP doctor
 $HLOOP dashboard
 $HLOOP conductor --no-fail
 ```
 
 `hloop` がPATHにないこと自体は問題ではありません。Skillの絶対パスを使えます。
+
+## バージョンとセッションの識別
+
+Skillを使うManagerは、ほかの調査や変更より先に `$HLOOP version` を実行し、最初の進捗メッセージで `herdr-dev-loop <runtime-version> を使用します` と表示します。既存loopでは同時に `loop_skill_version` と `run_id` も表示します。これにより、Codexのセッション履歴だけを見ても、そのセッションがどの版のHLoop契約で動いたかを判別できます。
+
+新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
+
+```text
+herdr-dev-loop 0.3.0 / namespace <namespace> を使用します（loop_skill_version: 0.3.0, run_id: 20260712T...-goal）
+```
+
+`hloop namespaces` は同居するloopを列挙し、旧 `.ai/loop` が存在する場合は `legacy ignored` と表示します。
+
+## 永続化とworktree初期化経験
+
+既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。
+
+worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
+
+```bash
+$HLOOP init ... \
+  --worktree-setup-command 'pnpm install --frozen-lockfile' \
+  --worktree-setup-command 'pnpm generate'
+```
+
+実行結果はnamespace外の `.ai/herdr-dev-loop/experience/worktree-setup.json` に最大200件蓄積されます。保存するのはcommand、成否、return code、所要時間、role/run識別子だけで、stdout/stderrは秘密値混入を避けるため保存しません。成功した経験を次回の既定値にする場合は次を使います。
+
+```bash
+$HLOOP experience recommend --command 'pnpm install --frozen-lockfile'
+$HLOOP experience show
+```
+
+明示的なsetup commandを付けずに次のloopを初期化すると、recommended commandsが引き継がれます。
+
+## Artifactなしで止まったroleの復旧
+
+roleがartifactを書かず終了しても、artifactを捏造せず終了・再投入できます。
+
+```bash
+$HLOOP agent abort R002 --reason 'Reviewer exited before artifact'
+$HLOOP agent requeue R002 --reason 'Retry with supported model'
+```
+
+paneは閉じられ、再投入時は古いworktreeを整理します。product差分が残るworktreeは誤消去を避けて停止し、Managerが本当に破棄すると判断した場合だけ `--force-cleanup` を付けます。
 
 ## 用語
 
@@ -52,9 +98,9 @@ $HLOOP conductor --no-fail
 - **STATE.json**：phase、タスク、agent、pane、worktreeの機械可読な状態。
 - **DECISIONS.md**：元の仕様だけでは決められない仕様判断。
 - **USER_ACTION_REQUIRED.md**：ユーザーの判断がないと進められない事項。
-- **result artifact**：Workerの `.ai/loop/results/<task-id>/result.md`。
-- **review artifact**：Reviewerの `.ai/loop/reviews/<review-id>.md`。
-- **gap artifact**：Gap Auditorの `.ai/loop/gaps/<gap-id>.md`。
+- **result artifact**：Workerの `.ai/herdr-dev-loop/loops/<namespace>/results/<task-id>/result.md`。
+- **review artifact**：Reviewerの `.ai/herdr-dev-loop/loops/<namespace>/reviews/<review-id>.md`。
+- **gap artifact**：Gap Auditorの `.ai/herdr-dev-loop/loops/<namespace>/gaps/<gap-id>.md`。
 
 ### protocol、provider、model
 
@@ -149,7 +195,8 @@ Advisor policy:
 ### 1. Skillと環境を検査する
 
 ```bash
-HLOOP="python3 /home/watabegg/.codex/skills/herdr-dev-loop/scripts/hloop"
+HLOOP="python3 /home/watabegg/.codex/skills/herdr-dev-loop/scripts/hloop --namespace <namespace>"
+$HLOOP version
 $HLOOP selftest
 $HLOOP doctor
 ```
@@ -163,6 +210,8 @@ $HLOOP --repo <repo> init \
   --goal-id <goal-id> \
   --goal "<完了条件を含む具体的な目標>" \
   --base main --create-branch \
+  --persistence local-only \
+  --worktree-root ../wt/<goal-id> \
   --branch-strategy integration --merge-mode squash \
   --worker-protocol native --review-protocol native \
   --worker-qa-profile repo-default --manager-qa-profile none \
@@ -172,17 +221,25 @@ $HLOOP --repo <repo> init \
 
 `--create-branch` はintegration branchの準備も行います。未commitの変更がある場合は、先に状態を確認してください。ループ以外のdirty fileがあるとmutating commandが停止することがあります。
 
+`--worktree-root` を指定すると、Worker、Reviewer、Gap Auditor、Advisorのworktreeがすべてその配下へ作られます。相対パスは対象リポジトリを基準に解決されます。`init --force`で再初期化した場合、旧loopは`.ai/herdr-dev-loop/archive/<namespace>/`へ退避され、新しい`run_id`が発行されます。
+
 ### 3. batchとtaskを作る
 
 ```bash
 $HLOOP --repo <repo> batch start "Initial implementation batch"
 $HLOOP --repo <repo> task new "<担当範囲の実装>" \
   --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
-$HLOOP --repo <repo> checkpoint --batch B001 --rollup \
-  --message "ai-loop(B001): initialize goal"
 ```
 
 `write-allow` はWorkerが変更してよい範囲です。並列Workerの範囲が重ならないように分割します。
+
+契約変更にはtaskファイルと`STATE.json`の手編集ではなく、次を使います。`local-only`では変更後のcheckpointは不要です。`branch-history`を選んだ場合だけ、Worker起動前にcheckpointします。
+
+```bash
+$HLOOP --repo <repo> task update T001 \
+  --add-write-allow 'src/shared/**' \
+  --add-acceptance '共有処理の回帰テストが通る'
+```
 
 ### 4. bounded tickから始める
 
@@ -215,6 +272,17 @@ $HLOOP reviewer message R001 --file review-followup.md
 $HLOOP gap message G001 --file gap-followup.md
 ```
 
+Workerはproduct変更をcommitした後、成果物を次のように確定します。branch、base SHA、変更ファイル、`run_id`、`merge_ready`はhloopが生成します。
+
+```bash
+$HLOOP worker finalize T001 \
+  --validation-command 'pnpm test --filter target' \
+  --validation-result passed \
+  --validation-summary 'targeted test passed'
+```
+
+`wait --harvest`、`tick`、`pump`は、Worker成果物がHEADへcommitされるまでreadyと扱いません。Reviewer、Gap Auditor、Advisorは`run_id`と監査対象`head_sha`が一致する場合だけ回収されます。
+
 直接 `herdr pane run` を使わず、hloopのmessageを使います。起動前の確認には `worker start`、`reviewer start`、`gap start` の `--dry-run` を使います。
 
 レビューまたはGap Auditorのartifactは、先にfix-task draftへ変換します。
@@ -226,10 +294,10 @@ $HLOOP triage gap G001
 
 Managerがdraftを確認した後、必要なものだけ `--create-tasks` でqueued taskにします。Advisorは `request`、`start`、`harvest`、`close` を明示的に実行します。`tick` と `pump` はAdvisorを自動起動しません。
 
-## `.ai/loop` の見方
+## `.ai/herdr-dev-loop/loops/<namespace>` の見方
 
 ```text
-.ai/loop/
+.ai/herdr-dev-loop/loops/<namespace>/
 ├── MISSION.md       # 目的と完了条件
 ├── PLAN.md          # タスク、QA、reviewの計画
 ├── PROFILE.md       # ループ設定
@@ -249,6 +317,7 @@ Workerの結果をManagerが書き換えて `done` にすることはできま�
 
 - **`HERDR_ENV=1` がない**：Herdrの管理下で再実行します。通常のCodexセッションでpane操作を代替しません。
 - **dirty fileで止まる**：`git status --short` で対象外の変更を確認し、既存作業を壊さないよう別worktreeや専用ブランチへ移します。
+- **role起動前にcheckpointを要求される**：taskやManager-owned loop入力が対象HEADと一致していません。表示された`hloop checkpoint`を実行してから再起動します。失敗時点では新しいworktreeは作られません。
 - **paneがない、agentが固まった**：まず `$HLOOP conductor --no-fail` を実行し、表示された状態に対応する `watch`、`message`、`harvest` を使います。
 - **レビュー指摘がある**：`triage` 後に、修正、仕様判断、accepted risk、false positiveのいずれかをManagerが決めます。
 - **仕様判断が必要**：`DECISIONS.md` に候補と根拠を記録し、ユーザー判断が必要なら `USER_ACTION_REQUIRED.md` に分けて停止します。
@@ -287,4 +356,4 @@ python3 /home/watabegg/.codex/skills/.system/skill-creator/scripts/quick_validat
 
 ## 公開時の注意
 
-Skillのソース、README、参照文書、スクリプトは公開できます。ただし、実プロジェクトで生成された `.ai/loop`、pane transcript、秘密値、cookie、社内URL、本番環境の運用情報はこのリポジトリへ持ち込みません。
+Skillのソース、README、参照文書、スクリプトは公開できます。ただし、実プロジェクトで生成された `.ai/herdr-dev-loop/loops/<namespace>`、pane transcript、秘密値、cookie、社内URL、本番環境の運用情報はこのリポジトリへ持ち込みません。
