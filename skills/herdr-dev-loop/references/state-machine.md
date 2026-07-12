@@ -2,13 +2,23 @@
 
 Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, Reviewer, or Advisor coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, QA, and agent backend strategy.
 
+Each state machine is selected by `--namespace` and lives only below `.ai/herdr-dev-loop/loops/<namespace>`. Legacy `.ai/loop` is never a fallback source. Multiple namespaces may coexist, while the repo-local Git lock serializes their mutations.
+
+At session entry, Manager prints `hloop version` and identifies the runtime version, loop-pinned version, and `run_id` in the first progress message. Each started role likewise identifies its version and role ID before investigation. `skill_version` in state and artifacts is part of the durable state-machine identity, not merely display metadata.
+
 Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with a repo-local Git lock (`git rev-parse --git-path hloop.lock`); Manager should not update `STATE.json`, start Worker/Reviewer/Gap/Advisor sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
 
 Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next. `conductor` also audits trust signals left in `STATE.json` and pane output, including unsafe sandbox values, dangerous Codex launch markers, non-hloop prompt paths, unharvested artifact states, untrusted Worker head markers such as `manager-working-tree` or `pending_code_commit`, Manager-owned Worker result paths, and manual integration traces.
 
+Before creating a role worktree, hloop verifies that the role's Manager-owned input files are committed at the target branch or SHA. A stale snapshot stops without creating the worktree and tells Manager to checkpoint the inputs.
+
+For `persistence: local-only`, committed snapshot checks are replaced by copying the selected namespace into the role worktree. Repository-specific `worktree_setup_commands` run before pane launch. Setup or launcher failure rolls back only the worktree and branch created by that start attempt; pre-existing worktrees and branches are preserved.
+
+An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
+
 ## Phases
 
-- `initialized`: `.ai/loop` exists and the integration branch is known.
+- `initialized`: `.ai/herdr-dev-loop/loops/<namespace>` exists and the integration branch is known.
 - `planning`: Manager is still refining `MISSION.md`, `PLAN.md`, or task boundaries.
 - `dispatching`: queued tasks can be started.
 - `running`: at least one Worker or Reviewer is active.
@@ -35,11 +45,11 @@ Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --se
 
 Each tick starts by reading:
 
-1. `.ai/loop/MISSION.md`
-2. `.ai/loop/PLAN.md`
-3. `.ai/loop/PROFILE.md`
-4. `.ai/loop/STATE.json`
-5. `.ai/loop/DECISIONS.md`
+1. `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`
+2. `.ai/herdr-dev-loop/loops/<namespace>/PLAN.md`
+3. `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`
+4. `.ai/herdr-dev-loop/loops/<namespace>/STATE.json`
+5. `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md`
 
 Then run, at most, one material transition:
 
@@ -108,7 +118,7 @@ When the review artifact appears, harvest it from the detached review worktree, 
 
 For Reviewers and Gap Auditors, artifact frontmatter status and Manager gate status are separate. `artifact_status` stores the artifact's reported result, while `gate_status` tracks Manager workflow progress such as `running`, `reported`, or `triaged`. The legacy per-agent `status` field mirrors `gate_status` for compatibility.
 
-For Advisors, participant artifacts are harvested into `.ai/loop/advice/`. Advisor outputs never close review/gap gates by themselves; Manager records the accepted recommendation in `DECISIONS.md`, accepted-risk notes, or fix tasks, then closes the advice request.
+For Advisors, participant artifacts are harvested into `.ai/herdr-dev-loop/loops/<namespace>/advice/`. Advisor outputs never close review/gap gates by themselves; Manager records the accepted recommendation in `DECISIONS.md`, accepted-risk notes, or fix tasks, then closes the advice request.
 
 ## Stop Conditions
 

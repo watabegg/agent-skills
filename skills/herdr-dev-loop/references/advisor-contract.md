@@ -34,7 +34,7 @@ If the answer requires user preference, product policy, external approval, secre
 Each participant writes only:
 
 ```text
-.ai/loop/advice/A001-P1.md
+.ai/herdr-dev-loop/loops/<namespace>/advice/A001-P1.md
 ```
 
 Frontmatter:
@@ -43,6 +43,9 @@ Frontmatter:
 ---
 advice_id: A001
 participant_id: P1
+run_id: 20260712T000000Z-example
+skill_version: 0.3.0
+head_sha: abc123
 provider: claude
 model: opus
 status: advised
@@ -62,6 +65,8 @@ Required sections:
 - `## Tradeoffs`
 - `## Suggested Manager Action`
 - `## User Escalation Needed`
+
+The first progress message must identify `herdr-dev-loop <version> / namespace <namespace> / Advisor <advice-id>/<participant-id>`, and the artifact must preserve the prompt-provided `skill_version`.
 
 Final line:
 

@@ -4,12 +4,13 @@ Gap Auditor compares the original plan/spec contract against the current integra
 
 Default runner: interactive role-agent TUI in a detached gap worktree. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md` or `hloop gap start`. Use this so Manager can monitor progress and the Gap Auditor can reliably write the final Markdown artifact.
 
-Gap Auditor TUI uses `workspace-write` sandbox because the final report must be written. Treat the codebase as read-only during investigation. The only permitted write is `.ai/loop/gaps/<gap-id>.md` after the audit is complete. `hloop gap harvest` validates the gap worktree and blocks if any other file changed.
+Gap Auditor TUI uses `workspace-write` sandbox because the final report must be written. Treat the codebase as read-only during investigation. The only permitted write is `.ai/herdr-dev-loop/loops/<namespace>/gaps/<gap-id>.md` after the audit is complete. `hloop gap harvest` validates the gap worktree and blocks if any other file changed.
 
 Assume Gap Auditor runs are long-running. Manager should inspect progress with `hloop gap watch <gap-id>`, wait with `hloop tick --gap-wait-ms <ms>`, or continue other safe Manager work while the auditor is running. The auditor is not complete until `gaps/<gap-id>.md` exists and is non-empty.
 
 The Gap Auditor prompt must say:
 
+- make the first progress message identify `herdr-dev-loop <version> / namespace <namespace> / Gap Auditor <gap-id>`
 - compare plan/spec sources against the current integration branch implementation
 - read `MISSION.md`, `PLAN.md`, `DECISIONS.md`, `tasks/*.md`, and `results/*/result.md`
 - read Manager-provided `spec_sources` when configured
@@ -20,6 +21,7 @@ The Gap Auditor prompt must say:
 - classify each requirement as `implemented`, `partial`, `missing`, `deferred`, `obsolete-spec`, or `needs-decision`
 - include `## Fix Task Candidates` with machine-readable task candidate blocks for missing or partial requirements that should become Worker fix tasks; each candidate needs `action: fix_task`, `priority` or `severity`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 - after audit is complete, write only `gaps/<gap-id>.md`
+- include the prompt-provided `skill_version` in artifact frontmatter
 - print `HERDR_LOOP_GAP_DONE:<gap-id>:<aligned|gaps-found|blocked|failed>`
 
 ## Gap Scope
@@ -27,7 +29,7 @@ The Gap Auditor prompt must say:
 Default scope is plan/spec coverage, not diff review:
 
 ```text
-spec_sources + .ai/loop/MISSION.md + .ai/loop/PLAN.md -> integration branch behavior
+spec_sources + .ai/herdr-dev-loop/loops/<namespace>/MISSION.md + .ai/herdr-dev-loop/loops/<namespace>/PLAN.md -> integration branch behavior
 ```
 
 Use `git diff <base-branch>...<integration-branch>` only as supporting evidence for when the integration branch claims to implement a requirement. Do not treat every diff risk as a gap unless it contradicts or omits the plan/spec.

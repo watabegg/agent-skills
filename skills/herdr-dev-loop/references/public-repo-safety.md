@@ -4,7 +4,8 @@ This skill repository is public-oriented. Keep it generic and free of private op
 
 Do not commit:
 
-- real `.ai/loop` artifacts from product repositories
+- real `.ai/herdr-dev-loop/loops/<namespace>` artifacts from product repositories
+- `.ai/herdr-dev-loop/experience/worktree-setup.json` when commands reveal private paths, registries, hosts, or repository operations
 - pane transcripts
 - tokens, cookies, API keys, credentials, browser profiles, or env files
 - customer, company, student, or production data

@@ -1,6 +1,6 @@
 # Decision Policy
 
-Specification decisions that cannot be resolved from the original plan/spec belong in `.ai/loop/DECISIONS.md`, not in pane chat.
+Specification decisions that cannot be resolved from the original plan/spec belong in `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md`, not in pane chat.
 
 Use `DECISIONS.md` as the durable decision ledger:
 

@@ -2,15 +2,19 @@
 
 Worker receives one task and one worktree.
 
+After committing product changes and completing validation, use `hloop worker finalize` to generate and commit `result.md`. Do not hand-copy `task_id`, `run_id`, `skill_version`, `base_sha`, `head_sha`, `changed_files`, or `merge_ready` when the helper is available.
+
 Default runner: interactive role-agent TUI. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md`, task frontmatter, or `hloop worker start`. This keeps the Worker visible in Herdr so the Manager can add requirements, inspect progress, or interrupt the Worker before it finishes. Use `--runner exec` only for well-bounded automation tasks that should complete without interaction.
 
 The Worker prompt must say:
 
+- make the first progress message identify `herdr-dev-loop <version> / namespace <namespace> / Worker <task-id>`
 - read `MISSION.md`, `PLAN.md`, `PROFILE.md`, `DECISIONS.md`, and `tasks/<task-id>.md`
 - follow the HLoop Worker Protocol by default
 - edit only `write_allow`
 - do not edit Manager-owned loop files
 - write `results/<task-id>/result.md`
+- include the prompt-provided `skill_version` in the result artifact
 - commit the branch
 - print `HERDR_LOOP_TASK_DONE:<task-id>:<done|blocked|failed|partial>`
 

@@ -2,9 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Task Frontmatter",
   "type": "object",
-  "required": ["id", "kind", "status", "branch", "base_ref", "base_sha", "write_allow", "acceptance"],
+  "required": ["id", "run_id", "skill_version", "kind", "status", "branch", "base_ref", "base_sha", "write_allow", "acceptance"],
   "properties": {
     "id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+    "run_id": {"type": "string"},
+    "skill_version": {"type": "string"},
     "kind": {"type": "string", "enum": ["implementation", "fix", "research"]},
     "status": {"type": "string", "enum": ["queued", "running", "result_reported", "merged", "done", "partial", "blocked", "failed", "abandoned", "failed_validation"]},
     "branch": {"type": "string"},

@@ -4,12 +4,13 @@ Reviewer compares the integration result against the base branch and the loop ar
 
 Default runner: interactive role-agent TUI in a detached review worktree. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md` or `hloop reviewer start`. Use this so Manager can monitor progress and the Reviewer can reliably write the final Markdown artifact.
 
-Reviewer TUI uses `workspace-write` sandbox because the final report must be written. Treat the codebase as read-only during investigation. The only permitted write is `.ai/loop/reviews/<review-id>.md` after review is complete. `hloop reviewer harvest` validates the review worktree and blocks if any other file changed.
+Reviewer TUI uses `workspace-write` sandbox because the final report must be written. Treat the codebase as read-only during investigation. The only permitted write is `.ai/herdr-dev-loop/loops/<namespace>/reviews/<review-id>.md` after review is complete. `hloop reviewer harvest` validates the review worktree and blocks if any other file changed.
 
 Assume Reviewer runs are long-running. Manager should inspect progress with `hloop reviewer watch <review-id>`, wait with `hloop tick --review-wait-ms <ms>`, or continue other safe Manager work while the Reviewer is running. The Reviewer is not complete until `reviews/<review-id>.md` exists and is non-empty.
 
 The Reviewer prompt must say:
 
+- make the first progress message identify `herdr-dev-loop <version> / namespace <namespace> / Reviewer <review-id>`
 - follow the HLoop Native Review Protocol by default
 - do not edit code
 - do not commit, merge, rebase, switch branches, run formatters, or run automatic fixes
@@ -18,6 +19,7 @@ The Reviewer prompt must say:
 - distinguish newly introduced, diff-expanded pre-existing, and unrelated pre-existing issues
 - write no files while investigating
 - after review is complete, write only `reviews/<review-id>.md`
+- include the prompt-provided `skill_version` in artifact frontmatter
 - include `## Fix Task Candidates` with machine-readable task candidate blocks for findings that should become Worker fix tasks; each candidate needs `action: fix_task`, `severity` or `priority`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 - print `HERDR_LOOP_REVIEW_DONE:<review-id>:<reported|blocked|failed>`
 
@@ -60,13 +62,13 @@ Default review mode is branch-style diff plus loop artifacts:
 
 ```text
 git diff <base-branch>...<integration-branch>
-.ai/loop/MISSION.md
-.ai/loop/PLAN.md
-.ai/loop/PROFILE.md
-.ai/loop/DECISIONS.md
-.ai/loop/tasks/*.md
-.ai/loop/results/*/result.md
-.ai/loop/validation/*.log
+.ai/herdr-dev-loop/loops/<namespace>/MISSION.md
+.ai/herdr-dev-loop/loops/<namespace>/PLAN.md
+.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md
+.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md
+.ai/herdr-dev-loop/loops/<namespace>/tasks/*.md
+.ai/herdr-dev-loop/loops/<namespace>/results/*/result.md
+.ai/herdr-dev-loop/loops/<namespace>/validation/*.log
 ```
 
 Use uncommitted diff review only when Manager intentionally wants to review local integration changes before commit.
