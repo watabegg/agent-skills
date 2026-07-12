@@ -115,21 +115,22 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 ### `herdr-dev-loop`
 
 - 目的:
-  - Herdr 上で Manager / Worker / Gap Auditor / Reviewer の Codex agent を、git worktree、integration branch、`.ai/loop` artifact によって安全に協調させる。
+  - Herdr 上で Manager / Worker / Gap Auditor / Reviewer / Advisor の Codex・Claude agent を、git worktree、integration branch、`.ai/herdr-dev-loop/loops/<namespace>` artifact によって安全に協調させる。
   - Worker / Reviewer は既定でこの Skill 内蔵の HLoop protocol を使い、外部の `$codex-impl` / `$codex-review-multi-v2` は必要時だけ選ぶ互換モードにする。
   - Gap Auditor には元 repo の plan/spec と統合ブランチ実装の相違確認を担当させ、仕様判断が必要な場合は `DECISIONS.md` と `USER_ACTION_REQUIRED.md` に分離して止める。
   - `scripts/hloop` で init、task 作成、Worker/Gap Auditor/Reviewer 起動、harvest、merge、validation、pump、triage、report を実行する。
-  - `.ai/loop/PROFILE.md` で branch strategy、Worker protocol、Review protocol、Review lanes、Worker QA profile、Manager final QA profile をプロダクトごとに調整する。
-  - Worker / Gap Auditor / Reviewer は対話式 Codex TUI を既定にし、Gap Auditor と Reviewer は detached worktree で最終 Markdown artifact だけを書き込む。
+  - namespaced `PROFILE.md` で branch strategy、roleごとのprovider/model/effort、Worker protocol、Review lanes、QA profileを調整する。
+  - Worker / Gap Auditor / Reviewer は対話式agent TUIを既定にし、Gap AuditorとReviewerはdetached worktreeで最終Markdown artifactだけを書き込む。
   - 既定では最大3 Workerを並列に走らせ、Reviewは検証済みmergeごと、Gap Auditorは低頻度に走らせる。
   - `pump` で安全な tick を複数回drainし、Review/Gapの指摘は `triage` でfix-task draftにしてからManager承認後にqueued task化する。
-  - 元 plan/spec だけでは判断できない仕様判断は `.ai/loop/DECISIONS.md` に記録し、ユーザー判断が必要なものは `USER_ACTION_REQUIRED.md` に分離する。
+  - 元 plan/spec だけでは判断できない仕様判断はnamespaced `DECISIONS.md`に記録し、ユーザー判断が必要なものは`USER_ACTION_REQUIRED.md`に分離する。
+  - state migration、attempt単位の再実行、merge transaction復旧、明示的な`finish` gateにより、中断・再開時の誤完了や変更消失を防ぐ。
 - 主な利用シーン:
-  - `/goal` や大きめの実装依頼を、複数 Codex agent に分割して進めたいとき。
+  - `/goal` や大きめの実装依頼を、複数のCodex・Claude agentに分割して進めたいとき。
   - Worker の書き込み範囲、Gap Auditor の plan/spec coverage gate、Reviewer の review artifact 境界、merge gate、validation gate をファイルベースで固定したいとき。
-  - Herdr pane id や Codex CLI の挙動を `hloop doctor` で確認しながら、bounded tick で運用したいとき。
+  - Herdr pane idやagent CLIの挙動を`hloop doctor`で確認しながら、bounded tickで運用したいとき。
 - 注意:
-  - 実プロジェクトで生成される `.ai/loop`、pane transcript、秘密値、社内 URL、本番運用情報はこの public repo に commit しない。
+  - 実プロジェクトで生成される`.ai/herdr-dev-loop`、pane transcript、秘密値、社内URL、本番運用情報はこのpublic repoにcommitしない。
 
 ## Skill を追加する方法
 

@@ -14,7 +14,9 @@ Before creating a role worktree, hloop verifies that the role's Manager-owned in
 
 For `persistence: local-only`, committed snapshot checks are replaced by copying the selected namespace into the role worktree. Repository-specific `worktree_setup_commands` run before pane launch. Setup or launcher failure rolls back only the worktree and branch created by that start attempt; pre-existing worktrees and branches are preserved.
 
-An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
+An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again with a new attempt id. The original attempt base is immutable; an unmerged branch with commits is archived instead of silently reused or deleted. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
+
+State format 2 is required. For a 0.3.x loop, first run `hloop migrate --dry-run`, inspect the result, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist.
 
 ## Phases
 
@@ -33,13 +35,16 @@ An artifact-less role can transition to `aborted` through `hloop agent abort`. `
 - `waiting_worker`: Workers are still running and no result artifact is ready.
 - `waiting_gap`: a Gap Auditor is still running after the bounded wait.
 - `waiting_review`: a Reviewer is still running after the bounded wait.
+- `paused`: Manager explicitly paused the loop; use `hloop resume` after checking the environment.
+- `blocked_agent`: a current-attempt terminal marker was observed without its required artifact.
 - `blocked_user_decision`: a blocking decision is required from the user.
 - `blocked_environment`: required tool, credentials, branch, or worktree state is missing.
 - `blocked_conflict`: merge conflict or write-scope conflict needs judgment.
 - `failed_validation`: integration validation failed and no obvious local fix was applied.
 - `failed_manager_qa`: Manager final QA found a blocking failure.
 - `no_progress`: no safe transition exists and Manager inspection is required.
-- `done`: all tasks are merged, validation passes, no blocking gap/review finding remains, and required Manager final QA is recorded.
+- `ready_to_finish`: all automatic work is complete and Manager must run `hloop finish`.
+- `done`: `hloop finish` confirmed the current integration SHA has passing validation, closed review and gap gates, required Manager QA, no active agents/merge, a clean Manager checkout, and no unresolved cleanup.
 
 ## Tick Order
 
@@ -72,7 +77,7 @@ Prefer a small number of obvious transitions over attempting to finish a goal in
 - a Gap Auditor or Reviewer artifact needs Manager triage
 - branch strategy requires Manager handoff before merge or publish
 - all safe immediate transitions are exhausted and the loop is waiting, only when `--stop-on-waiting` is set
-- a blocked, failed, no-progress, or done phase is reached
+- a paused, blocked, failed, no-progress, ready-to-finish, or done phase is reached
 - the transition limit is reached
 
 Do not let `pump` turn review/gap findings directly into queued tasks without Manager approval. Use `hloop triage ...` to draft fix tasks first, then rerun with `--create-tasks` only after the draft is accepted.

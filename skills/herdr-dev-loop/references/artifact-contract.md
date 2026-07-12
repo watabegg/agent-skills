@@ -31,6 +31,7 @@ All loop coordination is file-backed under `.ai/herdr-dev-loop/loops/<namespace>
 
 Required top-level fields:
 
+- `state_format_version`
 - `goal_id`
 - `run_id`
 - `skill_version`
@@ -38,6 +39,10 @@ Required top-level fields:
 - `loop_path`
 - `persistence`
 - `worktree_setup_commands`
+- `worker_setup_commands`
+- `reviewer_setup_commands`
+- `gap_setup_commands`
+- `advisor_setup_commands`
 - `phase`
 - `base_branch`
 - `integration_branch`
@@ -50,10 +55,16 @@ Required top-level fields:
 - `review_protocol`
 - `worker_agent_provider`
 - `worker_agent_model`
+- `worker_agent_effort`
+- `worker_claude_permission_mode`
 - `reviewer_agent_provider`
 - `reviewer_agent_model`
+- `reviewer_agent_effort`
+- `reviewer_claude_permission_mode`
 - `gap_agent_provider`
 - `gap_agent_model`
+- `gap_agent_effort`
+- `gap_claude_permission_mode`
 - `review_lanes`
 - `cycle`
 - `max_workers`
