@@ -1,6 +1,6 @@
 # Prompt Templates
 
-`scripts/hloop` renders concrete prompts from these contracts. Keep prompts short and force agents back to `.ai/loop` files. Worker, Gap Auditor, Reviewer, and explicit Advisor prompts are usually sent into interactive role-agent TUI panes. Codex is the default provider, but Manager may select Claude or a specific model per role. Use non-interactive exec runners only for bounded automation where Manager does not need live TUI inspection.
+`scripts/hloop` renders concrete prompts from these contracts. Keep prompts short and force agents back to `.ai/herdr-dev-loop/loops/<namespace>` files. Worker, Gap Auditor, Reviewer, and explicit Advisor prompts are usually sent into interactive role-agent TUI panes. Codex is the default provider, but Manager may select Claude or a specific model per role. Use non-interactive exec runners only for bounded automation where Manager does not need live TUI inspection.
 
 ## Worker Prompt Shape
 
@@ -8,11 +8,11 @@
 You are Worker T001.
 
 Read first:
-- .ai/loop/MISSION.md
-- .ai/loop/PLAN.md
-- .ai/loop/PROFILE.md
-- .ai/loop/DECISIONS.md
-- .ai/loop/tasks/T001.md
+- .ai/herdr-dev-loop/loops/<namespace>/MISSION.md
+- .ai/herdr-dev-loop/loops/<namespace>/PLAN.md
+- .ai/herdr-dev-loop/loops/<namespace>/PROFILE.md
+- .ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md
+- .ai/herdr-dev-loop/loops/<namespace>/tasks/T001.md
 
 Loop profile:
 - branch strategy
@@ -28,13 +28,13 @@ Rules:
 - do not merge, rebase, or switch to the integration branch
 
 Required output:
-- .ai/loop/results/T001/result.md
+- .ai/herdr-dev-loop/loops/<namespace>/results/T001/result.md
 - one git commit on your branch
 
 Result frontmatter:
 - use flat validation fields: `validation_recorded`, `validation_commands`, `validation_results`, and `validation_summary`
 - write list fields as multiline YAML lists, not inline `[a, b]` lists
-- commit `.ai/loop/results/T001/result.md` on the Worker branch before finishing
+- commit `.ai/herdr-dev-loop/loops/<namespace>/results/T001/result.md` on the Worker branch before finishing
 
 Final terminal line:
 HERDR_LOOP_TASK_DONE:T001:<done|blocked|failed|partial>
@@ -51,11 +51,11 @@ Compare:
 - agent backend/provider/model
 
 Read:
-- .ai/loop/MISSION.md
-- .ai/loop/PLAN.md
-- .ai/loop/DECISIONS.md
-- .ai/loop/tasks/*.md
-- .ai/loop/results/*/result.md
+- .ai/herdr-dev-loop/loops/<namespace>/MISSION.md
+- .ai/herdr-dev-loop/loops/<namespace>/PLAN.md
+- .ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md
+- .ai/herdr-dev-loop/loops/<namespace>/tasks/*.md
+- .ai/herdr-dev-loop/loops/<namespace>/results/*/result.md
 - configured spec_sources
 
 Rules:
@@ -65,7 +65,7 @@ Rules:
 - classify each item as implemented, partial, missing, deferred, obsolete-spec, or needs-decision
 
 Required output:
-- .ai/loop/gaps/G001.md
+- .ai/herdr-dev-loop/loops/<namespace>/gaps/G001.md
 - include `## Fix Task Candidates`; write `No fix task candidates.` when none are needed
 - each fix task candidate must include `action: fix_task`, `priority` or `severity`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 
@@ -84,13 +84,13 @@ Compare:
 - agent backend/provider/model
 
 Read:
-- .ai/loop/MISSION.md
-- .ai/loop/PLAN.md
-- .ai/loop/PROFILE.md
-- .ai/loop/DECISIONS.md
-- .ai/loop/STATE.json
-- .ai/loop/tasks/*.md
-- .ai/loop/results/*/result.md
+- .ai/herdr-dev-loop/loops/<namespace>/MISSION.md
+- .ai/herdr-dev-loop/loops/<namespace>/PLAN.md
+- .ai/herdr-dev-loop/loops/<namespace>/PROFILE.md
+- .ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md
+- .ai/herdr-dev-loop/loops/<namespace>/STATE.json
+- .ai/herdr-dev-loop/loops/<namespace>/tasks/*.md
+- .ai/herdr-dev-loop/loops/<namespace>/results/*/result.md
 
 Follow the HLoop Native Review Protocol unless PROFILE.md explicitly selects compatibility mode.
 
@@ -101,7 +101,7 @@ Rules:
 - assess Worker QA evidence and Manager final QA readiness/evidence separately
 
 Required output:
-- .ai/loop/reviews/R001.md
+- .ai/herdr-dev-loop/loops/<namespace>/reviews/R001.md
 - include `## Fix Task Candidates`; write `No fix task candidates.` when none are needed
 - each fix task candidate must include `action: fix_task`, `severity` or `priority`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 
@@ -117,11 +117,11 @@ Advisor is opt-in only. Manager creates an advice request explicitly when anothe
 You are Advisor A001/P1.
 
 Read first:
-- .ai/loop/MISSION.md
-- .ai/loop/PLAN.md
-- .ai/loop/PROFILE.md
-- .ai/loop/DECISIONS.md
-- .ai/loop/STATE.json
+- .ai/herdr-dev-loop/loops/<namespace>/MISSION.md
+- .ai/herdr-dev-loop/loops/<namespace>/PLAN.md
+- .ai/herdr-dev-loop/loops/<namespace>/PROFILE.md
+- .ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md
+- .ai/herdr-dev-loop/loops/<namespace>/STATE.json
 - source review/gap/task artifacts named by Manager
 - peer advice artifacts when this is a dialogue round
 - dialogue round and max rounds
@@ -135,7 +135,7 @@ Rules:
 - do not continue open-ended debate; Manager enforces max rounds and delivered follow-up limits
 
 Required output:
-- .ai/loop/advice/A001-P1.md
+- .ai/herdr-dev-loop/loops/<namespace>/advice/A001-P1.md
 - frontmatter: advice_id, participant_id, provider, model, status: advised|blocked|failed
 - sections: Recommendation, Reasoning, Tradeoffs, Suggested Manager Action, User Escalation Needed
 

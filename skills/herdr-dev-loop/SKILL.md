@@ -1,11 +1,11 @@
 ---
 name: herdr-dev-loop
-description: Orchestrate a bounded Herdr-managed multi-agent coding loop with pump/triage scheduling and interactive Worker, Gap Auditor, Reviewer, and opt-in Advisor panes. Use inside Herdr when a Manager agent needs to run Codex or Claude subordinate agents across git worktrees, persist the goal in .ai/loop artifacts, drain task/fix-task queues with hloop pump, use HLoop-native Worker and Reviewer protocols by default, compare original plan/spec sources against implementation, generate Manager-approved fix-task drafts from review/gap artifacts with hloop triage, optionally consult cross-model Advisors for non-user-blocking specification or fix strategy decisions, adapt branch/review/QA/agent backend strategy through .ai/loop/PROFILE.md, merge into an integration or project-specific branch flow, monitor agent panes, harvest artifacts from detached worktrees, and stop on blocking specification decisions or unsafe state.
+description: Orchestrate a bounded Herdr-managed multi-agent coding loop with pump/triage scheduling and interactive Worker, Gap Auditor, Reviewer, and opt-in Advisor panes. Use inside Herdr when a Manager agent needs to run Codex or Claude subordinate agents across git worktrees, persist the goal in explicitly namespaced .ai/herdr-dev-loop artifacts, drain task/fix-task queues with hloop pump, use HLoop-native Worker and Reviewer protocols by default, compare original plan/spec sources against implementation, generate Manager-approved fix-task drafts from review/gap artifacts with hloop triage, optionally consult cross-model Advisors for non-user-blocking specification or fix strategy decisions, adapt branch/review/QA/agent backend strategy through the namespaced PROFILE.md, merge into an integration or project-specific branch flow, monitor agent panes, harvest artifacts from detached worktrees, and stop on blocking specification decisions or unsafe state.
 ---
 
 # Herdr Dev Loop
 
-Use this skill as the Manager Agent for a file-backed development loop. The Manager is the agent currently using this skill. The loop coordinates isolated Worker agents, independent Gap Auditor agents, independent Reviewer agents, and explicit opt-in Advisor agents through git branches, worktrees, Herdr panes, and `.ai/loop` artifacts. Subordinate role agents default to Codex, but role-specific Codex/Claude provider and model choices can be recorded in `.ai/loop/PROFILE.md`.
+Use this skill as the Manager Agent for a file-backed development loop. The Manager is the agent currently using this skill. The loop coordinates isolated Worker agents, independent Gap Auditor agents, independent Reviewer agents, and explicit opt-in Advisor agents through git branches, worktrees, Herdr panes, and `.ai/herdr-dev-loop/loops/<namespace>` artifacts. Subordinate role agents default to Codex, but role-specific Codex/Claude provider and model choices can be recorded in `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`.
 
 This skill is intentionally conservative. Prefer one bounded tick at a time until the loop has proven stable for the current repository.
 
@@ -13,13 +13,15 @@ This skill is intentionally conservative. Prefer one bounded tick at a time unti
 
 Before starting or continuing a loop:
 
-1. Verify `HERDR_ENV=1`.
-2. Run `python3 <this-skill>/scripts/hloop doctor`.
-3. After installing or updating this skill, run `python3 <this-skill>/scripts/hloop selftest`.
-4. Confirm `herdr`, `git`, and the configured subordinate agent CLIs are available. Codex is the default fallback provider; Claude is optional unless selected for a role. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
-5. Read the current `.ai/loop/MISSION.md`, `.ai/loop/PLAN.md`, `.ai/loop/PROFILE.md`, `.ai/loop/STATE.json`, and `.ai/loop/DECISIONS.md` if they exist.
-6. Run `python3 <this-skill>/scripts/hloop dashboard` or `conductor --no-fail` when resuming an existing loop so pane/worktree/artifact drift is visible before mutating state.
-7. Continue from disk state, not from thread memory.
+1. Choose an explicit namespace and use it for every command: `HLOOP="python3 <this-skill>/scripts/hloop --namespace <namespace>"`. Run `$HLOOP namespaces` when resuming. Never read or migrate legacy `.ai/loop`; it is intentionally ignored.
+2. Before other investigation or mutation, run `$HLOOP version` and make the first user-visible progress message state `herdr-dev-loop <runtime-version> / namespace <namespace> を使用します` together with the reported `loop_skill_version` and `run_id` when present. This announcement is mandatory even if the user did not explicitly ask for version output.
+3. Verify `HERDR_ENV=1`.
+4. Run `$HLOOP doctor`.
+5. After installing or updating this skill, run `$HLOOP selftest`.
+6. Confirm `herdr`, `git`, and the configured subordinate agent CLIs are available. Codex is the default fallback provider; Claude is optional unless selected for a role. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
+7. Read the current `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`, `.ai/herdr-dev-loop/loops/<namespace>/PLAN.md`, `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`, `.ai/herdr-dev-loop/loops/<namespace>/STATE.json`, and `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md` if they exist.
+8. Run `$HLOOP dashboard` or `$HLOOP conductor --no-fail` when resuming an existing loop so pane/worktree/artifact drift is visible before mutating state.
+9. Continue from disk state, not from thread memory.
 
 If `HERDR_ENV=1` is absent, stop and tell the user this skill requires Herdr.
 
@@ -30,13 +32,13 @@ Use the absolute helper path when `hloop` is not installed on `PATH`. A missing 
 Use the helper script instead of hand-typing pane prompts:
 
 ```bash
-HLOOP="python3 <this-skill>/scripts/hloop"
+HLOOP="python3 <this-skill>/scripts/hloop --namespace <namespace>"
+$HLOOP version
 $HLOOP selftest
 $HLOOP doctor
-$HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider codex --reviewer-agent-model auto --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
+$HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --persistence local-only --worktree-root ../wt/<goal-id> --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider codex --reviewer-agent-model auto --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
 $HLOOP batch start "Initial implementation batch"
 $HLOOP task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
-$HLOOP checkpoint --batch B001 --rollup --message "ai-loop(B001): initialize goal"
 $HLOOP dashboard
 $HLOOP pump --max-transitions 20 --max-workers 3
 ```
@@ -61,13 +63,25 @@ Use `hloop dashboard` for the Manager's one-screen view of phase, queues, runnin
 
 Use `hloop batch start "<batch title>"` to group several related tasks or fix tasks into a local-history unit larger than one Worker task and smaller than the whole mission. When a current batch exists, `hloop task new` and triage-created fix tasks attach to it by default. Use `hloop batch close --summary "..."` when the batch is finished.
 
-Use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` to commit `.ai/loop` state updates without staging product files. Rollup may amend only an unpushed HEAD commit that is already an hloop `.ai/loop` checkpoint for the same batch; otherwise it creates a new checkpoint commit. Add `--force` only when intentionally committing ignored loop artifacts such as validation logs. Avoid hand-written `git add .ai/loop/... && git commit ...` unless debugging the helper itself.
+Use `hloop task update <task-id>` for write scope, acceptance, validation minimum, protocol, QA, or agent-backend changes. Checkpoint the changed contract before starting a Worker only in `branch-history`; `local-only` snapshots it directly. If that Worker is already running, also send the new requirement through `hloop worker message`.
 
-After a Worker, Gap Auditor, Reviewer, or Advisor artifact is harvested, close its Herdr pane and clean up the captured session when the provider supports it unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/loop` artifacts as the durable record; do not leave completed agent panes open as informal state.
+Workers should commit product changes first, then run `hloop worker finalize <task-id> --validation-command <command> --validation-result passed --validation-summary <summary>`. The helper derives and commits the result metadata. `wait`, `tick`, and `pump` do not harvest a Worker result until the exact artifact is committed at Worker HEAD.
+
+When `init --force` replaces a loop, the previous tree is archived below `.ai/herdr-dev-loop/archive/<namespace>/`. Every new loop pins its namespace, runtime `skill_version`, persistence mode, and `run_id`. Every started role records the runtime version, prints it in its first progress message, and preserves it in its artifact; Reviewer, Gap Auditor, and Advisor artifacts must also match the run and audited `head_sha`.
+
+`local-only` is the default persistence mode. Manager state is copied into role worktrees without requiring public branch history, and squash merge unstages namespaced loop artifacts before the product commit. Use `branch-history` only when the repository intentionally versions loop artifacts.
+
+Recover artifact-less or failed roles with `hloop agent abort <id> --reason ...` and `hloop agent requeue <id> --reason ...`. Cleanup refuses to discard product changes unless Manager explicitly adds `--force-cleanup`.
+
+Repository-specific worktree setup commands may be passed repeatedly with `init --worktree-setup-command`. Every outcome is appended to `.ai/herdr-dev-loop/experience/worktree-setup.json`. Curate reusable defaults with `hloop experience recommend --command ...`; a later `init` reuses recommended commands when no explicit setup command is supplied.
+
+With `branch-history` persistence, use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` to commit namespaced loop state without staging product files. `local-only` does not require checkpoints for role visibility. Avoid hand-written Git staging unless debugging the helper itself.
+
+After a Worker, Gap Auditor, Reviewer, or Advisor artifact is harvested, close its Herdr pane and clean up the captured session when the provider supports it unless the Manager intentionally passes `--keep-pane` or `--session-cleanup none` for inspection. Treat `.ai/herdr-dev-loop/loops/<namespace>` artifacts as the durable record; do not leave completed agent panes open as informal state.
 
 ## Source Of Truth
 
-The durable state lives under `.ai/loop`:
+The durable state lives under `.ai/herdr-dev-loop/loops/<namespace>`:
 
 - `MISSION.md`: user goal, constraints, non-goals, base branch, integration branch, done criteria
 - `PLAN.md`: task graph, product-specific branch handoff, parallelization rules, validation plan, Worker QA plan, Manager final QA plan, review plan
@@ -85,36 +99,36 @@ The durable state lives under `.ai/loop`:
 - `qa/FINAL.md`: Manager-owned final QA evidence when `manager_qa_profile` is not `none`
 - `reports/FINAL.md`: final report
 
-If thread memory and `.ai/loop` disagree, trust `.ai/loop` and record the discrepancy in `JOURNAL.md`.
+If thread memory and `.ai/herdr-dev-loop/loops/<namespace>` disagree, trust `.ai/herdr-dev-loop/loops/<namespace>` and record the discrepancy in `JOURNAL.md`.
 
 ## Roles
 
 Manager owns:
 
 - integration branch or product-specific branch handoff defined in `PROFILE.md` / `PLAN.md`
-- `.ai/loop/MISSION.md`, `PLAN.md`, `PROFILE.md`, `STATE.json`, `DECISIONS.md`, `JOURNAL.md`
+- `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`, `PLAN.md`, `PROFILE.md`, `STATE.json`, `DECISIONS.md`, `JOURNAL.md`
 - task creation, merge decisions, validation, review triage, and user escalation
 
 Worker owns:
 
 - only its branch and worktree
 - only paths allowed by the task `write_allow`
-- `.ai/loop/results/<task-id>/result.md`
+- `.ai/herdr-dev-loop/loops/<namespace>/results/<task-id>/result.md`
 
 Reviewer owns:
 
-- only `.ai/loop/reviews/<review-id>.md`
+- only `.ai/herdr-dev-loop/loops/<namespace>/reviews/<review-id>.md`
 - no code edits
 
 Gap Auditor owns:
 
-- only `.ai/loop/gaps/<gap-id>.md`
+- only `.ai/herdr-dev-loop/loops/<namespace>/gaps/<gap-id>.md`
 - no code edits
 - no generic code-review findings unless they directly prove plan/spec drift
 
 Advisor owns:
 
-- only `.ai/loop/advice/<advice-id>-<participant-id>.md`
+- only `.ai/herdr-dev-loop/loops/<namespace>/advice/<advice-id>-<participant-id>.md`
 - no code edits
 - no gate closure, task creation, merge, or final decision authority
 - recommendations for fix strategy, specification shape, accepted-risk rationale, or Manager decision records
@@ -155,7 +169,7 @@ Each tick or pump transition must:
 
 Do not run an unbounded loop. Prefer `tick --once` while inspecting a new repository; use `pump --max-transitions <n>` only after the workflow is stable.
 
-Use `hloop triage review <review-id>` or `hloop triage gap <gap-id>` to convert machine-readable `Fix Task Candidates` sections into `.ai/loop/triage/*.fix-task-draft.md`. Add `--create-tasks` only after Manager approval; this creates queued fix Workers from the candidates.
+Use `hloop triage review <review-id>` or `hloop triage gap <gap-id>` to convert machine-readable `Fix Task Candidates` sections into `.ai/herdr-dev-loop/loops/<namespace>/triage/*.fix-task-draft.md`. Add `--create-tasks` only after Manager approval; this creates queued fix Workers from the candidates.
 
 Default cadence is intentionally busy: keep up to three Workers running, run Reviewer after each validated integration advance, and run Gap Auditor every three validated merges or before final completion. Gap Auditor and Reviewer may run while Workers continue on isolated branches, but Manager must not merge Worker branches while a Gap Auditor or Reviewer is actively reading the integration branch.
 
@@ -172,7 +186,7 @@ Agent backend selection is separate from protocol selection:
 - Task frontmatter may override the Worker provider/model for a specific task.
 - Codex remains the default fallback provider for all roles.
 
-Use `.ai/loop/PROFILE.md` to adapt the loop to product reality. `branch_strategy: integration` enables the built-in integration-branch flow. `pr-per-task` and `custom` require Manager to record the exact handoff in `PLAN.md` and avoid assuming the default merge/publish steps. `worker_qa_profile` is the QA each Worker must record for its task; `manager_qa_profile` is the separate final QA gate Manager records in `qa/FINAL.md` after integration/review/gap gates.
+Use `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md` to adapt the loop to product reality. `branch_strategy: integration` enables the built-in integration-branch flow. `pr-per-task` and `custom` require Manager to record the exact handoff in `PLAN.md` and avoid assuming the default merge/publish steps. `worker_qa_profile` is the QA each Worker must record for its task; `manager_qa_profile` is the separate final QA gate Manager records in `qa/FINAL.md` after integration/review/gap gates.
 
 Assume Gap Auditor and Reviewer runs can take several minutes. Use `hloop gap watch <gap-id>` or `hloop reviewer watch <review-id>` to inspect the TUI pane. If an auditor or reviewer is still running, wait up to `gap_wait_ms` or `review_wait_ms` only after all other safe transitions for the tick have been considered. While waiting, continue Manager work that does not mutate the inspected integration head: refine tasks, prepare validation notes, harvest finished Workers, create fix tasks from already triaged findings, or dispatch non-overlapping queued Workers up to `max_workers`.
 
@@ -183,7 +197,7 @@ Before manually intervening in a running loop, run `hloop conductor --no-fail`. 
 Load only the reference needed for the current operation:
 
 - `references/state-machine.md`: phases, tick behavior, and stop conditions
-- `references/artifact-contract.md`: required `.ai/loop` file shapes and frontmatter
+- `references/artifact-contract.md`: required `.ai/herdr-dev-loop/loops/<namespace>` file shapes and frontmatter
 - `references/branch-policy.md`: branch/worktree topology, default integration flow, and custom branch strategy rules
 - `references/profile-examples.md`: `/goal` prompt examples for branch strategy, review lanes, Worker QA, and Manager final QA selection
 - `references/manager-loop.md`: Manager checklist and triage rules
@@ -202,7 +216,7 @@ Load only the reference needed for the current operation:
 Stop immediately when:
 
 - `HERDR_ENV=1` is not set.
-- `.ai/loop/STATE.json` is missing for a non-init operation.
+- `.ai/herdr-dev-loop/loops/<namespace>/STATE.json` is missing for a non-init operation.
 - a blocking user decision exists.
 - an unresolved plan/spec choice must be decided from outside the original plan; record it in `DECISIONS.md` and `USER_ACTION_REQUIRED.md`.
 - a Worker changed files outside `write_allow` or inside `write_deny`.

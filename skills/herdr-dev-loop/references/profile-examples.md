@@ -190,7 +190,7 @@ Branch/QA requirements:
 Expected final QA record:
 
 ```bash
-hloop qa record --status passed --summary "Staging smoke passed for <feature>" --evidence https://staging.example.test/<path> --evidence .ai/loop/reports/screenshots/<case>.png
+hloop qa record --status passed --summary "Staging smoke passed for <feature>" --evidence https://staging.example.test/<path> --evidence .ai/herdr-dev-loop/loops/<namespace>/reports/screenshots/<case>.png
 ```
 
 Expected behavior:
