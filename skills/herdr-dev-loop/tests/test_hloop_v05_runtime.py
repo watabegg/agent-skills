@@ -135,6 +135,53 @@ class ProviderPreflightIntegrationTests(unittest.TestCase):
                 blocked["last_preflight_error"]["reason"], preflight["reason"]
             )
 
+    def test_preflight_blocks_on_git_executable_identity_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            recorded = hloop.git_executable_identity()
+            state = hloop.load_state(repo)
+            state["git_identity"] = {**recorded, "sha256": "0" * 64}
+            hloop.save_state(repo, state)
+
+            with self.assertRaisesRegex(hloop.HLoopError, "git executable identity drift"):
+                hloop.preflight_loop(repo, require_integration_branch=True)
+
+            blocked = hloop.load_state(repo)
+            self.assertEqual(blocked["phase"], "blocked_environment")
+            self.assertIn(
+                "git executable identity drift", blocked["last_preflight_error"]["reason"]
+            )
+
+    def test_trust_git_updates_recorded_identity_and_requires_idle_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            state["git_identity"] = {**hloop.git_executable_identity(), "sha256": "0" * 64}
+            state["tasks"] = {"T001": {"status": "running"}}
+            hloop.save_state(repo, state)
+
+            with self.assertRaisesRegex(hloop.HLoopError, "role is running"):
+                hloop.cmd_runtime_trust_git(
+                    SimpleNamespace(repo=str(repo), reason="package upgrade")
+                )
+
+            state["tasks"]["T001"]["status"] = "merged"
+            hloop.save_state(repo, state)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    hloop.cmd_runtime_trust_git(
+                        SimpleNamespace(repo=str(repo), reason="package upgrade")
+                    ),
+                    0,
+                )
+            trusted = hloop.load_state(repo)
+            self.assertEqual(
+                trusted["git_identity"]["sha256"], hloop.git_executable_identity()["sha256"]
+            )
+            hloop.preflight_loop(repo, require_integration_branch=True)
+
 
 class BrokerReportLifecycleTests(unittest.TestCase):
     """Exercises agent report / inbox / manager sleep-next / broker status-recover."""
@@ -577,6 +624,135 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertEqual(task_state["pending_manager_messages"], [])
             self.assertFalse((repo / pending_rel).exists())
 
+    def test_message_drain_only_retries_undelivered_and_never_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "pane_id": "pane-1",
+                "agent_provider": "codex",
+                "pending_manager_messages": [],
+            }
+            undelivered_rel = hloop.write_pending_manager_message(
+                repo,
+                role="Worker",
+                agent_id="T001",
+                pane_id="pane-1",
+                source="argv",
+                message="please retry me",
+                error="simulated send failure",
+            )
+            unknown_rel = hloop.write_pending_manager_message(
+                repo,
+                role="Worker",
+                agent_id="T001",
+                pane_id="pane-1",
+                source="argv",
+                message="do not auto-resend me",
+                error="simulated ambiguous delivery",
+            )
+            task_state["pending_manager_messages"] = [
+                {
+                    "at": hloop.now_iso(),
+                    "source": "argv",
+                    "pending_path": undelivered_rel.as_posix(),
+                    "error": "boom",
+                    "status": "undelivered",
+                },
+                {
+                    "at": hloop.now_iso(),
+                    "source": "argv",
+                    "pending_path": unknown_rel.as_posix(),
+                    "error": "ambiguous",
+                    "status": "unknown",
+                },
+            ]
+            state["tasks"] = {"T001": task_state}
+            hloop.save_state(repo, state)
+
+            sent = []
+
+            def capture_send(provider, pane_id, message, *unused):
+                sent.append((pane_id, message))
+
+            with mock.patch.object(hloop, "send_agent_tui_message", side_effect=capture_send), mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), contextlib.redirect_stdout(io.StringIO()) as buffer:
+                hloop.cmd_message_drain(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        timeout_ms=1,
+                        input_settle_ms=0,
+                        submit_verify_ms=1,
+                        submit_attempts=1,
+                    )
+                )
+            self.assertIn("drained 1 pending message(s); 1 still pending", buffer.getvalue())
+            self.assertEqual(len(sent), 1)
+            self.assertIn("please retry me", sent[0][1])
+            self.assertEqual(len(task_state["pending_manager_messages"]), 1)
+            self.assertEqual(task_state["pending_manager_messages"][0]["status"], "unknown")
+            self.assertFalse((repo / undelivered_rel).exists())
+            self.assertTrue((repo / unknown_rel).exists())
+
+    def test_record_manager_message_carries_digest_and_valid_delivery_status(self):
+        target = {}
+        hloop.record_manager_message(target, "argv", "hello world")
+        entry = target["manager_messages"][-1]
+        self.assertEqual(entry["delivery_status"], "delivered")
+        self.assertEqual(entry["digest"], hloop.message_digest("hello world"))
+        with self.assertRaisesRegex(hloop.HLoopError, "unsupported message delivery status"):
+            hloop.record_manager_message(target, "argv", "hello", delivery_status="bogus")
+
+    def test_semantic_ack_barrier_blocks_worker_finalize_done_until_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            task_state = {"status": "running", "result_status": "in_progress"}
+            hloop.arm_semantic_ack_barrier(task_state, message_id="msg-1", digest="deadbeef")
+            state["tasks"] = {"T001": task_state}
+            hloop.save_state(repo, state)
+            hloop.write_text(
+                hloop.task_file(repo, "T001"),
+                hloop.frontmatter({"id": "T001", "run_id": state["run_id"]}) + "\n\n# Task T001\n",
+            )
+
+            self.assertTrue(hloop.semantic_ack_barrier_blocking(task_state))
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK approval"):
+                    hloop.cmd_worker_finalize(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            task_id="T001",
+                            status="done",
+                            validation_command=[],
+                            validation_result=[],
+                            blocking_question=[],
+                        )
+                    )
+
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo), agent_id="T001", decision="approve", reason="reviewed the change"
+                    )
+                )
+            reloaded_task_state = hloop.load_state(repo)["tasks"]["T001"]
+            self.assertEqual(reloaded_task_state["semantic_ack_barrier"]["status"], "approved")
+            self.assertEqual(hloop.semantic_ack_barrier_blocking(reloaded_task_state), "")
+
+    def test_contract_changing_message_rearms_an_already_resolved_barrier(self):
+        agent_state = {}
+        hloop.arm_semantic_ack_barrier(agent_state, message_id="msg-1", digest="aaa")
+        hloop.resolve_semantic_ack_barrier(agent_state, decision="approve", reason="ok")
+        self.assertEqual(agent_state["semantic_ack_barrier"]["status"], "approved")
+        hloop.arm_semantic_ack_barrier(agent_state, message_id="msg-2", digest="bbb")
+        self.assertEqual(agent_state["semantic_ack_barrier"]["status"], "pending")
+        self.assertEqual(agent_state["semantic_ack_barrier"]["message_id"], "msg-2")
+        self.assertTrue(hloop.semantic_ack_barrier_blocking(agent_state))
+
 
 class ReviewGroupRuntimeTests(unittest.TestCase):
     """Exercises reviewer start/harvest/close for every 0.5 review mode."""
@@ -881,6 +1057,19 @@ class ReviewGroupRuntimeTests(unittest.TestCase):
                             session_cleanup="none",
                         )
                     )
+
+    def test_reviewer_start_rejects_swarm_exceeding_configured_capacity_before_pane_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            state["review_capacity_limits"] = {"codex": 3}
+            hloop.save_state(repo, state)
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    hloop.hloop_providers.ProviderError, "review swarm capacity exceeded"
+                ):
+                    hloop.cmd_reviewer_start(self.start_args(repo, "swarm", "R901"))
+            self.assertNotIn("R901", state.get("reviews", {}))
+            self.assertFalse((repo.parent / "R901-worktree").exists())
 
     def test_triage_accepts_only_manifest_confirmed_fingerprints(self):
         confirmed = "sha256:" + "a" * 64
