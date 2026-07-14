@@ -23,7 +23,9 @@ $HLOOP namespaces
 
 `namespaces` lists coexisting loops and reports `.ai/loop` only as `legacy ignored`. `agent abort` and `agent requeue` recover roles that exited without artifacts. `experience show` and `experience recommend` expose the repo-local worktree setup history below `.ai/herdr-dev-loop/experience/`.
 
-Use `migrate --dry-run` and then `migrate --apply` for pre-0.4 state. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
+Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revision 0 state. herdr-dev-loop 0.5.0 writes format 3 revision 1 and rejects mutation from an unknown future revision. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
+
+Use `config path`, `config validate`, `config explain`, and `config init` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; 0.5.0 has no in-place `config apply` subcommand.
 
 Mutating helper commands take the repo-local Git lock from `git rev-parse --git-path hloop.lock` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
@@ -177,6 +179,8 @@ hloop doctor --sessions --json
 Treat P0 conductor findings as unsafe to continue. In particular, `danger-full-access` or `dangerously-bypass-approvals-and-sandbox` in STATE or pane output means the agent must be stopped and recreated through `hloop` with `workspace-write` sandbox. Treat P1 trust findings as blockers for the affected task/gate until Manager has rerun, harvested, or documented the residual risk.
 
 `review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
+
+Structured role reports use `agent report`; Manager reads them through `inbox list` and `manager next`, registers a wake lease with `manager sleep`, and consumes a handled event with `inbox ack`. `broker recover` replays the local outage spool. These broker, inbox, input, and spool paths remain local-only and are never checkpointed.
 
 Use `pump` for queue-drain behavior:
 

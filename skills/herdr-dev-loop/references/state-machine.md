@@ -16,7 +16,7 @@ For `persistence: local-only`, committed snapshot checks are replaced by copying
 
 An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again with a new attempt id. The original attempt base is immutable; an unmerged branch with commits is archived instead of silently reused or deleted. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
 
-State format 2 is required. For a 0.3.x loop, first run `hloop migrate --dry-run`, inspect the result, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist.
+State format 3 revision 1 is required by herdr-dev-loop 0.5.0. For format 2 or format 3 revision 0, first run `hloop migrate --dry-run`, inspect the complete revision path, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
 
 ## Phases
 
@@ -58,17 +58,18 @@ Each tick starts by reading:
 
 Then run, at most, one material transition:
 
-1. harvest completed Workers, Gap Auditors, Reviewers, or explicitly started Advisors
-2. close any harvested Worker/Gap Auditor/Reviewer/Advisor pane and clean up provider sessions when supported unless inspection is explicitly requested
-3. merge one ready Worker when no Gap Auditor or Reviewer is currently reading the integration branch
-4. validate integration
-5. require Manager triage for harvested Gap Auditor or Reviewer artifacts
-6. start one Gap Auditor when validation passes and the gap gate is open
-7. start one Reviewer when validation passes and the review gate is open
-8. dispatch queued Workers in a batch up to the safe worker limit
-9. wait for a running Gap Auditor or Reviewer only after no other safe transition is available
-10. require Manager final QA when `manager_qa_profile` is not `none`
-11. generate a final report
+1. replay a valid broker spool and drain the durable Manager inbox
+2. harvest completed Workers, Gap Auditors, Reviewers, or explicitly started Advisors
+3. close any harvested Worker/Gap Auditor/Reviewer/Advisor pane and clean up provider sessions when supported unless inspection is explicitly requested
+4. merge one ready Worker when no Gap Auditor or Reviewer is currently reading the integration branch
+5. validate integration and update requirement progress only after verifying artifact, SHA, and test or QA evidence
+6. require Manager triage for harvested Gap Auditor or Reviewer artifacts
+7. start one Gap Auditor when validation passes and the gap gate is open
+8. start one Reviewer when validation passes and the review gate is open
+9. dispatch queued Workers in a batch up to the safe worker limit, excluding only dependency-scoped decision blocks
+10. wait for a running role only after no other safe transition is available, using a Manager wake lease for structured reports
+11. require Manager final QA when `manager_qa_profile` is not `none`
+12. arm stable final gates and generate the terminal report only after all current-head gates pass
 
 Prefer a small number of obvious transitions over attempting to finish a goal in one tick.
 
@@ -132,7 +133,7 @@ Set a blocked or failed phase and stop when:
 - `HERDR_ENV=1` is absent.
 - required CLI tools are missing.
 - `STATE.json` is unreadable or contradicts the current branch.
-- a pending decision has `Blocking: true`.
+- every remaining safe task is dependency-blocked by an unresolved `blocking-user` decision.
 - a Worker result is missing required fields.
 - a Worker result reports `partial`, `blocked`, `failed`, `abandoned`, `merge_ready: false`, blocking questions, or missing validation.
 - a Worker changed files outside its allowed scope.
@@ -149,3 +150,7 @@ Waiting for a running Worker, Gap Auditor, Reviewer, or explicit Advisor is not 
 When the phase is `no_progress` or a long-running loop appears stuck, run `hloop conductor --no-fail` before changing strategy. Treat its P0/P1 findings as the next concrete Manager action unless the finding is proven stale by disk state.
 
 Do not continue normal dispatch or merge work while `conductor` reports a P0 trust issue. Stop the affected pane if it is still running, restart the agent through `hloop`, or record the run as unsafe. Treat P1 trust issues as blockers for the affected task/gate until Manager has rerun, harvested, or explicitly recorded the residual risk.
+
+An unresolved `blocking-user` decision blocks its named tasks and their unmerged dependencies. It becomes a loop-wide `blocked_user_decision` only after no unaffected queued task, running role, merge-ready result, validation, review, or gap work remains. A response alone does not unblock the tasks; the Manager must record a terminal decision resolution.
+
+Before terminal completion, Manager closes the current batch, completes review triage, clears fix-task drafts, and runs `hloop final-gates arm`. The arm is pinned to one target SHA. A newly created task disarms it. `hloop finish` rechecks merged tasks, current-head validation, review, gap, Manager QA, cleanup, and the arm before writing the final target and report.

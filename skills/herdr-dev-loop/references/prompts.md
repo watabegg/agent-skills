@@ -22,6 +22,12 @@ Loop profile:
 
 Follow the HLoop Worker Protocol unless the task explicitly chooses compatibility mode.
 
+Report protocol:
+- after read-only investigation, submit `hloop agent report --type ack` with understood goal, scope, acceptance, and approach before material edits
+- send `milestone` only for a meaningful state change
+- send `attention` when Manager action is required
+- send `completion` with artifact, head SHA, validation references, residual risks, and handoff before the terminal sentinel
+
 Rules:
 - edit only write_allow paths
 - do not edit STATE.json, MISSION.md, PLAN.md, PROFILE.md, DECISIONS.md, other tasks, or other results
@@ -63,6 +69,7 @@ Rules:
 - compare plan/spec requirements to actual implementation
 - report implementation/spec alignment gaps only
 - classify each item as implemented, partial, missing, deferred, obsolete-spec, or needs-decision
+- use the same semantic ACK, attention, and completion report protocol; a report never replaces the gap artifact
 
 Required output:
 - .ai/herdr-dev-loop/loops/<namespace>/gaps/G001.md
@@ -93,6 +100,12 @@ Read:
 - .ai/herdr-dev-loop/loops/<namespace>/results/*/result.md
 
 Follow the HLoop Native Review Protocol unless PROFILE.md explicitly selects compatibility mode.
+
+Review group:
+- record `single`, `swarm`, `dual`, or `dual-swarm`
+- pin every Coordinator lane and Verifier to the prompt-provided head SHA
+- retain budget or verifier shortfalls as `insufficient_evidence`
+- submit semantic ACK before investigation and completion only after manifest and artifact validation
 
 Rules:
 - do not edit code

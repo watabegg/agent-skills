@@ -22,6 +22,7 @@ The Reviewer prompt must say:
 - include the prompt-provided `skill_version` in artifact frontmatter
 - include `## Fix Task Candidates` with machine-readable task candidate blocks for findings that should become Worker fix tasks; each candidate needs `action: fix_task`, `severity` or `priority`, non-empty `write_allow`, non-empty `acceptance`, and `rationale`
 - print `HERDR_LOOP_REVIEW_DONE:<review-id>:<reported|blocked|failed>`
+- submit semantic ACK before investigation, attention for an evidence or specification blocker, and completion only after the manifest and review artifact are ready
 
 ## HLoop Native Review Protocol
 
@@ -72,6 +73,14 @@ git diff <base-branch>...<integration-branch>
 ```
 
 Use uncommitted diff review only when Manager intentionally wants to review local integration changes before commit.
+
+## Review Group Modes
+
+`single` uses one discovery lane. `swarm` uses four to eight lanes on one provider. `dual` uses one Codex and one Claude lane. `dual-swarm` uses four to eight lanes per provider. A Coordinator owns the provider-native sub-agents; only the Coordinator writes the HLoop review artifact.
+
+All lanes, normalized findings, and verifiers are pinned to the same head SHA. Matching semantic fingerprints from Codex and Claude are `consensus`; a provider-unique candidate remains `unique`. Both need independent fact verification. P0, P1, and specification-decision candidates require two passes, with both providers represented in dual modes. A missing lane, verifier shortfall, finding-count drift, or exhausted budget keeps the manifest incomplete and retains the candidate as `insufficient_evidence`.
+
+See [Review Swarm And Dual Review Contract](review-swarm.md) for the normalized finding and bounded verifier contract.
 
 ## Compatibility Mode
 

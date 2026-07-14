@@ -23,6 +23,7 @@ The Gap Auditor prompt must say:
 - after audit is complete, write only `gaps/<gap-id>.md`
 - include the prompt-provided `skill_version` in artifact frontmatter
 - print `HERDR_LOOP_GAP_DONE:<gap-id>:<aligned|gaps-found|blocked|failed>`
+- submit semantic ACK before investigation, attention when the specification boundary cannot be audited safely, and completion only after the gap artifact is ready
 
 ## Gap Scope
 

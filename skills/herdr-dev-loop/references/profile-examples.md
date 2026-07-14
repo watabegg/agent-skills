@@ -207,3 +207,36 @@ Expected behavior:
 - `staging`: require staging evidence when credentials/URL/data rules are available.
 - `custom`: follow the QA section in PLAN.md exactly.
 - `none`: skip that QA layer only with an explicit recorded reason.
+
+## `/goal` Example: Event-Driven Dual-Swarm Review
+
+```text
+/goal Implement <feature>, track the original requirements, and run bounded Codex plus Claude review before completion.
+
+Use $herdr-dev-loop.
+
+Loop profile:
+- branch_strategy: integration
+- worker_protocol: native
+- review_protocol: native
+- reviewer_agent_provider: codex
+- worker_qa_profile: local
+- manager_qa_profile: local
+
+Review start requirements:
+- Start the final Reviewer with `hloop reviewer start --mode dual-swarm`.
+- Use four discovery lanes per provider unless the accepted config selects another bounded count.
+
+Reporting requirements:
+- Record every new user instruction before changing the task graph.
+- Require semantic ACK from each long-running role before material work.
+- Process attention and completion through the durable inbox.
+- Sleep on a run-bound wake lease when the inbox has no actionable event.
+- Mark a requirement verified only from same-head artifact and passing validation or QA evidence.
+
+Completion requirements:
+- Close the batch and triage all confirmed review findings.
+- Preserve unique and consensus findings until independent verification finishes.
+- Arm final gates only after no fix-task draft remains.
+- Run finish only after current-head validation, review, gap, Manager QA, and cleanup pass.
+```

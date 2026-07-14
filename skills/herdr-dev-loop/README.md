@@ -2,7 +2,7 @@
 
 `herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/herdr-dev-loop/loops/<namespace>` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
 
-このREADMEは運用の入口です。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)、[`/goal`のプロファイル例](references/profile-examples.md)を参照してください。
+このREADMEは0.5.0運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、厳格なreviewは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。
 
 ## 最初に確認すること
 
@@ -34,14 +34,30 @@ Skillを使うManagerは、ほかの調査や変更より先に `$HLOOP version`
 新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
 
 ```text
-herdr-dev-loop 0.4.0 / namespace <namespace> を使用します（loop_skill_version: 0.4.0, run_id: 20260712T...-goal）
+herdr-dev-loop 0.5.0 / namespace <namespace> を使用します（loop_skill_version: 0.5.0, run_id: 20260714T...-goal）
 ```
 
 `hloop namespaces` は同居するloopを列挙し、旧 `.ai/loop` が存在する場合は `legacy ignored` と表示します。
 
+## `config.toml` の設定
+
+0.5.0はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
+
+```bash
+$HLOOP config path --json
+$HLOOP config validate --json
+$HLOOP config explain --repo <repo> --json
+```
+
+探索順は`$HLOOP_CONFIG_HOME/config.toml`、`$XDG_CONFIG_HOME/herdr-dev-loop/config.toml`、`~/.config/herdr-dev-loop/config.toml`です。最初に見つかった1ファイルだけを読み、複数ファイルをmergeしません。
+
+`[defaults]`にWorkerとReviewerのprovider、model、effort、同時Worker数、session cleanupを設定できます。`[[scope]]`は既定でcanonicalなrepository rootに一致し、同じrepository内のsubdirectoryから起動しても結果が変わりません。起動directory固有の設定だけ`match = "cwd"`を明示します。設定例は[`examples/config.toml`](examples/config.toml)にあります。
+
+解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、task override、role start overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
+
 ## 永続化とworktree初期化経験
 
-既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。0.3.xのstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。
+既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。format 2または古いformat 3のstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。0.5.0の現行stateはformat 3、revision 1です。
 
 worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
 
@@ -119,6 +135,62 @@ paneは閉じられ、再投入時は古いworktreeを整理します。product�
 - **manager_qa_profile**：統合、Reviewer、Gap Auditorの後にManagerが行う最終QAです。
 
 どちらも `repo-default`、`local`、`preview`、`staging`、`custom`、`none` を選べます。Workerにはローカル確認をさせ、Managerの最終QAを省略する場合は `worker_qa_profile: local` と `manager_qa_profile: none` にします。
+
+### Review mode
+
+Reviewer protocolとreview modeは別の設定です。`single`は1 provider、1 laneです。`swarm`は1 providerで4本から8本、`dual`はCodexとClaudeで1本ずつ、`dual-swarm`はproviderごとに4本から8本のdiscovery laneを使います。
+
+全laneとVerifierは同じhead SHAへ固定されます。CodexとClaudeが同じsemantic fingerprintを報告したfindingは`consensus`、一方だけなら`unique`です。どちらも二次確認へ進みます。P0、P1、仕様判断候補は2回の独立検証を必要とし、予算や独立Verifierが足りないfindingは`insufficient_evidence`として残ります。
+
+```bash
+$HLOOP reviewer start --mode swarm --dry-run
+$HLOOP reviewer start --mode dual-swarm --dry-run
+```
+
+詳細は[Review Swarm And Dual Review Contract](references/review-swarm.md)を参照してください。
+
+## 利用者入力、要件、判断
+
+利用者から新しい指示を受けたら、taskを変える前に入力を保存し、observableな受入条件へ変換します。
+
+```bash
+$HLOOP input record --source manager-chat --text '<利用者の指示>'
+$HLOOP requirement new \
+  --source-input U0001 \
+  --acceptance '<観測可能な完了条件>' \
+  --priority P1
+```
+
+raw inputは自動redactionされたlocal-only artifactで、checkpointやproduct commitには入りません。要件は`not_started`、`in_progress`、`implemented_unverified`、`verified`の順に進みます。`verified`には同じhead SHAのartifactとpassing testまたはQA evidenceが必要です。Agentの自己申告だけでは検証済みにできません。
+
+元のmissionやplanから決まらない選択は`decision new`で記録します。`blocking-user`には影響taskを必ず指定し、そのtaskと未mergeの依存taskだけを止めます。ほかの安全な作業が残る間はloop全体をblockedにしません。利用者回答は`decision respond`、Managerが確認した確定結果は`decision resolve`で分けて記録します。
+
+```bash
+$HLOOP decision new \
+  --title '<平易な質問>' --class blocking-user \
+  --affects T004 \
+  --option '<選択肢1>' --option '<選択肢2>' \
+  --recommend-option opt_1 --recommend-rationale '<根拠>'
+```
+
+## Agent報告とevent-driven Manager
+
+0.5.0のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
+
+Managerはpaneを巡回する前にdurable inboxを処理します。
+
+```bash
+$HLOOP inbox list
+$HLOOP manager next
+```
+
+対応事項がなければwake leaseを登録します。
+
+```bash
+$HLOOP manager sleep --ttl-seconds 3600
+```
+
+report brokerはat-least-onceでwakeを記録するため、Managerはevent IDとlease generationで重複を除き、処理後に`hloop inbox ack <event-id>`を実行します。brokerを利用できないreportはrun専用spoolへ退避され、`hloop broker recover`で冪等に再生します。paneの確認は無言終了やcrashのfallbackであり、通常進捗のpollingには使いません。
 
 ## `/goal` のプロンプト例
 
@@ -305,12 +377,16 @@ Managerがdraftを確認した後、必要なものだけ `--create-tasks` でqu
 ├── STATE.json       # 現在の状態
 ├── DECISIONS.md     # 仕様判断
 ├── USER_ACTION_REQUIRED.md
+├── inputs/          # redacted raw input。local-only
+├── inbox/ broker/ broker-spool/ # local-only
 ├── tasks/ results/ reviews/ gaps/ advice/ triage/
 ├── qa/              # Manager最終QA
 └── reports/         # 最終報告
 ```
 
 Managerは mission、plan、profile、state、decisionを所有します。Workerは自分のブランチと自分のresult artifactだけを書きます。Reviewerは `reviews/`、Gap Auditorは `gaps/`、Advisorは `advice/` の自分のartifactだけを書きます。
+
+Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.0 CLIは`requirements/`、`progress/`、`context/`、`decisions/`の個別directoryを生成しません。
 
 Workerの結果をManagerが書き換えて `done` にすることはできません。`partial`、`blocked`、`failed`、`merge_ready: false` の場合は、原因を記録して再実行またはfix taskへ進みます。
 
@@ -332,28 +408,38 @@ Workerの結果をManagerが書き換えて `done` にすることはできま�
 $HLOOP --repo <repo> dashboard
 $HLOOP --repo <repo> conductor --no-fail
 $HLOOP --repo <repo> validate
+$HLOOP --repo <repo> final-gates arm
+$HLOOP --repo <repo> finish
 $HLOOP --repo <repo> report
 ```
 
-`manager_qa_profile` が `none` 以外なら、最終QAを `qa/FINAL.md` に記録します。最終報告は `reports/FINAL.md` に残します。
+`manager_qa_profile` が `none` 以外なら、最終QAを `qa/FINAL.md` に記録します。`final-gates arm`は全task merge、batch close、review triage完了、fix-task draftなしを同一SHAで確認します。新taskを作るとarmは解除されます。`finish`だけがcurrent-headのvalidation、review、gap、Manager QA、cleanup、final gateを再確認してdoneへ進めます。
 
 ## Skillを更新した後のinstall
 
-このリポジトリのSkillを編集したら、検証してからインストール済みコピーを同期します。
+このリポジトリのSkillを編集したら、検証してからCodexとClaude Codeの両コピーを同期します。既存directoryをtimestamp付きでbackupしてから`rsync --delete`を実行します。
 
 ```bash
 SKILL_DIR="skills/herdr-dev-loop"
-INSTALLED_DIR="${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+CODEX_SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop"
+CLAUDE_SKILL_DIR="${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/herdr-dev-loop"
 
 python3 /home/watabegg/.codex/skills/.system/skill-creator/scripts/quick_validate.py "$SKILL_DIR"
 python3 "$SKILL_DIR/scripts/hloop" selftest
-rsync -a --delete "$SKILL_DIR/" "$INSTALLED_DIR/"
-diff -qr "$SKILL_DIR" "$INSTALLED_DIR"
-python3 "$INSTALLED_DIR/scripts/hloop" selftest
-python3 /home/watabegg/.codex/skills/.system/skill-creator/scripts/quick_validate.py "$INSTALLED_DIR"
+test ! -e "$CODEX_SKILL_DIR" || cp -a "$CODEX_SKILL_DIR" "${CODEX_SKILL_DIR}.backup-${STAMP}"
+test ! -e "$CLAUDE_SKILL_DIR" || cp -a "$CLAUDE_SKILL_DIR" "${CLAUDE_SKILL_DIR}.backup-${STAMP}"
+rsync -a --delete "$SKILL_DIR/" "$CODEX_SKILL_DIR/"
+rsync -a --delete "$SKILL_DIR/" "$CLAUDE_SKILL_DIR/"
+diff -qr "$SKILL_DIR" "$CODEX_SKILL_DIR"
+diff -qr "$SKILL_DIR" "$CLAUDE_SKILL_DIR"
+python3 "$CODEX_SKILL_DIR/scripts/hloop" version --json
+python3 "$CLAUDE_SKILL_DIR/scripts/hloop" version --json
+python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
+python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
 ```
 
-この同期は既存の同名Skillを上書きします。反映されない場合はCodexを再起動します。
+同期後は新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.0表示を確認します。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。移行済みnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/RELEASE-0.5.0.md`](docs/RELEASE-0.5.0.md)にあります。
 
 ## 公開時の注意
 
