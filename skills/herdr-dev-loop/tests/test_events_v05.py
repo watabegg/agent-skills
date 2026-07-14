@@ -50,6 +50,28 @@ def report(
                 "approach": "純粋validationとtransactional storageを分離する",
             }
         )
+    elif report_type == "milestone":
+        value["risks"] = ["broker restart後の順序を引き続き確認する"]
+    elif report_type == "attention":
+        value.update(
+            {
+                "impact": "Managerへcompletionを配送できない",
+                "attempted": ["brokerを再起動した"],
+                "options": ["spoolを再送する", "taskを停止する"],
+                "recommendation": "spoolを再送する",
+                "blocked_scope": ["completion reportの配送"],
+            }
+        )
+    elif report_type == "completion":
+        value.update(
+            {
+                "artifact": "results/T003/result.md",
+                "head_sha": "a" * 40,
+                "validation_results": ["focused events suite passed"],
+                "residual_risks": ["Manager final QAは別gateである"],
+                "handoff": "artifactとhead SHAを照合してharvestする",
+            }
+        )
     return value
 
 
@@ -104,6 +126,47 @@ class ReportValidationTests(unittest.TestCase):
             events.validate_report(
                 report(report_type="milestone", needs_manager=True)
             )
+
+    def test_each_report_type_requires_nonempty_semantic_payload(self):
+        required_field = {
+            "ack": "understood_goal",
+            "milestone": "risks",
+            "attention": "impact",
+            "completion": "artifact",
+        }
+        for report_type, field in required_field.items():
+            with self.subTest(report_type=report_type, condition="valid"):
+                normalized = events.validate_report(report(report_type=report_type))
+                self.assertEqual(normalized["type"], report_type)
+            with self.subTest(report_type=report_type, condition="missing"):
+                missing = report(report_type=report_type)
+                del missing[field]
+                with self.assertRaisesRegex(
+                    events.ReportValidationError, f"{report_type} reports require"
+                ):
+                    events.validate_report(missing)
+            with self.subTest(report_type=report_type, condition="empty"):
+                empty = report(report_type=report_type)
+                empty[field] = [] if field == "risks" else ""
+                with self.assertRaisesRegex(events.ReportValidationError, field):
+                    events.validate_report(empty)
+
+        completion = events.validate_report(report(report_type="completion"))
+        self.assertEqual(completion["artifact"], "results/T003/result.md")
+        self.assertEqual(completion["head_sha"], "a" * 40)
+        self.assertTrue(completion["validation_results"])
+        self.assertTrue(completion["residual_risks"])
+        self.assertTrue(completion["handoff"])
+
+        invalid_head = report(report_type="completion")
+        invalid_head["head_sha"] = "not-a-sha"
+        with self.assertRaisesRegex(events.ReportValidationError, "head_sha"):
+            events.validate_report(invalid_head)
+
+        unknown = report(report_type="milestone")
+        unknown["unreviewed_command"] = "run me"
+        with self.assertRaisesRegex(events.ReportValidationError, "unknown fields"):
+            events.validate_report(unknown)
 
 
 class BrokerStorageTests(unittest.TestCase):
@@ -221,33 +284,163 @@ class BrokerStorageTests(unittest.TestCase):
                 )
             )
 
+    def test_stale_wakes_are_terminalized_and_never_return_to_pending(self):
+        first_event = client_event(summary="旧lease向け")
+        second_event = client_event(summary="新lease向け")
+        with self.store.transaction() as transaction:
+            first = self.store.accept_report(transaction, first_event)
+            second = self.store.accept_report(transaction, second_event)
+            old_lease = self.store.register_wake_lease(
+                transaction,
+                run_id="run-001",
+                manager_session_id="session-1",
+                pane_id="wH:p1",
+                expires_at=EXPIRES_AT,
+                created_at=CREATED_AT,
+            )
+            old_wake = self.store.enqueue_wake(
+                transaction,
+                event_id=first.event["event_id"],
+                lease_generation=old_lease["generation"],
+                created_at=CREATED_AT,
+            )
+            new_lease = self.store.register_wake_lease(
+                transaction,
+                run_id="run-001",
+                manager_session_id="session-2",
+                pane_id="wH:p2",
+                expires_at=EXPIRES_AT,
+                created_at=CREATED_AT,
+            )
+            new_wake = self.store.enqueue_wake(
+                transaction,
+                event_id=second.event["event_id"],
+                lease_generation=new_lease["generation"],
+                created_at=CREATED_AT,
+            )
+
+            pending = self.store.pending_wakes(transaction, at=CREATED_AT)
+            self.assertEqual(
+                [(item["event_id"], item["lease_generation"]) for item in pending],
+                [(new_wake.wake["event_id"], new_lease["generation"])],
+            )
+            terminals = transaction.connection.execute(
+                """
+                SELECT event_id, lease_generation FROM wake_consumptions
+                ORDER BY consumption_id
+                """
+            ).fetchall()
+            self.assertEqual(
+                [(row["event_id"], row["lease_generation"]) for row in terminals],
+                [(old_wake.wake["event_id"], old_lease["generation"])],
+            )
+            self.assertEqual(
+                self.store.consume_wake(
+                    transaction,
+                    event_id=old_wake.wake["event_id"],
+                    lease_generation=old_lease["generation"],
+                    consumed_at=CREATED_AT,
+                ),
+                broker.WakeConsumption(False, "stale-lease"),
+            )
+            self.assertEqual(
+                self.store.pending_wakes(transaction, at=EXPIRES_AT), []
+            )
+            terminal_count = transaction.connection.execute(
+                "SELECT COUNT(*) AS count FROM wake_consumptions"
+            ).fetchone()["count"]
+            self.assertEqual(terminal_count, 2)
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                transaction.connection.execute(
+                    "UPDATE wake_consumptions SET consumed_at = ?",
+                    (EXPIRES_AT,),
+                )
+
     def test_spool_replay_deletes_only_after_commit_and_replays_idempotently(self):
         spool = self.root / "spool"
-        first = client_event(event_id="a9a68f73-af7b-4416-97bb-a043d0f702fa")
-        second = client_event(event_id="baf37552-86dd-42ba-a036-7d555e34a479")
+        first = client_event(event_id="ffffffff-ffff-4fff-8fff-ffffffffffff")
+        second = client_event(event_id="00000000-0000-4000-8000-000000000001")
         broker.spool_client_event(spool, first)
         with self.assertRaises(broker.IdempotencyConflict):
             broker.spool_client_event(
                 spool,
                 client_event(
-                    event_id="a9a68f73-af7b-4416-97bb-a043d0f702fa",
+                    event_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
                     summary="same id, different report",
                 ),
             )
         broker.spool_client_event(spool, second)
 
-        with self.store.transaction() as transaction:
-            replayed = self.store.replay_spool(transaction, spool)
+        restarted = broker.BrokerStore(self.root / "broker")
+        with restarted.transaction() as transaction:
+            replayed = restarted.replay_spool(transaction, spool)
             self.assertEqual([item.event["sequence"] for item in replayed], [1, 2])
+            self.assertEqual(
+                [item.event["event_id"] for item in replayed],
+                [first["event_id"], second["event_id"]],
+            )
             self.assertEqual(len(list(spool.glob("*.json"))), 2)
         self.assertEqual(list(spool.glob("*.json")), [])
 
         broker.spool_client_event(spool, first)
-        with self.store.transaction() as transaction:
-            replayed = self.store.replay_spool(transaction, spool)
+        with restarted.transaction() as transaction:
+            replayed = restarted.replay_spool(transaction, spool)
             self.assertFalse(replayed[0].inserted)
             self.assertEqual(replayed[0].event["sequence"], 1)
         self.assertEqual(list(spool.glob("*.json")), [])
+
+    def test_future_schema_is_rejected_without_ddl_mutation(self):
+        future_root = self.root / "future-broker"
+        future_root.mkdir()
+        database_path = future_root / "broker.sqlite3"
+        connection = sqlite3.connect(database_path)
+        connection.executescript(
+            """
+            CREATE TABLE broker_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO broker_meta(key, value) VALUES('schema_version', '2');
+            CREATE TABLE future_records (id INTEGER PRIMARY KEY, value TEXT);
+            CREATE TRIGGER future_records_allow_update
+            AFTER UPDATE ON future_records BEGIN SELECT 1; END;
+            """
+        )
+        before = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name
+            """
+        ).fetchall()
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.close()
+
+        with self.assertRaisesRegex(
+            broker.BrokerStorageError, "unsupported broker schema version: 2"
+        ):
+            broker.BrokerStore(future_root)
+
+        connection = sqlite3.connect(database_path)
+        after = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name
+            """
+        ).fetchall()
+        self.assertEqual(after, before)
+        self.assertEqual(
+            connection.execute("PRAGMA schema_version").fetchone()[0], schema_version
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT value FROM broker_meta WHERE key = 'schema_version'"
+            ).fetchone()[0],
+            "2",
+        )
+        connection.close()
+
+        reopened = broker.BrokerStore(self.root / "broker")
+        with reopened.transaction() as transaction:
+            self.assertEqual(
+                [item["sequence"] for item in reopened.events(transaction)], []
+            )
 
     def test_runtime_socket_and_broker_owner_metadata(self):
         socket_path = broker.derive_runtime_socket_path(
