@@ -227,18 +227,26 @@ class BrokerStore:
     def _initialize(self) -> None:
         connection = self._connect()
         try:
-            connection.executescript(_schema_sql())
-            row = connection.execute(
-                "SELECT value FROM broker_meta WHERE key = 'schema_version'"
+            metadata_exists = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'broker_meta'
+                """
             ).fetchone()
+            row = None
+            if metadata_exists is not None:
+                row = connection.execute(
+                    "SELECT value FROM broker_meta WHERE key = 'schema_version'"
+                ).fetchone()
+                if row is not None and row["value"] != str(BROKER_SCHEMA_VERSION):
+                    raise BrokerStorageError(
+                        f"unsupported broker schema version: {row['value']}"
+                    )
+            connection.executescript(_schema_sql())
             if row is None:
                 connection.execute(
                     "INSERT INTO broker_meta(key, value) VALUES('schema_version', ?)",
                     (str(BROKER_SCHEMA_VERSION),),
-                )
-            elif row["value"] != str(BROKER_SCHEMA_VERSION):
-                raise BrokerStorageError(
-                    f"unsupported broker schema version: {row['value']}"
                 )
         finally:
             connection.close()
@@ -519,8 +527,14 @@ class BrokerStore:
         }
         return StoredWake(wake, True)
 
-    def pending_wakes(self, transaction: BrokerTransaction) -> list[dict[str, Any]]:
+    def pending_wakes(
+        self, transaction: BrokerTransaction, *, at: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return deliverable wakes and terminalize stale lease generations."""
+
         transaction.require_active(self)
+        timestamp = at or utc_now()
+        parse_rfc3339(timestamp, field="at")
         rows = transaction.connection.execute(
             """
             SELECT w.wake_id, w.event_id, w.run_id, w.lease_generation,
@@ -533,7 +547,25 @@ class BrokerStore:
             ORDER BY w.wake_id
             """
         ).fetchall()
-        return [dict(row) for row in rows]
+        pending: list[dict[str, Any]] = []
+        for row in rows:
+            wake = dict(row)
+            if self.lease_generation_matches(
+                transaction,
+                run_id=wake["run_id"],
+                generation=wake["lease_generation"],
+                at=timestamp,
+            ):
+                pending.append(wake)
+                continue
+            self._record_wake_terminal(
+                transaction,
+                event_id=wake["event_id"],
+                run_id=wake["run_id"],
+                lease_generation=wake["lease_generation"],
+                terminal_at=timestamp,
+            )
+        return pending
 
     def consume_wake(
         self,
@@ -556,12 +588,20 @@ class BrokerStore:
         if row is None:
             return WakeConsumption(False, "missing")
         timestamp = consumed_at or utc_now()
+        parse_rfc3339(timestamp, field="consumed_at")
         if not self.lease_generation_matches(
             transaction,
             run_id=row["run_id"],
             generation=lease_generation,
             at=timestamp,
         ):
+            self._record_wake_terminal(
+                transaction,
+                event_id=event_id,
+                run_id=row["run_id"],
+                lease_generation=lease_generation,
+                terminal_at=timestamp,
+            )
             return WakeConsumption(False, "stale-lease")
         existing = transaction.connection.execute(
             """
@@ -572,16 +612,35 @@ class BrokerStore:
         ).fetchone()
         if existing is not None:
             return WakeConsumption(False, "duplicate")
-        parse_rfc3339(timestamp, field="consumed_at")
+        self._record_wake_terminal(
+            transaction,
+            event_id=event_id,
+            run_id=row["run_id"],
+            lease_generation=lease_generation,
+            terminal_at=timestamp,
+        )
+        return WakeConsumption(True, "consumed")
+
+    def _record_wake_terminal(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        event_id: str,
+        run_id: str,
+        lease_generation: int,
+        terminal_at: str,
+    ) -> None:
+        """Append the shared terminal record for consumed or stale wakes."""
+
+        transaction.require_active(self)
         transaction.connection.execute(
             """
-            INSERT INTO wake_consumptions(
+            INSERT OR IGNORE INTO wake_consumptions(
                 event_id, run_id, lease_generation, consumed_at
             ) VALUES (?, ?, ?, ?)
             """,
-            (event_id, row["run_id"], lease_generation, timestamp),
+            (event_id, run_id, lease_generation, terminal_at),
         )
-        return WakeConsumption(True, "consumed")
 
     def replay_spool(
         self, transaction: BrokerTransaction, spool_directory: Path
@@ -736,40 +795,104 @@ def spool_client_event(spool_directory: Path, client_event: Mapping[str, Any]) -
     except OSError:
         pass
     target = directory / f"{event['event_id']}.json"
-    if os.path.lexists(target):
-        existing = _read_spool_file(target)
-        if existing["payload_digest"] != event["payload_digest"]:
-            raise IdempotencyConflict(
-                f"spooled event_id {event['event_id']} has a different digest"
+    lock_fd = os.open(directory / ".enqueue.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if os.path.lexists(target):
+            existing = _read_spool_file(target)
+            if existing["payload_digest"] != event["payload_digest"]:
+                raise IdempotencyConflict(
+                    f"spooled event_id {event['event_id']} has a different digest"
+                )
+            return target
+        sequence = _next_spool_sequence(directory)
+        try:
+            _atomic_create_json(
+                target,
+                {"spool_sequence": sequence, "event": event},
             )
-        return target
-    try:
-        _atomic_create_json(target, event)
-    except FileExistsError:
-        existing = _read_spool_file(target)
-        if existing["payload_digest"] != event["payload_digest"]:
-            raise IdempotencyConflict(
-                f"spooled event_id {event['event_id']} has a different digest"
-            )
+        except FileExistsError:
+            existing = _read_spool_file(target)
+            if existing["payload_digest"] != event["payload_digest"]:
+                raise IdempotencyConflict(
+                    f"spooled event_id {event['event_id']} has a different digest"
+                )
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     return target
+
+
+def _next_spool_sequence(directory: Path) -> int:
+    highest = 0
+    for path in directory.glob("*.json"):
+        if path.is_symlink() or not path.is_file():
+            raise BrokerStorageError(f"unsafe spool entry: {path}")
+        sequence, event = _read_spool_entry(path)
+        if path.stem != event["event_id"]:
+            raise BrokerStorageError(
+                f"spool filename does not match event_id: {path.name}"
+            )
+        if sequence is not None:
+            highest = max(highest, sequence)
+    return highest + 1
+
+
+def _read_spool_entry(path: Path) -> tuple[int | None, dict[str, Any]]:
+    if path.is_symlink() or not path.is_file():
+        raise BrokerStorageError(f"unsafe spool entry: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, Mapping) and set(value) == {"spool_sequence", "event"}:
+            sequence = value["spool_sequence"]
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                raise BrokerStorageError(
+                    f"invalid spool entry {path}: spool_sequence must be positive"
+                )
+            return sequence, validate_client_event(value["event"])
+        return None, validate_client_event(value)
+    except (OSError, json.JSONDecodeError, ReportValidationError) as exc:
+        raise BrokerStorageError(f"invalid spool entry {path}: {exc}") from exc
+
+
+def _read_spool_file(path: Path) -> dict[str, Any]:
+    _, event = _read_spool_entry(path)
+    return event
 
 
 def iter_spooled_events(
     spool_directory: Path,
 ) -> Iterator[tuple[Path, dict[str, Any]]]:
-    """Yield validated spool entries in deterministic filename order."""
+    """Yield validated spool entries in durable enqueue order."""
 
     directory = Path(spool_directory)
     if not directory.exists():
         return
-    for path in sorted(directory.glob("*.json")):
+    entries: list[tuple[int | None, Path, dict[str, Any]]] = []
+    seen_sequences: dict[int, Path] = {}
+    for path in directory.glob("*.json"):
         if path.is_symlink() or not path.is_file():
             raise BrokerStorageError(f"unsafe spool entry: {path}")
-        event = _read_spool_file(path)
+        sequence, event = _read_spool_entry(path)
         if path.stem != event["event_id"]:
             raise BrokerStorageError(
                 f"spool filename does not match event_id: {path.name}"
             )
+        if sequence is not None and sequence in seen_sequences:
+            raise BrokerStorageError(
+                "duplicate spool_sequence "
+                f"{sequence}: {seen_sequences[sequence].name}, {path.name}"
+            )
+        if sequence is not None:
+            seen_sequences[sequence] = path
+        entries.append((sequence, path, event))
+    entries.sort(
+        key=lambda item: (
+            item[0] is not None,
+            item[0] if item[0] is not None else 0,
+            item[1].name,
+        )
+    )
+    for _, path, event in entries:
         yield path, event
 
 
@@ -878,16 +1001,6 @@ def _atomic_create_json(path: Path, value: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
-
-
-def _read_spool_file(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise BrokerStorageError(f"unsafe spool entry: {path}")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return validate_client_event(value)
-    except (OSError, json.JSONDecodeError, ReportValidationError) as exc:
-        raise BrokerStorageError(f"invalid spool entry {path}: {exc}") from exc
 
 
 def _remove_spool_if_unchanged(path: Path, expected_digest: str) -> None:

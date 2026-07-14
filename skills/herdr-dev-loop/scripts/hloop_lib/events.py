@@ -23,6 +23,7 @@ MAX_LIST_ITEMS = 256
 MAX_REFERENCE_LENGTH = 4_096
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_HEAD_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REPORT_FIELDS = frozenset(
     {
         "run_id",
@@ -36,6 +37,17 @@ _REPORT_FIELDS = frozenset(
         "scope",
         "acceptance",
         "approach",
+        "risks",
+        "impact",
+        "attempted",
+        "options",
+        "recommendation",
+        "blocked_scope",
+        "artifact",
+        "head_sha",
+        "validation_results",
+        "residual_risks",
+        "handoff",
         "next",
         "needs_manager",
         "evidence_refs",
@@ -135,8 +147,9 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
 
     Unknown fields are rejected so role output cannot silently become an
     executable broker or Manager command.  ACK reports carry their semantic
-    contract fields; other report types still normalize those fields to an
-    empty value so all stored events have one shape.
+    contract fields.  Milestone, attention, and completion reports carry the
+    evidence needed to interpret their state change independently.  A report
+    cannot smuggle fields belonging to a different semantic type.
     """
 
     if not isinstance(report, Mapping):
@@ -199,15 +212,54 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
     scope = report.get("scope", [])
     acceptance = report.get("acceptance", [])
     approach = report.get("approach", "")
-    if report_type == "ack":
-        if "understood_goal" not in report or "scope" not in report:
-            raise ReportValidationError(
-                "ack reports require understood_goal, scope, acceptance, and approach"
-            )
-        if "acceptance" not in report or "approach" not in report:
-            raise ReportValidationError(
-                "ack reports require understood_goal, scope, acceptance, and approach"
-            )
+    risks = report.get("risks", [])
+    impact = report.get("impact", "")
+    attempted = report.get("attempted", [])
+    options = report.get("options", [])
+    recommendation = report.get("recommendation", "")
+    blocked_scope = report.get("blocked_scope", [])
+    artifact = report.get("artifact", "")
+    head_sha = report.get("head_sha", "")
+    validation_results = report.get("validation_results", [])
+    residual_risks = report.get("residual_risks", [])
+    handoff = report.get("handoff", "")
+    required_by_type = {
+        "ack": {"understood_goal", "scope", "acceptance", "approach"},
+        "milestone": {"risks"},
+        "attention": {
+            "impact",
+            "attempted",
+            "options",
+            "recommendation",
+            "blocked_scope",
+        },
+        "completion": {
+            "artifact",
+            "head_sha",
+            "validation_results",
+            "residual_risks",
+            "handoff",
+        },
+    }
+    type_specific_fields = set().union(
+        required_by_type["milestone"],
+        required_by_type["attention"],
+        required_by_type["completion"],
+    )
+    unexpected_type_fields = (set(report) & type_specific_fields) - required_by_type[
+        report_type
+    ]
+    if unexpected_type_fields:
+        raise ReportValidationError(
+            f"{report_type} reports contain fields for another type: "
+            + ", ".join(sorted(unexpected_type_fields))
+        )
+    missing_type_fields = required_by_type[report_type] - set(report)
+    if missing_type_fields:
+        raise ReportValidationError(
+            f"{report_type} reports require: "
+            + ", ".join(sorted(missing_type_fields))
+        )
 
     normalized = {
         "run_id": _text(
@@ -269,11 +321,89 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
             allow_newlines=False,
         ),
     }
+    if report_type == "milestone":
+        normalized["risks"] = _string_list(
+            risks, field="risks", item_maximum=MAX_TEXT_LENGTH
+        )
+    elif report_type == "attention":
+        normalized.update(
+            {
+                "impact": _text(
+                    impact, field="impact", maximum=MAX_TEXT_LENGTH
+                ),
+                "attempted": _string_list(
+                    attempted, field="attempted", item_maximum=MAX_TEXT_LENGTH
+                ),
+                "options": _string_list(
+                    options, field="options", item_maximum=MAX_TEXT_LENGTH
+                ),
+                "recommendation": _text(
+                    recommendation,
+                    field="recommendation",
+                    maximum=MAX_TEXT_LENGTH,
+                ),
+                "blocked_scope": _string_list(
+                    blocked_scope,
+                    field="blocked_scope",
+                    item_maximum=MAX_TEXT_LENGTH,
+                ),
+            }
+        )
+    elif report_type == "completion":
+        normalized.update(
+            {
+                "artifact": _text(
+                    artifact,
+                    field="artifact",
+                    maximum=MAX_REFERENCE_LENGTH,
+                    allow_newlines=False,
+                ),
+                "head_sha": _text(
+                    head_sha,
+                    field="head_sha",
+                    maximum=64,
+                    allow_newlines=False,
+                ).lower(),
+                "validation_results": _string_list(
+                    validation_results,
+                    field="validation_results",
+                    item_maximum=MAX_TEXT_LENGTH,
+                ),
+                "residual_risks": _string_list(
+                    residual_risks,
+                    field="residual_risks",
+                    item_maximum=MAX_TEXT_LENGTH,
+                ),
+                "handoff": _text(
+                    handoff, field="handoff", maximum=MAX_TEXT_LENGTH
+                ),
+            }
+        )
     parse_rfc3339(normalized["created_at"])
-    if report_type == "ack" and (
-        not normalized["scope"] or not normalized["acceptance"]
+    required_nonempty_lists = {
+        "ack": ("scope", "acceptance"),
+        "milestone": ("evidence_refs", "risks"),
+        "attention": ("attempted", "options", "blocked_scope"),
+        "completion": (
+            "evidence_refs",
+            "validation_results",
+            "residual_risks",
+        ),
+    }
+    empty_type_fields = [
+        field
+        for field in required_nonempty_lists[report_type]
+        if not normalized[field]
+    ]
+    if empty_type_fields:
+        raise ReportValidationError(
+            f"{report_type} reports require non-empty "
+            + ", ".join(empty_type_fields)
+        )
+    if report_type == "completion" and not _HEAD_SHA_RE.fullmatch(
+        normalized["head_sha"]
     ):
-        raise ReportValidationError("ack reports require non-empty scope and acceptance")
+        raise ReportValidationError("head_sha must be a 40- or 64-character hex digest")
     canonical_json(normalized)
     return normalized
 
