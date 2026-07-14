@@ -50,13 +50,24 @@
     "blocking_decisions"
   ],
   "properties": {
-    "state_format_version": {"type": "integer", "minimum": 2},
+    "state_format_version": {"const": 3},
+    "schema_revision": {"type": "integer", "minimum": 1},
     "goal_id": {"type": "string"},
     "run_id": {"type": "string"},
     "skill_version": {"type": "string"},
     "namespace": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "loop_path": {"type": "string", "pattern": "^\\.ai/herdr-dev-loop/loops/"},
     "persistence": {"type": "string", "enum": ["local-only", "branch-history"]},
+    "config_source": {
+      "type": "object",
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": {"type": "string"},
+        "path": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "resolved_config": {"type": "object"},
     "worktree_setup_commands": {"type": "array", "items": {"type": "string"}},
     "worker_setup_commands": {"type": "array", "items": {"type": "string"}},
     "reviewer_setup_commands": {"type": "array", "items": {"type": "string"}},
@@ -72,6 +83,7 @@
     "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
     "manager_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
     "manager_qa_status": {"type": "string", "enum": ["pending", "passed", "accepted-risk", "blocked", "failed", "not-required"]},
+    "manager_qa_evidence_path": {"type": "string", "pattern": "^\\.ai/herdr-dev-loop/loops/"},
     "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."},
     "worker_protocol": {"type": "string", "enum": ["native", "codex-impl"]},
     "review_protocol": {"type": "string", "enum": ["native", "codex-review-multi-v2"]},
@@ -108,6 +120,27 @@
     "gap_runner": {"type": "string", "enum": ["tui", "exec"]},
     "spec_sources": {"type": "array", "items": {"type": "string"}},
     "current_batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
+    "artifact_policy": {"type": "object"},
+    "resume_requirements": {"type": "array", "items": {"type": "object"}},
+    "pending_fix_task_drafts": {"type": "array", "items": {"type": "string"}},
+    "final_gate": {
+      "type": ["object", "null"],
+      "properties": {
+        "generation": {"type": "integer", "minimum": 1},
+        "status": {"type": "string", "enum": ["armed", "disarmed"]},
+        "target_sha": {"type": "string"},
+        "armed_at": {"type": "string"},
+        "armed_by": {"type": "string"},
+        "disarmed_at": {"type": "string"},
+        "disarmed_by": {"type": "string"},
+        "disarm_reason": {"type": "string"}
+      },
+      "required": ["generation", "status", "target_sha", "armed_at", "armed_by"],
+      "additionalProperties": false
+    },
+    "attempt_history": {"type": "array", "items": {"type": "object"}},
+    "cleanup_history": {"type": "array", "items": {"type": "object"}},
+    "lifecycle_diagnostics": {"type": "array", "items": {"type": "object"}},
     "tasks": {"type": "object"},
     "batches": {"type": "object"},
     "reviews": {"type": "object"},
