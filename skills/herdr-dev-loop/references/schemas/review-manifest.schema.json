@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Review Group Manifest",
+  "type": "object",
+  "required": [
+    "review_id",
+    "mode",
+    "head_sha",
+    "budget",
+    "providers",
+    "findings",
+    "verification",
+    "completeness"
+  ],
+  "properties": {
+    "review_id": {"type": "string", "pattern": "^R[0-9]{3}$"},
+    "mode": {"enum": ["single", "swarm", "dual", "dual-swarm"]},
+    "head_sha": {"type": "string", "minLength": 1},
+    "budget": {"$ref": "#/$defs/budget"},
+    "providers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/provider"}
+    },
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "review-finding.schema.json"}
+    },
+    "verification": {"$ref": "#/$defs/verification"},
+    "completeness": {"$ref": "#/$defs/completeness"}
+  },
+  "$defs": {
+    "budget": {
+      "type": "object",
+      "required": [
+        "max_parallel_verifiers",
+        "max_verifications",
+        "time_limit_seconds",
+        "provider_limits"
+      ],
+      "properties": {
+        "max_parallel_verifiers": {"type": "integer", "minimum": 1, "maximum": 8},
+        "max_verifications": {"type": "integer", "minimum": 1},
+        "time_limit_seconds": {"type": "integer", "minimum": 1},
+        "provider_limits": {
+          "type": "object",
+          "propertyNames": {"enum": ["codex", "claude"]},
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        }
+      },
+      "additionalProperties": false
+    },
+    "lanePlan": {
+      "type": "object",
+      "required": ["provider", "lane_id", "purpose", "agent_label"],
+      "properties": {
+        "provider": {"enum": ["codex", "claude"]},
+        "lane_id": {"type": "string", "minLength": 1},
+        "purpose": {"type": "string", "minLength": 1},
+        "agent_label": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "laneResult": {
+      "type": "object",
+      "required": [
+        "provider",
+        "lane_id",
+        "purpose",
+        "agent_label",
+        "status",
+        "finding_count"
+      ],
+      "properties": {
+        "provider": {"enum": ["codex", "claude"]},
+        "lane_id": {"type": "string", "minLength": 1},
+        "purpose": {"type": "string", "minLength": 1},
+        "agent_label": {"type": "string", "minLength": 1},
+        "status": {"enum": ["completed", "failed", "timeout"]},
+        "finding_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "provider",
+        "model",
+        "head_sha",
+        "role",
+        "coordinator_label",
+        "required_lanes",
+        "verifier_pool",
+        "lanes"
+      ],
+      "properties": {
+        "provider": {"enum": ["codex", "claude"]},
+        "model": {"type": "string", "minLength": 1},
+        "head_sha": {"type": "string", "minLength": 1},
+        "role": {"enum": ["reviewer", "coordinator"]},
+        "coordinator_label": {"type": "string", "minLength": 1},
+        "required_lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {"$ref": "#/$defs/lanePlan"}
+        },
+        "verifier_pool": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "lanes": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {"$ref": "#/$defs/laneResult"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "assignment": {
+      "type": "object",
+      "required": ["fingerprint", "head_sha", "provider", "verifier_agent", "pass_number"],
+      "properties": {
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "head_sha": {"type": "string", "minLength": 1},
+        "provider": {"enum": ["codex", "claude"]},
+        "verifier_agent": {"type": "string", "minLength": 1},
+        "pass_number": {"enum": [1, 2]}
+      },
+      "additionalProperties": false
+    },
+    "verificationRecord": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "head_sha",
+        "provider",
+        "verifier_agent",
+        "pass_number",
+        "fact_status",
+        "ignore_status",
+        "decision_status",
+        "progress_without_decision",
+        "severity",
+        "recommended_action"
+      ],
+      "properties": {
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "head_sha": {"type": "string", "minLength": 1},
+        "provider": {"enum": ["codex", "claude"]},
+        "verifier_agent": {"type": "string", "minLength": 1},
+        "pass_number": {"enum": [1, 2]},
+        "fact_status": {
+          "enum": ["confirmed", "refuted", "needs_spec", "insufficient_evidence"]
+        },
+        "ignore_status": {"enum": ["must_not_ignore", "may_defer", "no_action"]},
+        "decision_status": {
+          "enum": ["none", "localized_user_choice", "blocking_user_choice"]
+        },
+        "progress_without_decision": {"enum": ["yes", "partial", "no"]},
+        "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+        "recommended_action": {
+          "enum": ["fix_task", "ask_user", "accepted_risk_candidate", "discard"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "shortfall": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "fact_status",
+        "reason",
+        "required_passes",
+        "assigned_passes"
+      ],
+      "properties": {
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "fact_status": {"const": "insufficient_evidence"},
+        "reason": {
+          "enum": [
+            "budget-exhausted",
+            "provider-budget-exhausted",
+            "independent-verifier-unavailable"
+          ]
+        },
+        "required_passes": {"enum": [1, 2]},
+        "assigned_passes": {"type": "integer", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "required": [
+        "assignments",
+        "shortfalls",
+        "provider_usage",
+        "budget_exhausted",
+        "records"
+      ],
+      "properties": {
+        "assignments": {"type": "array", "items": {"$ref": "#/$defs/assignment"}},
+        "shortfalls": {"type": "array", "items": {"$ref": "#/$defs/shortfall"}},
+        "provider_usage": {
+          "type": "object",
+          "propertyNames": {"enum": ["codex", "claude"]},
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "budget_exhausted": {"type": "boolean"},
+        "records": {"type": "array", "items": {"$ref": "#/$defs/verificationRecord"}}
+      },
+      "additionalProperties": false
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["complete", "issues", "missing_lanes", "incomplete_findings"],
+      "properties": {
+        "complete": {"type": "boolean"},
+        "issues": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "missing_lanes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "incomplete_findings": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"mode": {"enum": ["single", "swarm"]}}},
+      "then": {"properties": {"providers": {"minItems": 1, "maxItems": 1}}}
+    },
+    {
+      "if": {"properties": {"mode": {"enum": ["dual", "dual-swarm"]}}},
+      "then": {"properties": {"providers": {"minItems": 2, "maxItems": 2}}}
+    },
+    {
+      "if": {"properties": {"mode": {"enum": ["single", "dual"]}}},
+      "then": {
+        "properties": {
+          "providers": {
+            "items": {
+              "properties": {
+                "required_lanes": {"minItems": 1, "maxItems": 1}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"mode": {"enum": ["swarm", "dual-swarm"]}}},
+      "then": {
+        "properties": {
+          "providers": {
+            "items": {
+              "properties": {
+                "required_lanes": {"minItems": 4, "maxItems": 8}
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}
