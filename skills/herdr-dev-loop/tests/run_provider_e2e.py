@@ -81,6 +81,15 @@ def diagnostic_record(stdout: str, stderr: str) -> dict[str, Any]:
     }
 
 
+def normalize_timeout_output(output: str | bytes | None) -> str:
+    """Return TimeoutExpired output as text regardless of subprocess behavior."""
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output
+
+
 def provider_message(provider: str, stdout: str, last_message: str) -> str:
     if provider == "codex":
         return last_message or stdout
@@ -277,8 +286,8 @@ def main() -> int:
         proc = subprocess.CompletedProcess(
             command,
             124,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or "provider probe timed out",
+            stdout=normalize_timeout_output(exc.stdout),
+            stderr=normalize_timeout_output(exc.stderr) or "provider probe timed out",
         )
         timed_out = True
 
