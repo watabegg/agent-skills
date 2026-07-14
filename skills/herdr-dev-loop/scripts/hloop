@@ -1390,6 +1390,30 @@ def extract_fix_task_candidates(text: str, source_id: str) -> tuple[list[dict[st
     return candidates, rejected
 
 
+def confirmed_review_fix_task_candidates(
+    manifest: hloop_review.ReviewManifest,
+    candidates: list[dict[str, Any]],
+    rejected_candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    confirmed = set(manifest.confirmed_fingerprints)
+    accepted = []
+    rejected = list(rejected_candidates)
+    for candidate in candidates:
+        source_finding = str(candidate.get("source_finding") or "")
+        if source_finding not in confirmed:
+            rejected.append(
+                reject_fix_task_candidate(
+                    candidate["title"],
+                    [
+                        "source_finding must identify a manifest finding whose required verification records are all confirmed"
+                    ],
+                )
+            )
+            continue
+        accepted.append(candidate)
+    return accepted, rejected
+
+
 def ensure_loop_dirs(repo: Path) -> None:
     for rel in [
         "tasks",
@@ -2093,6 +2117,26 @@ def review_file(repo: Path, review_id: str) -> Path:
     return loop_path(repo) / "reviews" / f"{review_id}.md"
 
 
+def review_group_dir(repo: Path, review_id: str) -> Path:
+    return loop_path(repo) / "reviews" / review_id
+
+
+def review_manifest_file(repo: Path, review_id: str) -> Path:
+    return review_group_dir(repo, review_id) / "MANIFEST.json"
+
+
+def review_provider_file(repo: Path, review_id: str, provider: str) -> Path:
+    return review_group_dir(repo, review_id) / "providers" / f"{provider}.md"
+
+
+def review_final_file(repo: Path, review_id: str) -> Path:
+    return review_group_dir(repo, review_id) / "FINAL.md"
+
+
+def is_directory_review(review: dict[str, Any]) -> bool:
+    return str(review.get("mode") or "single") != "single"
+
+
 def gap_file(repo: Path, gap_id: str) -> Path:
     return loop_path(repo) / "gaps" / f"{gap_id}.md"
 
@@ -2133,13 +2177,26 @@ def worker_artifact_path(
 
 
 def review_artifact_path(repo: Path, review_id: str, review: dict[str, Any]) -> Path:
+    fallback = (
+        review_final_file(repo, review_id)
+        if is_directory_review(review)
+        else review_file(repo, review_id)
+    )
     if artifact_was_harvested(review):
-        return recorded_path(repo, review.get("review_path"), review_file(repo, review_id))
+        return recorded_path(repo, review.get("review_path"), fallback)
     return recorded_path(
         repo,
         review.get("worktree_review_path") or review.get("review_path"),
-        review_file(repo, review_id),
+        fallback,
     )
+
+
+def load_review_manifest(path: Path) -> hloop_review.ReviewManifest:
+    try:
+        raw = json.loads(read_text(path))
+        return hloop_review.ReviewManifest.from_record(raw)
+    except (json.JSONDecodeError, hloop_review.ReviewModelError) as exc:
+        raise HLoopError(f"invalid review manifest {path}: {exc}") from exc
 
 
 def gap_artifact_path(repo: Path, gap_id: str, gap: dict[str, Any]) -> Path:
@@ -3713,10 +3770,28 @@ def validate_reviewer_worktree_scope(
     review_state: dict[str, Any],
     worktree: Path,
 ) -> list[str]:
-    allowed = {
-        str((LOOP_DIR / "reviews" / f"{review_id}.md").as_posix()),
-        str((LOOP_DIR / "prompts" / f"{review_id}.reviewer.md").as_posix()),
-    }
+    allowed = {str((LOOP_DIR / "prompts" / f"{review_id}.reviewer.md").as_posix())}
+    if is_directory_review(review_state):
+        allowed.update(
+            {
+                str((LOOP_DIR / "reviews" / review_id / "MANIFEST.json").as_posix()),
+                str((LOOP_DIR / "reviews" / review_id / "FINAL.md").as_posix()),
+                *{
+                    str(
+                        (
+                            LOOP_DIR
+                            / "reviews"
+                            / review_id
+                            / "providers"
+                            / f"{provider}.md"
+                        ).as_posix()
+                    )
+                    for provider in normalize_list(review_state.get("review_providers"))
+                },
+            }
+        )
+    else:
+        allowed.add(str((LOOP_DIR / "reviews" / f"{review_id}.md").as_posix()))
     baseline = set(normalize_list(review_state.get("baseline_dirty_files")))
     violations = []
     for path in porcelain_paths(worktree):
@@ -4481,6 +4556,18 @@ HERDR_LOOP_ROLE_DONE:{str(state.get("run_id") or "")}:{task_id}:{str(task_meta.g
 """
 
 
+def build_reviewer_group_plan(
+    mode: str, head_sha: str, agent_config: dict[str, str]
+) -> hloop_review.ReviewGroupPlan:
+    return hloop_review.plan_review_group(
+        mode,
+        head_sha=head_sha,
+        provider=agent_config["provider"],
+        model=DEFAULT_AGENT_MODEL,
+        models={agent_config["provider"]: agent_config["model"]},
+    )
+
+
 def render_reviewer_prompt(
     review_id: str,
     base_branch: str,
@@ -4488,6 +4575,7 @@ def render_reviewer_prompt(
     state: dict[str, Any],
     agent_config: dict[str, str] | None = None,
     head_sha: str = "",
+    review_plan: hloop_review.ReviewGroupPlan | None = None,
 ) -> str:
     review_protocol = state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
     if review_protocol not in REVIEW_PROTOCOLS:
@@ -4504,6 +4592,47 @@ def render_reviewer_prompt(
         manager_qa_profile,
         branch_strategy,
     )
+    mode = review_plan.mode if review_plan is not None else "single"
+    if mode == "single":
+        output_contract = f"""Output:
+- During review, do not write files.
+- After review is complete, write only {LOOP_DIR.as_posix()}/reviews/{review_id}.md.
+- Include frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, base, head, head_sha: {head_sha}, status: reported|blocked|failed.
+- If blocked or failed, still write the artifact with the concrete reason.
+- Include a `## Fix Task Candidates` section. For every finding that should become a Worker fix task, add:
+  `### FTNNN: <title>`, `action: fix_task`, `severity: P0|P1|P2|P3`, non-empty `write_allow:`, non-empty `acceptance:`, and non-empty `rationale:`.
+  Incomplete candidates are rejected by `hloop triage` and will not become tasks.
+  If no fix task is needed, write `No fix task candidates.`
+"""
+    else:
+        plan_json = json.dumps(review_plan.to_record(), ensure_ascii=False, indent=2)
+        provider_paths = "\n".join(
+            f"- {LOOP_DIR.as_posix()}/reviews/{review_id}/providers/{provider}.md"
+            for provider in review_plan.providers
+        )
+        output_contract = f"""Review group mode: {mode}
+Target SHA for every lane and verifier: {review_plan.head_sha}
+
+The following plan is immutable for this started review. Run every listed discovery lane with the exact provider, purpose, and agent_label. Swarm providers must launch the listed 4-8 provider-native sub-agents. Do not replace missing lanes with a smaller plan.
+
+```json
+{plan_json}
+```
+
+Directory artifact contract:
+- During investigation, do not write HLoop artifacts.
+- After all provider lanes and verifier passes reach a terminal result, write exactly:
+  - {LOOP_DIR.as_posix()}/reviews/{review_id}/MANIFEST.json
+{provider_paths}
+  - {LOOP_DIR.as_posix()}/reviews/{review_id}/FINAL.md
+- `MANIFEST.json` must follow `skills/herdr-dev-loop/schemas/review-manifest.schema.json`. Start from the immutable plan above, add each provider's actual `lanes`, normalized `findings`, planned verification assignments and shortfalls, actual verification `records`, and the recomputed `completeness` result. Never claim a missing or failed lane as completed.
+- Every provider Markdown must have frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, head_sha: {head_sha}, provider, status: reported|blocked|failed. Record lane results, candidates, refutations, and shortfalls for only that provider.
+- `FINAL.md` must have frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, base, head, head_sha: {head_sha}, status: reported|blocked|failed.
+- `FINAL.md` must summarize confirmed, refuted, needs-spec, and insufficient-evidence findings without promoting incomplete evidence.
+- Include `## Fix Task Candidates` in `FINAL.md`. A candidate is permitted only when all required manifest verification records for its fingerprint have `fact_status: confirmed`; include `source_finding: <sha256 fingerprint>` plus action, severity, write_allow, acceptance, and rationale. Non-confirmed or unknown fingerprints are rejected by `hloop triage`.
+- If no confirmed finding needs a task, write `No fix task candidates.`
+- If blocked or failed, still write all available artifacts truthfully; missing data must leave manifest completeness false.
+"""
     return f"""You are Reviewer {review_id}.
 
 HLoop skill version: {SKILL_VERSION}
@@ -4531,6 +4660,7 @@ Review profile:
 - Manager final QA profile: {manager_qa_profile}
 - Review protocol: {review_protocol}
 - Review lanes: {", ".join(lanes)}
+- Review mode: {mode}
 - Agent backend: {agent_display(agent_config)}
 
 {protocol}
@@ -4546,15 +4676,7 @@ Rules:
 - Classify severity as P0/P1/P2/P3.
 - Recommend Manager action: fix_task, decision_needed, accepted_risk_candidate, or false_positive_candidate.
 
-Output:
-- During review, do not write files.
-- After review is complete, write only {LOOP_DIR.as_posix()}/reviews/{review_id}.md.
-- Include frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, base, head, head_sha: {head_sha}, status: reported|blocked|failed.
-- If blocked or failed, still write the artifact with the concrete reason.
-- Include a `## Fix Task Candidates` section. For every finding that should become a Worker fix task, add:
-  `### FTNNN: <title>`, `action: fix_task`, `severity: P0|P1|P2|P3`, non-empty `write_allow:`, non-empty `acceptance:`, and non-empty `rationale:`.
-  Incomplete candidates are rejected by `hloop triage` and will not become tasks.
-  If no fix task is needed, write `No fix task candidates.`
+{output_contract}
 
 Final terminal line:
 HERDR_LOOP_ROLE_DONE:{str(state.get("run_id") or "")}:{review_id}:{review_id}-A001:<reported|blocked|failed>
@@ -7982,6 +8104,14 @@ def cmd_validation_configure(args: argparse.Namespace) -> int:
 def cmd_reviewer_start(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
+    mode = str(
+        getattr(args, "mode", None)
+        or state.get("review_mode")
+        or state.get("resolved_config", {}).get("reviewer", {}).get("mode")
+        or "single"
+    )
+    if mode not in hloop_review.REVIEW_MODES:
+        raise HLoopError(f"unsupported review mode: {mode}")
     review_id = args.review_id or next_id("R", state.setdefault("reviews", {}))
     if review_id in state["reviews"]:
         raise HLoopError(f"review already exists: {review_id}")
@@ -7993,10 +8123,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id, state)
     prompt_rel = LOOP_DIR / "prompts" / f"{review_id}.reviewer.md"
-    review_rel = LOOP_DIR / "reviews" / f"{review_id}.md"
     prompt_path = worktree / prompt_rel
-    worktree_review_path = worktree / review_rel
-    review_path = review_file(repo, review_id)
     runner = args.runner or state.get("reviewer_runner", "tui")
     agent_config = role_agent_config(
         state,
@@ -8006,12 +8133,30 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
+    review_plan = build_reviewer_group_plan(mode, head_sha, agent_config)
+    review_rel = (
+        LOOP_DIR / "reviews" / review_id / "FINAL.md"
+        if mode != "single"
+        else LOOP_DIR / "reviews" / f"{review_id}.md"
+    )
+    worktree_review_path = worktree / review_rel
+    review_path = (
+        review_final_file(repo, review_id)
+        if mode != "single"
+        else review_file(repo, review_id)
+    )
     prompt = render_reviewer_prompt(
-        review_id, base, head, state, agent_config=agent_config, head_sha=head_sha
+        review_id,
+        base,
+        head,
+        state,
+        agent_config=agent_config,
+        head_sha=head_sha,
+        review_plan=review_plan,
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' and mode == 'single' else None)}"
     )
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
@@ -8034,8 +8179,6 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id, state)
     prompt_path = worktree / prompt_rel
-    worktree_review_path = worktree / review_rel
-    review_path = review_file(repo, review_id)
     runner = args.runner or state.get("reviewer_runner", "tui")
     agent_config = role_agent_config(
         state,
@@ -8045,12 +8188,30 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
+    review_plan = build_reviewer_group_plan(mode, head_sha, agent_config)
+    review_rel = (
+        LOOP_DIR / "reviews" / review_id / "FINAL.md"
+        if mode != "single"
+        else LOOP_DIR / "reviews" / f"{review_id}.md"
+    )
+    worktree_review_path = worktree / review_rel
+    review_path = (
+        review_final_file(repo, review_id)
+        if mode != "single"
+        else review_file(repo, review_id)
+    )
     prompt = render_reviewer_prompt(
-        review_id, base, head, state, agent_config=agent_config, head_sha=head_sha
+        review_id,
+        base,
+        head,
+        state,
+        agent_config=agent_config,
+        head_sha=head_sha,
+        review_plan=review_plan,
     )
     command = (
         f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' else None)}"
+        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' and mode == 'single' else None)}"
     )
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_preexisting = worktree.exists()
@@ -8085,7 +8246,9 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     state["reviews"][review_id] = {
         "status": "running",
         "gate_status": "running",
-        "mode": args.mode,
+        "mode": mode,
+        "review_plan": review_plan.to_record(),
+        "review_providers": list(review_plan.providers),
         "base": base,
         "head": head,
         "base_sha": base_sha,
@@ -8138,9 +8301,81 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     reported_review_id = str(meta.get("review_id") or "")
     if reported_review_id and reported_review_id != review_id:
         raise HLoopError(f"review_id mismatch: expected {review_id}, got {reported_review_id}")
-    final_path = review_file(repo, review_id)
-    if path.resolve() != final_path.resolve():
+    if is_directory_review(review_state):
+        worktree_raw = str(review_state.get("worktree") or "")
+        if not worktree_raw:
+            raise HLoopError(f"directory review has no worktree: {review_id}")
+        worktree = Path(worktree_raw).resolve()
+        manifest_source = review_manifest_file(worktree, review_id)
+        manifest = load_review_manifest(manifest_source)
+        if manifest.review_id != review_id:
+            raise HLoopError(
+                f"review manifest id mismatch: expected {review_id}, got {manifest.review_id}"
+            )
+        try:
+            expected_plan = hloop_review.ReviewGroupPlan.from_record(
+                review_state.get("review_plan")
+            )
+        except hloop_review.ReviewModelError as exc:
+            raise HLoopError(f"stored review plan is invalid for {review_id}: {exc}") from exc
+        if manifest.plan != expected_plan:
+            raise HLoopError(
+                f"review manifest plan drift for {review_id}; the started topology or target SHA changed"
+            )
+        provider_sources: dict[str, Path] = {}
+        provider_statuses: dict[str, str] = {}
+        for provider in expected_plan.providers:
+            provider_path = review_provider_file(worktree, review_id, provider)
+            if not provider_path.exists() or not read_text(provider_path).strip():
+                raise HLoopError(
+                    f"review provider artifact not found or empty: {provider_path}"
+                )
+            provider_meta = read_frontmatter(provider_path)
+            provider_identity_error = artifact_identity_error(
+                state, review_id, "reviewer", review_state, provider_meta
+            )
+            if provider_identity_error:
+                raise HLoopError(
+                    "stale or mismatched review provider artifact: "
+                    f"{provider_identity_error}: {provider_path}"
+                )
+            if str(provider_meta.get("provider") or "") != provider:
+                raise HLoopError(
+                    f"review provider mismatch: expected {provider}, "
+                    f"got {provider_meta.get('provider')}: {provider_path}"
+                )
+            provider_status = str(provider_meta.get("status") or "")
+            if provider_status not in REVIEW_ARTIFACT_STATUSES:
+                raise HLoopError(f"invalid provider artifact status in {provider_path}")
+            provider_sources[provider] = provider_path
+            provider_statuses[provider] = provider_status
+
+        final_path = review_final_file(repo, review_id)
+        manifest_path = review_manifest_file(repo, review_id)
         write_text(final_path, read_text(path))
+        write_text(
+            manifest_path,
+            json.dumps(manifest.to_record(), ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+        )
+        provider_paths = {}
+        for provider, provider_source in provider_sources.items():
+            provider_target = review_provider_file(repo, review_id, provider)
+            write_text(provider_target, read_text(provider_source))
+            provider_paths[provider] = str(provider_target)
+        review_state["manifest_path"] = str(manifest_path)
+        review_state["provider_report_paths"] = provider_paths
+        review_state["provider_artifact_statuses"] = provider_statuses
+        review_state["manifest_complete"] = manifest.completeness.complete
+        review_state["manifest_issues"] = list(manifest.completeness.issues)
+        review_state["confirmed_finding_fingerprints"] = list(
+            manifest.confirmed_fingerprints
+        )
+    else:
+        final_path = review_file(repo, review_id)
+        if path.resolve() != final_path.resolve():
+            write_text(final_path, read_text(path))
+    if path.resolve() != final_path.resolve():
         review_state["worktree_review_path_harvested"] = str(path)
         review_state.pop("worktree_review_path", None)
     worktree_raw = review_state.get("worktree")
@@ -8190,29 +8425,45 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     return 0
 
 
-def enforce_review_manifest_gate(review_id: str, review_state: dict[str, Any]) -> None:
+def enforce_review_manifest_gate(
+    repo: Path, review_id: str, review_state: dict[str, Any]
+) -> None:
     """Refuse to close non-single-mode reviews with an incomplete review manifest."""
 
     mode = str(review_state.get("mode") or "single")
     if mode == "single":
         return
-    try:
-        plan = hloop_review.plan_review_group(
-            mode, head_sha=str(review_state.get("head_sha") or "")
+    manifest = load_review_manifest(
+        recorded_path(
+            repo,
+            review_state.get("manifest_path"),
+            review_manifest_file(repo, review_id),
         )
-        manifest = hloop_review.ReviewManifest(
-            review_id=review_id,
-            plan=plan,
-            lane_results=(),
-            findings=(),
-            verification_plan=hloop_review.VerificationPlan(
-                assignments=(), shortfalls=(), provider_usage=()
-            ),
-            verifications=(),
+    )
+    try:
+        expected_plan = hloop_review.ReviewGroupPlan.from_record(
+            review_state.get("review_plan")
         )
     except hloop_review.ReviewModelError as exc:
-        raise HLoopError(f"cannot build review manifest for {review_id}: {exc}") from exc
-    completeness = hloop_review.check_manifest_completeness(manifest)
+        raise HLoopError(f"stored review plan is invalid for {review_id}: {exc}") from exc
+    if manifest.review_id != review_id or manifest.plan != expected_plan:
+        raise HLoopError(f"review manifest identity or immutable plan mismatch for {review_id}")
+    completeness = manifest.completeness
+    provider_statuses = review_state.get("provider_artifact_statuses") or {}
+    non_reported_artifacts = [
+        f"provider-artifact:{provider}:{provider_statuses.get(provider, 'missing')}"
+        for provider in expected_plan.providers
+        if provider_statuses.get(provider) != "reported"
+    ]
+    if str(review_state.get("artifact_status") or "") != "reported":
+        non_reported_artifacts.append(
+            f"final-artifact:{review_state.get('artifact_status') or 'missing'}"
+        )
+    if non_reported_artifacts:
+        raise HLoopError(
+            f"review manifest incomplete for {review_id} (mode={mode}): "
+            + "; ".join(non_reported_artifacts)
+        )
     if not completeness.complete:
         raise HLoopError(
             f"review manifest incomplete for {review_id} (mode={mode}): "
@@ -8233,7 +8484,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
         raise HLoopError(f"unknown review: {review_id}")
     if agent_gate_status(review_state) not in {"reported", "triaged"}:
         raise HLoopError(f"review is not ready for close: {review_id}")
-    enforce_review_manifest_gate(review_id, review_state)
+    enforce_review_manifest_gate(repo, review_id, review_state)
     cleanup_completed_agent_pane(
         repo,
         review_state,
@@ -9299,7 +9550,7 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
         source_state = state.get("reviews", {}).get(source_id)
         if not source_state:
             raise HLoopError(f"unknown review: {source_id}")
-        artifact_path = review_file(repo, source_id)
+        artifact_path = review_artifact_path(repo, source_id, source_state)
         created_from = f"reviews/{source_id}"
     elif source_type == "gap":
         source_state = state.get("gaps", {}).get(source_id)
@@ -9313,6 +9564,17 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
         raise HLoopError(f"source artifact not found or empty: {artifact_path}")
     text = read_text(artifact_path)
     candidates, rejected_candidates = extract_fix_task_candidates(text, source_id)
+    if source_type == "review" and is_directory_review(source_state):
+        manifest = load_review_manifest(
+            recorded_path(
+                repo,
+                source_state.get("manifest_path"),
+                review_manifest_file(repo, source_id),
+            )
+        )
+        candidates, rejected_candidates = confirmed_review_fix_task_candidates(
+            manifest, candidates, rejected_candidates
+        )
     draft_path = triage_draft_file(repo, source_id)
     draft = render_fix_task_draft(
         source_type,
