@@ -88,6 +88,28 @@ def _provider_tuple(values: Sequence[str], field_name: str) -> tuple[str, ...]:
     return tuple(provider for provider in SUPPORTED_PROVIDERS if provider in providers)
 
 
+def _record(value: Any, field_name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ReviewModelError(f"{field_name} must be an object")
+    return value
+
+
+def _record_items(value: Any, field_name: str) -> tuple[Any, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ReviewModelError(f"{field_name} must be an array")
+    return tuple(value)
+
+
+def _require_record_fields(
+    record: Mapping[str, Any], field_name: str, fields: Sequence[str]
+) -> None:
+    missing = [field for field in fields if field not in record]
+    if missing:
+        raise ReviewModelError(
+            f"{field_name} is missing required fields: {', '.join(missing)}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewBudget:
     """Hard planning bounds for verifier concurrency and total usage."""
@@ -149,6 +171,27 @@ class ReviewBudget:
             "provider_limits": dict(self.provider_limits),
         }
 
+    @classmethod
+    def from_record(cls, value: Any) -> "ReviewBudget":
+        record = _record(value, "budget")
+        _require_record_fields(
+            record,
+            "budget",
+            (
+                "max_parallel_verifiers",
+                "max_verifications",
+                "time_limit_seconds",
+                "provider_limits",
+            ),
+        )
+        limits = _record(record["provider_limits"], "budget.provider_limits")
+        return cls(
+            max_parallel_verifiers=record["max_parallel_verifiers"],
+            max_verifications=record["max_verifications"],
+            time_limit_seconds=record["time_limit_seconds"],
+            provider_limits=tuple(limits.items()),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DiscoveryLanePlan:
@@ -183,6 +226,19 @@ class DiscoveryLanePlan:
             "purpose": self.purpose,
             "agent_label": self.agent_label,
         }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "DiscoveryLanePlan":
+        record = _record(value, "lane plan")
+        _require_record_fields(
+            record, "lane plan", ("provider", "lane_id", "purpose", "agent_label")
+        )
+        return cls(
+            provider=record["provider"],
+            lane_id=record["lane_id"],
+            purpose=record["purpose"],
+            agent_label=record["agent_label"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +279,23 @@ class DiscoveryLaneResult:
             "status": self.status,
             "finding_count": self.finding_count,
         }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "DiscoveryLaneResult":
+        record = _record(value, "lane result")
+        _require_record_fields(
+            record,
+            "lane result",
+            ("provider", "lane_id", "purpose", "agent_label", "status", "finding_count"),
+        )
+        return cls(
+            provider=record["provider"],
+            lane_id=record["lane_id"],
+            purpose=record["purpose"],
+            agent_label=record["agent_label"],
+            status=record["status"],
+            finding_count=record["finding_count"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +342,37 @@ class ProviderReviewPlan:
             "required_lanes": [lane.to_record() for lane in self.lanes],
             "verifier_pool": list(self.verifier_agents),
         }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ProviderReviewPlan":
+        record = _record(value, "provider plan")
+        _require_record_fields(
+            record,
+            "provider plan",
+            (
+                "provider",
+                "model",
+                "head_sha",
+                "role",
+                "coordinator_label",
+                "required_lanes",
+                "verifier_pool",
+            ),
+        )
+        return cls(
+            provider=record["provider"],
+            model=record["model"],
+            head_sha=record["head_sha"],
+            role=record["role"],
+            coordinator_label=record["coordinator_label"],
+            lanes=tuple(
+                DiscoveryLanePlan.from_record(item)
+                for item in _record_items(record["required_lanes"], "required_lanes")
+            ),
+            verifier_agents=tuple(
+                _record_items(record["verifier_pool"], "verifier_pool")
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +432,24 @@ class ReviewGroupPlan:
             "providers": [plan.to_record() for plan in self.provider_plans],
             "budget": self.budget.to_record(),
         }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ReviewGroupPlan":
+        record = _record(value, "review group plan")
+        _require_record_fields(
+            record, "review group plan", ("mode", "head_sha", "providers", "budget")
+        )
+        provider_plans = tuple(
+            ProviderReviewPlan.from_record(item)
+            for item in _record_items(record["providers"], "providers")
+        )
+        return cls(
+            mode=record["mode"],
+            head_sha=record["head_sha"],
+            providers=tuple(plan.provider for plan in provider_plans),
+            provider_plans=provider_plans,
+            budget=ReviewBudget.from_record(record["budget"]),
+        )
 
 
 def plan_review_group(
@@ -559,6 +681,52 @@ class FindingCandidate:
             "requires_spec_decision": self.requires_spec_decision,
         }
 
+    @classmethod
+    def from_record(cls, value: Any) -> "FindingCandidate":
+        record = _record(value, "finding candidate")
+        _require_record_fields(
+            record,
+            "finding candidate",
+            (
+                "finding_id",
+                "fingerprint",
+                "provider",
+                "head_sha",
+                "discovering_agent",
+                "severity",
+                "confidence",
+                "title",
+                "file",
+                "line",
+                "symbol",
+                "trigger",
+                "product_impact",
+                "origin",
+                "proposed_fix",
+                "requires_spec_decision",
+            ),
+        )
+        candidate = cls(
+            finding_id=record["finding_id"],
+            provider=record["provider"],
+            head_sha=record["head_sha"],
+            discovering_agent=record["discovering_agent"],
+            severity=record["severity"],
+            confidence=record["confidence"],
+            title=record["title"],
+            file_path=record["file"],
+            line=record["line"],
+            symbol=record["symbol"],
+            trigger=record["trigger"],
+            product_impact=record["product_impact"],
+            origin=record["origin"],
+            proposed_fix=record["proposed_fix"],
+            requires_spec_decision=record["requires_spec_decision"],
+        )
+        if record["fingerprint"] != candidate.fingerprint:
+            raise ReviewModelError("finding candidate fingerprint does not match its evidence")
+        return candidate
+
 
 @dataclass(frozen=True, slots=True)
 class NormalizedFinding:
@@ -627,6 +795,51 @@ class NormalizedFinding:
             "candidates": [candidate.to_record() for candidate in self.candidates],
         }
 
+    @classmethod
+    def from_record(cls, value: Any) -> "NormalizedFinding":
+        record = _record(value, "normalized finding")
+        _require_record_fields(
+            record,
+            "normalized finding",
+            (
+                "fingerprint",
+                "head_sha",
+                "severity",
+                "requires_spec_decision",
+                "classification",
+                "cross_model_consensus",
+                "providers",
+                "candidate_ids",
+                "discovering_agents",
+                "candidates",
+            ),
+        )
+        finding = cls(
+            fingerprint=record["fingerprint"],
+            head_sha=record["head_sha"],
+            candidates=tuple(
+                FindingCandidate.from_record(item)
+                for item in _record_items(record["candidates"], "finding candidates")
+            ),
+        )
+        declared = {
+            "severity": record["severity"],
+            "requires_spec_decision": record["requires_spec_decision"],
+            "classification": record["classification"],
+            "cross_model_consensus": record["cross_model_consensus"],
+            "providers": list(_record_items(record["providers"], "finding providers")),
+            "candidate_ids": list(
+                _record_items(record["candidate_ids"], "finding candidate_ids")
+            ),
+            "discovering_agents": list(
+                _record_items(record["discovering_agents"], "finding discovering_agents")
+            ),
+        }
+        actual = finding.to_record()
+        if any(actual[key] != value for key, value in declared.items()):
+            raise ReviewModelError("normalized finding summary does not match its candidates")
+        return finding
+
 
 def normalize_findings(findings: Sequence[FindingCandidate]) -> tuple[NormalizedFinding, ...]:
     """Deduplicate within a SHA and retain every provider's independent report."""
@@ -683,6 +896,22 @@ class VerifierAssignment:
             "pass_number": self.pass_number,
         }
 
+    @classmethod
+    def from_record(cls, value: Any) -> "VerifierAssignment":
+        record = _record(value, "verifier assignment")
+        _require_record_fields(
+            record,
+            "verifier assignment",
+            ("fingerprint", "head_sha", "provider", "verifier_agent", "pass_number"),
+        )
+        return cls(
+            fingerprint=record["fingerprint"],
+            head_sha=record["head_sha"],
+            provider=record["provider"],
+            verifier_agent=record["verifier_agent"],
+            pass_number=record["pass_number"],
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class VerificationShortfall:
@@ -723,12 +952,58 @@ class VerificationShortfall:
             "assigned_passes": self.assigned_passes,
         }
 
+    @classmethod
+    def from_record(cls, value: Any) -> "VerificationShortfall":
+        record = _record(value, "verification shortfall")
+        _require_record_fields(
+            record,
+            "verification shortfall",
+            ("fingerprint", "fact_status", "reason", "required_passes", "assigned_passes"),
+        )
+        if record["fact_status"] != "insufficient_evidence":
+            raise ReviewModelError("verification shortfall fact_status must be insufficient_evidence")
+        return cls(
+            fingerprint=record["fingerprint"],
+            reason=record["reason"],
+            required_passes=record["required_passes"],
+            assigned_passes=record["assigned_passes"],
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class VerificationPlan:
     assignments: tuple[VerifierAssignment, ...]
     shortfalls: tuple[VerificationShortfall, ...]
     provider_usage: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        assignments = tuple(self.assignments)
+        shortfalls = tuple(self.shortfalls)
+        if any(not isinstance(item, VerifierAssignment) for item in assignments):
+            raise ReviewModelError("assignments must contain VerifierAssignment values")
+        if any(not isinstance(item, VerificationShortfall) for item in shortfalls):
+            raise ReviewModelError("shortfalls must contain VerificationShortfall values")
+        usage: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for provider, count in self.provider_usage:
+            if provider not in SUPPORTED_PROVIDERS or provider in seen:
+                raise ReviewModelError("provider_usage must contain unique supported providers")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ReviewModelError("provider_usage counts must be non-negative integers")
+            usage.append((provider, count))
+            seen.add(provider)
+        usage.sort(key=lambda item: SUPPORTED_PROVIDERS.index(item[0]))
+        if {item.provider for item in assignments} - seen:
+            raise ReviewModelError("provider_usage must include every assignment provider")
+        actual_usage = {
+            provider: sum(1 for item in assignments if item.provider == provider)
+            for provider, _ in usage
+        }
+        if any(actual_usage[provider] != count for provider, count in usage):
+            raise ReviewModelError("provider_usage must match verifier assignments")
+        object.__setattr__(self, "assignments", assignments)
+        object.__setattr__(self, "shortfalls", shortfalls)
+        object.__setattr__(self, "provider_usage", tuple(usage))
 
     @property
     def insufficient_fingerprints(self) -> tuple[str, ...]:
@@ -752,6 +1027,40 @@ class VerificationPlan:
             "provider_usage": dict(self.provider_usage),
             "budget_exhausted": self.budget_exhausted,
         }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "VerificationPlan":
+        record = _record(value, "verification plan")
+        _require_record_fields(
+            record,
+            "verification plan",
+            ("assignments", "shortfalls", "provider_usage", "budget_exhausted"),
+        )
+        usage = _record(record["provider_usage"], "verification provider_usage")
+        unknown_usage = set(usage) - set(SUPPORTED_PROVIDERS)
+        if unknown_usage:
+            raise ReviewModelError(
+                "verification provider_usage contains unsupported providers: "
+                + ", ".join(sorted(unknown_usage))
+            )
+        plan = cls(
+            assignments=tuple(
+                VerifierAssignment.from_record(item)
+                for item in _record_items(record["assignments"], "verification assignments")
+            ),
+            shortfalls=tuple(
+                VerificationShortfall.from_record(item)
+                for item in _record_items(record["shortfalls"], "verification shortfalls")
+            ),
+            provider_usage=tuple(
+                (provider, usage[provider])
+                for provider in SUPPORTED_PROVIDERS
+                if provider in usage
+            ),
+        )
+        if record["budget_exhausted"] is not plan.budget_exhausted:
+            raise ReviewModelError("verification budget_exhausted does not match shortfalls")
+        return plan
 
 
 def plan_verification(
@@ -920,6 +1229,40 @@ class VerificationRecord:
             "recommended_action": self.recommended_action,
         }
 
+    @classmethod
+    def from_record(cls, value: Any) -> "VerificationRecord":
+        record = _record(value, "verification record")
+        _require_record_fields(
+            record,
+            "verification record",
+            (
+                "fingerprint",
+                "head_sha",
+                "provider",
+                "verifier_agent",
+                "pass_number",
+                "fact_status",
+                "ignore_status",
+                "decision_status",
+                "progress_without_decision",
+                "severity",
+                "recommended_action",
+            ),
+        )
+        return cls(**{field: record[field] for field in (
+            "fingerprint",
+            "head_sha",
+            "provider",
+            "verifier_agent",
+            "pass_number",
+            "fact_status",
+            "ignore_status",
+            "decision_status",
+            "progress_without_decision",
+            "severity",
+            "recommended_action",
+        )})
+
 
 @dataclass(frozen=True, slots=True)
 class ManifestCompleteness:
@@ -935,6 +1278,25 @@ class ManifestCompleteness:
             "missing_lanes": list(self.missing_lanes),
             "incomplete_findings": list(self.incomplete_findings),
         }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ManifestCompleteness":
+        record = _record(value, "manifest completeness")
+        _require_record_fields(
+            record,
+            "manifest completeness",
+            ("complete", "issues", "missing_lanes", "incomplete_findings"),
+        )
+        if not isinstance(record["complete"], bool):
+            raise ReviewModelError("manifest completeness.complete must be boolean")
+        return cls(
+            complete=record["complete"],
+            issues=_text_tuple(record["issues"], "manifest issues"),
+            missing_lanes=_text_tuple(record["missing_lanes"], "manifest missing_lanes"),
+            incomplete_findings=_text_tuple(
+                record["incomplete_findings"], "manifest incomplete_findings"
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -980,6 +1342,75 @@ class ReviewManifest:
             },
             "completeness": self.completeness.to_record(),
         }
+
+    @property
+    def confirmed_fingerprints(self) -> tuple[str, ...]:
+        by_fingerprint: dict[str, list[VerificationRecord]] = {}
+        for record in self.verifications:
+            by_fingerprint.setdefault(record.fingerprint, []).append(record)
+        incomplete = set(self.completeness.incomplete_findings)
+        return tuple(
+            finding.fingerprint
+            for finding in self.findings
+            if finding.fingerprint not in incomplete
+            if by_fingerprint.get(finding.fingerprint)
+            and all(
+                record.fact_status == "confirmed"
+                for record in by_fingerprint[finding.fingerprint]
+            )
+        )
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ReviewManifest":
+        record = _record(value, "review manifest")
+        _require_record_fields(
+            record,
+            "review manifest",
+            (
+                "review_id",
+                "mode",
+                "head_sha",
+                "budget",
+                "providers",
+                "findings",
+                "verification",
+                "completeness",
+            ),
+        )
+        provider_records = _record_items(record["providers"], "manifest providers")
+        plan = ReviewGroupPlan.from_record(record)
+        lane_results = tuple(
+            DiscoveryLaneResult.from_record(item)
+            for provider in provider_records
+            for item in _record_items(
+                _record(provider, "manifest provider").get("lanes"),
+                "manifest provider lanes",
+            )
+        )
+        verification_record = _record(record["verification"], "manifest verification")
+        _require_record_fields(verification_record, "manifest verification", ("records",))
+        manifest = cls(
+            review_id=record["review_id"],
+            plan=plan,
+            lane_results=lane_results,
+            findings=tuple(
+                NormalizedFinding.from_record(item)
+                for item in _record_items(record["findings"], "manifest findings")
+            ),
+            verification_plan=VerificationPlan.from_record(verification_record),
+            verifications=tuple(
+                VerificationRecord.from_record(item)
+                for item in _record_items(
+                    verification_record["records"], "manifest verification records"
+                )
+            ),
+        )
+        declared_completeness = ManifestCompleteness.from_record(record["completeness"])
+        if declared_completeness != manifest.completeness:
+            raise ReviewModelError(
+                "manifest completeness does not match deserialized lane and verification data"
+            )
+        return manifest
 
 
 def check_manifest_completeness(manifest: ReviewManifest) -> ManifestCompleteness:
@@ -1057,6 +1488,14 @@ def check_manifest_completeness(manifest: ReviewManifest) -> ManifestCompletenes
             issues.add(f"assignment-for-unknown-finding:{assignment.fingerprint}")
         if assignment.head_sha != manifest.plan.head_sha:
             issues.add(f"assignment-head-mismatch:{assignment.fingerprint}")
+        if assignment.provider not in manifest.plan.providers:
+            issues.add(f"assignment-provider-mismatch:{assignment.fingerprint}")
+            incomplete_findings.add(assignment.fingerprint)
+        elif assignment.verifier_agent not in manifest.plan.provider_plan(
+            assignment.provider
+        ).verifier_agents:
+            issues.add(f"assignment-verifier-outside-plan:{assignment.fingerprint}")
+            incomplete_findings.add(assignment.fingerprint)
 
     observed_records: dict[tuple[str, str, str, int], VerificationRecord] = {}
     records_by_fingerprint: dict[str, list[VerificationRecord]] = {}
@@ -1070,6 +1509,10 @@ def check_manifest_completeness(manifest: ReviewManifest) -> ManifestCompletenes
             incomplete_findings.add(record.fingerprint)
         if record.head_sha != manifest.plan.head_sha:
             issues.add(f"verification-head-mismatch:{record.fingerprint}")
+            incomplete_findings.add(record.fingerprint)
+        finding = finding_by_fingerprint.get(record.fingerprint)
+        if finding is not None and record.severity != finding.severity:
+            issues.add(f"verification-severity-mismatch:{record.fingerprint}")
             incomplete_findings.add(record.fingerprint)
 
     for key, assignment in expected_assignments.items():

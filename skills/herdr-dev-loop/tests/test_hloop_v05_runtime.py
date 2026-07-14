@@ -578,6 +578,330 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertFalse((repo / pending_rel).exists())
 
 
+class ReviewGroupRuntimeTests(unittest.TestCase):
+    """Exercises reviewer start/harvest/close for every 0.5 review mode."""
+
+    RUN_ID = "review-runtime-run"
+
+    def setUp(self):
+        self.previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-review-group-runtime")
+
+    def tearDown(self):
+        hloop.configure_loop_namespace(self.previous_namespace)
+
+    def init_repo(self, root: Path) -> tuple[Path, dict]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        state = {
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "namespace": hloop.LOOP_NAMESPACE,
+            "run_id": self.RUN_ID,
+            "skill_version": hloop.SKILL_VERSION,
+            "persistence": "local-only",
+            "phase": "dispatching",
+            "base_branch": "main",
+            "integration_branch": "main",
+            "reviews": {},
+            "reviewer_runner": "tui",
+            "reviewer_agent_provider": "codex",
+            "reviewer_agent_model": "auto",
+        }
+        hloop.save_state(repo, state)
+        return repo, state
+
+    def start_args(self, repo: Path, mode: str, review_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            repo=str(repo),
+            review_id=review_id,
+            base=None,
+            head=None,
+            worktree=str(repo.parent / f"{review_id}-worktree"),
+            manager_pane=None,
+            direction="down",
+            launcher="pane",
+            runner="tui",
+            agent_provider="codex",
+            agent_model="auto",
+            mode=mode,
+            dry_run=True,
+        )
+
+    def write_review_artifacts(
+        self,
+        repo: Path,
+        state: dict,
+        *,
+        review_id: str,
+        mode: str,
+        complete: bool = True,
+    ) -> dict:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        agent_config = hloop.role_agent_config(state, "reviewer")
+        plan = hloop.build_reviewer_group_plan(mode, head_sha, agent_config)
+        worktree = repo.parent / f"{review_id}-artifact-worktree"
+        worktree.mkdir()
+        review_state = {
+            "status": "running",
+            "gate_status": "running",
+            "mode": mode,
+            "review_plan": plan.to_record(),
+            "review_providers": list(plan.providers),
+            "base": "main",
+            "head": "main",
+            "head_sha": head_sha,
+            "attempt_id": f"{review_id}-A001",
+            "skill_version": hloop.SKILL_VERSION,
+            "worktree": str(worktree),
+            "baseline_dirty_files": [],
+        }
+        if mode == "single":
+            artifact = hloop.review_file(worktree, review_id)
+            review_state["worktree_review_path"] = str(artifact)
+            review_state["review_path"] = str(hloop.review_file(repo, review_id))
+            hloop.write_text(
+                artifact,
+                hloop.frontmatter(
+                    {
+                        "review_id": review_id,
+                        "run_id": self.RUN_ID,
+                        "skill_version": hloop.SKILL_VERSION,
+                        "base": "main",
+                        "head": "main",
+                        "head_sha": head_sha,
+                        "status": "reported",
+                    }
+                )
+                + "\n## Fix Task Candidates\n\nNo fix task candidates.\n",
+            )
+        else:
+            lane_results = tuple(lane.result() for lane in plan.expected_lanes)
+            if not complete:
+                lane_results = lane_results[:-1]
+            manifest = hloop.hloop_review.ReviewManifest(
+                review_id=review_id,
+                plan=plan,
+                lane_results=lane_results,
+                findings=(),
+                verification_plan=hloop.hloop_review.plan_verification(plan, ()),
+                verifications=(),
+            )
+            hloop.write_text(
+                hloop.review_manifest_file(worktree, review_id),
+                json.dumps(manifest.to_record(), indent=2, sort_keys=True) + "\n",
+            )
+            for provider in plan.providers:
+                hloop.write_text(
+                    hloop.review_provider_file(worktree, review_id, provider),
+                    hloop.frontmatter(
+                        {
+                            "review_id": review_id,
+                            "run_id": self.RUN_ID,
+                            "skill_version": hloop.SKILL_VERSION,
+                            "head_sha": head_sha,
+                            "provider": provider,
+                            "status": "reported",
+                        }
+                    )
+                    + f"\n# {provider} provider report\n",
+                )
+            artifact = hloop.review_final_file(worktree, review_id)
+            review_state["worktree_review_path"] = str(artifact)
+            review_state["review_path"] = str(hloop.review_final_file(repo, review_id))
+            hloop.write_text(
+                artifact,
+                hloop.frontmatter(
+                    {
+                        "review_id": review_id,
+                        "run_id": self.RUN_ID,
+                        "skill_version": hloop.SKILL_VERSION,
+                        "base": "main",
+                        "head": "main",
+                        "head_sha": head_sha,
+                        "status": "reported",
+                    }
+                )
+                + "\n## Fix Task Candidates\n\nNo fix task candidates.\n",
+            )
+        state["reviews"][review_id] = review_state
+        hloop.save_state(repo, state)
+        return review_state
+
+    def test_start_prompts_harvest_and_close_every_review_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            for index, mode in enumerate(
+                ("single", "swarm", "dual", "dual-swarm"), start=1
+            ):
+                review_id = f"R{index:03d}"
+                with self.subTest(mode=mode):
+                    with contextlib.redirect_stdout(io.StringIO()) as buffer:
+                        self.assertEqual(
+                            hloop.cmd_reviewer_start(
+                                self.start_args(repo, mode, review_id)
+                            ),
+                            0,
+                        )
+                    self.assertIn("DRY RUN", buffer.getvalue())
+
+                    agent_config = hloop.role_agent_config(state, "reviewer")
+                    head_sha = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=repo,
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip()
+                    plan = hloop.build_reviewer_group_plan(mode, head_sha, agent_config)
+                    prompt = hloop.render_reviewer_prompt(
+                        review_id,
+                        "main",
+                        "main",
+                        state,
+                        agent_config=agent_config,
+                        head_sha=head_sha,
+                        review_plan=plan,
+                    )
+                    if mode == "single":
+                        self.assertIn(f"reviews/{review_id}.md", prompt)
+                    else:
+                        for lane in plan.expected_lanes:
+                            self.assertIn(lane.lane_id, prompt)
+                            self.assertIn(lane.agent_label, prompt)
+                        self.assertIn(f"reviews/{review_id}/MANIFEST.json", prompt)
+                        self.assertIn(f"reviews/{review_id}/FINAL.md", prompt)
+
+                    review_state = self.write_review_artifacts(
+                        repo, state, review_id=review_id, mode=mode
+                    )
+                    with mock.patch.object(
+                        hloop, "preflight_loop", return_value=state
+                    ), mock.patch.object(
+                        hloop, "validate_reviewer_worktree_scope", return_value=[]
+                    ), mock.patch.object(
+                        hloop, "cleanup_completed_agent_pane"
+                    ), mock.patch.object(
+                        hloop, "cleanup_review_worktree"
+                    ), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(
+                            hloop.cmd_reviewer_harvest(
+                                SimpleNamespace(
+                                    repo=str(repo),
+                                    review_id=review_id,
+                                    keep_pane=False,
+                                    session_cleanup="none",
+                                )
+                            ),
+                            0,
+                        )
+                        self.assertEqual(review_state["gate_status"], "reported")
+                        self.assertEqual(
+                            hloop.cmd_reviewer_close(
+                                SimpleNamespace(
+                                    repo=str(repo),
+                                    review_id=review_id,
+                                    verdict="passed",
+                                    reason="runtime fixture passed",
+                                    keep_pane=False,
+                                    session_cleanup="none",
+                                )
+                            ),
+                            0,
+                        )
+                    self.assertEqual(review_state["gate_status"], "triaged")
+                    if mode != "single":
+                        self.assertTrue(review_state["manifest_complete"])
+                        self.assertTrue(Path(review_state["manifest_path"]).is_file())
+                        self.assertEqual(
+                            set(review_state["provider_report_paths"]),
+                            set(plan.providers),
+                        )
+
+    def test_incomplete_swarm_harvests_but_close_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            review_state = self.write_review_artifacts(
+                repo, state, review_id="R001", mode="swarm", complete=False
+            )
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "validate_reviewer_worktree_scope", return_value=[]
+            ), mock.patch.object(
+                hloop, "cleanup_completed_agent_pane"
+            ), mock.patch.object(
+                hloop, "cleanup_review_worktree"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    hloop.cmd_reviewer_harvest(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            review_id="R001",
+                            keep_pane=False,
+                            session_cleanup="none",
+                        )
+                    ),
+                    0,
+                )
+                self.assertFalse(review_state["manifest_complete"])
+                with self.assertRaisesRegex(hloop.HLoopError, "manifest incomplete"):
+                    hloop.cmd_reviewer_close(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            review_id="R001",
+                            verdict="passed",
+                            reason="must not close",
+                            keep_pane=False,
+                            session_cleanup="none",
+                        )
+                    )
+
+    def test_triage_accepts_only_manifest_confirmed_fingerprints(self):
+        confirmed = "sha256:" + "a" * 64
+        refuted = "sha256:" + "b" * 64
+        candidates = [
+            {"title": "confirmed", "source_finding": confirmed},
+            {"title": "refuted", "source_finding": refuted},
+            {"title": "missing source", "source_finding": ""},
+        ]
+
+        accepted, rejected = hloop.confirmed_review_fix_task_candidates(
+            SimpleNamespace(confirmed_fingerprints=(confirmed,)), candidates, []
+        )
+
+        self.assertEqual([item["title"] for item in accepted], ["confirmed"])
+        self.assertEqual([item["title"] for item in rejected], ["refuted", "missing source"])
+        self.assertTrue(
+            all("all confirmed" in item["reasons"][0] for item in rejected)
+        )
+
+
 class RequirementProgressOutcomeTests(unittest.TestCase):
     """Exercises input record / requirement new / progress record / outcome show."""
 

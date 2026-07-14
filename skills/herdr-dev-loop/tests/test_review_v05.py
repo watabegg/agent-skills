@@ -9,6 +9,7 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
+RUNTIME_SCHEMAS = Path(__file__).parents[1] / "schemas"
 sys.path.insert(0, str(SCRIPTS))
 
 from hloop_lib.review import (  # noqa: E402
@@ -330,6 +331,7 @@ class ManifestGateTests(unittest.TestCase):
             manifest.completeness.incomplete_findings,
             (findings[0].fingerprint,),
         )
+        self.assertEqual(manifest.confirmed_fingerprints, ())
 
     def test_manifest_rejects_lane_finding_count_drift(self):
         group = plan_review_group("swarm", head_sha=HEAD, probe_count=4)
@@ -349,6 +351,72 @@ class ManifestGateTests(unittest.TestCase):
             "lane-finding-count-mismatch:codex:codex-L01",
             manifest.completeness.issues,
         )
+
+    def test_manifest_round_trip_deserializes_actual_lane_and_verifier_data(self):
+        group = plan_review_group("dual-swarm", head_sha=HEAD, probes_per_provider=4)
+        findings = normalize_findings(
+            (candidate(), candidate("A-F001", provider="claude"))
+        )
+        verification = plan_verification(group, findings)
+        manifest = ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=completed_lanes(group, findings),
+            findings=findings,
+            verification_plan=verification,
+            verifications=confirmed_records(verification),
+        )
+
+        restored = ReviewManifest.from_record(
+            json.loads(json.dumps(manifest.to_record()))
+        )
+
+        self.assertEqual(restored, manifest)
+        self.assertTrue(restored.completeness.complete)
+        self.assertEqual(restored.confirmed_fingerprints, (findings[0].fingerprint,))
+
+    def test_manifest_deserialization_rejects_claimed_complete_missing_lane(self):
+        group = plan_review_group("swarm", head_sha=HEAD, probe_count=4)
+        manifest = ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=tuple(lane.result() for lane in group.expected_lanes),
+            findings=(),
+            verification_plan=plan_verification(group, ()),
+            verifications=(),
+        ).to_record()
+        manifest["providers"][0]["lanes"].pop()
+
+        with self.assertRaisesRegex(ReviewModelError, "completeness does not match"):
+            ReviewManifest.from_record(manifest)
+
+    def test_only_fully_confirmed_finding_is_triage_eligible(self):
+        group = plan_review_group("swarm", head_sha=HEAD, probe_count=4)
+        findings = normalize_findings((candidate(),))
+        verification = plan_verification(group, findings)
+        refuted = tuple(
+            VerificationRecord.from_assignment(
+                assignment,
+                fact_status="refuted",
+                ignore_status="no_action",
+                decision_status="none",
+                progress_without_decision="yes",
+                severity="P2",
+                recommended_action="discard",
+            )
+            for assignment in verification.assignments
+        )
+        manifest = ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=completed_lanes(group, findings),
+            findings=findings,
+            verification_plan=verification,
+            verifications=refuted,
+        )
+
+        self.assertTrue(manifest.completeness.complete)
+        self.assertEqual(manifest.confirmed_fingerprints, ())
 
 
 class ReviewSchemaTests(unittest.TestCase):
@@ -376,6 +444,23 @@ class ReviewSchemaTests(unittest.TestCase):
             ]["enum"],
         )
         self.assertIn("completeness", manifest_schema["required"])
+
+        runtime_manifest_schema = json.loads(
+            (RUNTIME_SCHEMAS / "review-manifest.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        group_state_schema = json.loads(
+            (RUNTIME_SCHEMAS / "review-group-state.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            runtime_manifest_schema["$ref"],
+            "../references/schemas/review-manifest.schema.json",
+        )
+        self.assertIn("review_plan", group_state_schema["required"])
+        self.assertIn("manifest_path", group_state_schema["properties"])
 
 
 if __name__ == "__main__":
