@@ -24,6 +24,7 @@ from hloop_lib.reports import (  # noqa: E402
     blocked_outcome,
     draft_outcome,
     final_outcome,
+    render_outcome_markdown,
 )
 from hloop_lib.requirements import (  # noqa: E402
     CheckpointPolicyError,
@@ -390,6 +391,10 @@ class OutcomeGateTests(unittest.TestCase):
         self.assertEqual(final.kind, "FINAL")
         self.assertTrue(final.finalized)
         self.assertEqual(OutcomeReport.from_record(final.to_record()), final)
+        rendered = render_outcome_markdown(final)
+        self.assertIn("# Final Outcome", rendered)
+        self.assertIn("REQ-002", rendered)
+        self.assertIn("## Validation and QA", rendered)
 
     def test_final_rejects_target_drift(self):
         kwargs = report_kwargs(verified_progress(), gates=(self.passing_gate(),))

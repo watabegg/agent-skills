@@ -320,3 +320,81 @@ def blocked_outcome(*, external_goal_blocked: bool, **kwargs: Any) -> OutcomeRep
         external_goal_blocked=external_goal_blocked,
         **kwargs,
     )
+
+
+def render_outcome_markdown(report: OutcomeReport) -> str:
+    """Render one validated outcome model as the canonical human report."""
+
+    if not isinstance(report, OutcomeReport):
+        raise OutcomeModelError("report must be an OutcomeReport")
+    title = {
+        "DRAFT": "Outcome Draft",
+        "FINAL": "Final Outcome",
+        "BLOCKED": "Blocked Outcome",
+    }[report.kind]
+    lines = [
+        f"# {title}",
+        "",
+        f"- Run: `{report.run_id}`",
+        f"- Goal: {report.goal}",
+        f"- Generated: `{report.generated_at}`",
+        f"- Integration target: `{report.integration_target_sha or '-'}`",
+        f"- Current branch SHA: `{report.current_branch_sha or '-'}`",
+        f"- Finalized: `{str(report.finalized).lower()}`",
+        "",
+        "## Requirement Outcomes",
+        "",
+    ]
+    if report.requirement_progress:
+        for item in report.requirement_progress:
+            detail = item.remaining_work or "; ".join(item.blockers) or "完了"
+            lines.append(f"- `{item.requirement_id}`: `{item.status}` — {detail}")
+    else:
+        lines.append("- No accepted requirements were recorded.")
+
+    lines.extend(["", "## User-visible Changes", ""])
+    lines.extend(f"- {item}" for item in report.user_changes)
+    if not report.user_changes:
+        lines.append("- No user-visible change summary was recorded.")
+
+    lines.extend(["", "## Validation and QA", ""])
+    for gate in report.gates:
+        refs = ", ".join(gate.evidence_refs) or "no evidence recorded"
+        lines.append(f"- `{gate.name}`: `{gate.status}` — {refs}")
+    if not report.gates:
+        lines.append("- No gates were recorded.")
+
+    lines.extend(["", "## Review", ""])
+    lines.append(
+        "- Confirmed findings: "
+        + ("; ".join(report.review_findings) or "none")
+    )
+    lines.append("- Fixes: " + ("; ".join(report.review_fixes) or "none"))
+    lines.append(
+        "- Accepted risks: " + ("; ".join(report.accepted_risks) or "none")
+    )
+
+    lines.extend(["", "## Decisions and Unresolved Items", ""])
+    lines.append("- Decisions: " + ("; ".join(report.decisions) or "none"))
+    lines.append(
+        "- Unresolved: " + ("; ".join(report.unresolved_items) or "none")
+    )
+    if report.blocking_reason:
+        lines.append(f"- Blocking reason: {report.blocking_reason}")
+
+    lines.extend(
+        [
+            "",
+            "## Cleanup and Sessions",
+            "",
+            f"- Cleanup: {report.cleanup_status or 'not recorded'}",
+            f"- Sessions: {report.session_status or 'not recorded'}",
+            "",
+            "## Next User Actions",
+            "",
+        ]
+    )
+    lines.extend(f"- {item}" for item in report.next_user_actions)
+    if not report.next_user_actions:
+        lines.append("- No user action is required.")
+    return "\n".join(lines) + "\n"

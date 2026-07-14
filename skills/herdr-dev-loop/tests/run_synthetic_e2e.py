@@ -201,6 +201,28 @@ probes_per_provider = 4
     require(state["skill_version"] == ctx["runtime_version"], "state version mismatch")
     require(state["resolved_config"]["max_workers"] == 2, "config snapshot missing")
 
+    config_text = config_path.read_text(encoding="utf-8").replace(
+        "max_workers = 2", "max_workers = 4"
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+    apply_preview = run(
+        hloop_command(repo, namespace, "config", "apply", "--dry-run"),
+        cwd=root,
+        env=env,
+    )
+    preview_payload = json.loads(apply_preview.stdout)
+    require(preview_payload["changed"], "config apply dry-run missed a changed value")
+    unchanged = json.loads(path.read_text(encoding="utf-8"))
+    require(unchanged["max_workers"] == 2, "config apply dry-run mutated state")
+    run(
+        hloop_command(repo, namespace, "config", "apply", "--apply"),
+        cwd=root,
+        env=env,
+    )
+    applied = json.loads(path.read_text(encoding="utf-8"))
+    require(applied["max_workers"] == 4, "explicit config apply did not update state")
+    state = applied
+
     state["state_format_version"] = 2
     state.pop("schema_revision", None)
     state["skill_version"] = "0.4.0"
@@ -225,6 +247,7 @@ probes_per_provider = 4
     return {
         "config_source": migrated["config_source"]["kind"],
         "resolved_max_workers": migrated["resolved_config"]["max_workers"],
+        "explicit_apply_max_workers": migrated["max_workers"],
         "migration_steps": migration_plan["applied_steps"],
         "backup_count": len(backups),
     }
@@ -626,6 +649,7 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
     repo: Path = ctx["repo"]
     env: dict[str, str] = ctx["env"]
     namespace: str = ctx["namespace"]
+    path = state_path(repo, namespace)
     secret = "synthetic-secret-abcdefghijklmnop"
     run(
         hloop_command(
@@ -641,7 +665,7 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
         cwd=root,
         env=env,
     )
-    state = json.loads(state_path(repo, namespace).read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
     require(secret not in json.dumps(state), "raw credential leaked into STATE")
     run(
         hloop_command(
@@ -675,6 +699,20 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
         if status == "in_progress":
             args.extend(["--task-id", "T001", "--remaining-work", "run release gates"])
         run(args, cwd=root, env=env)
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "context",
+            "update",
+            "--source",
+            "U0001",
+            "--text",
+            "Preserve structured release evidence for the final report.",
+        ),
+        cwd=root,
+        env=env,
+    )
     outcome = run(
         hloop_command(repo, namespace, "outcome", "show", "--requirement-id", "REQ-001"),
         cwd=root,
@@ -709,6 +747,9 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
         cwd=root,
         env=env,
     )
+    question_path = path.parent / "decisions" / "D001" / "QUESTION.md"
+    require(question_path.is_file(), "decision question artifact missing")
+    require("# 判断のお願い" in question_path.read_text(encoding="utf-8"), "liaison question is not plain Japanese")
     run(
         hloop_command(
             repo,
@@ -745,8 +786,16 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
         cwd=root,
         env=env,
     )
-    final_state = json.loads(state_path(repo, namespace).read_text(encoding="utf-8"))
+    final_state = json.loads(path.read_text(encoding="utf-8"))
     require(final_state["decisions"]["D001"]["status"] == "accepted", "decision not resolved")
+    artifact_paths = [
+        path.parent / "requirements" / "REQUIREMENTS.md",
+        path.parent / "requirements" / "STATUS.md",
+        path.parent / "context" / "MANAGER_CONTEXT.md",
+        path.parent / "progress" / "LATEST.md",
+        path.parent / "decisions" / "D001" / "RESPONSE.md",
+    ]
+    require(all(item.is_file() for item in artifact_paths), "requirement/context/progress/decision artifact missing")
     return {
         "input_redacted_from_state": True,
         "requirement_status": projected["progress"]["status"],
@@ -815,6 +864,57 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     path = state_path(repo, namespace)
     state = json.loads(path.read_text(encoding="utf-8"))
     target = git(repo, "rev-parse", "master").stdout.strip()
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "progress",
+            "record",
+            "--requirement-id",
+            "REQ-001",
+            "--status",
+            "implemented_unverified",
+            "--evidence-kind",
+            "artifact",
+            "--evidence-ref",
+            "reports/release-evidence.json",
+            "--verified-by",
+            "hloop",
+            "--head-sha",
+            target,
+            "--remaining-work",
+            "run final validation",
+        ),
+        cwd=root,
+        env=env,
+    )
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "progress",
+            "record",
+            "--requirement-id",
+            "REQ-001",
+            "--status",
+            "verified",
+            "--evidence-kind",
+            "test",
+            "--evidence-ref",
+            "synthetic validation",
+            "--verified-by",
+            "hloop",
+            "--head-sha",
+            target,
+            "--result",
+            "passed",
+            "--remaining-work",
+            "",
+        ),
+        cwd=root,
+        env=env,
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
     state["tasks"] = {
         "T999": {
             "status": "merged",
@@ -853,6 +953,7 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     require(finished["phase"] == "done", "finish did not reach done")
     require(finished["final_target_sha"] == target, "finish target mismatch")
     require(report_path.is_file(), "finish report missing")
+    require("# Final Outcome" in report_path.read_text(encoding="utf-8"), "FINAL is not OutcomeReport-rendered")
     return {
         "phase": finished["phase"],
         "target_sha": target,

@@ -987,6 +987,9 @@ class RequirementProgressOutcomeTests(unittest.TestCase):
                     )
                 )
             self.assertIn("created REQ-001", buffer.getvalue())
+            loop_dir = repo / hloop.LOOP_DIR
+            self.assertTrue((loop_dir / "requirements" / "REQUIREMENTS.md").is_file())
+            self.assertTrue((loop_dir / "requirements" / "STATUS.md").is_file())
 
             hloop.cmd_progress_record(
                 SimpleNamespace(
@@ -1044,6 +1047,251 @@ class RequirementProgressOutcomeTests(unittest.TestCase):
             outcome = json.loads(buffer.getvalue())
             self.assertEqual(outcome["requirement"]["id"], "REQ-001")
             self.assertEqual(outcome["progress"]["status"], "implemented_unverified")
+            self.assertTrue((loop_dir / "progress" / "LATEST.md").is_file())
+            self.assertTrue((loop_dir / "progress" / "P0002.md").is_file())
+
+            hloop.cmd_context_update(
+                SimpleNamespace(
+                    repo=str(repo),
+                    source="U0001",
+                    text="Keep authentication changes backward compatible; token=context-secret-12345678.",
+                )
+            )
+            context = (loop_dir / "context" / "MANAGER_CONTEXT.md").read_text()
+            self.assertIn("backward compatible", context)
+            self.assertIn("U0001", context)
+            self.assertNotIn("context-secret-12345678", context)
+            self.assertIn("[REDACTED]", context)
+
+    def test_config_apply_is_explicit_dry_run_safe_and_idle_guarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            state["resolved_config"] = {
+                "max_workers": 3,
+                "session_cleanup": "archive",
+                "worker": {"provider": "codex", "model": "auto", "effort": "auto"},
+                "reviewer": {"provider": "codex", "model": "auto", "effort": "auto"},
+            }
+            hloop.save_state(repo, state)
+            config_home = root / "config"
+            config_home.mkdir()
+            (config_home / "config.toml").write_text(
+                """version = 1
+[defaults]
+max_workers = 2
+session_cleanup = "none"
+[defaults.worker]
+provider = "claude"
+model = "sonnet"
+effort = "high"
+""",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HLOOP_CONFIG_HOME": str(config_home)}):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    hloop.cmd_config_apply(
+                        SimpleNamespace(repo=str(repo), dry_run=True, apply=False)
+                    )
+                preview = json.loads(output.getvalue())
+                self.assertTrue(preview["changed"])
+                self.assertIsNone(hloop.load_state(repo).get("max_workers"))
+
+                hloop.cmd_config_apply(
+                    SimpleNamespace(repo=str(repo), dry_run=False, apply=True)
+                )
+            applied = hloop.load_state(repo)
+            self.assertEqual(applied["max_workers"], 2)
+            self.assertEqual(applied["session_cleanup"], "none")
+            self.assertEqual(applied["worker_agent_provider"], "claude")
+            self.assertEqual(applied["worker_agent_model"], "sonnet")
+
+            applied["tasks"] = {"T001": {"status": "running"}}
+            hloop.save_state(repo, applied)
+            with mock.patch.dict(os.environ, {"HLOOP_CONFIG_HOME": str(config_home)}):
+                with self.assertRaisesRegex(hloop.HLoopError, "roles are running"):
+                    hloop.cmd_config_apply(
+                        SimpleNamespace(repo=str(repo), dry_run=False, apply=True)
+                    )
+
+    def test_decision_artifacts_are_plain_language_and_block_only_affected_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            state["tasks"] = {
+                "T001": {"status": "queued", "depends_on": []},
+                "T002": {"status": "queued", "depends_on": []},
+            }
+            hloop.save_state(repo, state)
+            hloop.cmd_decision_new(
+                SimpleNamespace(
+                    repo=str(repo),
+                    id="D001",
+                    title="既存データの表示方法をどちらにするか",
+                    decision_class="deferred-user",
+                    affects=["T001"],
+                    option=["従来表示を保つ", "新表示へ切り替える"],
+                    tradeoff=["互換性を保てる", "操作を簡潔にできる"],
+                    recommend_option="opt_1",
+                    recommend_rationale="既存利用者への影響が小さいため",
+                    source_finding=["scout:F001"],
+                    created_from="specification-scout",
+                )
+            )
+            state = hloop.load_state(repo)
+            scheduler = hloop.build_decision_scheduler(state)
+            self.assertFalse(scheduler.loop_blocked)
+            self.assertEqual(scheduler.decision_blocked_task_ids, ("T001",))
+            self.assertIn("T002", scheduler.dispatchable_task_ids)
+            question = (
+                repo / hloop.LOOP_DIR / "decisions" / "D001" / "QUESTION.md"
+            ).read_text()
+            self.assertIn("# 判断のお願い", question)
+            self.assertIn("## 選択肢", question)
+            self.assertIn("この判断に依存しない作業は継続できます", question)
+
+            hloop.cmd_decision_respond(
+                SimpleNamespace(
+                    repo=str(repo),
+                    id="D001",
+                    text="従来表示を保つ",
+                    option="opt_1",
+                    recommendation=None,
+                    responded_by="user",
+                )
+            )
+            response = (
+                repo / hloop.LOOP_DIR / "decisions" / "D001" / "RESPONSE.md"
+            ).read_text()
+            self.assertIn("従来表示を保つ", response)
+
+    def test_advisor_close_is_idempotent_and_consumes_reported_participants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            state["advice"] = {
+                "A001": {
+                    "status": "reported",
+                    "gate_status": "reported",
+                    "participants": [
+                        {"participant_id": "P1", "status": "reported", "gate_status": "reported"}
+                    ],
+                }
+            }
+            hloop.save_state(repo, state)
+            args = SimpleNamespace(
+                repo=str(repo),
+                advice_id="A001",
+                verdict="no-action",
+                reason="evidence is sufficient",
+            )
+            with mock.patch.object(
+                hloop,
+                "preflight_loop",
+                side_effect=lambda checked_repo, **_kwargs: hloop.load_state(checked_repo),
+            ):
+                hloop.cmd_advisor_close(args)
+                first = hloop.load_state(repo)
+                first_time = first["advice"]["A001"]["triaged_at"]
+                hloop.cmd_advisor_close(args)
+            closed = hloop.load_state(repo)["advice"]["A001"]
+            self.assertEqual(closed["triaged_at"], first_time)
+            self.assertEqual(closed["participants"][0]["gate_status"], "consumed")
+
+    def test_run_level_handoff_abandon_and_supersede_are_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+
+            hloop.cmd_completion_handoff(
+                SimpleNamespace(
+                    repo=str(repo),
+                    next_namespace="next-run",
+                    head_sha=head,
+                    reason="split remaining scope",
+                )
+            )
+            self.assertEqual(hloop.load_state(repo)["phase"], "handoff")
+
+            state = hloop.load_state(repo)
+            state["phase"] = "dispatching"
+            state["terminal_outcome"] = {}
+            hloop.save_state(repo, state)
+            hloop.cmd_completion_abandon(
+                SimpleNamespace(repo=str(repo), reason="user cancelled the goal")
+            )
+            self.assertEqual(hloop.load_state(repo)["phase"], "abandoned_by_user")
+
+            state = hloop.load_state(repo)
+            state["phase"] = "done"
+            state["final_target_sha"] = head
+            state["terminal_outcome"] = {"status": "done", "target_sha": head}
+            hloop.save_state(repo, state)
+            hloop.cmd_completion_supersede(
+                SimpleNamespace(
+                    repo=str(repo),
+                    head_sha=head,
+                    reason="a successor run owns later evidence",
+                    next_namespace="successor-run",
+                )
+            )
+            superseded = hloop.load_state(repo)
+            self.assertEqual(superseded["phase"], "superseded")
+            self.assertEqual(
+                superseded["terminal_outcome"]["next_namespace"], "successor-run"
+            )
+            inventory = hloop.collect_loop_inventory(repo, probe_panes=False)
+            self.assertFalse(
+                any(
+                    "reviewer start" in action or "gap start" in action
+                    for action in inventory["next_actions"]
+                )
+            )
+
+    def test_blocked_outcome_is_explicit_and_outcome_report_rendered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            requirement = hloop.hloop_requirements.Requirement(
+                requirement_id="REQ-001",
+                source_inputs=("U0001",),
+                acceptance=("user decision is resolved",),
+                priority="P1",
+                accepted_at="2026-07-15T00:00:00+00:00",
+            ).to_record()
+            requirement["progress"] = hloop.hloop_requirements.RequirementProgress(
+                requirement_id="REQ-001",
+                status="blocked",
+                blockers=("user response",),
+            ).to_record()
+            state.update(
+                {
+                    "goal_id": "blocked-goal",
+                    "run_id": "run-blocked",
+                    "phase": "blocked_user_decision",
+                    "requirements": {"REQ-001": requirement},
+                    "tasks": {},
+                }
+            )
+            hloop.save_state(repo, state)
+            hloop.cmd_outcome_blocked(
+                SimpleNamespace(repo=str(repo), reason="same user decision blocks all safe work")
+            )
+            blocked = hloop.load_state(repo)
+            self.assertEqual(blocked["phase"], "blocked")
+            report_path = repo / hloop.LOOP_DIR / "reports" / "BLOCKED.md"
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("# Blocked Outcome", report)
+            self.assertIn("same user decision blocks all safe work", report)
 
 
 if __name__ == "__main__":
