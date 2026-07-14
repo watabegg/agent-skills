@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/review-manifest.schema.json",
+  "title": "Herdr Dev Loop Review Manifest",
+  "$ref": "../references/schemas/review-manifest.schema.json"
+}
