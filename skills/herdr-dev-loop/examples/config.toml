@@ -1,0 +1,39 @@
+# herdr-dev-loop 0.5.0 configuration example.
+# Copy to one of the locations shown by `hloop config path --json`.
+version = 1
+
+[defaults]
+max_workers = 3
+session_cleanup = "archive"
+
+[defaults.worker]
+provider = "codex"
+model = "auto"
+effort = "auto"
+
+[defaults.reviewer]
+mode = "swarm"
+provider = "codex"
+model = "auto"
+effort = "auto"
+probe_count = 6
+
+# `match = "repo"` is the default. The canonical repository root is matched,
+# so running hloop from a nested directory does not change the result.
+[[scope]]
+path = "~/src"
+
+[scope.worker]
+provider = "claude"
+model = "sonnet"
+
+# Use cwd matching only when invocation-directory-specific behavior is wanted.
+[[scope]]
+path = "~/src/high-risk-service"
+match = "cwd"
+max_workers = 2
+
+[scope.reviewer]
+mode = "dual-swarm"
+providers = ["codex", "claude"]
+probes_per_provider = 4

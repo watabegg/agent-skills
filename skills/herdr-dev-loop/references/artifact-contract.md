@@ -13,6 +13,7 @@ All loop coordination is file-backed under `.ai/herdr-dev-loop/loops/<namespace>
   JOURNAL.md
   DECISIONS.md
   USER_ACTION_REQUIRED.md
+  inputs/                 # local-only redacted input records
   tasks/
   batches/
   results/
@@ -23,7 +24,9 @@ All loop coordination is file-backed under `.ai/herdr-dev-loop/loops/<namespace>
   triage/
   validation/
   qa/
-  inbox/
+  inbox/                  # local-only report and wake records
+  broker/                 # local-only durable broker storage
+  broker-spool/           # local-only outage recovery spool
   reports/
 ```
 
@@ -76,13 +79,15 @@ Required top-level fields:
 - `reviews`
 - `gaps`
 - `advice`
-- `blocking_decisions`
+- `decisions`
 
 Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pane id.
 
 `namespace` and `loop_path` must match the Manager command's explicit `--namespace`. A command never searches another namespace or legacy `.ai/loop` when the selected `STATE.json` is missing.
 
 Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r1 state.
+
+The current 0.5.0 contract is `state_format_version: 3` and `schema_revision: 1`. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned backup, and applies every declared revision rather than rebinding old evidence to the new schema.
 
 `persistence: local-only` copies the namespace snapshot to role worktrees and excludes loop artifacts from integration commits. `persistence: branch-history` requires Manager-owned inputs to be committed at the audited ref. `worktree_setup_commands` contains the ordered repository-specific bootstrap contract applied before role launch; run outcomes are stored separately under `.ai/herdr-dev-loop/experience/worktree-setup.json`.
 
@@ -116,6 +121,16 @@ Recommended optional fields:
 - per advice `mode`, `source_refs`, `participants`, `gate_status`, and `verdict`
 - per advisor participant `provider`, `model`, `worktree`, `worktree_advice_path_harvested`, `artifact_status`, `write_scope_violations`
 - `last_validation.results[].log`: relative path to captured stdout/stderr under `.ai/herdr-dev-loop/loops/<namespace>/validation/`
+- `config_source` and `resolved_config`: the configuration file identity and immutable init snapshot
+- `attempt_history`: append-only role attempt identities
+- `resume_requirements`: stale gates, blockers, dirty paths, and running roles discovered while paused
+- `pending_fix_task_drafts` and `final_gate`: stable final-review arm state
+- `terminal_outcome`: final target and terminal status
+- `artifact_policy`: canonical active/harvested locations and local-only artifact classes
+
+Raw or redacted input bodies, inbox events, broker databases, sockets, spooled reports, and provider credentials are never checkpoint-eligible. `STATE.json` may retain safe digests, IDs, counts, and resolved non-secret configuration, but not the underlying prompt or transport secret.
+
+Accepted requirements, their progress, and machine-readable decision records currently live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. The 0.5.0 CLI does not create separate `requirements/`, `progress/`, `context/`, or `decisions/` directories.
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 

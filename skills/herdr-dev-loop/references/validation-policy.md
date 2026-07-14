@@ -54,6 +54,8 @@ Record exact commands and results in Worker result artifacts and in `STATE.json.
 
 Record Worker QA evidence paths, preview URLs, staging URLs, screenshots, seeded data cleanup, or blockers in the Worker result artifact when they apply. Record Manager final QA evidence in `qa/FINAL.md` and the final report. Do not force browser QA for every repository; choose the product-appropriate QA surface from PROFILE and PLAN.
 
+For a herdr-dev-loop release, unit tests and selftest are not substitutes for the scenario runners. Run `tests/run_synthetic_e2e.py --json` and preserve its structured scenario results. Run `tests/run_provider_e2e.py --provider <codex|claude> --json` only with an authenticated disposable session; the provider runner performs the live read-only probe by default. When credentials or a session are unavailable, use the runner's explicit `--allow-skip --skip-reason <reason>` path; a skipped result proves non-execution and does not count as a live provider pass.
+
 In frontmatter, write non-empty command and result lists as multiline lists. `hloop` rejects non-empty inline lists for known list fields because comma-splitting command strings is unsafe. Empty lists such as `blocking_questions: []` remain allowed.
 
 ## Integration Failure

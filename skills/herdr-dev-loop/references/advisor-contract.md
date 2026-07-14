@@ -68,6 +68,8 @@ Required sections:
 
 The first progress message must identify `herdr-dev-loop <version> / namespace <namespace> / Advisor <advice-id>/<participant-id>`, and the artifact must preserve the prompt-provided `skill_version`.
 
+The Advisor submits semantic ACK before analysis, milestone only when its recommendation or risk changes, attention when required evidence is unavailable, and completion after the participant artifact is ready. Reports never authorize a decision, task, merge, or gate transition.
+
 Final line:
 
 ```text
