@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import queue
 import sqlite3
 import sys
 import tempfile
@@ -18,6 +20,18 @@ from hloop_lib import broker, events  # noqa: E402
 
 CREATED_AT = "2026-07-15T00:00:00+00:00"
 EXPIRES_AT = "2026-07-16T00:00:00+00:00"
+
+
+def initialize_broker_after_barrier(root, barrier, result_queue):
+    """Open one shared broker root from a spawned child process."""
+
+    try:
+        barrier.wait(timeout=30)
+        broker.BrokerStore(Path(root), timeout_seconds=30)
+    except BaseException as exc:  # pragma: no cover - asserted via the queue
+        result_queue.put(f"{type(exc).__name__}: {exc}")
+    else:
+        result_queue.put("ok")
 
 
 def report(
@@ -177,6 +191,65 @@ class BrokerStorageTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_concurrent_first_open_is_serialized_across_processes(self):
+        process_count = 8
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(process_count)
+        result_queue = context.Queue()
+        root = self.root / "concurrent-broker"
+        processes = [
+            context.Process(
+                target=initialize_broker_after_barrier,
+                args=(str(root), barrier, result_queue),
+            )
+            for _ in range(process_count)
+        ]
+
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=45)
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+            results = []
+            for _ in processes:
+                try:
+                    results.append(result_queue.get(timeout=2))
+                except queue.Empty:
+                    results.append("missing child result")
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+            result_queue.close()
+            result_queue.join_thread()
+
+        self.assertEqual(
+            [process.exitcode for process in processes], [0] * process_count
+        )
+        self.assertEqual(results, ["ok"] * process_count)
+        connection = sqlite3.connect(root / "broker.sqlite3")
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM broker_meta WHERE key = 'schema_version'"
+                ).fetchone()[0],
+                str(broker.BROKER_SCHEMA_VERSION),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM broker_meta WHERE key = 'schema_version'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
 
     def test_event_inbox_and_sequence_are_transactional_and_idempotent(self):
         event_id = "28b79cf0-8e32-4b89-88af-e332ee5a5dbe"
