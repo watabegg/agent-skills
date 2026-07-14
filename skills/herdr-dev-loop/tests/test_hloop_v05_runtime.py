@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -271,6 +272,310 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
             self.assertIn(event_id, buffer.getvalue())
+
+
+class BrokerTransportAndAuthenticationTests(unittest.TestCase):
+    """Exercises detached-worktree broker sharing, inbox show, report auth, hooks, drain."""
+
+    def setUp(self):
+        self.previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-broker-transport-and-auth")
+
+    def tearDown(self):
+        hloop.configure_loop_namespace(self.previous_namespace)
+
+    def init_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.PIPE)
+        state = {
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "namespace": hloop.LOOP_NAMESPACE,
+            "phase": "dispatching",
+            "run_id": "run-001",
+            "integration_branch": "main",
+        }
+        hloop.save_state(repo, state)
+        return repo
+
+    def report_args(self, repo: Path, **overrides) -> SimpleNamespace:
+        base = dict(
+            repo=str(repo),
+            run_id=None,
+            role_id="T001",
+            attempt_id=None,
+            event_id=None,
+            task_contract_digest=None,
+            report_token=None,
+            type="milestone",
+            stage="implementing",
+            summary="made progress",
+            next="continue implementation",
+            evidence_ref=["skills/herdr-dev-loop/scripts/hloop:1"],
+            understood_goal=None,
+            scope=None,
+            acceptance=None,
+            approach=None,
+            risk=["none identified"],
+            impact=None,
+            attempted=None,
+            option_text=None,
+            recommendation=None,
+            blocked_scope=None,
+            artifact=None,
+            head_sha=None,
+            validation_result_ref=None,
+            residual_risk=None,
+            handoff=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_broker_transport_is_shared_across_worktrees_without_copying_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            worktree = root / "worker-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "T001-A001", str(worktree), "main"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            self.assertEqual(hloop.broker_root(repo), hloop.broker_root(worktree))
+            self.assertFalse(
+                str(hloop.broker_root(worktree)).startswith(str(hloop.loop_path(worktree))),
+                "broker storage must live outside the per-worktree loop snapshot",
+            )
+
+            event_id = str(uuid.uuid4())
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(
+                    self.report_args(worktree, role_id="T001", attempt_id="T001-A001", event_id=event_id)
+                )
+            self.assertIn(f"accepted {event_id}", buffer.getvalue())
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
+            self.assertIn(event_id, buffer.getvalue(), "Manager's own repo path did not see the Worker's report")
+
+    def test_inbox_show_matches_the_fixed_wake_message_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            event_id = str(uuid.uuid4())
+            hloop.cmd_agent_report(self.report_args(repo, event_id=event_id))
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_inbox_show(SimpleNamespace(repo=str(repo), event_id=event_id))
+            shown = json.loads(buffer.getvalue())
+            self.assertEqual(shown["event_id"], event_id)
+            self.assertEqual(shown["role_id"], "T001")
+
+            with self.assertRaises(hloop.HLoopError):
+                hloop.cmd_inbox_show(SimpleNamespace(repo=str(repo), event_id=str(uuid.uuid4())))
+
+    def test_report_token_authentication_accepts_matching_and_rejects_mismatched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as txn:
+                store.register_active_role(
+                    txn,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest=hashlib.sha256(b"contract").hexdigest(),
+                    token="s3cr3t-token",
+                )
+
+            with self.assertRaises(hloop.HLoopError):
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        attempt_id="T001-A001",
+                        task_contract_digest=hashlib.sha256(b"contract").hexdigest(),
+                        report_token="wrong-token",
+                    )
+                )
+
+            event_id = str(uuid.uuid4())
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        event_id=event_id,
+                        attempt_id="T001-A001",
+                        task_contract_digest=hashlib.sha256(b"contract").hexdigest(),
+                        report_token="s3cr3t-token",
+                    )
+                )
+            self.assertIn(f"accepted {event_id}", buffer.getvalue())
+
+            with store.transaction() as txn:
+                store.revoke_active_role(txn, run_id="run-001", role_id="T001")
+            with self.assertRaises(hloop.HLoopError):
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        attempt_id="T001-A001",
+                        task_contract_digest=hashlib.sha256(b"contract").hexdigest(),
+                        report_token="s3cr3t-token",
+                    )
+                )
+
+    def test_manager_sleep_surfaces_already_pending_report_instead_of_losing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            event_id = str(uuid.uuid4())
+            hloop.cmd_agent_report(self.report_args(repo, event_id=event_id))
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_manager_sleep(
+                    SimpleNamespace(
+                        repo=str(repo), ttl_seconds=3600, manager_session_id="sess", pane_id="pane"
+                    )
+                )
+            output = buffer.getvalue()
+            self.assertIn("unread reports already pending: 1", output)
+            self.assertIn(event_id, output)
+
+    def test_hooks_install_status_uninstall_round_trip_preserves_user_hooks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            settings_path = repo / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(
+                json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo user-hook"}]}]}}),
+                encoding="utf-8",
+            )
+
+            hloop.cmd_hooks_install(
+                SimpleNamespace(
+                    repo=str(repo),
+                    provider="claude",
+                    settings_path=None,
+                    codex_continuation_capability="unknown",
+                )
+            )
+            installed = json.loads(settings_path.read_text(encoding="utf-8"))
+            stop_handlers = [h for group in installed["hooks"]["Stop"] for h in group["hooks"]]
+            self.assertEqual(len(stop_handlers), 2, "existing user hook must be preserved")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_hooks_status(
+                    SimpleNamespace(repo=str(repo), provider="claude", settings_path=None)
+                )
+            status = json.loads(buffer.getvalue())
+            self.assertEqual(status["owned_stop_hooks"], 1)
+
+            hloop.cmd_hooks_uninstall(
+                SimpleNamespace(repo=str(repo), provider="claude", settings_path=None)
+            )
+            after = json.loads(settings_path.read_text(encoding="utf-8"))
+            remaining = [h for group in after["hooks"]["Stop"] for h in group["hooks"]]
+            self.assertEqual(len(remaining), 1)
+            self.assertIn("echo user-hook", remaining[0]["command"])
+
+    def test_hooks_guard_returns_fixed_context_only_when_active_roles_lack_a_valid_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            state["tasks"] = {"T001": {"status": "running"}}
+            hloop.save_state(repo, state)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_hooks_guard(
+                    SimpleNamespace(repo=str(repo), provider="claude", hloop_hook_owner="x")
+                )
+            response = json.loads(buffer.getvalue())
+            self.assertIn("additionalContext", response["hookSpecificOutput"])
+
+            hloop.cmd_manager_sleep(
+                SimpleNamespace(
+                    repo=str(repo), ttl_seconds=3600, manager_session_id="sess", pane_id="pane"
+                )
+            )
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_hooks_guard(
+                    SimpleNamespace(repo=str(repo), provider="claude", hloop_hook_owner="x")
+                )
+            self.assertEqual(json.loads(buffer.getvalue()), {})
+
+    def test_message_drain_resends_pending_message_and_clears_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "pane_id": "pane-1",
+                "agent_provider": "codex",
+                "pending_manager_messages": [],
+            }
+            pending_rel = hloop.write_pending_manager_message(
+                repo,
+                role="Worker",
+                agent_id="T001",
+                pane_id="pane-1",
+                source="argv",
+                message="please retry",
+                error="simulated send failure",
+            )
+            task_state["pending_manager_messages"].append(
+                {"at": hloop.now_iso(), "source": "argv", "pending_path": pending_rel.as_posix(), "error": "boom"}
+            )
+            state["tasks"] = {"T001": task_state}
+            hloop.save_state(repo, state)
+
+            sent = []
+
+            def capture_send(provider, pane_id, message, *unused):
+                sent.append((pane_id, message))
+
+            with mock.patch.object(hloop, "send_agent_tui_message", side_effect=capture_send), mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), contextlib.redirect_stdout(io.StringIO()) as buffer:
+                hloop.cmd_message_drain(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        timeout_ms=1,
+                        input_settle_ms=0,
+                        submit_verify_ms=1,
+                        submit_attempts=1,
+                    )
+                )
+            self.assertIn("drained 1 pending message(s); 0 still pending", buffer.getvalue())
+            self.assertEqual(len(sent), 1)
+            self.assertIn("please retry", sent[0][1])
+            self.assertEqual(task_state["pending_manager_messages"], [])
+            self.assertFalse((repo / pending_rel).exists())
 
 
 class RequirementProgressOutcomeTests(unittest.TestCase):

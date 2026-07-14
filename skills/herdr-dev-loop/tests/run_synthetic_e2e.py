@@ -382,8 +382,12 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
         },
         event_id=spooled_id,
     )
-    spool_dir = repo / ".ai" / "herdr-dev-loop" / "loops" / namespace / "broker-spool"
-    spool_dir.mkdir(parents=True, exist_ok=True)
+    previous_namespace = hloop.LOOP_NAMESPACE
+    hloop.configure_loop_namespace(namespace)
+    try:
+        spool_dir = hloop.broker_spool_dir(repo)
+    finally:
+        hloop.configure_loop_namespace(previous_namespace)
     spool_client_event(spool_dir, milestone)
     recovered = run(
         hloop_command(repo, namespace, "broker", "recover"),
