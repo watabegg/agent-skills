@@ -90,6 +90,7 @@ def _schema_sql() -> str:
         "wake_outbox",
         "wake_consumptions",
         "broker_owners",
+        "active_roles",
     )
     triggers = []
     for table in append_only_tables:
@@ -185,6 +186,17 @@ def _schema_sql() -> str:
             socket_path TEXT NOT NULL,
             started_at TEXT NOT NULL,
             UNIQUE(namespace, run_id, owner_epoch)
+        );
+
+        CREATE TABLE IF NOT EXISTS active_roles (
+            registration_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            role_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            task_contract_digest TEXT NOT NULL,
+            token_digest TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            registered_at TEXT NOT NULL
         );
         """
         + "\n".join(triggers)
@@ -366,6 +378,15 @@ class BrokerStore:
         )
         return StoredEvent(stored, True)
 
+    def get_event(
+        self, transaction: BrokerTransaction, *, event_id: str
+    ) -> dict[str, Any] | None:
+        transaction.require_active(self)
+        row = transaction.connection.execute(
+            "SELECT event_json FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return json.loads(row["event_json"]) if row is not None else None
+
     def events(self, transaction: BrokerTransaction) -> list[dict[str, Any]]:
         transaction.require_active(self)
         rows = transaction.connection.execute(
@@ -381,6 +402,34 @@ class BrokerStore:
                    inbox.report_type, inbox.projected_at
             FROM inbox ORDER BY inbox.sequence
             """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def unconsumed_inbox(
+        self, transaction: BrokerTransaction, *, run_id: str
+    ) -> list[dict[str, Any]]:
+        """Return inbox rows for a run that have never been consumed by any wake.
+
+        This checks the raw append-only inbox rather than ``wake_outbox``, so a
+        report that arrived while no lease was active (or under a lease
+        generation that had already lapsed) still surfaces here. Combined with
+        registering a wake lease in the same transaction, this closes the
+        window where a report could otherwise be lost between an inbox check
+        and a Manager going to sleep.
+        """
+
+        transaction.require_active(self)
+        run_id = _nonempty_line(run_id, "run_id")
+        rows = transaction.connection.execute(
+            """
+            SELECT inbox.event_id, inbox.sequence, inbox.run_id, inbox.role_id,
+                   inbox.report_type, inbox.projected_at
+            FROM inbox
+            WHERE inbox.run_id = ?
+              AND inbox.event_id NOT IN (SELECT event_id FROM wake_consumptions)
+            ORDER BY inbox.sequence
+            """,
+            (run_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -746,6 +795,153 @@ class BrokerStore:
             (namespace, run_id),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def current_lease(
+        self, transaction: BrokerTransaction, *, run_id: str
+    ) -> dict[str, Any] | None:
+        """Return the most recently registered wake lease for a run, if any."""
+
+        transaction.require_active(self)
+        row = transaction.connection.execute(
+            """
+            SELECT run_id, generation, manager_session_id, pane_id,
+                   expires_at, created_at
+            FROM wake_leases WHERE run_id = ?
+            ORDER BY generation DESC LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def register_active_role(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        run_id: str,
+        role_id: str,
+        attempt_id: str,
+        task_contract_digest: str,
+        token: str,
+        registered_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Append the authoritative identity a role must present on every report."""
+
+        transaction.require_active(self)
+        run_id = _nonempty_line(run_id, "run_id")
+        role_id = _nonempty_line(role_id, "role_id")
+        attempt_id = _nonempty_line(attempt_id, "attempt_id")
+        task_contract_digest = _nonempty_line(
+            task_contract_digest, "task_contract_digest"
+        ).lower()
+        token = _nonempty_line(token, "token")
+        timestamp = registered_at or utc_now()
+        parse_rfc3339(timestamp, field="registered_at")
+        token_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        transaction.connection.execute(
+            """
+            INSERT INTO active_roles(
+                run_id, role_id, attempt_id, task_contract_digest,
+                token_digest, active, registered_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?)
+            """,
+            (run_id, role_id, attempt_id, task_contract_digest, token_digest, timestamp),
+        )
+        return {
+            "run_id": run_id,
+            "role_id": role_id,
+            "attempt_id": attempt_id,
+            "task_contract_digest": task_contract_digest,
+            "active": True,
+            "registered_at": timestamp,
+        }
+
+    def revoke_active_role(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        run_id: str,
+        role_id: str,
+        revoked_at: str | None = None,
+    ) -> bool:
+        """Append a tombstone row so a superseded attempt cannot submit reports."""
+
+        transaction.require_active(self)
+        run_id = _nonempty_line(run_id, "run_id")
+        role_id = _nonempty_line(role_id, "role_id")
+        current = self._latest_active_role(transaction, run_id=run_id, role_id=role_id)
+        if current is None or not current["active"]:
+            return False
+        timestamp = revoked_at or utc_now()
+        parse_rfc3339(timestamp, field="revoked_at")
+        transaction.connection.execute(
+            """
+            INSERT INTO active_roles(
+                run_id, role_id, attempt_id, task_contract_digest,
+                token_digest, active, registered_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                run_id,
+                role_id,
+                current["attempt_id"],
+                current["task_contract_digest"],
+                current["token_digest"],
+                timestamp,
+            ),
+        )
+        return True
+
+    def authenticate_role_report(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        run_id: str,
+        role_id: str,
+        attempt_id: str,
+        task_contract_digest: str,
+        token: str,
+    ) -> bool:
+        """Return whether a submitted report matches the registered active identity.
+
+        A role with no registration at all is not authenticated by this
+        method; callers decide whether that means reject or allow (for roles
+        that do not yet register, e.g. during incremental rollout).
+        """
+
+        transaction.require_active(self)
+        current = self._latest_active_role(transaction, run_id=run_id, role_id=role_id)
+        if current is None or not current["active"]:
+            return False
+        if current["attempt_id"] != attempt_id:
+            return False
+        if current["task_contract_digest"] != task_contract_digest.lower():
+            return False
+        token_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return current["token_digest"] == token_digest
+
+    def has_active_role_registration(
+        self, transaction: BrokerTransaction, *, run_id: str, role_id: str
+    ) -> bool:
+        transaction.require_active(self)
+        return self._latest_active_role(transaction, run_id=run_id, role_id=role_id) is not None
+
+    def _latest_active_role(
+        self, transaction: BrokerTransaction, *, run_id: str, role_id: str
+    ) -> dict[str, Any] | None:
+        row = transaction.connection.execute(
+            """
+            SELECT run_id, role_id, attempt_id, task_contract_digest,
+                   token_digest, active, registered_at
+            FROM active_roles WHERE run_id = ? AND role_id = ?
+            ORDER BY registration_id DESC LIMIT 1
+            """,
+            (run_id, role_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["active"] = bool(result["active"])
+        return result
 
 
 def fixed_wake_message(event: Mapping[str, Any], lease_generation: int) -> str:
