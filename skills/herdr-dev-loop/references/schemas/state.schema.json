@@ -48,7 +48,7 @@
     "reviews",
     "gaps",
     "advice",
-    "blocking_decisions"
+    "decisions"
   ],
   "properties": {
     "state_format_version": {"const": 3},
@@ -69,6 +69,7 @@
       "additionalProperties": false
     },
     "resolved_config": {"type": "object"},
+    "last_provider_preflight": {"type": "object", "additionalProperties": true},
     "worktree_setup_commands": {"type": "array", "items": {"type": "string"}},
     "worker_setup_commands": {"type": "array", "items": {"type": "string"}},
     "reviewer_setup_commands": {"type": "array", "items": {"type": "string"}},
@@ -144,10 +145,19 @@
     "lifecycle_diagnostics": {"type": "array", "items": {"type": "object"}},
     "tasks": {"type": "object"},
     "batches": {"type": "object"},
-    "reviews": {"type": "object"},
+    "reviews": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "mode": {"type": "string", "enum": ["single", "swarm", "dual", "dual-swarm"]}
+        },
+        "additionalProperties": true
+      }
+    },
     "gaps": {"type": "object"},
     "advice": {"type": "object"},
-    "blocking_decisions": {"type": "array", "items": {"type": "string"}}
+    "decisions": {"type": "object"}
   },
   "additionalProperties": true
 }
