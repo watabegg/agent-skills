@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Requirement Progress Snapshot",
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "required": ["kind", "reference", "verified_by", "head_sha", "result"],
+      "properties": {
+        "kind": {
+          "enum": ["artifact", "sha", "test", "qa", "review", "decision", "agent-report"]
+        },
+        "reference": {"type": "string", "minLength": 1},
+        "verified_by": {"enum": ["", "manager", "hloop"]},
+        "head_sha": {"type": "string"},
+        "result": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "requirement_progress": {
+      "type": "object",
+      "required": [
+        "requirement_id",
+        "status",
+        "task_ids",
+        "evidence",
+        "remaining_work",
+        "blockers"
+      ],
+      "properties": {
+        "requirement_id": {"type": "string", "pattern": "^REQ-[0-9]{3}$"},
+        "status": {
+          "enum": [
+            "not_started",
+            "in_progress",
+            "implemented_unverified",
+            "verified",
+            "blocked",
+            "deferred",
+            "superseded"
+          ]
+        },
+        "task_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "evidence": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "remaining_work": {"type": "string"},
+        "blockers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "verified"}}},
+          "then": {
+            "properties": {
+              "evidence": {
+                "minItems": 1,
+                "contains": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "kind": {"not": {"const": "agent-report"}},
+                        "verified_by": {"enum": ["manager", "hloop"]}
+                      },
+                      "required": ["kind", "verified_by"]
+                    },
+                    {
+                      "if": {"properties": {"kind": {"enum": ["test", "qa"]}}},
+                      "then": {
+                        "properties": {
+                          "result": {"enum": ["passed", "confirmed", "accepted"]}
+                        }
+                      },
+                      "else": {
+                        "properties": {
+                          "result": {"enum": ["", "passed", "confirmed", "accepted"]}
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "remaining_work": {"const": ""},
+              "blockers": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "blocked"}}},
+          "then": {"properties": {"blockers": {"minItems": 1}}}
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["id", "created_at", "summary", "requirements"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^P[0-9]{4}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "summary": {"type": "string", "minLength": 1},
+    "requirements": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/requirement_progress"}
+    }
+  },
+  "additionalProperties": false
+}

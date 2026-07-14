@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Accepted Requirement",
+  "type": "object",
+  "required": [
+    "id",
+    "source_inputs",
+    "acceptance",
+    "priority",
+    "dependencies",
+    "status",
+    "supersedes",
+    "superseded_by"
+  ],
+  "properties": {
+    "id": {"type": "string", "pattern": "^REQ-[0-9]{3}$"},
+    "source_inputs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^U[0-9]{4}$"}
+    },
+    "acceptance": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "priority": {"enum": ["P0", "P1", "P2", "P3"]},
+    "dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^REQ-[0-9]{3}$"}
+    },
+    "accepted_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["accepted", "superseded"]},
+    "supersedes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^REQ-[0-9]{3}$"}
+    },
+    "superseded_by": {"type": "string"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "superseded"}}},
+      "then": {
+        "properties": {
+          "superseded_by": {"type": "string", "pattern": "^REQ-[0-9]{3}$"}
+        }
+      },
+      "else": {"properties": {"superseded_by": {"const": ""}}}
+    }
+  ],
+  "additionalProperties": false
+}

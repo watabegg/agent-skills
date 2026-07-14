@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Gated Outcome Report",
+  "$defs": {
+    "gate": {
+      "type": "object",
+      "required": ["name", "status", "evidence_refs", "target_sha", "verified_by", "required"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "status": {
+          "enum": ["pending", "passed", "accepted-risk", "not-required", "blocked", "failed"]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "target_sha": {"type": "string"},
+        "verified_by": {"enum": ["", "manager", "hloop"]},
+        "required": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": [
+    "kind",
+    "run_id",
+    "goal",
+    "generated_at",
+    "requirements",
+    "gates",
+    "integration_target_sha",
+    "current_branch_sha",
+    "user_changes",
+    "validation_evidence",
+    "review",
+    "decisions",
+    "unresolved_items",
+    "cleanup_status",
+    "session_status",
+    "next_user_actions",
+    "blocking_reason",
+    "external_goal_blocked",
+    "finalized"
+  ],
+  "properties": {
+    "kind": {"enum": ["DRAFT", "FINAL", "BLOCKED"]},
+    "run_id": {"type": "string", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "requirements": {
+      "type": "array",
+      "items": {"$ref": "progress.schema.json#/$defs/requirement_progress"}
+    },
+    "gates": {"type": "array", "items": {"$ref": "#/$defs/gate"}},
+    "integration_target_sha": {"type": "string"},
+    "current_branch_sha": {"type": "string"},
+    "user_changes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "validation_evidence": {
+      "type": "array",
+      "items": {"$ref": "progress.schema.json#/$defs/evidence"}
+    },
+    "review": {
+      "type": "object",
+      "required": ["confirmed_findings", "fixes", "accepted_risks"],
+      "properties": {
+        "confirmed_findings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "fixes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "accepted_risks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      },
+      "additionalProperties": false
+    },
+    "decisions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "unresolved_items": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "cleanup_status": {"type": "string"},
+    "session_status": {"type": "string"},
+    "next_user_actions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "blocking_reason": {"type": "string"},
+    "external_goal_blocked": {"type": "boolean"},
+    "finalized": {"type": "boolean"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "DRAFT"}}},
+      "then": {"properties": {"finalized": {"const": false}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "FINAL"}}},
+      "then": {
+        "properties": {
+          "finalized": {"const": true},
+          "external_goal_blocked": {"const": false},
+          "blocking_reason": {"const": ""},
+          "requirements": {
+            "minItems": 1,
+            "items": {
+              "allOf": [
+                {"$ref": "progress.schema.json#/$defs/requirement_progress"},
+                {"properties": {"status": {"enum": ["verified", "deferred", "superseded"]}}}
+              ]
+            }
+          },
+          "gates": {
+            "minItems": 1,
+            "items": {
+              "allOf": [
+                {"$ref": "#/$defs/gate"},
+                {
+                  "if": {"properties": {"required": {"const": true}}},
+                  "then": {
+                    "anyOf": [
+                      {"properties": {"status": {"const": "not-required"}}},
+                      {
+                        "properties": {
+                          "status": {"enum": ["passed", "accepted-risk"]},
+                          "evidence_refs": {"minItems": 1},
+                          "target_sha": {"minLength": 1},
+                          "verified_by": {"enum": ["manager", "hloop"]}
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "integration_target_sha": {"type": "string", "minLength": 1},
+          "current_branch_sha": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "BLOCKED"}}},
+      "then": {
+        "properties": {
+          "finalized": {"const": true},
+          "external_goal_blocked": {"const": true},
+          "blocking_reason": {"type": "string", "minLength": 1},
+          "gates": {
+            "contains": {
+              "properties": {"status": {"const": "blocked"}, "required": {"const": true}},
+              "required": ["status", "required"]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}
