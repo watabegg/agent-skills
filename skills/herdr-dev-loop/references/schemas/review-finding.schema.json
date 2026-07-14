@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Normalized Review Finding",
+  "type": "object",
+  "required": [
+    "fingerprint",
+    "head_sha",
+    "severity",
+    "requires_spec_decision",
+    "classification",
+    "cross_model_consensus",
+    "providers",
+    "candidate_ids",
+    "discovering_agents",
+    "candidates"
+  ],
+  "properties": {
+    "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "head_sha": {"type": "string", "minLength": 1},
+    "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+    "requires_spec_decision": {"type": "boolean"},
+    "classification": {"enum": ["consensus", "unique"]},
+    "cross_model_consensus": {"type": "boolean"},
+    "providers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {"enum": ["codex", "claude"]}
+    },
+    "candidate_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "discovering_agents": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"classification": {"const": "consensus"}}},
+      "then": {
+        "properties": {
+          "cross_model_consensus": {"const": true},
+          "providers": {"minItems": 2}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"classification": {"const": "unique"}}},
+      "then": {"properties": {"cross_model_consensus": {"const": false}}}
+    }
+  ],
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "required": [
+        "finding_id",
+        "fingerprint",
+        "provider",
+        "head_sha",
+        "discovering_agent",
+        "severity",
+        "confidence",
+        "title",
+        "file",
+        "line",
+        "symbol",
+        "trigger",
+        "product_impact",
+        "origin",
+        "proposed_fix",
+        "requires_spec_decision"
+      ],
+      "properties": {
+        "finding_id": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "provider": {"enum": ["codex", "claude"]},
+        "head_sha": {"type": "string", "minLength": 1},
+        "discovering_agent": {"type": "string", "minLength": 1},
+        "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "title": {"type": "string", "minLength": 1},
+        "file": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 1},
+        "symbol": {"type": "string", "minLength": 1},
+        "trigger": {"type": "string", "minLength": 1},
+        "product_impact": {"type": "string", "minLength": 1},
+        "origin": {
+          "enum": [
+            "introduced",
+            "diff-expanded-pre-existing",
+            "unrelated-pre-existing"
+          ]
+        },
+        "proposed_fix": {"type": "string", "minLength": 1},
+        "requires_spec_decision": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
