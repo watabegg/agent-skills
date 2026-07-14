@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,31 @@ from typing import Any
 # starts; validation subprocesses receive the same guarantee in cmd_validate.
 sys.dont_write_bytecode = True
 
+from hloop_lib import broker as hloop_broker
 from hloop_lib import config as hloop_config
+from hloop_lib import decisions as hloop_decisions
+from hloop_lib import events as hloop_events
+from hloop_lib import providers as hloop_providers
+from hloop_lib import requirements as hloop_requirements
+from hloop_lib import review as hloop_review
+from hloop_lib.decisions import (
+    DECISION_ACCEPTED,
+    DECISION_ADVISORY,
+    DECISION_ANSWERED,
+    DECISION_BLOCKING_USER,
+    DECISION_DEFERRED_USER,
+    DECISION_PENDING,
+    DECISION_REJECTED,
+    DECISION_SUPERSEDED,
+    DecisionRecord,
+    DecisionTransitionError,
+    DecisionValidationError,
+    decision_aware_dispatch,
+    evaluate_task_dependencies,
+    reclassify_decision,
+    record_response,
+    resolve_decision,
+)
 from hloop_lib.lifecycle import (
     FinalGateArm,
     FinalGateConditions,
@@ -1054,6 +1078,18 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     if command == "advisor":
         return getattr(args, "advisor_command", "") in {"request", "start", "harvest", "close", "message"}
     if command == "agent":
+        return True
+    if command == "inbox":
+        return getattr(args, "inbox_command", "") == "ack"
+    if command == "manager":
+        return True
+    if command == "broker":
+        return getattr(args, "broker_command", "") == "recover"
+    if command == "input":
+        return True
+    if command == "requirement":
+        return True
+    if command == "progress":
         return True
     if command == "experience":
         return getattr(args, "experience_command", "") == "recommend"
@@ -2492,8 +2528,19 @@ def preflight_loop(
         fail("codex command not found")
     if require_agent_provider:
         provider = normalize_agent_provider(require_agent_provider)
-        if not command_exists(provider):
-            fail(f"{provider} command not found")
+        invocation = hloop_providers.build_provider_invocation(
+            provider=provider,
+            runner="tui",
+            sandbox="workspace-write",
+            prompt_path=repo / LOOP_DIR / "prompts" / "_preflight-probe.md",
+        )
+        capability = hloop_providers.probe_provider_capability(invocation)
+        state["last_provider_preflight"] = {
+            "at": now_iso(),
+            **capability.as_record(),
+        }
+        if not capability.launch_allowed:
+            fail(capability.reason)
     if require_integration_branch:
         expected = str(state.get("integration_branch") or "")
         actual = current_branch(repo)
@@ -3279,6 +3326,64 @@ def collect_advice_inventory(
     return items
 
 
+def decision_records_from_state(state: dict[str, Any]) -> dict[str, DecisionRecord]:
+    """Parse ``state["decisions"]`` into validated records, skipping bad entries.
+
+    Malformed records must never crash dashboard/status reporting; they are
+    dropped from the returned mapping (the raw dict is still visible via
+    ``hloop decision list`` / ``STATE.json`` for debugging).
+    """
+
+    records: dict[str, DecisionRecord] = {}
+    for decision_id, raw in (state.get("decisions") or {}).items():
+        try:
+            record = DecisionRecord.from_record(raw)
+        except DecisionValidationError:
+            continue
+        records[decision_id] = record
+    return records
+
+
+def pending_blocking_user_decisions(state: dict[str, Any]) -> dict[str, DecisionRecord]:
+    """Unresolved ``blocking-user`` decisions, keyed by decision id."""
+
+    return {
+        decision_id: record
+        for decision_id, record in decision_records_from_state(state).items()
+        if record.blocks_affected_tasks
+    }
+
+
+def build_decision_scheduler(state: dict[str, Any]) -> "hloop_decisions.SchedulerDecision":
+    """Evaluate decision-aware, partial-blocking dispatch for the current state.
+
+    ``loop_blocked`` is only true when every queued task is blocked by a
+    pending/answered ``blocking-user`` decision and no other safe work
+    (running/reported tasks, in-flight review or gap agents, a merge-ready
+    task, or pending validation) is available to the Manager.
+    """
+
+    tasks_map = state.get("tasks") or {}
+    decisions_map = state.get("decisions") or {}
+    safe_work_remaining = bool(
+        running_review_exists(state)
+        or running_gap_exists(state)
+        or pending_review_exists(state)
+        or pending_gap_exists(state)
+        or state.get("needs_validation")
+        or any(
+            task.get("status") == "result_reported" and task.get("merge_ready")
+            for task in tasks_map.values()
+        )
+    )
+    try:
+        return decision_aware_dispatch(
+            tasks_map, decisions_map, safe_work_remaining=safe_work_remaining
+        )
+    except (DecisionValidationError, DecisionTransitionError) as exc:
+        raise HLoopError(f"invalid decision state: {exc}") from exc
+
+
 def collect_loop_inventory(
     repo: Path,
     *,
@@ -3312,14 +3417,28 @@ def collect_loop_inventory(
                 f"git switch {integration}",
             )
         )
-    if state.get("blocking_decisions"):
+    pending_blocking_decisions = pending_blocking_user_decisions(state)
+    if pending_blocking_decisions:
+        affected = sorted(
+            {
+                task_id
+                for record in pending_blocking_decisions.values()
+                for task_id in record.affected_task_ids
+            }
+        )
         issues.append(
             make_issue(
                 "P1",
                 "blocking-decisions",
                 "state",
-                "STATE.json contains blocking decisions.",
-                "Update DECISIONS.md and USER_ACTION_REQUIRED.md before dispatching new work.",
+                (
+                    f"STATE.json has {len(pending_blocking_decisions)} pending "
+                    "blocking-user decision(s) "
+                    f"({', '.join(sorted(pending_blocking_decisions))}) affecting "
+                    f"task(s) {', '.join(affected) if affected else '(none)'}."
+                ),
+                "Respond with `hloop decision respond` and resolve with "
+                "`hloop decision resolve` before dispatching affected tasks.",
             )
         )
     phase = str(state.get("phase") or "")
@@ -3824,7 +3943,9 @@ def lifecycle_resume_requirements(repo: Path, state: dict[str, Any]) -> list[dic
     target = current_integration_target(repo, state)
     if not target:
         return []
-    blockers = [f"decision {item}" for item in normalize_list(state.get("blocking_decisions"))]
+    blockers = [
+        f"decision {decision_id}" for decision_id in pending_blocking_user_decisions(state)
+    ]
     if state.get("active_merge"):
         blockers.append("active merge transaction")
     requirements = compute_resume_requirements(
@@ -5551,7 +5672,7 @@ None.
         "reviews": {},
         "gaps": {},
         "advice": {},
-        "blocking_decisions": [],
+        "decisions": {},
         "attempt_history": [],
         "cleanup_history": [],
         "lifecycle_diagnostics": [],
@@ -5617,6 +5738,7 @@ None.
         old.setdefault("max_gap_auditors", args.max_gap_auditors)
         old.setdefault("gaps", {})
         old.setdefault("batches", {})
+        old.setdefault("decisions", {})
         save_state(repo, old)
         print(f"STATE.json already exists: {state_path(repo)}")
         return 0
@@ -6034,6 +6156,180 @@ def cmd_batch_show(args: argparse.Namespace) -> int:
     print("tasks: " + (", ".join(payload["task_ids"]) or "-"))
     if batch.get("summary"):
         print(f"summary: {batch.get('summary')}")
+    return 0
+
+
+def require_decision(state: dict[str, Any], decision_id: str) -> DecisionRecord:
+    raw = state.setdefault("decisions", {}).get(decision_id)
+    if raw is None:
+        raise HLoopError(f"unknown decision: {decision_id}")
+    try:
+        return DecisionRecord.from_record(raw)
+    except DecisionValidationError as exc:
+        raise HLoopError(f"invalid decision record {decision_id}: {exc}") from exc
+
+
+def cmd_decision_new(args: argparse.Namespace) -> int:
+    """Fallback Specification Scout entry point.
+
+    HLoop 0.5 has no dedicated interactive decision pane in this slice, so a
+    candidate decision is recorded directly as structured JSON in
+    ``state["decisions"]``; tick/pump output and JOURNAL.md act as the
+    Liaison-fallback notification surface (see cmd_tick/pump_stop_reason).
+    """
+
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    decisions_state = state.setdefault("decisions", {})
+    decision_id = args.id or next_id("D", decisions_state)
+    if decision_id in decisions_state:
+        raise HLoopError(f"decision already exists: {decision_id}")
+    option_labels = args.option or ["accept-recommendation", "reject-recommendation"]
+    if not 2 <= len(option_labels) <= 3:
+        raise HLoopError("a decision requires 2 or 3 --option values")
+    option_ids = [f"opt_{index}" for index in range(1, len(option_labels) + 1)]
+    options = [
+        {"id": option_id, "label": label, "tradeoffs": [label]}
+        for option_id, label in zip(option_ids, option_labels)
+    ]
+    recommend_option = args.recommend_option or option_ids[0]
+    if recommend_option not in option_ids:
+        raise HLoopError(f"--recommend-option must be one of {', '.join(option_ids)}")
+    recommendation = {
+        "option_id": recommend_option,
+        "rationale": args.recommend_rationale
+        or "No explicit Manager recommendation captured; defaults to the first listed option.",
+    }
+    affected = normalize_list(args.affects)
+    try:
+        record = DecisionRecord(
+            decision_id=decision_id,
+            decision_class=args.decision_class,
+            status=DECISION_PENDING,
+            question=args.title,
+            options=tuple(options),
+            recommendation=recommendation,
+            affected_task_ids=tuple(affected),
+            created_from="hloop decision new",
+        )
+    except DecisionValidationError as exc:
+        raise HLoopError(str(exc)) from exc
+    decisions_state[decision_id] = record.to_record()
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Opened decision `{decision_id}` ({record.decision_class}): {record.question}"
+        + (f" (affects: {', '.join(affected)})" if affected else " (advisory scope; no task affected)"),
+    )
+    print(f"created {decision_id}")
+    return 0
+
+
+def cmd_decision_list(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    decisions_state = state.get("decisions") or {}
+    rows = []
+    for decision_id in sorted(decisions_state):
+        try:
+            record = DecisionRecord.from_record(decisions_state[decision_id])
+        except DecisionValidationError:
+            rows.append({"id": decision_id, "error": "invalid decision record"})
+            continue
+        rows.append(
+            {
+                "id": record.decision_id,
+                "class": record.decision_class,
+                "status": record.status,
+                "question": record.question,
+                "affected_task_ids": list(record.affected_task_ids),
+                "blocks_affected_tasks": record.blocks_affected_tasks,
+            }
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("no decisions")
+        return 0
+    for row in rows:
+        if row.get("error"):
+            print(f"{row['id']}: {row['error']}")
+            continue
+        affects = ",".join(row["affected_task_ids"]) or "-"
+        blocking = " BLOCKING" if row["blocks_affected_tasks"] else ""
+        print(
+            f"{row['id']} [{row['class']}/{row['status']}]{blocking} "
+            f"affects={affects} {row['question']}"
+        )
+    return 0
+
+
+def cmd_decision_respond(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    decisions_state = state.setdefault("decisions", {})
+    record = require_decision(state, args.id)
+    selected_option = args.option or record.recommendation.option_id
+    response = {
+        "responded_by": args.responded_by or "manager",
+        "responded_at": now_iso(),
+        "selected_option": selected_option,
+        "free_text": args.text,
+    }
+    try:
+        updated = record_response(record, response)
+        if args.recommendation:
+            payload = updated.to_record()
+            payload["recommendation"]["rationale"] = args.recommendation
+            updated = DecisionRecord.from_record(payload)
+    except (DecisionValidationError, DecisionTransitionError) as exc:
+        raise HLoopError(str(exc)) from exc
+    decisions_state[args.id] = updated.to_record()
+    save_state(repo, state)
+    journal(repo, f"Recorded response to decision `{args.id}`: {args.text}")
+    print(f"responded {args.id}: status={updated.status}")
+    return 0
+
+
+def cmd_decision_resolve(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    decisions_state = state.setdefault("decisions", {})
+    record = require_decision(state, args.id)
+    rationale = args.note or f"Resolved via hloop decision resolve as {args.outcome}."
+    try:
+        updated = resolve_decision(
+            record,
+            outcome=args.outcome,
+            rationale=rationale,
+            resolved_by=args.resolved_by or "manager",
+            resolved_at=now_iso(),
+            selected_option=args.selected_option or "",
+        )
+    except (DecisionValidationError, DecisionTransitionError) as exc:
+        raise HLoopError(str(exc)) from exc
+    decisions_state[args.id] = updated.to_record()
+    save_state(repo, state)
+    journal(repo, f"Resolved decision `{args.id}` as `{args.outcome}`: {rationale}")
+    print(f"resolved {args.id}: status={updated.status}")
+    return 0
+
+
+def cmd_decision_reclassify(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    decisions_state = state.setdefault("decisions", {})
+    record = require_decision(state, args.id)
+    try:
+        updated = reclassify_decision(record, args.decision_class)
+    except (DecisionValidationError, DecisionTransitionError) as exc:
+        raise HLoopError(str(exc)) from exc
+    decisions_state[args.id] = updated.to_record()
+    save_state(repo, state)
+    journal(repo, f"Reclassified decision `{args.id}` as `{args.decision_class}`.")
+    print(f"reclassified {args.id}: class={updated.decision_class}")
     return 0
 
 
@@ -7648,6 +7944,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     state["reviews"][review_id] = {
         "status": "running",
         "gate_status": "running",
+        "mode": args.mode,
         "base": base,
         "head": head,
         "base_sha": base_sha,
@@ -7752,6 +8049,36 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     return 0
 
 
+def enforce_review_manifest_gate(review_id: str, review_state: dict[str, Any]) -> None:
+    """Refuse to close non-single-mode reviews with an incomplete review manifest."""
+
+    mode = str(review_state.get("mode") or "single")
+    if mode == "single":
+        return
+    try:
+        plan = hloop_review.plan_review_group(
+            mode, head_sha=str(review_state.get("head_sha") or "")
+        )
+        manifest = hloop_review.ReviewManifest(
+            review_id=review_id,
+            plan=plan,
+            lane_results=(),
+            findings=(),
+            verification_plan=hloop_review.VerificationPlan(
+                assignments=(), shortfalls=(), provider_usage=()
+            ),
+            verifications=(),
+        )
+    except hloop_review.ReviewModelError as exc:
+        raise HLoopError(f"cannot build review manifest for {review_id}: {exc}") from exc
+    completeness = hloop_review.check_manifest_completeness(manifest)
+    if not completeness.complete:
+        raise HLoopError(
+            f"review manifest incomplete for {review_id} (mode={mode}): "
+            + "; ".join(completeness.issues)
+        )
+
+
 def cmd_reviewer_close(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -7765,6 +8092,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
         raise HLoopError(f"unknown review: {review_id}")
     if agent_gate_status(review_state) not in {"reported", "triaged"}:
         raise HLoopError(f"review is not ready for close: {review_id}")
+    enforce_review_manifest_gate(review_id, review_state)
     cleanup_completed_agent_pane(
         repo,
         review_state,
@@ -8943,6 +9271,7 @@ def write_sets_overlap(a: list[str], b: list[str]) -> bool:
 
 
 def queued_dispatchable_tasks(state: dict[str, Any]) -> list[str]:
+    decision_blocked = set(build_decision_scheduler(state).decision_blocked_task_ids)
     running_sets = [
         normalize_list(task.get("write_allow"))
         for task in state.get("tasks", {}).values()
@@ -8951,6 +9280,8 @@ def queued_dispatchable_tasks(state: dict[str, Any]) -> list[str]:
     dispatchable = []
     for task_id, task in state.get("tasks", {}).items():
         if task.get("status") != "queued":
+            continue
+        if task_id in decision_blocked:
             continue
         depends = normalize_list(task.get("depends_on"))
         if any(state["tasks"].get(dep, {}).get("status") != "merged" for dep in depends):
@@ -8994,14 +9325,29 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if not args.dry_run:
         state["cycle"] = int(state.get("cycle", 0)) + 1
         save_state(repo, state)
-    if state.get("blocking_decisions"):
+    scheduler_decision = build_decision_scheduler(state)
+    if scheduler_decision.loop_blocked:
+        blocking_ids = ", ".join(scheduler_decision.blocking_decision_ids) or "unknown"
         if args.dry_run:
-            print("DRY RUN blocked: pending user decision")
+            print(f"DRY RUN blocked: pending user decision ({blocking_ids})")
             return 2
         state["phase"] = "blocked_user_decision"
         save_state(repo, state)
-        print("blocked: pending user decision")
+        journal(
+            repo,
+            "Loop blocked: every queued task depends on unresolved decision(s) "
+            f"{blocking_ids} and no other safe work remains.",
+        )
+        print(f"blocked: pending user decision ({blocking_ids})")
         return 2
+    if scheduler_decision.decision_blocked_task_ids and not args.dry_run:
+        for evaluation in scheduler_decision.evaluations:
+            if evaluation.blocked_by_decision:
+                journal(
+                    repo,
+                    f"Skipping task `{evaluation.task_id}`: blocked by unresolved "
+                    f"decision(s) {', '.join(evaluation.blocking_decision_ids)}.",
+                )
 
     if state.get("needs_validation") or state.get("phase") == "validating":
         return cmd_validate(args)
@@ -9237,7 +9583,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[str, int] | None:
     phase = str(state.get("phase") or "")
-    if state.get("blocking_decisions"):
+    if build_decision_scheduler(state).loop_blocked:
         return ("pending user decision", 2)
     retryable_preflight_block = active_preflight_environment_block(state) and str(
         state.get("last_preflight_error", {}).get("previous_phase") or "dispatching"
@@ -9540,6 +9886,369 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
     return 0
 
 
+def broker_root(repo: Path) -> Path:
+    return repo / LOOP_DIR / "broker"
+
+
+def broker_spool_dir(repo: Path) -> Path:
+    # Deliberately a sibling of broker_root(), not nested under it, so a
+    # locked-down or corrupted broker directory cannot also block the
+    # fallback spool path used when the broker itself is unavailable.
+    directory = repo / LOOP_DIR / "broker-spool"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _open_broker_store(repo: Path) -> "hloop_broker.BrokerStore":
+    return hloop_broker.BrokerStore(broker_root(repo))
+
+
+def cmd_agent_report(args: argparse.Namespace) -> int:
+    """Submit an agent report; spools to disk when the broker is unavailable."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    report_type = args.type
+    report: dict[str, Any] = {
+        "run_id": args.run_id or str(state.get("run_id") or "local"),
+        "role_id": args.role_id,
+        "attempt_id": args.attempt_id or args.role_id,
+        "task_contract_digest": args.task_contract_digest
+        or hashlib.sha256(args.role_id.encode("utf-8")).hexdigest(),
+        "type": report_type,
+        "stage": args.stage,
+        "summary": args.summary,
+        "next": args.next,
+        "needs_manager": report_type in {"ack", "attention"},
+        "evidence_refs": args.evidence_ref or [],
+        "created_at": now_iso(),
+    }
+    if report_type == "ack":
+        report.update(
+            understood_goal=args.understood_goal or args.summary,
+            scope=args.scope or [],
+            acceptance=args.acceptance or [],
+            approach=args.approach or args.summary,
+        )
+    elif report_type == "milestone":
+        report["risks"] = args.risk or []
+    elif report_type == "attention":
+        report.update(
+            impact=args.impact or args.summary,
+            attempted=args.attempted or [],
+            options=args.option_text or [],
+            recommendation=args.recommendation or "",
+            blocked_scope=args.blocked_scope or [],
+        )
+    elif report_type == "completion":
+        report.update(
+            artifact=args.artifact or "",
+            head_sha=args.head_sha or "",
+            validation_results=args.validation_result_ref or [],
+            residual_risks=args.residual_risk or [],
+            handoff=args.handoff or "",
+        )
+    try:
+        client_event = hloop_events.prepare_client_event(report, event_id=args.event_id)
+    except hloop_events.ReportValidationError as exc:
+        raise HLoopError(f"invalid report: {exc}") from exc
+
+    try:
+        store = _open_broker_store(repo)
+        with store.transaction() as txn:
+            stored = store.accept_report(txn, client_event)
+            lease = state.get("broker_lease")
+            if lease and str(lease.get("run_id")) == str(stored.event["run_id"]):
+                try:
+                    store.enqueue_wake(
+                        txn,
+                        event_id=stored.event["event_id"],
+                        lease_generation=int(lease["generation"]),
+                        manager_session_id=lease.get("manager_session_id"),
+                        pane_id=lease.get("pane_id"),
+                    )
+                except hloop_broker.LeaseGenerationMismatch:
+                    pass
+    except (hloop_broker.BrokerStorageError, OSError) as exc:
+        spool_path = hloop_broker.spool_client_event(broker_spool_dir(repo), client_event)
+        journal(
+            repo,
+            f"Broker unavailable ({exc}); spooled report {client_event['event_id']} to {spool_path.name}",
+        )
+        print(f"spooled {client_event['event_id']} (broker unavailable: {exc})")
+        return 0
+    journal(repo, f"Agent report accepted by broker: {stored.event['event_id']} ({report_type})")
+    print(f"accepted {stored.event['event_id']} (broker)")
+    return 0
+
+
+def cmd_inbox_list(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    store = _open_broker_store(repo)
+    with store.transaction() as txn:
+        rows = store.inbox(txn)
+    if not rows:
+        print("inbox empty")
+        return 0
+    for row in rows:
+        print(json.dumps(row, sort_keys=True))
+    return 0
+
+
+def cmd_inbox_ack(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    lease = state.get("broker_lease")
+    if not lease:
+        raise HLoopError("no active manager wake lease; run `hloop manager sleep` first")
+    store = _open_broker_store(repo)
+    with store.transaction() as txn:
+        result = store.consume_wake(
+            txn, event_id=args.event_id, lease_generation=int(lease["generation"])
+        )
+    if not result.accepted:
+        raise HLoopError(f"could not ack {args.event_id}: {result.reason}")
+    journal(repo, f"Acked inbox event `{args.event_id}`.")
+    print(f"acked {args.event_id}")
+    return 0
+
+
+def cmd_manager_sleep(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    run_id = str(state.get("run_id") or "local")
+    store = _open_broker_store(repo)
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=args.ttl_seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    manager_session_id = (
+        args.manager_session_id or os.environ.get("HERDR_SESSION_ID") or "manager"
+    )
+    pane_id = args.pane_id or os.environ.get("HERDR_PANE_ID") or "manager"
+    with store.transaction() as txn:
+        lease = store.register_wake_lease(
+            txn,
+            run_id=run_id,
+            manager_session_id=manager_session_id,
+            pane_id=pane_id,
+            expires_at=expires_at,
+        )
+    state["broker_lease"] = lease
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Manager sleeping; wake lease generation {lease['generation']} expires {expires_at}.",
+    )
+    print(f"lease generation {lease['generation']} expires {expires_at}")
+    return 0
+
+
+def cmd_manager_next(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    store = _open_broker_store(repo)
+    spool_dir = broker_spool_dir(repo)
+    spooled = list(hloop_broker.iter_spooled_events(spool_dir))
+    if spooled:
+        with store.transaction() as txn:
+            replayed = store.replay_spool(txn, spool_dir)
+        journal(repo, f"Replayed {len(replayed)} spooled report(s) into the broker.")
+        print(f"replayed {len(replayed)} spooled report(s); re-run to see pending wakes")
+        return 0
+    with store.transaction() as txn:
+        wakes = store.pending_wakes(txn)
+    if not wakes:
+        print("no pending wakes")
+        return 0
+    for wake in wakes:
+        print(json.dumps(wake, sort_keys=True))
+    return 0
+
+
+def cmd_broker_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    run_id = str(state.get("run_id") or "local")
+    store = _open_broker_store(repo)
+    with store.transaction() as txn:
+        events = store.events(txn)
+        inbox_rows = store.inbox(txn)
+        owner = store.current_owner(txn, namespace=LOOP_NAMESPACE, run_id=run_id)
+    spooled = list(hloop_broker.iter_spooled_events(broker_spool_dir(repo)))
+    status = {
+        "events": len(events),
+        "inbox": len(inbox_rows),
+        "spooled": len(spooled),
+        "owner": owner,
+        "lease": state.get("broker_lease"),
+    }
+    print(json.dumps(status, sort_keys=True, default=str))
+    return 0
+
+
+def cmd_broker_recover(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    store = _open_broker_store(repo)
+    spool_dir = broker_spool_dir(repo)
+    with store.transaction() as txn:
+        replayed = store.replay_spool(txn, spool_dir)
+    journal(repo, f"Broker recover replayed {len(replayed)} spooled report(s).")
+    print(f"replayed {len(replayed)} spooled report(s)")
+    return 0
+
+
+def next_input_id(existing: dict[str, Any]) -> str:
+    nums = [int(key[1:]) for key in existing if re.fullmatch(r"U[0-9]{4}", key)]
+    return f"U{(max(nums) if nums else 0) + 1:04d}"
+
+
+def next_requirement_id(existing: dict[str, Any]) -> str:
+    nums = [int(key[4:]) for key in existing if re.fullmatch(r"REQ-[0-9]{3}", key)]
+    return f"REQ-{(max(nums) if nums else 0) + 1:03d}"
+
+
+def local_sensitive_input_dir(repo: Path) -> Path:
+    directory = repo / LOOP_DIR / "inputs"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def cmd_input_record(args: argparse.Namespace) -> int:
+    """Capture raw user input as a redacted, checkpoint-excluded local record."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    inputs_index = state.setdefault("inputs_index", {})
+    input_id = next_input_id(inputs_index)
+    try:
+        record = hloop_requirements.InputRecord.capture(
+            input_id=input_id,
+            received_at=now_iso(),
+            source=args.source,
+            raw_input=args.text,
+        )
+    except hloop_requirements.RequirementModelError as exc:
+        raise HLoopError(str(exc)) from exc
+
+    input_path = local_sensitive_input_dir(repo) / f"{input_id}.json"
+    relative_path = input_path.relative_to(repo).as_posix()
+    if not hloop_requirements.checkpoint_inclusion_allowed(
+        relative_path, artifact_class=record.artifact_class
+    ):
+        # Expected: this path is deliberately excluded from `hloop checkpoint`
+        # and any product commit; it stays local-only on disk.
+        pass
+    input_path.write_text(
+        json.dumps(record.to_record(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    inputs_index[input_id] = {
+        "prompt_digest": record.prompt_digest,
+        "redactions": list(record.redactions),
+        "received_at": record.received_at,
+        "source": record.source,
+    }
+    save_state(repo, state)
+    journal(repo, f"Captured local input `{input_id}` from {record.source} (local-sensitive, not checkpointed).")
+    print(f"captured {input_id}")
+    return 0
+
+
+def require_requirement(state: dict[str, Any], requirement_id: str) -> hloop_requirements.Requirement:
+    raw = state.get("requirements", {}).get(requirement_id)
+    if raw is None:
+        raise HLoopError(f"unknown requirement: {requirement_id}")
+    return hloop_requirements.Requirement.from_record(raw)
+
+
+def cmd_requirement_new(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    requirements_state = state.setdefault("requirements", {})
+    requirement_id = args.id or next_requirement_id(requirements_state)
+    if requirement_id in requirements_state:
+        raise HLoopError(f"requirement already exists: {requirement_id}")
+    try:
+        requirement = hloop_requirements.Requirement(
+            requirement_id=requirement_id,
+            source_inputs=tuple(args.source_input),
+            acceptance=tuple(args.acceptance),
+            priority=args.priority,
+            dependencies=tuple(args.depends_on or ()),
+            accepted_at=now_iso(),
+        )
+    except hloop_requirements.RequirementModelError as exc:
+        raise HLoopError(str(exc)) from exc
+    requirements_state[requirement_id] = requirement.to_record()
+    save_state(repo, state)
+    journal(repo, f"Accepted requirement `{requirement_id}` ({requirement.priority}).")
+    print(f"created {requirement_id}")
+    return 0
+
+
+def cmd_progress_record(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    requirement = require_requirement(state, args.requirement_id)
+    requirements_state = state.setdefault("requirements", {})
+    raw_progress = requirements_state[requirement.requirement_id].get("progress")
+    current = (
+        hloop_requirements.RequirementProgress.from_record(raw_progress)
+        if raw_progress
+        else hloop_requirements.RequirementProgress(requirement_id=requirement.requirement_id)
+    )
+    evidence = list(current.evidence)
+    if args.evidence_kind:
+        try:
+            evidence.append(
+                hloop_requirements.EvidenceRef(
+                    kind=args.evidence_kind,
+                    reference=args.evidence_ref,
+                    verified_by=args.verified_by or "",
+                    head_sha=args.head_sha or "",
+                    result=args.result or "",
+                )
+            )
+        except hloop_requirements.ProgressEvidenceError as exc:
+            raise HLoopError(str(exc)) from exc
+    try:
+        updated = hloop_requirements.transition_progress(
+            current,
+            args.status,
+            task_ids=tuple(args.task_id) if args.task_id else current.task_ids,
+            evidence=tuple(evidence),
+            remaining_work=args.remaining_work if args.remaining_work is not None else current.remaining_work,
+            blockers=tuple(args.blocker) if args.blocker else current.blockers,
+        )
+    except (hloop_requirements.RequirementModelError, hloop_requirements.ProgressEvidenceError) as exc:
+        raise HLoopError(str(exc)) from exc
+    requirements_state[requirement.requirement_id]["progress"] = updated.to_record()
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Requirement `{requirement.requirement_id}` progress -> {updated.status} "
+        f"({len(updated.evidence)} evidence ref(s)).",
+    )
+    print(f"{requirement.requirement_id}: {updated.status}")
+    return 0
+
+
+def cmd_outcome_show(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    requirement = require_requirement(state, args.requirement_id)
+    raw_progress = state.get("requirements", {})[requirement.requirement_id].get("progress")
+    progress = (
+        hloop_requirements.RequirementProgress.from_record(raw_progress)
+        if raw_progress
+        else hloop_requirements.RequirementProgress(requirement_id=requirement.requirement_id)
+    )
+    outcome = {
+        "requirement": requirement.to_record(),
+        "progress": progress.to_record(),
+    }
+    print(json.dumps(outcome, indent=2, sort_keys=True))
+    return 0
+
+
 def running_agent_ids(state: dict[str, Any]) -> list[str]:
     ids: list[str] = []
     ids.extend(
@@ -9781,6 +10490,15 @@ def checkpoint_paths(repo: Path, args: argparse.Namespace) -> list[str]:
         if normalized == (LOOP_DIR / "LOCK").as_posix() and not args.include_lock:
             continue
         if normalized.startswith((LOOP_DIR / "prompts").as_posix() + "/") and not args.include_prompts:
+            continue
+        # Local-sensitive artifacts (raw/redacted user input, the report
+        # broker's durable store and outage spool) are never checkpointed,
+        # matching hloop_lib.requirements.is_local_sensitive_path's model and
+        # the "local-only" artifact_policy recorded in STATE.json.
+        relative = normalized[len(loop_prefix):] if normalized.startswith(loop_prefix) else ""
+        if hloop_requirements.is_local_sensitive_path(relative or normalized):
+            continue
+        if relative.split("/", 1)[0] in {"broker", "broker-spool"}:
             continue
         filtered.append(normalized)
     return filtered
@@ -10424,6 +11142,117 @@ def build_parser() -> argparse.ArgumentParser:
     agent_requeue.add_argument("--reason", required=True)
     agent_requeue.add_argument("--force-cleanup", action="store_true")
     agent_requeue.set_defaults(func=cmd_agent_requeue)
+    agent_report = agent_sub.add_parser("report", help="submit a semantic agent report to the broker")
+    agent_report.add_argument("--role-id", required=True, help="T..., R..., G..., or A.../P...")
+    agent_report.add_argument("--attempt-id")
+    agent_report.add_argument("--run-id")
+    agent_report.add_argument("--event-id")
+    agent_report.add_argument("--task-contract-digest")
+    agent_report.add_argument(
+        "--type", choices=["ack", "milestone", "attention", "completion"], required=True
+    )
+    agent_report.add_argument("--stage", required=True)
+    agent_report.add_argument("--summary", required=True)
+    agent_report.add_argument("--next", required=True)
+    agent_report.add_argument("--evidence-ref", action="append")
+    agent_report.add_argument("--understood-goal")
+    agent_report.add_argument("--scope", action="append")
+    agent_report.add_argument("--acceptance", action="append")
+    agent_report.add_argument("--approach")
+    agent_report.add_argument("--risk", action="append")
+    agent_report.add_argument("--impact")
+    agent_report.add_argument("--attempted", action="append")
+    agent_report.add_argument("--option-text", action="append")
+    agent_report.add_argument("--recommendation")
+    agent_report.add_argument("--blocked-scope", action="append")
+    agent_report.add_argument("--artifact")
+    agent_report.add_argument("--head-sha")
+    agent_report.add_argument("--validation-result-ref", action="append")
+    agent_report.add_argument("--residual-risk", action="append")
+    agent_report.add_argument("--handoff")
+    agent_report.set_defaults(func=cmd_agent_report)
+
+    inbox = sub.add_parser("inbox", help="Manager inbox operations backed by the report broker")
+    inbox_sub = inbox.add_subparsers(dest="inbox_command", required=True)
+    inbox_list = inbox_sub.add_parser("list", help="list broker inbox entries")
+    inbox_list.set_defaults(func=cmd_inbox_list)
+    inbox_ack = inbox_sub.add_parser("ack", help="acknowledge (consume) one pending wake")
+    inbox_ack.add_argument("event_id")
+    inbox_ack.set_defaults(func=cmd_inbox_ack)
+
+    manager = sub.add_parser("manager", help="Manager sleep/wake operations backed by the report broker")
+    manager_sub = manager.add_subparsers(dest="manager_command", required=True)
+    manager_sleep = manager_sub.add_parser("sleep", help="register a wake lease before waiting for reports")
+    manager_sleep.add_argument("--ttl-seconds", type=int, default=3600)
+    manager_sleep.add_argument("--manager-session-id")
+    manager_sleep.add_argument("--pane-id")
+    manager_sleep.set_defaults(func=cmd_manager_sleep)
+    manager_next = manager_sub.add_parser(
+        "next", help="drain any spooled reports, else print pending wakes for the active lease"
+    )
+    manager_next.set_defaults(func=cmd_manager_next)
+
+    broker = sub.add_parser("broker", help="durable report broker operations")
+    broker_sub = broker.add_subparsers(dest="broker_command", required=True)
+    broker_status = broker_sub.add_parser("status", help="show broker event/inbox/spool counts")
+    broker_status.set_defaults(func=cmd_broker_status)
+    broker_recover = broker_sub.add_parser(
+        "recover", help="replay any spooled reports (from a prior broker outage) into the broker"
+    )
+    broker_recover.set_defaults(func=cmd_broker_recover)
+
+    input_cmd = sub.add_parser("input", help="capture raw user input as a local, redacted, checkpoint-excluded record")
+    input_sub = input_cmd.add_subparsers(dest="input_command", required=True)
+    input_record = input_sub.add_parser("record", help="capture one input")
+    input_record.add_argument("--source", required=True)
+    input_record.add_argument("--text", required=True)
+    input_record.set_defaults(func=cmd_input_record)
+
+    requirement = sub.add_parser("requirement", help="Manager-accepted requirement ledger")
+    requirement_sub = requirement.add_subparsers(dest="requirement_command", required=True)
+    requirement_new = requirement_sub.add_parser("new", help="accept a new requirement")
+    requirement_new.add_argument("--id")
+    requirement_new.add_argument("--source-input", action="append", required=True)
+    requirement_new.add_argument("--acceptance", action="append", required=True)
+    requirement_new.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], required=True)
+    requirement_new.add_argument("--depends-on", action="append")
+    requirement_new.set_defaults(func=cmd_requirement_new)
+
+    progress = sub.add_parser("progress", help="requirement progress, evidence-gated")
+    progress_sub = progress.add_subparsers(dest="progress_command", required=True)
+    progress_record = progress_sub.add_parser("record", help="transition one requirement's progress")
+    progress_record.add_argument("--requirement-id", required=True)
+    progress_record.add_argument(
+        "--status",
+        required=True,
+        choices=[
+            "not_started",
+            "in_progress",
+            "implemented_unverified",
+            "verified",
+            "blocked",
+            "deferred",
+            "superseded",
+        ],
+    )
+    progress_record.add_argument("--task-id", action="append")
+    progress_record.add_argument(
+        "--evidence-kind",
+        choices=["artifact", "sha", "test", "qa", "review", "decision", "agent-report"],
+    )
+    progress_record.add_argument("--evidence-ref")
+    progress_record.add_argument("--verified-by", choices=["manager", "hloop"])
+    progress_record.add_argument("--head-sha")
+    progress_record.add_argument("--result")
+    progress_record.add_argument("--remaining-work")
+    progress_record.add_argument("--blocker", action="append")
+    progress_record.set_defaults(func=cmd_progress_record)
+
+    outcome = sub.add_parser("outcome", help="requirement-oriented outcome projection")
+    outcome_sub = outcome.add_subparsers(dest="outcome_command", required=True)
+    outcome_show = outcome_sub.add_parser("show", help="print one requirement's outcome")
+    outcome_show.add_argument("--requirement-id", required=True)
+    outcome_show.set_defaults(func=cmd_outcome_show)
 
     batch = sub.add_parser("batch", help="batch operations for grouping tasks and loop checkpoints")
     batch_sub = batch.add_subparsers(dest="batch_command", required=True)
@@ -10496,6 +11325,59 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--worker-agent-model")
     task_update.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
     task_update.set_defaults(func=cmd_task_update)
+
+    decision = sub.add_parser("decision", help="specification decision operations")
+    decision_sub = decision.add_subparsers(dest="decision_command", required=True)
+    decision_new = decision_sub.add_parser("new", help="open a new decision record")
+    decision_new.add_argument("--id", help="decision id such as D001; defaults to the next id")
+    decision_new.add_argument("--title", required=True, help="the decision question")
+    decision_new.add_argument(
+        "--class",
+        dest="decision_class",
+        required=True,
+        choices=sorted({DECISION_ADVISORY, DECISION_DEFERRED_USER, DECISION_BLOCKING_USER}),
+    )
+    decision_new.add_argument(
+        "--affects", action="append", help="task id blocked by this decision (repeatable)"
+    )
+    decision_new.add_argument(
+        "--option",
+        action="append",
+        help="an option label; requires 2 or 3 (repeatable, default accept/reject)",
+    )
+    decision_new.add_argument("--recommend-option", help="option id (opt_1, opt_2, ...) to recommend")
+    decision_new.add_argument("--recommend-rationale", help="rationale for the recommended option")
+    decision_new.set_defaults(func=cmd_decision_new)
+    decision_list = decision_sub.add_parser("list", help="list decision records")
+    decision_list.add_argument("--json", action="store_true")
+    decision_list.set_defaults(func=cmd_decision_list)
+    decision_respond = decision_sub.add_parser("respond", help="record a response to a decision")
+    decision_respond.add_argument("--id", required=True)
+    decision_respond.add_argument("--text", required=True, help="free-text response")
+    decision_respond.add_argument("--option", help="option id being selected; defaults to the recommendation")
+    decision_respond.add_argument("--recommendation", help="update the recorded recommendation rationale")
+    decision_respond.add_argument("--responded-by")
+    decision_respond.set_defaults(func=cmd_decision_respond)
+    decision_resolve = decision_sub.add_parser("resolve", help="record a terminal Manager resolution")
+    decision_resolve.add_argument("--id", required=True)
+    decision_resolve.add_argument(
+        "--outcome", required=True, choices=[DECISION_ACCEPTED, DECISION_REJECTED, DECISION_SUPERSEDED]
+    )
+    decision_resolve.add_argument("--note", help="resolution rationale")
+    decision_resolve.add_argument("--selected-option", help="option id; defaults to the recorded response")
+    decision_resolve.add_argument("--resolved-by")
+    decision_resolve.set_defaults(func=cmd_decision_resolve)
+    decision_reclassify = decision_sub.add_parser(
+        "reclassify", help="change a pending decision's class"
+    )
+    decision_reclassify.add_argument("--id", required=True)
+    decision_reclassify.add_argument(
+        "--class",
+        dest="decision_class",
+        required=True,
+        choices=sorted({DECISION_ADVISORY, DECISION_DEFERRED_USER, DECISION_BLOCKING_USER}),
+    )
+    decision_reclassify.set_defaults(func=cmd_decision_reclassify)
 
     worker = sub.add_parser("worker", help="worker operations")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -10660,6 +11542,11 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_start.add_argument("--runner", choices=["exec", "tui"])
     reviewer_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     reviewer_start.add_argument("--agent-model")
+    reviewer_start.add_argument(
+        "--mode",
+        choices=sorted(hloop_review.REVIEW_MODES),
+        default="single",
+    )
     reviewer_start.add_argument("--dry-run", action="store_true")
     reviewer_start.set_defaults(func=cmd_reviewer_start)
     reviewer_harvest = reviewer_sub.add_parser("harvest")
