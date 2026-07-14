@@ -289,6 +289,216 @@ def scenario_attempt_and_merge(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def scenario_merge_conflict_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Drive `hloop merge` through a real Git conflict, not the primitives directly."""
+
+    root: Path = ctx["root"]
+    env: dict[str, str] = ctx["env"]
+    repo = make_repo(root, "merge-conflict-repo")
+    namespace = "merge-conflict-e2e"
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "init",
+            "--goal",
+            "synthetic merge conflict recovery",
+            "--integration",
+            "master",
+            "--persistence",
+            "local-only",
+        ),
+        cwd=root,
+        env=env,
+    )
+    path = state_path(repo, namespace)
+    task_id = "T900"
+    branch = "synthetic/merge-conflict-task"
+
+    base_sha = git(repo, "rev-parse", "master").stdout.strip()
+    git(repo, "switch", "-c", branch)
+    (repo / "README.md").write_text("worker change\n", encoding="utf-8")
+    git(repo, "commit", "-am", "worker change")
+    result_dir = repo / ".ai" / "herdr-dev-loop" / "loops" / namespace / "results" / task_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    (result_dir / "result.md").write_text("---\nstatus: done\n---\n\n# Result\n", encoding="utf-8")
+    git(repo, "add", "-f", str(result_dir.relative_to(repo)))
+    git(repo, "commit", "-m", "worker result")
+    worker_head = git(repo, "rev-parse", branch).stdout.strip()
+    git(repo, "switch", "master")
+    (repo / "README.md").write_text("manager change\n", encoding="utf-8")
+    git(repo, "commit", "-am", "manager change")
+
+    def write_task() -> None:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["tasks"][task_id] = {
+            "status": "result_reported",
+            "branch": branch,
+            "worker_base_sha": base_sha,
+            "base_sha": base_sha,
+            "head_sha": worker_head,
+            "result_status": "done",
+            "merge_ready": True,
+            "validation_recorded": True,
+            "write_allow": ["README.md"],
+            "write_deny": [],
+            "active_attempt_id": f"{task_id}-A001",
+            "attempt_id": f"{task_id}-A001",
+            "attempt_no": 1,
+        }
+        path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    write_task()
+
+    conflict = run(
+        hloop_command(repo, namespace, "merge", task_id, "--mode", "squash"),
+        cwd=root,
+        env=env,
+        expected={1},
+    )
+    require(
+        "conflict" in (conflict.stdout + conflict.stderr).lower(),
+        "expected hloop merge to report a real content conflict",
+    )
+    after_conflict = json.loads(path.read_text(encoding="utf-8"))
+    require(
+        after_conflict.get("active_merge", {}).get("status") == "content-conflict",
+        "merge transaction did not record content-conflict status",
+    )
+    require(
+        after_conflict["tasks"][task_id]["status"] == "blocked_merge_conflict",
+        "task status was not marked blocked on conflict",
+    )
+
+    run(hloop_command(repo, namespace, "merge", task_id, "--abort"), cwd=root, env=env)
+    after_abort = json.loads(path.read_text(encoding="utf-8"))
+    require(not after_abort.get("active_merge"), "abort did not clear the merge transaction")
+    require(
+        after_abort["tasks"][task_id]["status"] == "result_reported",
+        "abort did not restore the task to result_reported",
+    )
+    require(
+        not git(repo, "status", "--porcelain", "--", "README.md").stdout.strip(),
+        "abort left the product file dirty",
+    )
+
+    run(
+        hloop_command(repo, namespace, "merge", task_id, "--mode", "squash"),
+        cwd=root,
+        env=env,
+        expected={1},
+    )
+    (repo / "README.md").write_text("resolved by manager\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+    run(hloop_command(repo, namespace, "merge", task_id, "--continue"), cwd=root, env=env)
+    completed = json.loads(path.read_text(encoding="utf-8"))
+    require(completed["tasks"][task_id]["status"] == "merged", "continue did not complete the merge")
+    require(not completed.get("active_merge"), "active_merge still present after continue")
+    require(
+        (repo / "README.md").read_text(encoding="utf-8") == "resolved by manager\n",
+        "resolved content missing from integration branch after continue",
+    )
+
+    stale_abort = run(
+        hloop_command(repo, namespace, "merge", task_id, "--abort"),
+        cwd=root,
+        env=env,
+        expected={2},
+    )
+    require(
+        "no active merge transaction" in (stale_abort.stdout + stale_abort.stderr),
+        "abort without an active transaction did not fail closed",
+    )
+
+    return {
+        "conflict_status": after_conflict.get("active_merge", {}).get("status"),
+        "task_status_after_conflict": after_conflict["tasks"][task_id]["status"],
+        "task_status_after_abort": after_abort["tasks"][task_id]["status"],
+        "task_status_after_continue": completed["tasks"][task_id]["status"],
+    }
+
+
+def scenario_cleanup_gate_resolution(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Drive `hloop cleanup resolve` for a worker worktree cleanup failure."""
+
+    root: Path = ctx["root"]
+    env: dict[str, str] = ctx["env"]
+    repo = make_repo(root, "cleanup-gate-repo")
+    namespace = "cleanup-gate-e2e"
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "init",
+            "--goal",
+            "synthetic cleanup gate",
+            "--integration",
+            "master",
+            "--persistence",
+            "local-only",
+        ),
+        cwd=root,
+        env=env,
+    )
+    path = state_path(repo, namespace)
+    task_id = "T901"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["tasks"][task_id] = {
+        "status": "merged",
+        "branch": "synthetic/cleanup-gate-task",
+        "worktree": str(root / "does-not-exist" / task_id),
+        "cleanup_pending": False,
+        "cleanup_done": False,
+        "worktree_cleanup_status": "failed",
+        "worktree_cleanup_error": "synthetic: git worktree remove failed",
+        "worktree_cleanup_error_fingerprint": "synthetic-fingerprint",
+        "attempt_id": f"{task_id}-A001",
+    }
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    finish_probe = run(
+        hloop_command(repo, namespace, "finish"),
+        cwd=root,
+        env=env,
+        expected={2},
+    )
+    require(
+        "cleanup is unresolved" in (finish_probe.stdout + finish_probe.stderr),
+        "finish did not block on the unresolved Worker cleanup failure",
+    )
+
+    accepted = run(
+        hloop_command(
+            repo,
+            namespace,
+            "cleanup",
+            "resolve",
+            task_id,
+            "--status",
+            "accepted-risk",
+            "--reason",
+            "synthetic: worktree already removed manually by Manager",
+        ),
+        cwd=root,
+        env=env,
+    )
+    require("resolved cleanup" in accepted.stdout, "cleanup resolve did not confirm the resolution")
+    resolved_state = json.loads(path.read_text(encoding="utf-8"))
+    resolutions = resolved_state["tasks"][task_id].get("cleanup_resolutions") or {}
+    require("worktree" in resolutions, "accepted-risk resolution was not recorded on the task")
+    require(resolutions["worktree"]["status"] == "accepted-risk", "resolution status mismatch")
+    require(
+        len(resolved_state.get("cleanup_history") or []) >= 1,
+        "cleanup resolution was not appended to cleanup_history",
+    )
+
+    return {
+        "blocked_finish_status": finish_probe.returncode,
+        "resolution_status": resolutions["worktree"]["status"],
+        "cleanup_history_count": len(resolved_state.get("cleanup_history") or []),
+    }
+
+
 def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
     root: Path = ctx["root"]
     repo: Path = ctx["repo"]
@@ -655,6 +865,8 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
 SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = (
     ("config-and-migration", scenario_config_migration),
     ("attempt-and-merge-transaction", scenario_attempt_and_merge),
+    ("merge-conflict-recovery", scenario_merge_conflict_recovery),
+    ("cleanup-gate-resolution", scenario_cleanup_gate_resolution),
     ("report-broker-sleep-wake-recovery", scenario_report_broker),
     ("requirements-decisions-outcomes", scenario_requirements_decisions),
     ("dual-review-and-budget", scenario_review_budget),
