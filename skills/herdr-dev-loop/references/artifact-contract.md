@@ -32,6 +32,7 @@ All loop coordination is file-backed under `.ai/herdr-dev-loop/loops/<namespace>
 Required top-level fields:
 
 - `state_format_version`
+- `schema_revision`
 - `goal_id`
 - `run_id`
 - `skill_version`
@@ -80,6 +81,8 @@ Required top-level fields:
 Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pane id.
 
 `namespace` and `loop_path` must match the Manager command's explicit `--namespace`. A command never searches another namespace or legacy `.ai/loop` when the selected `STATE.json` is missing.
+
+Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r1 state.
 
 `persistence: local-only` copies the namespace snapshot to role worktrees and excludes loop artifacts from integration commits. `persistence: branch-history` requires Manager-owned inputs to be committed at the audited ref. `worktree_setup_commands` contains the ordered repository-specific bootstrap contract applied before role launch; run outcomes are stored separately under `.ai/herdr-dev-loop/experience/worktree-setup.json`.
 
