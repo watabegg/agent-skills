@@ -22,7 +22,9 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -59,15 +61,24 @@ from hloop_lib.decisions import (
     resolve_decision,
 )
 from hloop_lib.lifecycle import (
+    MERGE_ABORTED,
+    MERGE_ACTIVE,
+    MERGE_COMPLETED,
+    MERGE_CONTENT_CONFLICT,
+    MERGE_ENVIRONMENT_FAILURE,
     FinalGateArm,
     FinalGateConditions,
     GateEvidence,
     LifecycleInvariantError,
+    MergeTransaction,
+    allowed_merge_operations,
     arm_final_gates,
+    cleanup_resolution_record,
     compute_resume_requirements,
     diagnose_done_target_drift,
     disarm_final_gates,
     validate_final_gate_arm,
+    validate_merge_transaction,
 )
 from hloop_lib.migration import (
     MigrationError,
@@ -599,10 +610,10 @@ def assert_migration_safe(repo: Path, state: dict[str, Any]) -> None:
         )
     if state.get("active_merge"):
         raise HLoopError("cannot migrate while a merge transaction is active")
-    for task_id, task in state.get("tasks", {}).items():
-        worktree_raw = str(task.get("worktree") or "")
+    for role_kind, role_id, role_state in iter_all_roles(state):
+        worktree_raw = str(role_state.get("worktree") or "")
         if worktree_raw and Path(worktree_raw).exists() and product_dirty_paths_for_agent(Path(worktree_raw)):
-            raise HLoopError(f"cannot migrate dirty role worktree: {task_id}")
+            raise HLoopError(f"cannot migrate dirty role worktree: {role_kind} {role_id}")
 
 
 def migrate_format_one_to_two(state: dict[str, Any]) -> dict[str, Any]:
@@ -1063,7 +1074,7 @@ def retire_legacy_loop_lock(repo: Path) -> None:
 
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
-    if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish", "final-gates"}:
+    if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish", "final-gates", "cleanup"}:
         return True
     if command == "batch":
         return getattr(args, "batch_command", "") in {"start", "assign", "close"}
@@ -2010,6 +2021,35 @@ def cleanup_agent_session(provider: str, session_id: str, mode: str) -> tuple[bo
     return True, f"skipped:{provider}-session-cleanup-unsupported"
 
 
+def retry_agent_session_cleanup(
+    repo: Path,
+    agent_state: dict[str, Any],
+    *,
+    label: str,
+    provider: str,
+    session_id: str,
+    session_cleanup: str,
+) -> None:
+    ok, detail = cleanup_agent_session(provider, session_id, session_cleanup)
+    agent_state["agent_session_cleanup"] = detail
+    if normalize_agent_provider(provider) == "codex":
+        agent_state["codex_session_cleanup"] = detail
+    if ok:
+        agent_state["agent_session_cleaned_at"] = now_iso()
+        if normalize_agent_provider(provider) == "codex":
+            agent_state["codex_session_cleaned_at"] = agent_state["agent_session_cleaned_at"]
+        agent_state.pop("agent_session_cleanup_error", None)
+        agent_state.pop("agent_session_cleanup_error_fingerprint", None)
+        agent_state.pop("codex_session_cleanup_error", None)
+        journal(repo, f"{provider} session `{session_id}` for `{label}` cleanup: {detail}.")
+    else:
+        agent_state["agent_session_cleanup_error"] = detail
+        agent_state["agent_session_cleanup_error_fingerprint"] = cleanup_error_fingerprint("session", detail)
+        if normalize_agent_provider(provider) == "codex":
+            agent_state["codex_session_cleanup_error"] = detail
+        journal(repo, f"Failed {provider} session cleanup for `{label}` session `{session_id}`: {detail}")
+
+
 def cleanup_completed_agent_pane(
     repo: Path,
     agent_state: dict[str, Any],
@@ -2061,28 +2101,20 @@ def cleanup_completed_agent_pane(
         agent_state["pane_cleanup_status"] = "closed"
         agent_state["closed_pane_id"] = pane_id
         agent_state.pop("pane_id", None)
+        agent_state.pop("pane_cleanup_error", None)
+        agent_state.pop("pane_cleanup_error_fingerprint", None)
         journal(repo, f"Closed `{label}` pane `{pane_id}` after harvesting its artifact.")
     else:
         message = (proc.stderr or proc.stdout or "").strip()
         agent_state["pane_cleanup_status"] = "failed"
         agent_state["pane_cleanup_error"] = message
+        agent_state["pane_cleanup_error_fingerprint"] = cleanup_error_fingerprint("pane", message)
         journal(repo, f"Failed to close `{label}` pane `{pane_id}`: {message}")
         return
     if session_id:
-        ok, detail = cleanup_agent_session(provider, session_id, session_cleanup)
-        agent_state["agent_session_cleanup"] = detail
-        if normalize_agent_provider(provider) == "codex":
-            agent_state["codex_session_cleanup"] = detail
-        if ok:
-            agent_state["agent_session_cleaned_at"] = now_iso()
-            if normalize_agent_provider(provider) == "codex":
-                agent_state["codex_session_cleaned_at"] = agent_state["agent_session_cleaned_at"]
-            journal(repo, f"{provider} session `{session_id}` for `{label}` cleanup: {detail}.")
-        else:
-            agent_state["agent_session_cleanup_error"] = detail
-            if normalize_agent_provider(provider) == "codex":
-                agent_state["codex_session_cleanup_error"] = detail
-            journal(repo, f"Failed {provider} session cleanup for `{label}` session `{session_id}`: {detail}")
+        retry_agent_session_cleanup(
+            repo, agent_state, label=label, provider=provider, session_id=session_id, session_cleanup=session_cleanup
+        )
 
 
 def current_pane_id() -> str:
@@ -2595,6 +2627,7 @@ def preflight_loop(
     require_agent_provider: str | None = None,
     require_integration_branch: bool = False,
     allow_loop_dirty: bool = True,
+    skip_dirty_check: bool = False,
     mark_blocked: bool = True,
 ) -> dict[str, Any]:
     state = load_state(repo)
@@ -2660,9 +2693,14 @@ def preflight_loop(
             fail("integration_branch is missing from STATE.json")
         if actual != expected:
             fail(f"current branch must be integration branch {expected}; currently {actual}")
-    dirty = unsafe_dirty_paths(repo, allow_loop_dirty=allow_loop_dirty)
-    if dirty:
-        fail("working tree has non-loop dirty files: " + ", ".join(dirty))
+    if not skip_dirty_check:
+        # A content-conflict or environment-failure merge transaction leaves the
+        # working tree intentionally dirty (conflict markers, a partial squash
+        # index).  Callers recovering an active transaction skip this blanket
+        # check and rely on the transaction-aware preflight instead.
+        dirty = unsafe_dirty_paths(repo, allow_loop_dirty=allow_loop_dirty)
+        if dirty:
+            fail("working tree has non-loop dirty files: " + ", ".join(dirty))
     if mark_blocked:
         recover_preflight_environment_block(repo, state)
     return state
@@ -5397,6 +5435,7 @@ validation_commands: ["npm test -- --grep foo,bar"]
             runner="exec",
             sandbox="workspace-write",
             prompt_rel=LOOP_DIR / "prompts" / "A001-P1.advisor.md",
+            cwd=skill_root,
             output_rel=LOOP_DIR / "advice" / "A001-P1.md",
         ),
         "claude exec command rendering drifted",
@@ -6991,6 +7030,10 @@ def cleanup_hloop_prompt_file(worktree: Path, agent_id: str, suffix: str) -> Non
         raise HLoopError(f"failed to remove generated prompt {prompt}: {exc}") from exc
 
 
+def cleanup_error_fingerprint(kind: str, detail: str) -> str:
+    return hashlib.sha256(f"{kind}:{detail}".encode("utf-8")).hexdigest()[:16]
+
+
 def record_worktree_cleanup_failure(
     repo: Path,
     agent_state: dict[str, Any],
@@ -7000,6 +7043,7 @@ def record_worktree_cleanup_failure(
     detail = command_error_detail(exc)
     agent_state["worktree_cleanup_status"] = "failed"
     agent_state["worktree_cleanup_error"] = detail
+    agent_state["worktree_cleanup_error_fingerprint"] = cleanup_error_fingerprint("worktree", detail)
     agent_state["worktree_cleanup_failed_at"] = now_iso()
     journal(repo, f"Failed to remove {label} worktree: {detail}")
     print(f"warning: failed to remove {label} worktree: {detail}", file=sys.stderr)
@@ -7248,21 +7292,66 @@ def start_agent_launcher(
     return extract_pane_id(json_from_cmd(cmd))
 
 
-def codex_command_for_prompt(
+def agent_provider_invocation(
     *,
+    provider: str,
+    model: str,
     runner: str,
     sandbox: str,
     prompt_rel: Path,
+    cwd: Path,
+    output_rel: Path | None = None,
+    effort: str = DEFAULT_AGENT_EFFORT,
+    writable_dirs: list[Path] | None = None,
+    claude_permission_mode: str = DEFAULT_CLAUDE_PERMISSION_MODE,
+) -> hloop_providers.ProviderInvocation:
+    """Resolve one provider launch to its argv via ``hloop_providers``.
+
+    This is the single source of provider flags shared by preflight, launch,
+    and the persisted ``provider_invocation`` evidence, so they never diverge.
+    """
+
+    provider = normalize_agent_provider(provider)
+    model = normalize_agent_model(model)
+    if runner not in AGENT_RUNNERS:
+        raise HLoopError(f"unsupported runner: {runner}")
+    base = Path(cwd).resolve()
+    prompt_abs = (base / prompt_rel).resolve()
+    output_abs = (base / output_rel).resolve() if output_rel is not None else None
+    permission_mode = claude_permission_mode if provider == "claude" else "auto"
+    try:
+        return hloop_providers.build_provider_invocation(
+            provider=provider,
+            runner=runner,
+            sandbox=sandbox,
+            prompt_path=prompt_abs,
+            model=model,
+            effort=effort,
+            permission_mode=permission_mode,
+            output_path=output_abs if runner == "exec" and provider == "codex" else None,
+            writable_dirs=writable_dirs or (),
+        )
+    except hloop_providers.ProviderError as exc:
+        raise HLoopError(str(exc)) from exc
+
+
+def agent_command_from_invocation(
+    invocation: hloop_providers.ProviderInvocation,
+    *,
+    provider: str,
+    runner: str,
+    prompt_rel: Path,
     output_rel: Path | None = None,
 ) -> str:
-    return agent_command_for_prompt(
-        provider="codex",
-        model=DEFAULT_AGENT_MODEL,
-        runner=runner,
-        sandbox=sandbox,
-        prompt_rel=prompt_rel,
-        output_rel=output_rel,
-    )
+    prompt_ref = shlex.quote(str(prompt_rel))
+    argv = list(invocation.argv)
+    if runner == "exec":
+        command = f"{shlex.join(argv)} < {prompt_ref}"
+        if output_rel is not None and provider == "claude":
+            command = f"{command} > {shlex.quote(str(output_rel))}"
+    else:
+        command = f"{shlex.join(argv)} \"$(cat {prompt_ref})\""
+    return command
 
 
 def agent_command_for_prompt(
@@ -7272,65 +7361,28 @@ def agent_command_for_prompt(
     runner: str,
     sandbox: str,
     prompt_rel: Path,
+    cwd: Path | None = None,
     output_rel: Path | None = None,
     effort: str = DEFAULT_AGENT_EFFORT,
     writable_dirs: list[Path] | None = None,
     claude_permission_mode: str = DEFAULT_CLAUDE_PERMISSION_MODE,
 ) -> str:
     provider = normalize_agent_provider(provider)
-    model = normalize_agent_model(model)
-    prompt_ref = shlex.quote(str(prompt_rel))
-    if runner not in AGENT_RUNNERS:
-        raise HLoopError(f"unsupported runner: {runner}")
-    if provider == "codex":
-        model_args = [] if model == DEFAULT_AGENT_MODEL else ["--model", model]
-        effort_args = [] if effort == DEFAULT_AGENT_EFFORT else ["-c", f"model_reasoning_effort={effort}"]
-        writable_args = [item for path in (writable_dirs or []) for item in ("--add-dir", str(path))]
-        if runner == "exec":
-            parts = ["codex", "exec", "--sandbox", sandbox, *model_args, *effort_args, *writable_args]
-            if output_rel is not None:
-                parts.extend(["--output-last-message", str(output_rel)])
-            parts.append("-")
-            return f"{shlex.join(parts)} < {prompt_ref}"
-        parts = [
-            "codex",
-            "--sandbox",
-            sandbox,
-            "--ask-for-approval",
-            "never",
-            "--no-alt-screen",
-            *model_args,
-            *effort_args,
-            *writable_args,
-        ]
-        return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
-    if provider == "claude":
-        model_args = [] if model == DEFAULT_AGENT_MODEL else ["--model", model]
-        if runner == "exec":
-            parts = [
-                "claude",
-                "--print",
-                "--permission-mode",
-                claude_permission_mode,
-                *model_args,
-            ]
-            if effort != DEFAULT_AGENT_EFFORT:
-                parts.extend(["--effort", effort])
-            command = f"{shlex.join(parts)} < {prompt_ref}"
-            if output_rel is not None:
-                command = f"{command} > {shlex.quote(str(output_rel))}"
-            return command
-        parts = [
-            "claude",
-            "--permission-mode",
-            claude_permission_mode,
-            "--ax-screen-reader",
-            *model_args,
-        ]
-        if effort != DEFAULT_AGENT_EFFORT:
-            parts.extend(["--effort", effort])
-        return f"{shlex.join(parts)} \"$(cat {prompt_ref})\""
-    raise HLoopError(f"unsupported agent provider: {provider}")
+    invocation = agent_provider_invocation(
+        provider=provider,
+        model=model,
+        runner=runner,
+        sandbox=sandbox,
+        prompt_rel=prompt_rel,
+        cwd=cwd or Path.cwd(),
+        output_rel=output_rel,
+        effort=effort,
+        writable_dirs=writable_dirs,
+        claude_permission_mode=claude_permission_mode,
+    )
+    return agent_command_from_invocation(
+        invocation, provider=provider, runner=runner, prompt_rel=prompt_rel, output_rel=output_rel
+    )
 
 
 def role_agent_command(
@@ -7339,15 +7391,18 @@ def role_agent_command(
     *,
     runner: str,
     prompt_rel: Path,
+    cwd: Path,
     output_rel: Path | None = None,
-) -> str:
+) -> tuple[str, hloop_providers.ProviderInvocation]:
     writable = [git_common_dir(repo)] if config["provider"] == "codex" else []
-    return agent_command_for_prompt(
-        provider=config["provider"],
+    provider = normalize_agent_provider(config["provider"])
+    invocation = agent_provider_invocation(
+        provider=provider,
         model=config["model"],
         runner=runner,
         sandbox="workspace-write",
         prompt_rel=prompt_rel,
+        cwd=cwd,
         output_rel=output_rel,
         effort=config.get("effort", DEFAULT_AGENT_EFFORT),
         writable_dirs=writable,
@@ -7355,6 +7410,10 @@ def role_agent_command(
             "claude_permission_mode", DEFAULT_CLAUDE_PERMISSION_MODE
         ),
     )
+    command = agent_command_from_invocation(
+        invocation, provider=provider, runner=runner, prompt_rel=prompt_rel, output_rel=output_rel
+    )
+    return command, invocation
 
 
 def ensure_worker_attempt(
@@ -7413,10 +7472,10 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel)}"
+    agent_command, _preview_invocation = role_agent_command(
+        repo, agent_config, runner=runner, prompt_rel=prompt_rel, cwd=worktree
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add {worktree} -b {branch} {integration}")
         print(f"DRY RUN prompt: {worktree / prompt_rel}")
@@ -7477,10 +7536,10 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel)}"
+    agent_command, provider_invocation = role_agent_command(
+        repo, agent_config, runner=runner, prompt_rel=prompt_rel, cwd=worktree
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if not branch_exists(repo, integration):
         raise HLoopError(
             f"integration branch does not exist: {integration}. "
@@ -7542,6 +7601,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "skill_version": SKILL_VERSION,
             "sandbox": "workspace-write",
             "started_at": now_iso(),
+            "provider_invocation": provider_invocation.as_record(),
         }
     )
     state["phase"] = "running"
@@ -7764,20 +7824,112 @@ def complete_merge_state(repo: Path, state: dict[str, Any], task_id: str, mode: 
     journal(repo, f"Merged Worker `{task_id}` from `{task_state.get('branch', '')}`.")
 
 
+def merge_transaction_index_state(repo: Path, target: str) -> str:
+    return git(repo, ["rev-parse", f"{target}^{{tree}}"])
+
+
+def build_merge_transaction(
+    *,
+    task_id: str,
+    attempt_id: str,
+    branch: str,
+    pre_merge_head: str,
+    worker_head: str,
+    index_state: str,
+    changed_paths: Sequence[str],
+    status: str = MERGE_ACTIVE,
+) -> MergeTransaction:
+    return MergeTransaction(
+        transaction_id=f"M-{task_id}-{attempt_id}",
+        task_id=task_id,
+        attempt_id=attempt_id,
+        branch=branch,
+        pre_merge_head=pre_merge_head,
+        worker_head=worker_head,
+        result_head=worker_head,
+        index_state=index_state,
+        changed_paths=tuple(changed_paths),
+        status=status,
+    )
+
+
+def observed_merge_transaction(repo: Path, transaction: MergeTransaction) -> MergeTransaction:
+    """Recompute the transaction's Git-observed identity fields right now.
+
+    Used to detect an out-of-band reset, manual commit, or Worker-branch merge
+    that happened outside the transaction while a merge was active or conflicted.
+    """
+
+    head = git(repo, ["rev-parse", "HEAD"])
+    worker_head = (
+        git(repo, ["rev-parse", transaction.branch])
+        if branch_exists(repo, transaction.branch)
+        else transaction.worker_head
+    )
+    index_state = merge_transaction_index_state(repo, "HEAD")
+    return dataclass_replace(
+        transaction,
+        pre_merge_head=head,
+        worker_head=worker_head,
+        index_state=index_state,
+    )
+
+
+def preflight_merge_transaction(repo: Path, active: dict[str, Any], op: str) -> MergeTransaction:
+    """Transaction-aware preflight shared by abort, continue, and retry.
+
+    Rejects the operation when it is not legal for the transaction's current
+    status, and stops with ``manual-integration-trace`` when live Git
+    observations no longer match the recorded transaction identity.
+    """
+
+    try:
+        prior = MergeTransaction.from_record(active)
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
+    allowed = allowed_merge_operations(prior.status)
+    if op not in allowed:
+        raise HLoopError(
+            f"`{op}` is not allowed for merge transaction status `{prior.status}`; "
+            f"allowed operations: {', '.join(allowed)}"
+        )
+    observed = observed_merge_transaction(repo, prior)
+    drift = validate_merge_transaction(prior, observed)
+    if not drift.ok:
+        raise HLoopError(
+            "merge transaction drifted from recorded Git observations: "
+            + "; ".join(issue.message for issue in drift.issues)
+        )
+    return prior
+
+
+def transition_merge_transaction(
+    repo: Path, state: dict[str, Any], prior: MergeTransaction, status: str
+) -> MergeTransaction:
+    candidate = dataclass_replace(prior, status=status)
+    result = validate_merge_transaction(prior, candidate)
+    result.raise_for_errors()
+    if status in (MERGE_ABORTED, MERGE_COMPLETED):
+        state.pop("active_merge", None)
+    else:
+        existing = state.get("active_merge") or {}
+        extra = {key: value for key, value in existing.items() if key not in candidate.to_record()}
+        state["active_merge"] = {**extra, **candidate.to_record()}
+    return candidate
+
+
 def cmd_merge_abort(repo: Path, state: dict[str, Any], task_id: str) -> int:
     active = state.get("active_merge") or {}
     if str(active.get("task_id") or "") != task_id:
         raise HLoopError(f"no active merge transaction for {task_id}")
-    pre_head = str(active.get("pre_merge_head") or "")
-    if not pre_head:
-        raise HLoopError(f"merge transaction lacks pre_merge_head for {task_id}")
-    git(repo, ["reset", "--merge", pre_head])
+    prior = preflight_merge_transaction(repo, active, "abort")
+    git(repo, ["reset", "--merge", prior.pre_merge_head])
+    transition_merge_transaction(repo, state, prior, MERGE_ABORTED)
     state["tasks"][task_id]["status"] = "result_reported"
     state["tasks"][task_id].pop("merge_error", None)
-    state.pop("active_merge", None)
     state["phase"] = "dispatching"
     save_state(repo, state)
-    journal(repo, f"Aborted merge transaction for `{task_id}` and restored `{pre_head}`.")
+    journal(repo, f"Aborted merge transaction for `{task_id}` and restored `{prior.pre_merge_head}`.")
     print(f"aborted merge {task_id}")
     return 0
 
@@ -7786,6 +7938,7 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
     active = state.get("active_merge") or {}
     if str(active.get("task_id") or "") != task_id:
         raise HLoopError(f"no active merge transaction for {task_id}")
+    prior = preflight_merge_transaction(repo, active, "continue")
     unmerged = git(repo, ["diff", "--name-only", "--diff-filter=U"])
     if unmerged.strip():
         raise HLoopError("merge still has unresolved paths: " + ", ".join(unmerged.splitlines()))
@@ -7797,6 +7950,7 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
         raise HLoopError("merge continue has no staged changes")
     mode = str(active.get("mode") or state.get("merge_mode") or "squash")
     git(repo, ["commit", "-m", f"ai-loop({task_id}): {mode} {state['tasks'][task_id]['branch']}"])
+    transition_merge_transaction(repo, state, prior, MERGE_COMPLETED)
     complete_merge_state(repo, state, task_id, mode)
     print(f"continued merge {task_id}")
     return 0
@@ -7804,14 +7958,32 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
 
 def cmd_merge(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
-    state = preflight_loop(repo, require_integration_branch=True)
     task_id = args.task_id
+    recovery_op = (
+        "abort"
+        if getattr(args, "abort", False)
+        else "continue" if getattr(args, "continue_merge", False) else "retry" if getattr(args, "retry", False) else None
+    )
+    preexisting_active = (load_state(repo).get("active_merge") or {}) if recovery_op else {}
+    recovering_active_transaction = bool(recovery_op) and str(preexisting_active.get("task_id") or "") == task_id
+    # A conflicted or environment-failed merge transaction leaves the working
+    # tree dirty on purpose; the transaction-aware preflight below is the
+    # correct authority for abort/continue/retry, not the blanket dirty check.
+    state = preflight_loop(
+        repo,
+        require_integration_branch=True,
+        skip_dirty_check=recovering_active_transaction,
+    )
     if getattr(args, "abort", False):
         return cmd_merge_abort(repo, state, task_id)
     if getattr(args, "continue_merge", False):
         return cmd_merge_continue(repo, state, task_id)
     if getattr(args, "retry", False):
-        if state.get("active_merge"):
+        active = state.get("active_merge") or {}
+        if active:
+            if str(active.get("task_id") or "") != task_id:
+                raise HLoopError(f"no active merge transaction for {task_id}")
+            preflight_merge_transaction(repo, active, "retry")
             cmd_merge_abort(repo, state, task_id)
             state = preflight_loop(repo, require_integration_branch=True)
     task_state = state.get("tasks", {}).get(task_id)
@@ -7877,13 +8049,20 @@ def cmd_merge(args: argparse.Namespace) -> int:
             commits = git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"])
             print(f"DRY RUN git cherry-pick {' '.join(commits.splitlines())}")
         return 0
+    attempt_id = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or f"{task_id}-A001")
+    pre_merge_head = git(repo, ["rev-parse", "HEAD"])
+    transaction = build_merge_transaction(
+        task_id=task_id,
+        attempt_id=attempt_id,
+        branch=branch,
+        pre_merge_head=pre_merge_head,
+        worker_head=actual_head,
+        index_state=merge_transaction_index_state(repo, "HEAD"),
+        changed_paths=files,
+    )
     state["active_merge"] = {
-        "task_id": task_id,
-        "attempt_id": task_state.get("active_attempt_id") or task_state.get("attempt_id"),
-        "branch": branch,
-        "worker_head": actual_head,
+        **transaction.to_record(),
         "worker_base_sha": base_sha,
-        "pre_merge_head": git(repo, ["rev-parse", "HEAD"]),
         "mode": mode,
         "started_at": now_iso(),
     }
@@ -7912,6 +8091,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     except subprocess.CalledProcessError as exc:
         detail = command_error_detail(exc)
         if is_environment_git_error(detail):
+            transition_merge_transaction(repo, state, transaction, MERGE_ENVIRONMENT_FAILURE)
             task_state["status"] = "blocked_environment"
             task_state["merge_error"] = detail
             state["phase"] = "blocked_environment"
@@ -7925,6 +8105,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
                 f"```text\n{detail}\n```\n",
             )
             raise HLoopError(f"merge blocked by git/environment state for {task_id}: {detail}") from exc
+        transition_merge_transaction(repo, state, transaction, MERGE_CONTENT_CONFLICT)
         task_state["status"] = "blocked_merge_conflict"
         state["phase"] = "blocked_conflict"
         save_state(repo, state)
@@ -7934,6 +8115,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             f"\n## Merge conflict for {task_id}\n\nResolve or abort the merge for `{branch}`.\n",
         )
         raise exc
+    transition_merge_transaction(repo, state, transaction, MERGE_COMPLETED)
     complete_merge_state(repo, state, task_id, mode)
     print(f"merged {task_id}")
     return 0
@@ -7971,6 +8153,9 @@ def cleanup_task(
         task_state["cleanup_pending"] = False
         task_state["cleanup_done"] = True
         task_state["cleaned_at"] = now_iso()
+        task_state.pop("worktree_cleanup_status", None)
+        task_state.pop("worktree_cleanup_error", None)
+        task_state.pop("worktree_cleanup_error_fingerprint", None)
 
 
 def cleanup_merged_tasks(repo: Path, state: dict[str, Any], dry_run: bool = False) -> None:
@@ -7984,6 +8169,179 @@ def cleanup_merged_tasks(repo: Path, state: dict[str, Any], dry_run: bool = Fals
                 dry_run=dry_run,
             )
             cleanup_task(repo, task_id, task, state, dry_run=dry_run, best_effort=True)
+
+
+def iter_all_roles(state: dict[str, Any]):
+    """Yield ``(role_kind, role_id, role_state)`` for every Worker, Reviewer,
+    Gap Auditor, and Advisor participant so the finish gate and `cleanup
+    resolve` can address any role by a single ID."""
+
+    for task_id, task in state.get("tasks", {}).items():
+        yield "worker", task_id, task
+    for review_id, review in state.get("reviews", {}).items():
+        yield "reviewer", review_id, review
+    for gap_id, gap in state.get("gaps", {}).items():
+        yield "gap", gap_id, gap
+    for advice_id, advice in state.get("advice", {}).items():
+        if not isinstance(advice, dict):
+            continue
+        for participant in advice.get("participants", []):
+            participant_id = str(participant.get("participant_id") or "P1")
+            yield "advisor", f"{advice_id}/{participant_id}", participant
+
+
+def role_cleanup_failures(role_state: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """Map failure kind (``worktree``, ``pane``, ``session``) to ``(detail, fingerprint)``."""
+
+    failures: dict[str, tuple[str, str]] = {}
+    if role_state.get("worktree_cleanup_status") == "failed":
+        failures["worktree"] = (
+            str(role_state.get("worktree_cleanup_error") or ""),
+            str(role_state.get("worktree_cleanup_error_fingerprint") or ""),
+        )
+    if role_state.get("pane_cleanup_status") == "failed":
+        failures["pane"] = (
+            str(role_state.get("pane_cleanup_error") or ""),
+            str(role_state.get("pane_cleanup_error_fingerprint") or ""),
+        )
+    if role_state.get("agent_session_cleanup_error"):
+        failures["session"] = (
+            str(role_state.get("agent_session_cleanup_error") or ""),
+            str(role_state.get("agent_session_cleanup_error_fingerprint") or ""),
+        )
+    return failures
+
+
+def unresolved_cleanup_failures(role_state: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """Active failures minus those covered by a matching cleaned/accepted-risk resolution.
+
+    A provider or environment that does not support a cleanup step records
+    ``skipped:...`` or ``unsupported`` statuses, which never reach here since
+    only ``failed`` statuses and session errors are considered failures.
+    """
+
+    failures = role_cleanup_failures(role_state)
+    resolutions = role_state.get("cleanup_resolutions") or {}
+    unresolved: dict[str, tuple[str, str]] = {}
+    for kind, (detail, fingerprint) in failures.items():
+        resolution = resolutions.get(kind)
+        if isinstance(resolution, dict) and fingerprint and resolution.get("error_fingerprint") == fingerprint:
+            continue
+        unresolved[kind] = (detail, fingerprint)
+    return unresolved
+
+
+def find_role_for_cleanup(state: dict[str, Any], role_id: str) -> tuple[str, str, dict[str, Any]]:
+    if role_id in state.get("tasks", {}):
+        return "worker", role_id, state["tasks"][role_id]
+    if role_id in state.get("reviews", {}):
+        return "reviewer", role_id, state["reviews"][role_id]
+    if role_id in state.get("gaps", {}):
+        return "gap", role_id, state["gaps"][role_id]
+    advice_id, _, participant_id = role_id.partition("/")
+    advice = state.get("advice", {}).get(advice_id)
+    if isinstance(advice, dict):
+        participants = advice.get("participants", [])
+        if participant_id:
+            return "advisor", role_id, find_advisor_participant(advice, participant_id)
+        if len(participants) == 1:
+            only = participants[0]
+            resolved_id = f"{advice_id}/{only.get('participant_id') or 'P1'}"
+            return "advisor", resolved_id, only
+        raise HLoopError(
+            f"advisor request `{advice_id}` has multiple participants; "
+            "specify `<advice-id>/<participant-id>`"
+        )
+    raise HLoopError(f"unknown role id: {role_id}")
+
+
+def retry_role_cleanup(
+    repo: Path, state: dict[str, Any], role_kind: str, role_id: str, role_state: dict[str, Any]
+) -> None:
+    label = f"{role_kind.capitalize()} {role_id}"
+    session_cleanup = str(state.get("session_cleanup", "archive"))
+    if role_state.get("pane_cleanup_status") == "failed" and role_state.get("pane_id"):
+        cleanup_completed_agent_pane(repo, role_state, label=label, session_cleanup=session_cleanup)
+    if role_state.get("agent_session_cleanup_error"):
+        session_id = str(role_state.get("agent_session_id") or "")
+        provider = str(
+            role_state.get("agent_session_provider") or role_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER
+        )
+        if session_id:
+            retry_agent_session_cleanup(
+                repo, role_state, label=label, provider=provider, session_id=session_id, session_cleanup=session_cleanup
+            )
+    if role_state.get("worktree_cleanup_status") == "failed":
+        if role_kind == "worker":
+            cleanup_task(repo, role_id, role_state, state, best_effort=True)
+        elif role_kind == "reviewer":
+            cleanup_review_worktree(repo, role_id, role_state, best_effort=True)
+        elif role_kind == "gap":
+            cleanup_gap_worktree(repo, role_id, role_state, best_effort=True)
+        elif role_kind == "advisor":
+            advice_id, _, _participant_id = role_id.partition("/")
+            cleanup_advisor_worktree(repo, advice_id, role_state, best_effort=True)
+
+
+def cmd_cleanup_resolve(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, mark_blocked=False, skip_dirty_check=True)
+    role_kind, role_id, role_state = find_role_for_cleanup(state, args.role_id)
+    status = args.status
+    if status not in {"cleaned", "accepted-risk"}:
+        raise HLoopError("--status must be cleaned or accepted-risk")
+    reason = str(args.reason or "").strip()
+    if not reason:
+        raise HLoopError("--reason is required")
+    before = role_cleanup_failures(role_state)
+    if not before:
+        raise HLoopError(f"no active cleanup failure for {role_kind} {role_id}")
+    manager_identity = str(os.environ.get("HLOOP_MANAGER_IDENTITY") or os.environ.get("USER") or "manager")
+    resolutions = role_state.setdefault("cleanup_resolutions", {})
+    history = state.setdefault("cleanup_history", [])
+    resolved_at = now_iso()
+    attempt_id = str(
+        role_state.get("attempt_id") or role_state.get("active_attempt_id") or f"{role_id}-A001"
+    )
+    run_id = str(state.get("run_id") or "local")
+
+    def audit(kind: str, detail: str, fingerprint: str, record_status: str) -> dict[str, Any]:
+        record = cleanup_resolution_record(
+            run_id=run_id,
+            role_id=role_id,
+            attempt_id=attempt_id,
+            status=record_status,
+            reason=reason,
+            manager_identity=manager_identity,
+            resolved_at=resolved_at,
+            error_fingerprint=fingerprint or cleanup_error_fingerprint(kind, detail),
+        )
+        return record.to_record()
+
+    if status == "cleaned":
+        retry_role_cleanup(repo, state, role_kind, role_id, role_state)
+        remaining = role_cleanup_failures(role_state)
+        for kind, (detail, fingerprint) in before.items():
+            if kind in remaining:
+                continue
+            history.append(audit(kind, detail, fingerprint, "cleaned"))
+            resolutions.pop(kind, None)
+        save_state(repo, state)
+        if remaining:
+            raise HLoopError(
+                f"cleanup retry did not clear all failures for {role_kind} {role_id}: "
+                + ", ".join(sorted(remaining))
+                + "; use `--status accepted-risk` to proceed intentionally"
+            )
+    else:
+        for kind, (detail, fingerprint) in before.items():
+            record = audit(kind, detail, fingerprint, "accepted-risk")
+            resolutions[kind] = record
+            history.append(record)
+        save_state(repo, state)
+    journal(repo, f"Resolved cleanup for {role_kind} `{role_id}` as `{status}`: {reason}")
+    print(f"resolved cleanup for {role_id}: {status}")
+    return 0
 
 
 def validation_log_rel(state: dict[str, Any], index: int) -> Path:
@@ -8154,10 +8512,15 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         head_sha=head_sha,
         review_plan=review_plan,
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' and mode == 'single' else None)}"
+    agent_command, _preview_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=review_rel if runner == "exec" and mode == "single" else None,
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
         print(f"DRY RUN prompt: {prompt_path}")
@@ -8209,10 +8572,15 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         head_sha=head_sha,
         review_plan=review_plan,
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=review_rel if runner == 'exec' and mode == 'single' else None)}"
+    agent_command, provider_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=review_rel if runner == "exec" and mode == "single" else None,
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_preexisting = worktree.exists()
     if not worktree_preexisting:
@@ -8269,6 +8637,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "worktree_review_path": str(worktree_review_path),
         "baseline_dirty_files": baseline_dirty,
         "started_at": now_iso(),
+        "provider_invocation": provider_invocation.as_record(),
     }
     state["phase"] = "reviewing"
     save_state(repo, state)
@@ -8645,10 +9014,15 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     prompt = render_gap_prompt(
         gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+    agent_command, _preview_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=gap_rel if runner == "exec" else None,
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
         print(f"DRY RUN prompt: {prompt_path}")
@@ -8686,10 +9060,15 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     prompt = render_gap_prompt(
         gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=gap_rel if runner == 'exec' else None)}"
+    agent_command, provider_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=gap_rel if runner == "exec" else None,
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_preexisting = worktree.exists()
     if not worktree_preexisting:
@@ -8744,6 +9123,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "worktree_gap_path": str(worktree_gap_path),
         "baseline_dirty_files": baseline_dirty,
         "started_at": now_iso(),
+        "provider_invocation": provider_invocation.as_record(),
     }
     state["phase"] = "gap_checking"
     save_state(repo, state)
@@ -9161,10 +9541,15 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     prompt = render_advisor_prompt(
         advice_id, participant, advice_state, state, advice_rel, head_sha=head_sha
     )
-    command = (
-        f"cd {shlex.quote(str(worktree))} && "
-        f"{role_agent_command(repo, agent_config, runner=runner, prompt_rel=prompt_rel, output_rel=advice_rel if runner == 'exec' else None)}"
+    agent_command, provider_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=advice_rel if runner == "exec" else None,
     )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if args.dry_run:
         print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
         print(f"DRY RUN prompt: {prompt_path}")
@@ -9236,6 +9621,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             "worktree_advice_path": str(worktree_advice_path),
             "baseline_dirty_files": baseline_dirty,
             "started_at": now_iso(),
+            "provider_invocation": provider_invocation.as_record(),
         }
     )
     advice_state["status"] = "running"
@@ -11416,12 +11802,17 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
     if not manager_qa_passed(state):
         errors.append("current completion target lacks passing Manager QA")
     cleanup_pending = [
-        task_id
-        for task_id, task in state.get("tasks", {}).items()
-        if task.get("cleanup_pending") or task.get("worktree_cleanup_status") == "failed"
+        task_id for task_id, task in state.get("tasks", {}).items() if task.get("cleanup_pending")
     ]
     if cleanup_pending:
-        errors.append("cleanup is unresolved: " + ", ".join(cleanup_pending))
+        errors.append("worktree cleanup has not run yet: " + ", ".join(cleanup_pending))
+    for role_kind, role_id, role_state in iter_all_roles(state):
+        unresolved = unresolved_cleanup_failures(role_state)
+        if unresolved:
+            errors.append(
+                f"cleanup is unresolved for {role_kind} `{role_id}` ({', '.join(sorted(unresolved))}); "
+                "run `hloop cleanup resolve` with --status cleaned or accepted-risk"
+            )
     if state.get("active_merge"):
         errors.append("a merge transaction is active")
     final_gate = final_gate_from_state(state)
@@ -12199,6 +12590,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     finish = sub.add_parser("finish", help="mark done only after all current-head gates pass")
     finish.set_defaults(func=cmd_finish)
+
+    cleanup = sub.add_parser("cleanup", help="cleanup gate operations")
+    cleanup_sub = cleanup.add_subparsers(dest="cleanup_command", required=True)
+    cleanup_resolve = cleanup_sub.add_parser(
+        "resolve", help="close a role's cleanup failure with evidence before finish"
+    )
+    cleanup_resolve.add_argument("role_id")
+    cleanup_resolve.add_argument("--status", choices=["cleaned", "accepted-risk"], required=True)
+    cleanup_resolve.add_argument("--reason", required=True)
+    cleanup_resolve.set_defaults(func=cmd_cleanup_resolve)
 
     reviewer = sub.add_parser("reviewer", help="reviewer operations")
     reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
