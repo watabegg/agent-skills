@@ -40,6 +40,7 @@ _INPUT_ID_RE = re.compile(r"^U[0-9]{4}$")
 _REQUIREMENT_ID_RE = re.compile(r"^REQ-[0-9]{3}$")
 _PROGRESS_ID_RE = re.compile(r"^P[0-9]{4}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_HEAD_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 class RequirementModelError(ValueError):
@@ -90,10 +91,21 @@ _AUTHORIZATION_RE = re.compile(
     r"(?im)(\bAuthorization\s*:\s*)(?:Bearer|Basic)\s+[^\s,;]+"
 )
 _BEARER_RE = re.compile(r"(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
+_CREDENTIAL_URI_RE = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.-]*://[^/@\s:]+:)([^/@\s]+)(@)"
+)
 _ASSIGNMENT_RE = re.compile(
     r"(?im)(\b(?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token|token|password|"
     r"passwd|client[-_ ]?secret|secret(?:[-_ ]?key)?)\b\s*[:=]\s*)"
-    r"(?:\"[^\"\n]+\"|'[^'\n]+'|[^\s,;]+)"
+    r"(?!\[REDACTED(?: [A-Z ]+)?\])(?:\"[^\"\n]+\"|'[^'\n]+'|[^\s,;]+)"
+)
+_ENVIRONMENT_CREDENTIAL_RE = re.compile(
+    r"(?im)(\b(?![a-z0-9_]*public_key\b)[a-z][a-z0-9_]*"
+    r"(?:_token|_secret|_password|_passwd|_key)\b[ \t]*=[ \t]*)"
+    r"(?!\[REDACTED(?: [A-Z ]+)?\])(?:\"[^\"\n]+\"|'[^'\n]+'|[^\s,;]+)"
+)
+_GITLAB_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9])"
 )
 _KNOWN_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
@@ -121,7 +133,14 @@ def redact_sensitive_text_with_kinds(text: str) -> tuple[str, tuple[str, ...]]:
         ("private-key", _PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]"),
         ("authorization", _AUTHORIZATION_RE, r"\1[REDACTED]"),
         ("bearer-token", _BEARER_RE, r"\1 [REDACTED]"),
+        ("credential-uri", _CREDENTIAL_URI_RE, r"\1[REDACTED]\3"),
         ("credential-assignment", _ASSIGNMENT_RE, r"\1[REDACTED]"),
+        (
+            "environment-credential",
+            _ENVIRONMENT_CREDENTIAL_RE,
+            r"\1[REDACTED]",
+        ),
+        ("gitlab-token", _GITLAB_TOKEN_RE, "[REDACTED TOKEN]"),
         ("known-token", _KNOWN_TOKEN_RE, "[REDACTED TOKEN]"),
     )
     for kind, pattern, replacement in patterns:
@@ -419,10 +438,18 @@ class EvidenceRef:
             raise ProgressEvidenceError("verified test/QA evidence requires a result")
         if not isinstance(self.head_sha, str) or not isinstance(self.result, str):
             raise ProgressEvidenceError("evidence head_sha and result must be strings")
+        if self.head_sha and not _HEAD_SHA_RE.fullmatch(self.head_sha):
+            raise ProgressEvidenceError(
+                "evidence head_sha must be a 40- or 64-character hex digest"
+            )
 
     @property
     def qualifies_for_verified(self) -> bool:
+        """Return whether this item may participate in a verified bundle."""
+
         if self.kind == "agent-report" or self.verified_by not in VERIFICATION_AUTHORITIES:
+            return False
+        if not self.head_sha:
             return False
         if self.kind in {"test", "qa"}:
             return self.result in PASSING_EVIDENCE_RESULTS
@@ -488,9 +515,33 @@ class RequirementProgress:
         blockers = _unique_texts(self.blockers, "blockers")
         object.__setattr__(self, "blockers", blockers)
         if self.status == "verified":
-            if not any(item.qualifies_for_verified for item in self.evidence):
+            artifacts = tuple(
+                item
+                for item in self.evidence
+                if item.kind == "artifact"
+                and item.verified_by in VERIFICATION_AUTHORITIES
+            )
+            if not artifacts or any(not item.head_sha for item in artifacts):
                 raise ProgressEvidenceError(
-                    "verified status requires Manager/HLoop-verified non-agent evidence"
+                    "verified status requires Manager/HLoop-verified artifact evidence "
+                    "bound to a head SHA"
+                )
+            validations = tuple(
+                item
+                for item in self.evidence
+                if item.kind in {"test", "qa"}
+                and item.verified_by in VERIFICATION_AUTHORITIES
+                and item.result in PASSING_EVIDENCE_RESULTS
+            )
+            if not validations or any(not item.head_sha for item in validations):
+                raise ProgressEvidenceError(
+                    "verified status requires passing test/QA evidence bound to a head SHA"
+                )
+            target_shas = {item.head_sha for item in (*artifacts, *validations)}
+            if len(target_shas) != 1:
+                raise ProgressEvidenceError(
+                    "verified artifact and passing test/QA evidence must use the same "
+                    "target head SHA"
                 )
             if blockers:
                 raise ProgressEvidenceError("verified progress cannot retain blockers")

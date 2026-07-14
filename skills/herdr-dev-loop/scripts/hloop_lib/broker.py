@@ -225,31 +225,41 @@ class BrokerStore:
         return connection
 
     def _initialize(self) -> None:
-        connection = self._connect()
-        try:
-            metadata_exists = connection.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'broker_meta'
-                """
-            ).fetchone()
-            row = None
-            if metadata_exists is not None:
-                row = connection.execute(
-                    "SELECT value FROM broker_meta WHERE key = 'schema_version'"
-                ).fetchone()
-                if row is not None and row["value"] != str(BROKER_SCHEMA_VERSION):
-                    raise BrokerStorageError(
-                        f"unsupported broker schema version: {row['value']}"
-                    )
-            connection.executescript(_schema_sql())
-            if row is None:
-                connection.execute(
-                    "INSERT INTO broker_meta(key, value) VALUES('schema_version', ?)",
-                    (str(BROKER_SCHEMA_VERSION),),
-                )
-        finally:
-            connection.close()
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                connection = self._connect()
+                try:
+                    metadata_exists = connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = 'broker_meta'
+                        """
+                    ).fetchone()
+                    row = None
+                    if metadata_exists is not None:
+                        row = connection.execute(
+                            "SELECT value FROM broker_meta WHERE key = 'schema_version'"
+                        ).fetchone()
+                        if row is not None and row["value"] != str(
+                            BROKER_SCHEMA_VERSION
+                        ):
+                            raise BrokerStorageError(
+                                f"unsupported broker schema version: {row['value']}"
+                            )
+                    connection.executescript(_schema_sql())
+                    if row is None:
+                        connection.execute(
+                            "INSERT INTO broker_meta(key, value) "
+                            "VALUES('schema_version', ?)",
+                            (str(BROKER_SCHEMA_VERSION),),
+                        )
+                finally:
+                    connection.close()
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         try:
             self.database_path.chmod(0o600)
         except OSError:

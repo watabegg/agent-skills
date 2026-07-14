@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sys
 import unittest
 from pathlib import Path
+
+try:
+    import jsonschema
+except ImportError:  # pragma: no cover - optional for skill consumers
+    jsonschema = None
 
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
@@ -36,6 +42,7 @@ from hloop_lib.requirements import (  # noqa: E402
 
 
 NOW = "2026-07-15T00:00:00+00:00"
+HEAD_SHA = "a" * 40
 
 
 def requirement(number: int, *, supersedes=()) -> Requirement:
@@ -49,20 +56,30 @@ def requirement(number: int, *, supersedes=()) -> Requirement:
     )
 
 
+def verified_evidence(head_sha: str = HEAD_SHA) -> tuple[EvidenceRef, ...]:
+    return (
+        EvidenceRef(
+            kind="artifact",
+            reference="results/T005/result.md",
+            verified_by="hloop",
+            head_sha=head_sha,
+        ),
+        EvidenceRef(
+            kind="test",
+            reference="python3 -m unittest test_requirements_v05.py",
+            verified_by="hloop",
+            head_sha=head_sha,
+            result="passed",
+        ),
+    )
+
+
 def verified_progress() -> RequirementProgress:
     return RequirementProgress(
         requirement_id="REQ-002",
         status="verified",
         task_ids=("T005",),
-        evidence=(
-            EvidenceRef(
-                kind="test",
-                reference="python3 -m unittest test_requirements_v05.py",
-                verified_by="hloop",
-                head_sha="abc123",
-                result="passed",
-            ),
-        ),
+        evidence=verified_evidence(),
     )
 
 
@@ -104,6 +121,56 @@ class InputRecordTests(unittest.TestCase):
         self.assertEqual(captured.artifact_class, "local-sensitive")
         self.assertFalse(captured.checkpoint_included)
         self.assertFalse(captured.product_commit_included)
+
+    def test_capture_redacts_environment_uri_and_gitlab_credentials(self):
+        original = (
+            "AWS_SECRET_ACCESS_KEY=aws-secret-material\n"
+            "DEPLOY_TOKEN=deployment-token-material\n"
+            "WEBHOOK_SECRET=webhook-secret-material\n"
+            "DATABASE_PASSWORD=database-env-password\n"
+            "DATABASE_URL=postgres://reporter:database-password@db.example.test/app\n"
+            "GITLAB_TOKEN=glpat-abcdefghijklmnopqrstuvwxyz\n"
+            "standalone glpat-zyxwvutsrqponmlkjihgfedcba"
+        )
+
+        captured = InputRecord.capture(
+            input_id="U0001",
+            received_at=NOW,
+            source="manager-pane",
+            raw_input=original,
+        )
+
+        for secret in (
+            "aws-secret-material",
+            "deployment-token-material",
+            "webhook-secret-material",
+            "database-env-password",
+            "database-password",
+            "glpat-abcdefghijklmnopqrstuvwxyz",
+            "glpat-zyxwvutsrqponmlkjihgfedcba",
+        ):
+            self.assertNotIn(secret, captured.raw_input)
+        self.assertEqual(
+            set(captured.redactions),
+            {"credential-uri", "environment-credential", "gitlab-token"},
+        )
+
+    def test_capture_preserves_ordinary_text_and_noncredential_urls(self):
+        ordinary = (
+            "A token bucket controls throughput.\n"
+            "PUBLIC_KEY=documentation-fingerprint\n"
+            "Docs: https://example.test/guide and postgres://db.example.test/app"
+        )
+
+        captured = InputRecord.capture(
+            input_id="U0001",
+            received_at=NOW,
+            source="manager-pane",
+            raw_input=ordinary,
+        )
+
+        self.assertEqual(captured.raw_input, ordinary)
+        self.assertEqual(captured.redactions, ())
 
     def test_direct_record_rejects_unredacted_or_checkpointed_input(self):
         with self.assertRaisesRegex(RequirementModelError, "unredacted"):
@@ -192,25 +259,78 @@ class ProgressTests(unittest.TestCase):
                 "REQ-001", status="verified", evidence=(agent_assertion,)
             )
 
+    def test_verified_requires_artifact_and_passing_validation_on_the_same_head(self):
+        artifact = verified_evidence()[0]
+        validation = verified_evidence()[1]
+
+        with self.assertRaisesRegex(ProgressEvidenceError, "passing test/QA"):
+            RequirementProgress(
+                "REQ-001", status="verified", evidence=(artifact,)
+            )
+        with self.assertRaisesRegex(ProgressEvidenceError, "artifact.*head SHA"):
+            RequirementProgress(
+                "REQ-001",
+                status="verified",
+                evidence=(
+                    EvidenceRef(
+                        kind="artifact",
+                        reference="results/T005/result.md",
+                        verified_by="hloop",
+                    ),
+                    validation,
+                ),
+            )
+        with self.assertRaisesRegex(ProgressEvidenceError, "same target head SHA"):
+            RequirementProgress(
+                "REQ-001",
+                status="verified",
+                evidence=(
+                    artifact,
+                    EvidenceRef(
+                        kind="qa",
+                        reference="local smoke check",
+                        verified_by="manager",
+                        head_sha="b" * 40,
+                        result="confirmed",
+                    ),
+                ),
+            )
+        with self.assertRaisesRegex(ProgressEvidenceError, "requires a result"):
+            EvidenceRef(
+                kind="test",
+                reference="python3 -m unittest test_requirements_v05.py",
+                verified_by="hloop",
+                head_sha=HEAD_SHA,
+            )
+
+    def test_incomplete_verified_record_cannot_reach_final_outcome(self):
+        incomplete_record = {
+            "requirement_id": "REQ-001",
+            "status": "verified",
+            "task_ids": ["T005"],
+            "evidence": [verified_evidence()[0].to_record()],
+            "remaining_work": "",
+            "blockers": [],
+        }
+
+        with self.assertRaisesRegex(ProgressEvidenceError, "passing test/QA"):
+            progress = RequirementProgress.from_record(incomplete_record)
+            final_outcome(
+                **report_kwargs(progress, gates=(OutcomeGateTests.passing_gate(),))
+            )
+
     def test_hloop_verified_test_evidence_allows_verified_transition(self):
         working = RequirementProgress("REQ-001", status="in_progress")
         implemented = transition_progress(working, "implemented_unverified")
-        evidence = EvidenceRef(
-            kind="test",
-            reference="python3 -m unittest test_requirements_v05.py",
-            verified_by="hloop",
-            head_sha="abc123",
-            result="passed",
-        )
         verified = transition_progress(
             implemented,
             "verified",
-            evidence=(evidence,),
+            evidence=verified_evidence(),
             remaining_work="",
             blockers=(),
         )
         self.assertEqual(verified.status, "verified")
-        self.assertTrue(verified.evidence[0].qualifies_for_verified)
+        self.assertTrue(verified.evidence[1].qualifies_for_verified)
 
     def test_snapshot_is_requirement_oriented(self):
         snapshot = ProgressSnapshot(
@@ -325,6 +445,31 @@ class SchemaContractTests(unittest.TestCase):
             schemas["outcome.schema.json"]["properties"]["kind"]["enum"],
             ["DRAFT", "FINAL", "BLOCKED"],
         )
+
+    @unittest.skipUnless(jsonschema is not None, "jsonschema is not installed")
+    def test_progress_schema_rejects_incomplete_verified_evidence(self):
+        schema = json.loads((SCHEMAS / "progress.schema.json").read_text())
+        validator = jsonschema.Draft202012Validator(schema)
+        valid = ProgressSnapshot(
+            progress_id="P0001",
+            created_at=NOW,
+            requirements=(verified_progress(),),
+        ).to_record()
+        self.assertTrue(validator.is_valid(valid))
+
+        artifact_only = copy.deepcopy(valid)
+        artifact_only["requirements"][0]["evidence"] = [
+            verified_evidence()[0].to_record()
+        ]
+        self.assertFalse(validator.is_valid(artifact_only))
+
+        missing_head = copy.deepcopy(valid)
+        missing_head["requirements"][0]["evidence"][0]["head_sha"] = ""
+        self.assertFalse(validator.is_valid(missing_head))
+
+        missing_result = copy.deepcopy(valid)
+        missing_result["requirements"][0]["evidence"][1]["result"] = ""
+        self.assertFalse(validator.is_valid(missing_result))
 
 
 if __name__ == "__main__":

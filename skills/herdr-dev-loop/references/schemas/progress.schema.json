@@ -11,7 +11,10 @@
         },
         "reference": {"type": "string", "minLength": 1},
         "verified_by": {"enum": ["", "manager", "hloop"]},
-        "head_sha": {"type": "string"},
+        "head_sha": {
+          "type": "string",
+          "pattern": "^(?:|[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
         "result": {"type": "string"}
       },
       "additionalProperties": false
@@ -61,31 +64,35 @@
           "then": {
             "properties": {
               "evidence": {
-                "minItems": 1,
-                "contains": {
-                  "allOf": [
-                    {
+                "$comment": "The Python model also requires artifact and validation evidence to use the same head_sha.",
+                "minItems": 2,
+                "allOf": [
+                  {
+                    "contains": {
                       "properties": {
-                        "kind": {"not": {"const": "agent-report"}},
-                        "verified_by": {"enum": ["manager", "hloop"]}
-                      },
-                      "required": ["kind", "verified_by"]
-                    },
-                    {
-                      "if": {"properties": {"kind": {"enum": ["test", "qa"]}}},
-                      "then": {
-                        "properties": {
-                          "result": {"enum": ["passed", "confirmed", "accepted"]}
+                        "kind": {"const": "artifact"},
+                        "verified_by": {"enum": ["manager", "hloop"]},
+                        "head_sha": {
+                          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
                         }
                       },
-                      "else": {
-                        "properties": {
-                          "result": {"enum": ["", "passed", "confirmed", "accepted"]}
-                        }
-                      }
+                      "required": ["kind", "verified_by", "head_sha"]
                     }
-                  ]
-                }
+                  },
+                  {
+                    "contains": {
+                      "properties": {
+                        "kind": {"enum": ["test", "qa"]},
+                        "verified_by": {"enum": ["manager", "hloop"]},
+                        "head_sha": {
+                          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+                        },
+                        "result": {"enum": ["passed", "confirmed", "accepted"]}
+                      },
+                      "required": ["kind", "verified_by", "head_sha", "result"]
+                    }
+                  }
+                ]
               },
               "remaining_work": {"const": ""},
               "blockers": {"maxItems": 0}
