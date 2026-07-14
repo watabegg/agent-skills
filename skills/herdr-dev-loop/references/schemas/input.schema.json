@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Local-sensitive Input Record",
+  "type": "object",
+  "required": [
+    "id",
+    "received_at",
+    "source",
+    "prompt_digest",
+    "raw_input",
+    "redactions",
+    "artifact_class",
+    "checkpoint_included",
+    "product_commit_included"
+  ],
+  "properties": {
+    "id": {"type": "string", "pattern": "^U[0-9]{4}$"},
+    "received_at": {"type": "string", "format": "date-time"},
+    "source": {"type": "string", "minLength": 1},
+    "prompt_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "raw_input": {"type": "string"},
+    "redactions": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "artifact_class": {"const": "local-sensitive"},
+    "checkpoint_included": {"const": false},
+    "product_commit_included": {"const": false}
+  },
+  "additionalProperties": false
+}
