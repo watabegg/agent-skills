@@ -26,6 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# HLoop is commonly executed from its source checkout.  Keep importing its
+# local modules from creating repository-local bytecode before validation even
+# starts; validation subprocesses receive the same guarantee in cmd_validate.
+sys.dont_write_bytecode = True
+
 from hloop_lib import config as hloop_config
 from hloop_lib.lifecycle import (
     FinalGateArm,
@@ -2355,11 +2360,43 @@ def unsafe_dirty_paths(repo: Path, *, allow_loop_dirty: bool = True) -> list[str
     ]
 
 
+def active_preflight_environment_block(state: dict[str, Any]) -> bool:
+    error = state.get("last_preflight_error")
+    return (
+        str(state.get("phase") or "") == "blocked_environment"
+        and isinstance(error, dict)
+        and error.get("source") == "preflight"
+        and not error.get("resolved_at")
+    )
+
+
 def mark_blocked_environment(repo: Path, state: dict[str, Any], reason: str) -> None:
+    previous_error = state.get("last_preflight_error")
+    previous_phase = str(state.get("phase") or "dispatching")
+    if active_preflight_environment_block(state) and isinstance(previous_error, dict):
+        previous_phase = str(previous_error.get("previous_phase") or "dispatching")
     state["phase"] = "blocked_environment"
-    state["last_preflight_error"] = {"at": now_iso(), "reason": reason}
+    state["last_preflight_error"] = {
+        "at": now_iso(),
+        "reason": reason,
+        "source": "preflight",
+        "previous_phase": previous_phase,
+    }
     save_state(repo, state)
     journal(repo, f"Blocked by preflight: {reason}")
+
+
+def recover_preflight_environment_block(repo: Path, state: dict[str, Any]) -> bool:
+    if not active_preflight_environment_block(state):
+        return False
+    error = state["last_preflight_error"]
+    recovered_phase = str(error.get("previous_phase") or "dispatching")
+    state["phase"] = recovered_phase
+    error["resolved_at"] = now_iso()
+    error["resolved_phase"] = recovered_phase
+    save_state(repo, state)
+    journal(repo, f"Recovered preflight environment blocker; restored phase `{recovered_phase}`.")
+    return True
 
 
 def preflight_loop(
@@ -2427,6 +2464,8 @@ def preflight_loop(
     dirty = unsafe_dirty_paths(repo, allow_loop_dirty=allow_loop_dirty)
     if dirty:
         fail("working tree has non-loop dirty files: " + ", ".join(dirty))
+    if mark_blocked:
+        recover_preflight_environment_block(repo, state)
     return state
 
 
@@ -7376,6 +7415,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             print(f"DRY RUN {command}")
             results.append({"command": command, "result": "dry-run"})
             continue
+        validation_env = os.environ.copy()
+        validation_env["PYTHONDONTWRITEBYTECODE"] = "1"
         proc = subprocess.run(
             command,
             cwd=str(repo),
@@ -7383,6 +7424,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=validation_env,
         )
         output = proc.stdout or ""
         if output:
@@ -8876,6 +8918,15 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if str(state.get("phase") or "") == "paused":
         print("loop is paused; run `hloop resume` before tick/pump")
         return 0
+    if str(state.get("phase") or "") in {
+        "blocked_environment",
+        "blocked_conflict",
+        "failed_validation",
+        "failed_manager_qa",
+        "no_progress",
+    }:
+        print(f"blocked: phase is {state.get('phase')}")
+        return 2
     if not normalize_list(state.get("validation_commands")) and any(
         task.get("status") == "queued"
         and str(task.get("kind") or "implementation") in {"implementation", "fix"}
@@ -9132,6 +9183,16 @@ def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[s
     phase = str(state.get("phase") or "")
     if state.get("blocking_decisions"):
         return ("pending user decision", 2)
+    retryable_preflight_block = active_preflight_environment_block(state) and str(
+        state.get("last_preflight_error", {}).get("previous_phase") or "dispatching"
+    ) not in {
+        "blocked_user_decision",
+        "blocked_environment",
+        "blocked_conflict",
+        "failed_validation",
+        "failed_manager_qa",
+        "no_progress",
+    }
     if phase in {
         "blocked_user_decision",
         "blocked_environment",
@@ -9139,7 +9200,7 @@ def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[s
         "failed_validation",
         "failed_manager_qa",
         "no_progress",
-    }:
+    } and not retryable_preflight_block:
         return (f"phase is {phase}", 2)
     if phase == "done":
         return ("loop is done", 0)
