@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,32 +147,286 @@ effort = "medium"
                 self.assertIn("artifact_policy", migrated)
                 self.assertEqual(len(list((state_path.parent / "migration").glob("STATE.v2.r0.*.json"))), 1)
 
-    def test_future_revision_refuses_mutation_without_rewriting_state(self):
+    def test_format_three_revision_zero_migrates_and_current_contract_requires_revision(self):
+        skill_root = SCRIPT.parents[1]
+        schema = json.loads(
+            (skill_root / "references" / "schemas" / "state.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        contract = (skill_root / "references" / "artifact-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("schema_revision", schema["required"])
+        self.assertIn("schema_revision", hloop.contract_required_state_fields(contract))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.make_repo(root)
+            with self.isolated_config_env(root):
+                state_path = self.init_loop(repo, "revision-zero")
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.pop("schema_revision")
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+
+                prefix = ["--repo", str(repo), "--namespace", "revision-zero", "migrate"]
+                code, output, error = self.run_cli([*prefix, "--dry-run"])
+                self.assertEqual((code, error), (0, ""), output)
+                plan = json.loads(output)
+                self.assertEqual((plan["from_format"], plan["from_revision"]), (3, 0))
+                self.assertEqual(plan["applied_steps"], ["format-3-revision-1"])
+
+                code, output, error = self.run_cli([*prefix, "--apply"])
+                self.assertEqual((code, error), (0, ""), output)
+                migrated = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    (migrated["state_format_version"], migrated["schema_revision"]),
+                    (3, 1),
+                )
+                self.assertEqual(
+                    len(list((state_path.parent / "migration").glob("STATE.v3.r0.*.json"))),
+                    1,
+                )
+
+    def test_selftest_rejects_revision_missing_from_schema_and_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            copied_skill = Path(directory) / "herdr-dev-loop"
+            shutil.copytree(SCRIPT.parents[1], copied_skill)
+            schema_path = copied_skill / "references" / "schemas" / "state.schema.json"
+            schema_text = schema_path.read_text(encoding="utf-8")
+            schema_path.write_text(
+                schema_text.replace('    "schema_revision",\n', "", 1),
+                encoding="utf-8",
+            )
+            contract_path = copied_skill / "references" / "artifact-contract.md"
+            contract_text = contract_path.read_text(encoding="utf-8")
+            contract_path.write_text(
+                contract_text.replace("- `schema_revision`\n", "", 1),
+                encoding="utf-8",
+            )
+
+            code, output, error = self.run_cli(
+                ["selftest", "--skill-dir", str(copied_skill), "--json"]
+            )
+            self.assertEqual((code, error), (1, ""), output)
+            self.assertIn(
+                "state.schema.json lacks required schema_revision",
+                json.loads(output)["errors"],
+            )
+
+    def test_future_revision_rejects_mutating_command_matrix_before_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = self.make_repo(root)
             with self.isolated_config_env(root):
                 state_path = self.init_loop(repo, "future-state")
+                worker_worktree = root / "worker-worktree"
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", "future-worker", str(worker_worktree), "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 state["schema_revision"] = 2
                 state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-                before = state_path.read_bytes()
-                code, _, error = self.run_cli(
-                    [
-                        "--repo",
-                        str(repo),
-                        "--namespace",
-                        "future-state",
-                        "task",
-                        "new",
-                        "must refuse",
-                        "--write-allow",
-                        "src/**",
-                    ]
-                )
+                journal_path = state_path.parent / "JOURNAL.md"
+                prefix = ["--repo", str(repo), "--namespace", "future-state"]
+
+                code, output, error = self.run_cli([*prefix, "status", "--raw-state"])
+                self.assertEqual((code, error), (0, ""), output)
+                self.assertEqual(json.loads(output)["schema_revision"], 2)
+                before_migrate = (state_path.read_bytes(), journal_path.read_bytes())
+                code, _, error = self.run_cli([*prefix, "migrate", "--dry-run"])
                 self.assertEqual(code, 2)
-                self.assertIn("newer than runtime", error)
-                self.assertEqual(state_path.read_bytes(), before)
+                self.assertIn(
+                    "state format-3.revision-2 is newer than runtime format-3.revision-1",
+                    error,
+                )
+                self.assertEqual(
+                    (state_path.read_bytes(), journal_path.read_bytes()),
+                    before_migrate,
+                )
+
+                state["tasks"] = {
+                    "T001": {
+                        "status": "running",
+                        "branch": "future-worker",
+                        "worktree": str(worker_worktree),
+                        "attempt_no": 1,
+                    }
+                }
+                state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+                lock_output = subprocess.run(
+                    ["git", "rev-parse", "--git-path", "hloop.lock"],
+                    cwd=repo,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                lock_path = Path(lock_output)
+                if not lock_path.is_absolute():
+                    lock_path = repo / lock_path
+                lock_path.unlink(missing_ok=True)
+
+                def snapshot():
+                    return {
+                        "state": state_path.read_bytes(),
+                        "journal": journal_path.read_bytes(),
+                        "branches": subprocess.run(
+                            ["git", "for-each-ref", "--format=%(refname):%(objectname)", "refs/heads"],
+                            cwd=repo,
+                            check=True,
+                            text=True,
+                            capture_output=True,
+                        ).stdout,
+                        "worktrees": subprocess.run(
+                            ["git", "worktree", "list", "--porcelain"],
+                            cwd=repo,
+                            check=True,
+                            text=True,
+                            capture_output=True,
+                        ).stdout,
+                        "worker_head": subprocess.run(
+                            ["git", "rev-parse", "HEAD"],
+                            cwd=worker_worktree,
+                            check=True,
+                            text=True,
+                            capture_output=True,
+                        ).stdout,
+                    }
+
+                before = snapshot()
+                commands = {
+                    "pause": ["pause", "--reason", "must refuse"],
+                    "validation configure": [
+                        "validation",
+                        "configure",
+                        "--command",
+                        "python3 -m unittest",
+                    ],
+                    "agent abort": ["agent", "abort", "T001", "--reason", "must refuse"],
+                    "agent requeue": ["agent", "requeue", "T001", "--reason", "must refuse"],
+                }
+                with mock.patch.object(
+                    hloop,
+                    "cleanup_completed_agent_pane",
+                    side_effect=AssertionError("pane cleanup must not run"),
+                ):
+                    for label, command in commands.items():
+                        with self.subTest(command=label):
+                            code, _, error = self.run_cli([*prefix, *command])
+                            self.assertEqual(code, 2)
+                            self.assertIn(
+                                "state format-3.revision-2 is newer than runtime "
+                                "format-3.revision-1",
+                                error,
+                            )
+                            self.assertEqual(snapshot(), before)
+                            self.assertFalse(lock_path.exists())
+
+    def test_pre_final_pause_resumes_without_unreached_gate_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.make_repo(root)
+            with self.isolated_config_env(root):
+                state_path = self.init_loop(repo, "pre-final-resume")
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["manager_qa_profile"] = "local"
+                state["manager_qa_status"] = "pending"
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                prefix = ["--repo", str(repo), "--namespace", "pre-final-resume"]
+
+                code, output, error = self.run_cli(
+                    [*prefix, "pause", "--reason", "operator handoff"]
+                )
+                self.assertEqual((code, error), (0, ""), output)
+                code, output, error = self.run_cli([*prefix, "resume"])
+                self.assertEqual((code, error), (0, ""), output)
+                resumed = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(resumed["phase"], "dispatching")
+                self.assertEqual(resumed["resume_requirements"], [])
+
+    def test_resume_rejects_only_previously_passing_gate_that_became_stale(self):
+        gate_states = {
+            "validation": lambda state, head: state.update(
+                {"last_validation": {"head_sha": head, "results": [{"result": "passed"}]}}
+            ),
+            "review": lambda state, head: state.update(
+                {
+                    "reviews": {
+                        "R001": {
+                            "status": "triaged",
+                            "gate_status": "triaged",
+                            "head_sha": head,
+                            "closed_head_sha": head,
+                        }
+                    }
+                }
+            ),
+            "gap": lambda state, head: state.update(
+                {
+                    "gaps": {
+                        "G001": {
+                            "status": "triaged",
+                            "gate_status": "triaged",
+                            "head_sha": head,
+                            "closed_head_sha": head,
+                        }
+                    }
+                }
+            ),
+            "manager-qa": lambda state, head: state.update(
+                {
+                    "manager_qa_profile": "local",
+                    "manager_qa_status": "passed",
+                    "manager_qa_head_sha": head,
+                    "completion_target_sha": head,
+                }
+            ),
+        }
+        for gate_name, configure_gate in gate_states.items():
+            with self.subTest(gate=gate_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = self.make_repo(root)
+                with self.isolated_config_env(root):
+                    namespace = f"stale-{gate_name}"
+                    state_path = self.init_loop(repo, namespace)
+                    old_head = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=repo,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip()
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    configure_gate(state, old_head)
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    prefix = ["--repo", str(repo), "--namespace", namespace]
+
+                    code, output, error = self.run_cli(
+                        [*prefix, "pause", "--reason", "target may advance"]
+                    )
+                    self.assertEqual((code, error), (0, ""), output)
+                    (repo / "advance.txt").write_text("advance\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "advance.txt"], cwd=repo, check=True)
+                    subprocess.run(
+                        ["git", "commit", "-m", "advance target"],
+                        cwd=repo,
+                        check=True,
+                        capture_output=True,
+                    )
+
+                    code, _, error = self.run_cli([*prefix, "resume"])
+                    self.assertEqual(code, 2)
+                    self.assertIn(f"{gate_name} was recorded for a different target", error)
+                    paused = json.loads(state_path.read_text(encoding="utf-8"))
+                    self.assertEqual(paused["phase"], "paused")
+                    self.assertEqual(len(paused["resume_requirements"]), 1)
+                    requirement = paused["resume_requirements"][0]
+                    self.assertEqual(requirement["code"], "gate-stale")
+                    self.assertEqual(requirement["subject"], gate_name)
 
     def test_final_gate_arms_only_stable_batch_and_new_task_disarms_it(self):
         with tempfile.TemporaryDirectory() as directory:

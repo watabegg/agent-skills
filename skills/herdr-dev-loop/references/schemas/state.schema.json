@@ -4,6 +4,7 @@
   "type": "object",
   "required": [
     "state_format_version",
+    "schema_revision",
     "goal_id",
     "run_id",
     "skill_version",
