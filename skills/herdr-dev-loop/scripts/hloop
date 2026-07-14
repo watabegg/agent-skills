@@ -235,7 +235,18 @@ class HLoopError(RuntimeError):
     pass
 
 
+class ManagerMessageDeliveryUnknown(HLoopError):
+    """The message was typed and an Enter attempt was made, but delivery could
+    not be visually confirmed.  This is distinct from a confirmed failure: the
+    caller must not treat it as ``undelivered`` and silently auto-retry it."""
+
+
 SKILL_VERSION = read_skill_version()
+
+
+MESSAGE_DELIVERY_STATUSES = frozenset(
+    {"delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"}
+)
 
 
 def configure_loop_namespace(value: str | None) -> str:
@@ -291,6 +302,42 @@ def git(repo: Path, args: list[str], check: bool = True) -> str:
     if proc.returncode != 0 and check:
         raise HLoopError(proc.stderr.strip())
     return (proc.stdout or "").strip()
+
+
+def git_executable_identity() -> dict[str, Any]:
+    """Resolve the git binary HLoop is about to trust and fingerprint it.
+
+    Recorded at ``init``/migration time and re-checked on every ``preflight_loop``
+    so a PATH-substituted or replaced ``git`` cannot silently change HLoop's
+    trust boundary mid-run.
+    """
+
+    resolved = shutil.which("git")
+    if not resolved:
+        raise HLoopError("git command not found")
+    real = os.path.realpath(resolved)
+    stat = os.stat(real)
+    digest = hashlib.sha256(Path(real).read_bytes()).hexdigest()
+    version_proc = run_cmd(["git", "--version"], check=False, capture=True)
+    return {
+        "path": real,
+        "st_dev": stat.st_dev,
+        "st_ino": stat.st_ino,
+        "sha256": digest,
+        "version": (version_proc.stdout or "").strip(),
+        "recorded_at": now_iso(),
+    }
+
+
+def git_identity_drift(recorded: dict[str, Any], current: dict[str, Any]) -> str:
+    """Return a human-readable drift description, or an empty string if trusted."""
+
+    mismatches = [
+        f"{field}: recorded={recorded.get(field)!r} current={current.get(field)!r}"
+        for field in ("path", "st_dev", "st_ino", "sha256")
+        if recorded.get(field) != current.get(field)
+    ]
+    return "; ".join(mismatches)
 
 
 def command_error_detail(exc: BaseException) -> str:
@@ -1913,8 +1960,9 @@ def send_agent_tui_message(
             return
         if attempt + 1 < attempts and input_settle_ms > 0:
             time.sleep(input_settle_ms / 1000)
-    raise HLoopError(
-        f"manager message was typed but not submitted after {attempts} Enter attempt(s)"
+    raise ManagerMessageDeliveryUnknown(
+        f"manager message was typed and Enter was sent {attempts} time(s), but submission "
+        "could not be visually confirmed"
     )
 
 
@@ -1927,7 +1975,13 @@ def resend_pending_manager_messages(
     submit_verify_ms: int,
     submit_attempts: int,
 ) -> tuple[int, int]:
-    """Resend one role's undelivered Manager messages; return (drained, remaining)."""
+    """Resend one role's `undelivered` Manager messages; return (drained, remaining).
+
+    Entries tagged anything other than `undelivered` (defensively defaulted to
+    `undelivered` for pre-0.5.0 state) are left untouched: `unknown` messages
+    must never be auto-resent, and a resend that itself comes back `unknown`
+    is recorded as such rather than retried indefinitely.
+    """
 
     pane_id = str(agent_state.get("pane_id") or "")
     pending = agent_state.get("pending_manager_messages") or []
@@ -1937,6 +1991,9 @@ def resend_pending_manager_messages(
     drained = 0
     marker = "## Message\n\n"
     for entry in pending:
+        if str(entry.get("status") or "undelivered") != "undelivered":
+            remaining.append(entry)
+            continue
         pending_path = entry.get("pending_path")
         full_path = repo / pending_path if pending_path else None
         if full_path is None or not full_path.exists():
@@ -1954,6 +2011,18 @@ def resend_pending_manager_messages(
                 submit_verify_ms,
                 submit_attempts,
             )
+        except ManagerMessageDeliveryUnknown as exc:
+            record_manager_message(
+                agent_state, "drain", message, delivery_status="unknown", delivery_error=str(exc)
+            )
+            agent_state.setdefault("unknown_manager_messages", []).append(
+                {"at": now_iso(), "source": "drain", "error": str(exc)}
+            )
+            try:
+                full_path.unlink()
+            except OSError:
+                pass
+            continue
         except HLoopError:
             remaining.append(entry)
             continue
@@ -1979,17 +2048,33 @@ def manager_message_from_args(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def manager_message_envelope(
-    state: dict[str, Any], agent_id: str, agent: dict[str, Any], message: str
+    state: dict[str, Any],
+    agent_id: str,
+    agent: dict[str, Any],
+    message: str,
+    *,
+    contract_changing: bool = False,
 ) -> tuple[str, str]:
     message_id = str(uuid.uuid4())
     run_id = str(state.get("run_id") or "")
     attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
     ack = f"HERDR_LOOP_MESSAGE_ACK:{run_id}:{agent_id}:{attempt_id}:{message_id}"
+    contract_notice = (
+        "This message changes the task contract. Material work (a `done` finalize "
+        "or merge) is blocked until the Manager resolves the semantic ACK barrier "
+        "with `hloop agent ack resolve`.\n\n"
+        if contract_changing
+        else ""
+    )
     body = (
         f"Manager message id: {message_id}\n"
-        f"Before acting, print exactly: {ack}\n\n{message.rstrip()}\n"
+        f"Before acting, print exactly: {ack}\n\n{contract_notice}{message.rstrip()}\n"
     )
     return message_id, body
+
+
+def message_digest(message: str) -> str:
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
 
 
 def record_manager_message(
@@ -1997,16 +2082,22 @@ def record_manager_message(
     source: str,
     message: str,
     *,
-    delivery_status: str = "sent",
+    delivery_status: str = "delivered",
     delivery_error: str | None = None,
     pending_path: str | None = None,
-) -> None:
+) -> dict[str, Any]:
+    if delivery_status not in MESSAGE_DELIVERY_STATUSES:
+        raise HLoopError(f"unsupported message delivery status: {delivery_status}")
+    sent_at = now_iso()
     entry = {
-        "at": now_iso(),
+        "at": sent_at,
+        "sent_at": sent_at,
         "source": source,
         "bytes": len(message.encode("utf-8")),
         "lines": len(message.splitlines()) or 1,
+        "digest": message_digest(message),
         "delivery_status": delivery_status,
+        "result": None,
     }
     match = re.search(r"Manager message id: ([0-9a-f-]{36})", message)
     if match:
@@ -2016,6 +2107,52 @@ def record_manager_message(
     if pending_path:
         entry["pending_path"] = pending_path
     target_state.setdefault("manager_messages", []).append(entry)
+    return entry
+
+
+SEMANTIC_ACK_DECISIONS = frozenset({"approve", "reject"})
+
+
+def arm_semantic_ack_barrier(agent_state: dict[str, Any], *, message_id: str, digest: str) -> None:
+    """(Re-)arm the semantic ACK barrier for a contract-changing Manager message.
+
+    Any existing barrier -- pending, approved, or rejected -- is replaced, so a
+    later contract-changing message always requires a fresh Manager decision
+    even if an earlier barrier had already been resolved.
+    """
+
+    agent_state["semantic_ack_barrier"] = {
+        "message_id": message_id,
+        "digest": digest,
+        "status": "pending",
+        "armed_at": now_iso(),
+    }
+
+
+def semantic_ack_barrier_blocking(agent_state: dict[str, Any]) -> str:
+    """Return a non-empty block reason while material work must wait, else ""."""
+
+    barrier = agent_state.get("semantic_ack_barrier")
+    if not isinstance(barrier, dict) or barrier.get("status") != "pending":
+        return ""
+    return (
+        f"message `{barrier.get('message_id')}` is a contract-changing message "
+        "awaiting semantic ACK approval; resolve it with `hloop agent ack resolve`"
+    )
+
+
+def resolve_semantic_ack_barrier(
+    agent_state: dict[str, Any], *, decision: str, reason: str
+) -> dict[str, Any]:
+    if decision not in SEMANTIC_ACK_DECISIONS:
+        raise HLoopError(f"unsupported semantic ACK decision: {decision}")
+    barrier = agent_state.get("semantic_ack_barrier")
+    if not isinstance(barrier, dict) or barrier.get("status") != "pending":
+        raise HLoopError("no pending semantic ACK barrier to resolve")
+    barrier["status"] = "approved" if decision == "approve" else "rejected"
+    barrier["resolved_at"] = now_iso()
+    barrier["resolution_reason"] = reason
+    return barrier
 
 
 def write_pending_manager_message(
@@ -2076,19 +2213,25 @@ def record_pending_manager_message(
         agent_state,
         source,
         message,
-        delivery_status="pending",
+        delivery_status="undelivered",
         delivery_error=detail,
         pending_path=pending_path,
     )
     agent_state["last_manager_message_error"] = detail
     agent_state["last_pending_manager_message"] = pending_path
     agent_state.setdefault("pending_manager_messages", []).append(
-        {"at": now_iso(), "source": source, "pending_path": pending_path, "error": detail}
+        {
+            "at": now_iso(),
+            "source": source,
+            "pending_path": pending_path,
+            "error": detail,
+            "status": "undelivered",
+        }
     )
     save_state(repo, state)
     journal(
         repo,
-        f"Recorded pending Manager message for {role} `{agent_id}` at `{pending_path}`; "
+        f"Recorded undelivered Manager message for {role} `{agent_id}` at `{pending_path}`; "
         f"delivery failed: {detail}",
     )
     print(
@@ -2096,6 +2239,74 @@ def record_pending_manager_message(
         file=sys.stderr,
     )
     return 2
+
+
+def record_unknown_manager_message(
+    repo: Path,
+    state: dict[str, Any],
+    agent_state: dict[str, Any],
+    *,
+    role: str,
+    agent_id: str,
+    source: str,
+    message: str,
+    error: Exception,
+) -> int:
+    """Record a message whose delivery could not be confirmed.
+
+    ``unknown`` messages are intentionally kept out of ``pending_manager_messages``
+    so `hloop message drain` never auto-resends them; only an explicit retry,
+    pane check, or ``resolve`` clears them.
+    """
+
+    detail = str(error)
+    record_manager_message(
+        agent_state,
+        source,
+        message,
+        delivery_status="unknown",
+        delivery_error=detail,
+    )
+    agent_state["last_manager_message_error"] = detail
+    agent_state.setdefault("unknown_manager_messages", []).append(
+        {"at": now_iso(), "source": source, "error": detail}
+    )
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Manager message delivery to {role} `{agent_id}` is unknown (not auto-resent): {detail}",
+    )
+    print(
+        f"manager message delivery to {agent_id} is unknown: {detail}; "
+        "confirm pane state or resend explicitly; it will not be auto-drained",
+        file=sys.stderr,
+    )
+    return 3
+
+
+def supersede_pending_manager_messages(repo: Path, agent_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Mark an ending attempt's outstanding messages superseded and drop pending files.
+
+    Called on abort/requeue so a dead attempt's undelivered or unknown messages
+    are archived rather than silently forwarded into, or resent against, a new
+    attempt.
+    """
+
+    messages = agent_state.get("manager_messages") or []
+    for entry in messages:
+        if entry.get("delivery_status") in {"undelivered", "unknown"}:
+            entry["delivery_status"] = "superseded"
+            entry["superseded_at"] = now_iso()
+    for entry in agent_state.get("pending_manager_messages") or []:
+        pending_path = entry.get("pending_path")
+        if not pending_path:
+            continue
+        try:
+            (repo / pending_path).unlink()
+        except OSError:
+            pass
+    agent_state["pending_manager_messages"] = []
+    return messages
 
 
 def extract_agent_session_id(pane: dict[str, Any] | None) -> str | None:
@@ -2781,6 +2992,23 @@ def preflight_loop(
 
     if not command_exists("git"):
         fail("git command not found")
+    recorded_identity = state.get("git_identity")
+    if isinstance(recorded_identity, dict) and recorded_identity:
+        try:
+            current_identity = git_executable_identity()
+        except HLoopError as exc:
+            fail(f"git identity probe failed: {exc}")
+            raise AssertionError("unreachable")
+        drift = git_identity_drift(recorded_identity, current_identity)
+        if drift:
+            fail(
+                "git executable identity drift detected: "
+                f"{drift}; run `hloop runtime trust-git --reason <text>` to accept it"
+            )
+    elif mark_blocked:
+        # Legacy STATE created before identity tracking existed: record the
+        # currently-trusted executable instead of retroactively blocking.
+        state["git_identity"] = git_executable_identity()
     if require_herdr:
         if os.environ.get("HERDR_ENV") != "1":
             fail("HERDR_ENV=1 is required")
@@ -5585,7 +5813,7 @@ validation_commands: ["npm test -- --grep foo,bar"]
     )
     limit_participant = {
         "participant_id": "P1",
-        "manager_messages": [{"delivery_status": "sent"}],
+        "manager_messages": [{"delivery_status": "delivered"}],
     }
     advisor_limit_rejected = False
     try:
@@ -5625,13 +5853,14 @@ validation_commands: ["npm test -- --grep foo,bar"]
         message_state,
         "argv",
         "hello",
-        delivery_status="pending",
+        delivery_status="undelivered",
         delivery_error="Codex is still working",
         pending_path=(LOOP_DIR / "inbox" / "pending" / "example.md").as_posix(),
     )
     check(
-        message_state.get("manager_messages", [{}])[-1].get("delivery_status") == "pending",
-        "manager message delivery status was not recorded",
+        message_state.get("manager_messages", [{}])[-1].get("delivery_status") == "undelivered"
+        and message_state.get("manager_messages", [{}])[-1].get("digest"),
+        "manager message delivery status/digest was not recorded",
     )
     check(
         item_artifact_state(
@@ -6101,6 +6330,7 @@ None.
             "inbox": "local-only",
             "broker": "local-only",
         },
+        "git_identity": git_executable_identity(),
         "created_at": now_iso(),
     }
     if state_path(repo).exists() and not args.force:
@@ -6156,6 +6386,7 @@ None.
         old.setdefault("requirements", {})
         old.setdefault("manager_context", [])
         old.setdefault("progress_sequence", 0)
+        old.setdefault("git_identity", git_executable_identity())
         write_requirement_artifacts(repo, old)
         write_manager_context_artifact(repo, old)
         write_decision_artifacts(repo, old)
@@ -7268,6 +7499,10 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     status = str(args.status)
     if str(task_state.get("result_status") or "") in {"blocked", "failed", "partial"} and status == "done":
         raise HLoopError("a terminal blocked/failed/partial attempt must be requeued before status done")
+    if status == "done":
+        block_reason = semantic_ack_barrier_blocking(task_state)
+        if block_reason:
+            raise HLoopError(f"cannot finalize status done for {task_id}: {block_reason}")
     result_rel = LOOP_DIR / "results" / task_id / "result.md"
     dirty = [path for path in porcelain_paths(repo) if path != result_rel.as_posix()]
     if dirty:
@@ -8042,6 +8277,71 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     return 0
 
 
+def send_manager_message_and_record(
+    repo: Path,
+    state: dict[str, Any],
+    agent_state: dict[str, Any],
+    *,
+    role: str,
+    agent_id: str,
+    pane_id: str,
+    message: str,
+    source: str,
+    args: argparse.Namespace,
+) -> int:
+    """Envelope, (re-)arm the semantic ACK barrier if needed, send, and record.
+
+    Shared by the Worker/Reviewer/Gap/Advisor `message` commands so the three
+    delivery outcomes -- `delivered`, `undelivered`, `unknown` -- are recorded
+    identically everywhere a Manager message is sent.
+    """
+
+    contract_changing = bool(getattr(args, "contract_changing", False))
+    message_id, message = manager_message_envelope(
+        state, agent_id, agent_state, message, contract_changing=contract_changing
+    )
+    if contract_changing:
+        arm_semantic_ack_barrier(agent_state, message_id=message_id, digest=message_digest(message))
+    try:
+        send_agent_tui_message(
+            str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER),
+            pane_id,
+            message,
+            args.timeout_ms,
+            args.input_settle_ms,
+            args.submit_verify_ms,
+            args.submit_attempts,
+        )
+    except ManagerMessageDeliveryUnknown as exc:
+        return record_unknown_manager_message(
+            repo,
+            state,
+            agent_state,
+            role=role,
+            agent_id=agent_id,
+            source=source,
+            message=message,
+            error=exc,
+        )
+    except HLoopError as exc:
+        return record_pending_manager_message(
+            repo,
+            state,
+            agent_state,
+            role=role,
+            agent_id=agent_id,
+            pane_id=pane_id,
+            source=source,
+            message=message,
+            error=exc,
+        )
+    record_manager_message(agent_state, source, message)
+    save_state(repo, state)
+    journal(repo, f"Sent Manager message to {role} `{agent_id}` in pane `{pane_id}` from {source}.")
+    print(f"sent manager message to {agent_id} in pane {pane_id}")
+    return 0
+
+
 def cmd_worker_message(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -8061,34 +8361,17 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(state, task_id, task_state, message)
-    try:
-        send_agent_tui_message(
-            str(task_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
-            pane_id,
-            message,
-            args.timeout_ms,
-            args.input_settle_ms,
-            args.submit_verify_ms,
-            args.submit_attempts,
-        )
-    except HLoopError as exc:
-        return record_pending_manager_message(
-            repo,
-            state,
-            task_state,
-            role="Worker",
-            agent_id=task_id,
-            pane_id=pane_id,
-            source=source,
-            message=message,
-            error=exc,
-        )
-    record_manager_message(task_state, source, message)
-    save_state(repo, state)
-    journal(repo, f"Sent Manager message to Worker `{task_id}` in pane `{pane_id}` from {source}.")
-    print(f"sent manager message to {task_id} in pane {pane_id}")
-    return 0
+    return send_manager_message_and_record(
+        repo,
+        state,
+        task_state,
+        role="Worker",
+        agent_id=task_id,
+        pane_id=pane_id,
+        message=message,
+        source=source,
+        args=args,
+    )
 
 
 def cmd_message_drain(args: argparse.Namespace) -> int:
@@ -8345,6 +8628,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
     task_state = state.get("tasks", {}).get(task_id)
     if not task_state:
         raise HLoopError(f"unknown task: {task_id}")
+    block_reason = semantic_ack_barrier_blocking(task_state)
+    if block_reason:
+        raise HLoopError(f"cannot merge {task_id}: {block_reason}")
     if task_state.get("result_status") != "done" or task_state.get("merge_ready") is not True:
         raise HLoopError(f"task is not merge ready: {task_id}")
     if normalize_list(task_state.get("blocking_questions")):
@@ -8848,6 +9134,10 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         },
     )
     review_plan = build_reviewer_group_plan(mode, head_sha, agent_config)
+    hloop_providers.check_review_capacity(
+        hloop_review.required_provider_capacity(review_plan),
+        limits=state.get("review_capacity_limits"),
+    )
     review_rel = (
         LOOP_DIR / "reviews" / review_id / "FINAL.md"
         if mode != "single"
@@ -8908,6 +9198,10 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         },
     )
     review_plan = build_reviewer_group_plan(mode, head_sha, agent_config)
+    capacity_check = hloop_providers.check_review_capacity(
+        hloop_review.required_provider_capacity(review_plan),
+        limits=state.get("review_capacity_limits"),
+    )
     review_rel = (
         LOOP_DIR / "reviews" / review_id / "FINAL.md"
         if mode != "single"
@@ -8973,6 +9267,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "mode": mode,
         "review_plan": review_plan.to_record(),
         "review_providers": list(review_plan.providers),
+        "capacity_check": [result.as_record() for result in capacity_check],
         "base": base,
         "head": head,
         "base_sha": base_sha,
@@ -9307,34 +9602,17 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(state, review_id, review_state, message)
-    try:
-        send_agent_tui_message(
-            str(review_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
-            pane_id,
-            message,
-            args.timeout_ms,
-            args.input_settle_ms,
-            args.submit_verify_ms,
-            args.submit_attempts,
-        )
-    except HLoopError as exc:
-        return record_pending_manager_message(
-            repo,
-            state,
-            review_state,
-            role="Reviewer",
-            agent_id=review_id,
-            pane_id=pane_id,
-            source=source,
-            message=message,
-            error=exc,
-        )
-    record_manager_message(review_state, source, message)
-    save_state(repo, state)
-    journal(repo, f"Sent Manager message to Reviewer `{review_id}` in pane `{pane_id}` from {source}.")
-    print(f"sent manager message to {review_id} in pane {pane_id}")
-    return 0
+    return send_manager_message_and_record(
+        repo,
+        state,
+        review_state,
+        role="Reviewer",
+        agent_id=review_id,
+        pane_id=pane_id,
+        message=message,
+        source=source,
+        args=args,
+    )
 
 
 def cmd_gap_start(args: argparse.Namespace) -> int:
@@ -9677,34 +9955,17 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(state, gap_id, gap_state, message)
-    try:
-        send_agent_tui_message(
-            str(gap_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
-            pane_id,
-            message,
-            args.timeout_ms,
-            args.input_settle_ms,
-            args.submit_verify_ms,
-            args.submit_attempts,
-        )
-    except HLoopError as exc:
-        return record_pending_manager_message(
-            repo,
-            state,
-            gap_state,
-            role="Gap Auditor",
-            agent_id=gap_id,
-            pane_id=pane_id,
-            source=source,
-            message=message,
-            error=exc,
-        )
-    record_manager_message(gap_state, source, message)
-    save_state(repo, state)
-    journal(repo, f"Sent Manager message to Gap Auditor `{gap_id}` in pane `{pane_id}` from {source}.")
-    print(f"sent manager message to {gap_id} in pane {pane_id}")
-    return 0
+    return send_manager_message_and_record(
+        repo,
+        state,
+        gap_state,
+        role="Gap Auditor",
+        agent_id=gap_id,
+        pane_id=pane_id,
+        message=message,
+        source=source,
+        args=args,
+    )
 
 
 def require_advice_state(state: dict[str, Any], advice_id: str) -> dict[str, Any]:
@@ -9743,11 +10004,14 @@ def advisor_dialogue_mode(advice_state: dict[str, Any]) -> bool:
     return str(advice_state.get("mode") or DEFAULT_ADVISOR_MODE) == "dialogue"
 
 
+_DELIVERED_MESSAGE_STATUSES = frozenset({"delivered", "acknowledged", "applied"})
+
+
 def advisor_delivered_followup_count(participant: dict[str, Any]) -> int:
     return sum(
         1
         for item in participant.get("manager_messages", [])
-        if str(item.get("delivery_status") or "sent") == "sent"
+        if str(item.get("delivery_status") or "delivered") in _DELIVERED_MESSAGE_STATUSES
     )
 
 
@@ -10157,9 +10421,16 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(
-        state, f"{args.advice_id}/{args.participant_id}", participant, message
+    contract_changing = bool(getattr(args, "contract_changing", False))
+    message_id, message = manager_message_envelope(
+        state,
+        f"{args.advice_id}/{args.participant_id}",
+        participant,
+        message,
+        contract_changing=contract_changing,
     )
+    if contract_changing:
+        arm_semantic_ack_barrier(participant, message_id=message_id, digest=message_digest(message))
     followups_before, max_rounds = enforce_advisor_message_round_limit(
         state, advice_state, participant
     )
@@ -10172,6 +10443,17 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
             args.input_settle_ms,
             args.submit_verify_ms,
             args.submit_attempts,
+        )
+    except ManagerMessageDeliveryUnknown as exc:
+        return record_unknown_manager_message(
+            repo,
+            state,
+            participant,
+            role="Advisor",
+            agent_id=f"{args.advice_id}/{args.participant_id}",
+            source=source,
+            message=message,
+            error=exc,
         )
     except HLoopError as exc:
         return record_pending_manager_message(
@@ -10933,6 +11215,7 @@ def cmd_agent_abort(args: argparse.Namespace) -> int:
     )
     if not args.keep_worktree:
         cleanup_agent_worktree_for_lifecycle(repo, agent, force=args.force_cleanup)
+    supersede_pending_manager_messages(repo, agent)
     agent["status"] = "aborted"
     if role != "worker":
         agent["gate_status"] = "aborted"
@@ -10942,6 +11225,21 @@ def cmd_agent_abort(args: argparse.Namespace) -> int:
     save_state(repo, state)
     journal(repo, f"Aborted {role} `{args.agent_id}`: {args.reason}")
     print(f"aborted {args.agent_id}: {args.reason}")
+    return 0
+
+
+def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    role, agent = resolve_agent_state(state, args.agent_id)
+    barrier = resolve_semantic_ack_barrier(agent, decision=args.decision, reason=args.reason)
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Resolved semantic ACK barrier for {role} `{args.agent_id}` "
+        f"(message `{barrier.get('message_id')}`) as `{barrier['status']}`: {args.reason}",
+    )
+    print(f"{args.agent_id}: semantic ACK barrier {barrier['status']}")
     return 0
 
 
@@ -10961,6 +11259,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
     )
     cleanup_agent_worktree_for_lifecycle(repo, agent, force=args.force_cleanup)
     revoke_active_role_report_identity(repo, state, args.agent_id)
+    superseded_messages = supersede_pending_manager_messages(repo, agent)
     history = {
         "agent_id": args.agent_id,
         "role": role,
@@ -10974,6 +11273,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
         "head_sha": previous.get("head_sha"),
         "worktree": previous.get("worktree"),
         "pane_id": previous.get("pane_id"),
+        "superseded_manager_messages": superseded_messages,
     }
     state.setdefault("agent_attempt_history", []).append(history)
     agent.setdefault("attempts", []).append(history)
@@ -11021,6 +11321,8 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
             "codex_session_cleanup",
             "manager_messages",
             "pending_manager_messages",
+            "unknown_manager_messages",
+            "semantic_ack_barrier",
         ):
             agent.pop(key, None)
         agent["root_branch"] = root_branch
@@ -11052,6 +11354,33 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
     save_state(repo, state)
     journal(repo, f"Requeued {role} `{args.agent_id}`: {args.reason}")
     print(f"requeued {args.agent_id}: {args.reason}")
+    return 0
+
+
+def cmd_runtime_trust_git(args: argparse.Namespace) -> int:
+    """Re-trust a new git executable identity after a legitimate upgrade.
+
+    Refuses while any role is running or a merge transaction is active so the
+    trust boundary cannot move underneath in-flight work; ``preflight_loop``
+    blocks every other command on drift until this runs.
+    """
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    if any_active_roles(state):
+        raise HLoopError("cannot trust a new git identity while a role is running")
+    if state.get("active_merge"):
+        raise HLoopError("cannot trust a new git identity during an active merge transaction")
+    previous = state.get("git_identity")
+    current = git_executable_identity()
+    state["git_identity"] = current
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Trusted new git executable identity ({args.reason}); "
+        f"previous={json.dumps(previous, sort_keys=True)} new={json.dumps(current, sort_keys=True)}",
+    )
+    print(f"trusted git identity: {current['path']} sha256={current['sha256']}")
     return 0
 
 
@@ -13148,6 +13477,25 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument("--residual-risk", action="append")
     agent_report.add_argument("--handoff")
     agent_report.set_defaults(func=cmd_agent_report)
+    agent_ack = agent_sub.add_parser(
+        "ack", help="resolve a role's semantic ACK barrier for a contract-changing message"
+    )
+    agent_ack_sub = agent_ack.add_subparsers(dest="agent_ack_command", required=True)
+    agent_ack_resolve = agent_ack_sub.add_parser(
+        "resolve", help="approve or reject the pending semantic ACK barrier"
+    )
+    agent_ack_resolve.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    agent_ack_resolve.add_argument("--decision", choices=["approve", "reject"], required=True)
+    agent_ack_resolve.add_argument("--reason", required=True)
+    agent_ack_resolve.set_defaults(func=cmd_agent_ack_resolve)
+
+    runtime = sub.add_parser("runtime", help="runtime trust and identity operations")
+    runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_trust_git = runtime_sub.add_parser(
+        "trust-git", help="re-trust the current git executable identity after a legitimate upgrade"
+    )
+    runtime_trust_git.add_argument("--reason", required=True)
+    runtime_trust_git.set_defaults(func=cmd_runtime_trust_git)
 
     inbox = sub.add_parser("inbox", help="Manager inbox operations backed by the report broker")
     inbox_sub = inbox.add_subparsers(dest="inbox_command", required=True)
@@ -13480,6 +13828,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
     )
+    worker_message.add_argument(
+        "--contract-changing",
+        action="store_true",
+        help="arm a semantic ACK barrier that blocks a `done` finalize until resolved",
+    )
     worker_message.set_defaults(func=cmd_worker_message)
 
     message = sub.add_parser("message", help="Manager message delivery operations")
@@ -13684,6 +14037,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
     )
+    reviewer_message.add_argument(
+        "--contract-changing",
+        action="store_true",
+        help="arm a semantic ACK barrier that blocks a merge-ready result until resolved",
+    )
     reviewer_message.set_defaults(func=cmd_reviewer_message)
 
     gap = sub.add_parser("gap", help="plan/spec gap audit operations")
@@ -13756,6 +14114,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
+    )
+    gap_message.add_argument(
+        "--contract-changing",
+        action="store_true",
+        help="arm a semantic ACK barrier that blocks material work until resolved",
     )
     gap_message.set_defaults(func=cmd_gap_message)
 
@@ -13831,6 +14194,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
+    )
+    advisor_message.add_argument(
+        "--contract-changing",
+        action="store_true",
+        help="arm a semantic ACK barrier that blocks material work until resolved",
     )
     advisor_message.set_defaults(func=cmd_advisor_message)
 

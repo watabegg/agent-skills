@@ -452,6 +452,31 @@ class ReviewGroupPlan:
         )
 
 
+DEFAULT_PROVIDER_REVIEW_CAPACITY = 10
+"""Default concurrent-agent ceiling per provider (coordinator/reviewer + discovery
+lanes + verifier pool). Swarm modes request up to 8 lanes + a coordinator + a
+verifier pool, so the default leaves headroom without being unbounded."""
+
+
+def required_provider_capacity(plan: ReviewGroupPlan) -> dict[str, int]:
+    """Concurrent agents each provider must host to run ``plan``.
+
+    Counts the coordinator process (swarm modes only; single/dual reviewers run
+    holistically with no separate coordinator), every discovery lane, and the
+    bounded verifier pool. Callers check this against a configured or
+    provider-reported ceiling *before* creating any pane, so an unsatisfiable
+    plan never leaves partially-started process state behind.
+    """
+
+    required: dict[str, int] = {}
+    for provider_plan in plan.provider_plans:
+        coordinator = 1 if provider_plan.role == "coordinator" else 0
+        required[provider_plan.provider] = (
+            coordinator + len(provider_plan.lanes) + len(provider_plan.verifier_agents)
+        )
+    return required
+
+
 def plan_review_group(
     mode: str,
     *,

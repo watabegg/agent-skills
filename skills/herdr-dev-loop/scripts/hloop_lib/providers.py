@@ -327,6 +327,67 @@ def probe_provider_capability(
     )
 
 
+DEFAULT_REVIEW_CAPACITY = {"codex": 10, "claude": 10}
+"""Default per-provider ceiling on concurrent review sub-agents (coordinator +
+discovery lanes + verifier pool) an installed CLI is trusted to host safely.
+Overridable per-namespace via STATE ``review_capacity_limits``."""
+
+
+@dataclass(frozen=True)
+class ReviewCapacityResult:
+    """Per-provider capacity evidence checked before any review pane exists."""
+
+    provider: str
+    required: int
+    ceiling: int
+
+    @property
+    def ok(self) -> bool:
+        return self.required <= self.ceiling
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "required": self.required,
+            "ceiling": self.ceiling,
+            "ok": self.ok,
+        }
+
+
+def review_capacity_ceiling(provider: str, *, limits: Mapping[str, int] | None = None) -> int:
+    if limits and provider in limits:
+        return int(limits[provider])
+    return DEFAULT_REVIEW_CAPACITY.get(provider, 8)
+
+
+def check_review_capacity(
+    required: Mapping[str, int], *, limits: Mapping[str, int] | None = None
+) -> list[ReviewCapacityResult]:
+    """Evaluate every provider's required-vs-ceiling capacity.
+
+    Callers must check ``.ok`` before creating a Coordinator pane: a plan that
+    requests more concurrent sub-agents than the provider is trusted to host
+    must fail closed, not spawn a partially-staffed swarm.
+    """
+
+    results = [
+        ReviewCapacityResult(
+            provider=provider,
+            required=count,
+            ceiling=review_capacity_ceiling(provider, limits=limits),
+        )
+        for provider, count in required.items()
+    ]
+    exceeded = [result for result in results if not result.ok]
+    if exceeded:
+        detail = "; ".join(
+            f"{result.provider}: requires {result.required}, ceiling is {result.ceiling}"
+            for result in exceeded
+        )
+        raise ProviderError(f"review swarm capacity exceeded: {detail}")
+    return results
+
+
 def _missing_required_flags(
     invocation: ProviderInvocation, help_text: str
 ) -> list[str]:
