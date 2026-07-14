@@ -1062,6 +1062,23 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     return False
 
 
+def command_requires_state_schema_guard(args: argparse.Namespace) -> bool:
+    """Return whether a command may mutate resources governed by STATE.json.
+
+    Migration is the only mutating command that intentionally accepts an older
+    schema.  It performs its own future-version check before writing a backup
+    or state.  ``wait --harvest`` acquires its lock only after an artifact is
+    ready, so it needs the same guard without holding the lock while waiting.
+    """
+
+    command = getattr(args, "command", "")
+    if command == "migrate":
+        return False
+    if command == "wait":
+        return bool(getattr(args, "harvest", False))
+    return command_requires_loop_lock(args)
+
+
 def load_state(repo: Path) -> dict[str, Any]:
     path = state_path(repo)
     if not path.exists():
@@ -1078,6 +1095,29 @@ def load_state(repo: Path) -> dict[str, Any]:
             f"loop namespace mismatch: selected={LOOP_NAMESPACE} state={recorded_namespace}"
         )
     return state
+
+
+def assert_mutating_state_schema_compatible(repo: Path) -> None:
+    """Reject incompatible state before a mutating command can cause effects."""
+
+    if not state_path(repo).exists():
+        return
+    state = load_state(repo)
+    try:
+        state_schema = schema_version_of(state)
+    except MigrationError as exc:
+        raise HLoopError(f"invalid state schema marker: {exc}") from exc
+    if state_schema < RUNTIME_SCHEMA_VERSION:
+        raise HLoopError(
+            f"state migration required: {state_schema.label()} "
+            f"runtime={RUNTIME_SCHEMA_VERSION.label()}; run `hloop migrate --dry-run` "
+            "then `hloop migrate --apply`"
+        )
+    if state_schema > RUNTIME_SCHEMA_VERSION:
+        raise HLoopError(
+            f"state {state_schema.label()} is newer than runtime "
+            f"{RUNTIME_SCHEMA_VERSION.label()}; mutating commands are disabled"
+        )
 
 
 def save_state(repo: Path, state: dict[str, Any]) -> None:
@@ -3731,39 +3771,51 @@ def cmd_final_gates_arm(args: argparse.Namespace) -> int:
 def gate_evidence_for_resume(state: dict[str, Any]) -> tuple[GateEvidence, ...]:
     validation = state.get("last_validation", {})
     validation_results = validation.get("results", [])
-    validation_status = (
-        "passed"
-        if validation_results and all(item.get("result") == "passed" for item in validation_results)
-        else ("failed" if validation_results else "")
+    validation_passed = bool(validation_results) and all(
+        item.get("result") == "passed" for item in validation_results
     )
-    reviews = list(state.get("reviews", {}).values())
-    gaps = list(state.get("gaps", {}).values())
-    review_record = reviews[-1] if reviews else {}
-    gap_record = gaps[-1] if gaps else {}
+
+    def latest_closed_record(records: dict[str, Any]) -> dict[str, Any]:
+        for record in reversed(list(records.values())):
+            if isinstance(record, dict) and agent_gate_status(record) == "triaged":
+                return record
+        return {}
+
+    review_record = latest_closed_record(state.get("reviews", {}))
+    gap_record = latest_closed_record(state.get("gaps", {}))
+    manager_qa_status = str(state.get("manager_qa_status") or "")
+    manager_qa_passed = manager_qa_status in MANAGER_QA_PASSING_STATUSES
     return (
         GateEvidence(
             "validation",
-            validation_status,
+            "passed" if validation_passed else "",
             str(validation.get("head_sha") or ""),
+            required=validation_passed,
         ),
         GateEvidence(
             "review",
-            "passed" if review_gate_passed(state) else str(agent_gate_status(review_record)),
+            "passed" if review_record else "",
             str(review_record.get("closed_head_sha") or review_record.get("head_sha") or ""),
-            required=normalize_int(state.get("max_reviewers"), DEFAULT_MAX_REVIEWERS) > 0,
+            required=(
+                normalize_int(state.get("max_reviewers"), DEFAULT_MAX_REVIEWERS) > 0
+                and bool(review_record)
+            ),
         ),
         GateEvidence(
             "gap",
-            "passed" if gap_gate_passed(state) else str(agent_gate_status(gap_record)),
+            "passed" if gap_record else "",
             str(gap_record.get("closed_head_sha") or gap_record.get("head_sha") or ""),
-            required=normalize_int(state.get("max_gap_auditors"), DEFAULT_MAX_GAP_AUDITORS) > 0,
+            required=(
+                normalize_int(state.get("max_gap_auditors"), DEFAULT_MAX_GAP_AUDITORS) > 0
+                and bool(gap_record)
+            ),
         ),
         GateEvidence(
             "manager-qa",
-            str(state.get("manager_qa_status") or ""),
+            manager_qa_status if manager_qa_passed else "",
             str(state.get("manager_qa_head_sha") or state.get("completion_target_sha") or ""),
             passing_statuses=("passed", "accepted-risk", "not-required"),
-            required=state_manager_qa_profile(state) != "none",
+            required=state_manager_qa_profile(state) != "none" and manager_qa_passed,
         ),
     )
 
@@ -4667,6 +4719,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     check(
         set(contract_fields) == set(schema_required),
         "STATE.json required fields differ between artifact-contract.md and state.schema.json",
+    )
+    check(
+        "schema_revision" in set(schema_required),
+        "state.schema.json lacks required schema_revision",
     )
 
     result_schema = schemas.get("result.schema.json", {})
@@ -9672,6 +9728,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 harvest_args = argparse.Namespace(**vars(args))
                 harvest_args.agent_id = item["id"]
                 with loop_lock(repo):
+                    assert_mutating_state_schema_compatible(repo)
                     return cmd_harvest(harvest_args)
             print(f"harvest with: hloop harvest {item['id']}")
             return 0
@@ -10883,9 +10940,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         configure_loop_namespace(getattr(args, "namespace", None))
-        if command_requires_loop_lock(args):
+        repo: Path | None = None
+        if command_requires_state_schema_guard(args):
             repo = repo_root(Path(args.repo).resolve())
+            # Check before taking the lock so an already-future loop remains
+            # byte/resource invariant, then check again under the lock to close
+            # the race with another runtime updating STATE.json.
+            assert_mutating_state_schema_compatible(repo)
+        if command_requires_loop_lock(args):
+            repo = repo or repo_root(Path(args.repo).resolve())
             with loop_lock(repo):
+                if command_requires_state_schema_guard(args):
+                    assert_mutating_state_schema_compatible(repo)
                 return int(args.func(args))
         return int(args.func(args))
     except HLoopError as exc:
