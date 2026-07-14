@@ -26,6 +26,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from hloop_lib import config as hloop_config
+from hloop_lib.lifecycle import (
+    FinalGateArm,
+    FinalGateConditions,
+    GateEvidence,
+    LifecycleInvariantError,
+    arm_final_gates,
+    compute_resume_requirements,
+    diagnose_done_target_drift,
+    disarm_final_gates,
+    validate_final_gate_arm,
+)
+from hloop_lib.migration import (
+    MigrationError,
+    MigrationStep,
+    SchemaVersion,
+    migrate_schema,
+    schema_version_of,
+)
+
 
 LOOP_HOME = Path(".ai") / "herdr-dev-loop"
 DEFAULT_LOOP_NAMESPACE = "default"
@@ -51,7 +71,10 @@ DEFAULT_AGENT_PROVIDER = "codex"
 DEFAULT_AGENT_MODEL = "auto"
 DEFAULT_AGENT_EFFORT = "auto"
 DEFAULT_CLAUDE_PERMISSION_MODE = "auto"
-STATE_FORMAT_VERSION = 2
+STATE_FORMAT_VERSION = 3
+STATE_SCHEMA_REVISION = 1
+RUNTIME_SCHEMA_VERSION = SchemaVersion(STATE_FORMAT_VERSION, STATE_SCHEMA_REVISION)
+LEGACY_STATE_FORMAT_VERSION = 2
 DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MIN_FREE_INODES = 50_000
 DEFAULT_ADVISOR_ENABLED = False
@@ -121,6 +144,36 @@ CHECKPOINT_TRAILER_BATCH = "HLoop-Batch"
 CHECKPOINT_KIND_LOOP_STATE = "loop-state"
 LOOP_ARCHIVE_ROOT = LOOP_HOME / "archive"
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+BUILT_IN_CONFIG_DEFAULTS = {
+    "max_workers": DEFAULT_MAX_WORKERS,
+    "session_cleanup": "archive",
+    "worker": {
+        "provider": DEFAULT_AGENT_PROVIDER,
+        "model": DEFAULT_AGENT_MODEL,
+        "effort": DEFAULT_AGENT_EFFORT,
+    },
+    "reviewer": {
+        "provider": DEFAULT_AGENT_PROVIDER,
+        "model": DEFAULT_AGENT_MODEL,
+        "effort": DEFAULT_AGENT_EFFORT,
+    },
+}
+CONFIG_TEMPLATE = """version = 1
+
+[defaults]
+max_workers = 3
+session_cleanup = "archive"
+
+[defaults.worker]
+provider = "codex"
+model = "auto"
+effort = "auto"
+
+[defaults.reviewer]
+provider = "codex"
+model = "auto"
+effort = "auto"
+"""
 
 
 def read_skill_version() -> str:
@@ -507,9 +560,7 @@ def cmd_namespace_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def migrated_state(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
-    if normalize_int(state.get("state_format_version"), 1) >= STATE_FORMAT_VERSION:
-        return dict(state)
+def assert_migration_safe(repo: Path, state: dict[str, Any]) -> None:
     running = running_agent_ids(state)
     if running:
         raise HLoopError(
@@ -521,10 +572,11 @@ def migrated_state(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
         worktree_raw = str(task.get("worktree") or "")
         if worktree_raw and Path(worktree_raw).exists() and product_dirty_paths_for_agent(Path(worktree_raw)):
             raise HLoopError(f"cannot migrate dirty role worktree: {task_id}")
+
+
+def migrate_format_one_to_two(state: dict[str, Any]) -> dict[str, Any]:
     result = json.loads(json.dumps(state))
-    result["state_format_version"] = STATE_FORMAT_VERSION
     result["migrated_from_skill_version"] = str(state.get("skill_version") or "unversioned")
-    result["skill_version"] = SKILL_VERSION
     result.setdefault("worker_setup_commands", normalize_list(state.get("worktree_setup_commands")))
     result.setdefault("reviewer_setup_commands", [])
     result.setdefault("gap_setup_commands", [])
@@ -551,16 +603,117 @@ def migrated_state(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def migrate_format_two_to_three(state: dict[str, Any]) -> dict[str, Any]:
+    result = json.loads(json.dumps(state))
+    resolved_snapshot = json.loads(json.dumps(BUILT_IN_CONFIG_DEFAULTS))
+    for key in ("max_workers", "session_cleanup"):
+        if key in state:
+            resolved_snapshot[key] = state[key]
+    for role in ("worker", "reviewer"):
+        for key in ("provider", "model", "effort"):
+            state_key = f"{role}_agent_{key}"
+            if state_key in state:
+                resolved_snapshot[role][key] = state[state_key]
+    result.setdefault(
+        "config_source",
+        {"kind": "state-migration", "path": ""},
+    )
+    result.setdefault("resolved_config", resolved_snapshot)
+    result.setdefault("manager_qa_evidence_path", (LOOP_DIR / "qa" / "FINAL.md").as_posix())
+    result.setdefault(
+        "artifact_policy",
+        {
+            "role_active": "role-worktree",
+            "role_harvested": "manager-loop",
+            "inputs": "local-only",
+            "inbox": "local-only",
+            "broker": "local-only",
+        },
+    )
+    result.setdefault("final_gate", None)
+    result.setdefault("resume_requirements", [])
+    result.setdefault("pending_fix_task_drafts", [])
+    result.setdefault("terminal_outcome", {})
+    return result
+
+
+def migrate_format_three_revision_one(state: dict[str, Any]) -> dict[str, Any]:
+    result = json.loads(json.dumps(state))
+    result.setdefault("attempt_history", [])
+    result.setdefault("cleanup_history", [])
+    result.setdefault("lifecycle_diagnostics", [])
+    return result
+
+
+RUNTIME_MIGRATION_STEPS = (
+    MigrationStep(
+        SchemaVersion(1, 0),
+        SchemaVersion(2, 0),
+        "format-1-to-2",
+        migrate_format_one_to_two,
+    ),
+    MigrationStep(
+        SchemaVersion(2, 0),
+        SchemaVersion(3, 0),
+        "format-2-to-3",
+        migrate_format_two_to_three,
+    ),
+    MigrationStep(
+        SchemaVersion(3, 0),
+        SchemaVersion(3, 1),
+        "format-3-revision-1",
+        migrate_format_three_revision_one,
+    ),
+)
+
+
+def migrated_runtime_state(repo: Path, state: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    assert_migration_safe(repo, state)
+    try:
+        migration = migrate_schema(
+            state,
+            target=RUNTIME_SCHEMA_VERSION,
+            steps=RUNTIME_MIGRATION_STEPS,
+        )
+    except MigrationError as exc:
+        raise HLoopError(str(exc)) from exc
+    result = dict(migration.state)
+    result["skill_version"] = SKILL_VERSION
+    return result, migration.applied_steps
+
+
+def migrated_state(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility adapter for 0.4 callers that passed unversioned state.
+
+    The CLI migration always advances through the full runtime chain.  The
+    imported helper historically upgraded an unversioned mapping to format 2,
+    so that one-step behavior remains available to 0.4 characterization tests.
+    """
+
+    if "state_format_version" not in state:
+        assert_migration_safe(repo, state)
+        result = migrate_format_one_to_two(state)
+        result["state_format_version"] = LEGACY_STATE_FORMAT_VERSION
+        result["skill_version"] = SKILL_VERSION
+        return result
+    return migrated_runtime_state(repo, state)[0]
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
-    updated = migrated_state(repo, state)
+    updated, applied_steps = migrated_runtime_state(repo, state)
+    source_version = schema_version_of(state)
+    target_version = schema_version_of(updated)
     if not args.apply:
         print(
             json.dumps(
                 {
-                    "from_format": state.get("state_format_version", 1),
-                    "to_format": updated.get("state_format_version"),
+                    "from_format": source_version.format_version,
+                    "from_revision": source_version.revision,
+                    "to_format": target_version.format_version,
+                    "to_revision": target_version.revision,
+                    "applied_steps": list(applied_steps),
                     "from_skill_version": state.get("skill_version", "unversioned"),
                     "to_skill_version": updated.get("skill_version"),
                     "run_id_preserved": state.get("run_id") == updated.get("run_id"),
@@ -570,12 +723,237 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    backup = loop_path(repo) / "migration" / f"STATE.v{state.get('state_format_version', 1)}.{filename_timestamp()}.json"
+    backup = (
+        loop_path(repo)
+        / "migration"
+        / f"STATE.v{source_version.format_version}.r{source_version.revision}.{filename_timestamp()}.json"
+    )
     write_text(backup, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
     save_state(repo, updated)
-    journal(repo, f"Migrated state format to `{STATE_FORMAT_VERSION}` with backup `{backup.relative_to(repo)}`.")
-    print(f"migrated state format to {STATE_FORMAT_VERSION}; backup: {backup}")
+    journal(
+        repo,
+        f"Migrated state to format `{STATE_FORMAT_VERSION}` revision `{STATE_SCHEMA_REVISION}` "
+        f"with backup `{backup.relative_to(repo)}`.",
+    )
+    print(
+        f"migrated state to format {STATE_FORMAT_VERSION} revision {STATE_SCHEMA_REVISION}; "
+        f"backup: {backup}"
+    )
     return 0
+
+
+def config_candidates_payload() -> tuple[list[hloop_config.ConfigCandidate], hloop_config.ConfigCandidate | None]:
+    try:
+        hloop_config.check_python_capability()
+        candidates = hloop_config.discover_config_candidates()
+        selected = hloop_config.find_config_file()
+    except hloop_config.ConfigError as exc:
+        raise HLoopError(str(exc)) from exc
+    return candidates, selected
+
+
+def cmd_config_path(args: argparse.Namespace) -> int:
+    candidates, selected = config_candidates_payload()
+    payload = {
+        "selected": str(selected.path) if selected else None,
+        "selected_source": selected.source if selected else None,
+        "default_target": str(candidates[0].path),
+        "candidates": [
+            {"source": item.source, "path": str(item.path), "exists": item.path.is_file()}
+            for item in candidates
+        ],
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif selected:
+        print(selected.path)
+    else:
+        print(f"no config file; default target: {candidates[0].path}")
+    return 0
+
+
+def selected_config_path(explicit: str | None = None) -> Path | None:
+    if explicit:
+        return hloop_config.canonicalize_path(explicit)
+    _, selected = config_candidates_payload()
+    return selected.path if selected else None
+
+
+def validate_config_semantics(data: dict[str, Any]) -> None:
+    errors: list[str] = []
+    if data.get("version") != 1:
+        errors.append("config.version must be 1")
+    forbidden_key_fragments = ("token", "secret", "password", "credential", "api_key", "command")
+
+    def validate_table(label: str, table: Any) -> None:
+        if not isinstance(table, dict):
+            return
+        for key in table:
+            normalized = str(key).lower()
+            if any(fragment in normalized for fragment in forbidden_key_fragments):
+                errors.append(f"{label}.{key} is not allowed in config.toml")
+        max_workers = table.get("max_workers")
+        if max_workers is not None and (
+            isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1
+        ):
+            errors.append(f"{label}.max_workers must be a positive integer")
+        cleanup = table.get("session_cleanup")
+        if cleanup is not None and cleanup not in SESSION_CLEANUP_MODES:
+            errors.append(
+                f"{label}.session_cleanup must be one of {sorted(SESSION_CLEANUP_MODES)}"
+            )
+        for role in ("worker", "reviewer"):
+            role_table = table.get(role)
+            if not isinstance(role_table, dict):
+                continue
+            provider = role_table.get("provider")
+            if provider is not None and provider not in AGENT_PROVIDERS:
+                errors.append(f"{label}.{role}.provider must be one of {sorted(AGENT_PROVIDERS)}")
+            providers = role_table.get("providers")
+            if providers is not None and any(item not in AGENT_PROVIDERS for item in providers):
+                errors.append(f"{label}.{role}.providers contains an unsupported provider")
+            for key in ("model", "effort", "mode"):
+                value = role_table.get(key)
+                if isinstance(value, str) and ("\n" in value or "\x00" in value):
+                    errors.append(f"{label}.{role}.{key} must be a single safe line")
+            for key in role_table:
+                normalized = str(key).lower()
+                if any(fragment in normalized for fragment in forbidden_key_fragments):
+                    errors.append(f"{label}.{role}.{key} is not allowed in config.toml")
+
+    validate_table("defaults", data.get("defaults"))
+    for index, scope in enumerate(data.get("scope") or []):
+        validate_table(f"scope[{index}]", scope)
+    if errors:
+        raise HLoopError("invalid config: " + "; ".join(errors))
+
+
+def cmd_config_validate(args: argparse.Namespace) -> int:
+    path = selected_config_path(getattr(args, "path", None))
+    if path is None:
+        payload = {"ok": True, "path": None, "source": "built-in-default"}
+    else:
+        try:
+            data = hloop_config.load_config_file(path)
+            hloop_config.validate_config(data, base=path.parent)
+            validate_config_semantics(data)
+        except hloop_config.ConfigError as exc:
+            raise HLoopError(str(exc)) from exc
+        payload = {"ok": True, "path": str(path), "source": "config.toml"}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif path is None:
+        print("config valid: built-in defaults (no config file)")
+    else:
+        print(f"config valid: {path}")
+    return 0
+
+
+def cmd_config_explain(args: argparse.Namespace) -> int:
+    target = hloop_config.canonicalize_path(
+        getattr(args, "config_repo", None) or args.repo
+    )
+    try:
+        selected = hloop_config.find_config_file()
+        if selected is not None:
+            validate_config_semantics(hloop_config.load_config_file(selected.path))
+        resolution, selected = hloop_config.load_and_resolve(
+            BUILT_IN_CONFIG_DEFAULTS,
+            target_dir=target,
+        )
+    except hloop_config.ConfigError as exc:
+        raise HLoopError(str(exc)) from exc
+    payload = {
+        "target": str(target),
+        "repo_root": str(hloop_config.find_repo_root(target) or ""),
+        "config_path": str(selected.path) if selected else None,
+        "config_source": selected.source if selected else "built-in-default",
+        "resolved": resolution.as_dict(),
+        "values": resolution.explain(),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"target: {payload['target']}")
+        print(f"repo_root: {payload['repo_root'] or '-'}")
+        print(f"config: {payload['config_path'] or 'built-in defaults'}")
+        for row in payload["values"]:
+            print(f"{row['key']} = {json.dumps(row['value'], ensure_ascii=False)} ({row['source']})")
+    return 0
+
+
+def cmd_config_init(args: argparse.Namespace) -> int:
+    candidates, _ = config_candidates_payload()
+    path = selected_config_path(getattr(args, "path", None)) or candidates[0].path
+    if path.exists() and not args.force:
+        raise HLoopError(f"config file already exists: {path}; use --force to replace it")
+    write_text(path, CONFIG_TEMPLATE)
+    if args.json:
+        print(json.dumps({"created": str(path)}, ensure_ascii=False, indent=2))
+    else:
+        print(f"created config: {path}")
+    return 0
+
+
+def init_config_override(args: argparse.Namespace) -> dict[str, Any]:
+    override: dict[str, Any] = {}
+    if getattr(args, "max_workers", None) is not None:
+        override["max_workers"] = args.max_workers
+    if getattr(args, "session_cleanup", None) is not None:
+        override["session_cleanup"] = args.session_cleanup
+    for role in ("worker", "reviewer"):
+        role_values: dict[str, Any] = {}
+        for key in ("provider", "model", "effort"):
+            value = getattr(args, f"{role}_agent_{key}", None)
+            if value is not None:
+                role_values[key] = value
+        if role_values:
+            override[role] = role_values
+    return override
+
+
+def resolve_init_config(
+    args: argparse.Namespace, repo: Path
+) -> tuple[hloop_config.ConfigResolution, hloop_config.ConfigCandidate | None]:
+    try:
+        selected = hloop_config.find_config_file()
+        if selected is not None:
+            validate_config_semantics(hloop_config.load_config_file(selected.path))
+        resolution, selected = hloop_config.load_and_resolve(
+            BUILT_IN_CONFIG_DEFAULTS,
+            target_dir=repo,
+            start_override=init_config_override(args),
+        )
+    except hloop_config.ConfigError as exc:
+        raise HLoopError(str(exc)) from exc
+    max_workers = resolution.get("max_workers")
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+        raise HLoopError("resolved config max_workers must be a positive integer")
+    session_cleanup = str(resolution.get("session_cleanup") or "")
+    if session_cleanup not in SESSION_CLEANUP_MODES:
+        raise HLoopError(
+            "resolved config session_cleanup must be one of: "
+            + ", ".join(sorted(SESSION_CLEANUP_MODES))
+        )
+    args.max_workers = max_workers
+    args.session_cleanup = session_cleanup
+    for role in ("worker", "reviewer"):
+        setattr(
+            args,
+            f"{role}_agent_provider",
+            normalize_agent_provider(resolution.get(role, "provider")),
+        )
+        setattr(
+            args,
+            f"{role}_agent_model",
+            normalize_agent_model(resolution.get(role, "model")),
+        )
+        setattr(
+            args,
+            f"{role}_agent_effort",
+            str(resolution.get(role, "effort") or DEFAULT_AGENT_EFFORT),
+        )
+    return resolution, selected
 
 
 def repo_lock_path(repo: Path) -> Path:
@@ -654,7 +1032,7 @@ def retire_legacy_loop_lock(repo: Path) -> None:
 
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
-    if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish"}:
+    if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish", "final-gates"}:
         return True
     if command == "batch":
         return getattr(args, "batch_command", "") in {"start", "assign", "close"}
@@ -1264,7 +1642,6 @@ def send_agent_tui_message(
     provider = normalize_agent_provider(provider)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(state, task_id, task_state, message)
     check_herdr_env()
     initial_pane, _ = wait_agent_tui_ready(provider, pane_id, timeout_ms)
     initial_session_id = extract_agent_session_id(initial_pane)
@@ -1594,19 +1971,60 @@ def prompt_file(repo: Path, name: str) -> Path:
     return loop_path(repo) / "prompts" / name
 
 
+def recorded_path(repo: Path, value: Any, fallback: Path) -> Path:
+    if not value:
+        return fallback
+    path = Path(str(value))
+    return path if path.is_absolute() else repo / path
+
+
+def artifact_was_harvested(agent: dict[str, Any]) -> bool:
+    return bool(agent.get("harvested_at")) or agent_gate_status(agent) in {
+        "reported",
+        "triaged",
+        "blocked_write_scope",
+        "consumed",
+    }
+
+
+def worker_artifact_path(
+    repo: Path, state: dict[str, Any], task_id: str, task: dict[str, Any]
+) -> Path:
+    if artifact_was_harvested(task):
+        return recorded_path(repo, task.get("result_path"), result_file(repo, task_id))
+    worktree = Path(task.get("worktree") or default_worktree(repo, task_id, state)).resolve()
+    return result_file(worktree, task_id)
+
+
 def review_artifact_path(repo: Path, review_id: str, review: dict[str, Any]) -> Path:
-    path = review.get("worktree_review_path") or review.get("review_path")
-    return Path(path) if path else review_file(repo, review_id)
+    if artifact_was_harvested(review):
+        return recorded_path(repo, review.get("review_path"), review_file(repo, review_id))
+    return recorded_path(
+        repo,
+        review.get("worktree_review_path") or review.get("review_path"),
+        review_file(repo, review_id),
+    )
 
 
 def gap_artifact_path(repo: Path, gap_id: str, gap: dict[str, Any]) -> Path:
-    path = gap.get("worktree_gap_path") or gap.get("gap_path")
-    return Path(path) if path else gap_file(repo, gap_id)
+    if artifact_was_harvested(gap):
+        return recorded_path(repo, gap.get("gap_path"), gap_file(repo, gap_id))
+    return recorded_path(
+        repo,
+        gap.get("worktree_gap_path") or gap.get("gap_path"),
+        gap_file(repo, gap_id),
+    )
 
 
 def advice_artifact_path(repo: Path, advice_id: str, participant: dict[str, Any]) -> Path:
-    path = participant.get("worktree_advice_path") or participant.get("advice_path")
-    return Path(path) if path else advice_file(repo, advice_id, str(participant.get("participant_id") or "P1"))
+    fallback = advice_file(repo, advice_id, str(participant.get("participant_id") or "P1"))
+    if artifact_was_harvested(participant):
+        return recorded_path(repo, participant.get("advice_path"), fallback)
+    return recorded_path(
+        repo,
+        participant.get("worktree_advice_path") or participant.get("advice_path"),
+        fallback,
+    )
 
 
 def triage_draft_file(repo: Path, source_id: str) -> Path:
@@ -1956,15 +2374,27 @@ def preflight_loop(
 ) -> dict[str, Any]:
     state = load_state(repo)
 
-    def fail(reason: str) -> None:
-        if mark_blocked:
+    def fail(reason: str, *, persist: bool = True) -> None:
+        if mark_blocked and persist:
             mark_blocked_environment(repo, state, reason)
         raise HLoopError(reason)
 
-    if normalize_int(state.get("state_format_version"), 1) < STATE_FORMAT_VERSION:
+    try:
+        state_schema = schema_version_of(state)
+    except MigrationError as exc:
+        fail(f"invalid state schema marker: {exc}", persist=False)
+        raise AssertionError("unreachable")
+    if state_schema < RUNTIME_SCHEMA_VERSION:
         fail(
-            f"state migration required: format={state.get('state_format_version', 1)} "
-            f"runtime={STATE_FORMAT_VERSION}; run `hloop migrate --dry-run` then `hloop migrate --apply`"
+            f"state migration required: {state_schema.label()} "
+            f"runtime={RUNTIME_SCHEMA_VERSION.label()}; run `hloop migrate --dry-run` "
+            "then `hloop migrate --apply`"
+        )
+    if state_schema > RUNTIME_SCHEMA_VERSION:
+        fail(
+            f"state {state_schema.label()} is newer than runtime "
+            f"{RUNTIME_SCHEMA_VERSION.label()}; mutating commands are disabled",
+            persist=False,
         )
 
     if not command_exists("git"):
@@ -2408,6 +2838,20 @@ def agent_contract_issues(
     return issues
 
 
+def artifact_location_status(
+    agent: dict[str, Any], artifact_path: Path, worktree: dict[str, Any]
+) -> str:
+    if not artifact_was_harvested(agent):
+        return "active-worktree"
+    if not artifact_path.is_file():
+        return "unexpectedly-missing"
+    if not worktree.get("exists") or normalize_bool(agent.get("cleanup_done")) or str(
+        agent.get("worktree_cleanup_status") or ""
+    ) == "removed":
+        return "cleaned-after-harvest"
+    return "harvested-manager"
+
+
 def collect_worker_inventory(
     repo: Path,
     state: dict[str, Any],
@@ -2424,11 +2868,13 @@ def collect_worker_inventory(
         str(default_worktree(repo, task_id, state)) if status in {"running", "result_reported"} else ""
     )
     worktree = worktree_state(worktree_raw)
-    artifact_path = result_file(Path(worktree["path"]), task_id) if worktree["path"] else result_file(default_worktree(repo, task_id, state), task_id)
+    artifact_path = worker_artifact_path(repo, state, task_id, task)
     artifact_meta, artifact_state = safe_frontmatter(artifact_path)
+    location_status = artifact_location_status(task, artifact_path, worktree)
     artifact: dict[str, Any] = {
         "path": str(artifact_path),
         "state": artifact_state,
+        "location_status": location_status,
         "exists": artifact_state == "present",
         "status": str(artifact_meta.get("status") or task.get("result_status") or ""),
         "merge_ready": normalize_bool(artifact_meta.get("merge_ready", task.get("merge_ready"))),
@@ -2437,12 +2883,14 @@ def collect_worker_inventory(
         ),
         "committed_path": str(task.get("committed_result_path") or ""),
     }
-    if worktree["exists"] and artifact["exists"]:
+    if not artifact_was_harvested(task) and worktree["exists"] and artifact["exists"]:
         artifact["commit_state"] = safe_result_commit_state(
             Path(worktree["path"]),
             task_id,
             str(artifact_meta.get("head_sha") or task.get("head_sha") or "HEAD"),
         )
+    elif artifact_was_harvested(task) and task.get("committed_result_path"):
+        artifact["commit_state"] = "verified-at-harvest"
     artifact_ready_now, readiness_reason = artifact_readiness(
         repo, state, task_id, "worker", task, artifact_path
     )
@@ -2462,6 +2910,16 @@ def collect_worker_inventory(
     )
     issues: list[dict[str, str]] = []
     issues.extend(agent_contract_issues(repo, role="worker", agent_id=task_id, agent=task))
+    if location_status == "unexpectedly-missing":
+        issues.append(
+            make_issue(
+                "P1",
+                "worker-artifact-unexpectedly-missing",
+                f"worker:{task_id}",
+                "Harvested Worker artifact is missing from the Manager loop path.",
+                f"Re-harvest {task_id} from its immutable Worker head before relying on completion evidence.",
+            )
+        )
     if status == "running":
         if artifact["ready"]:
             issues.append(
@@ -2552,6 +3010,8 @@ def collect_gate_inventory(
         if role == "reviewer"
         else gap_artifact_path(repo, agent_id, agent)
     )
+    worktree = worktree_state(agent.get("worktree"))
+    location_status = artifact_location_status(agent, artifact_path, worktree)
     artifact_meta, artifact_state = safe_frontmatter(artifact_path)
     artifact_ready_now, readiness_reason = artifact_readiness(
         repo, state, agent_id, role, agent, artifact_path
@@ -2570,6 +3030,16 @@ def collect_gate_inventory(
     )
     issues: list[dict[str, str]] = []
     issues.extend(agent_contract_issues(repo, role=role, agent_id=agent_id, agent=agent))
+    if location_status == "unexpectedly-missing":
+        issues.append(
+            make_issue(
+                "P1",
+                f"{role}-artifact-unexpectedly-missing",
+                f"{role}:{agent_id}",
+                f"Harvested {role} artifact is missing from the Manager loop path.",
+                "Restore or re-harvest the canonical Manager artifact before closing the gate.",
+            )
+        )
     gate_name = "review" if role == "reviewer" else "gap"
     if gate_status == "running":
         if artifact_ready_now:
@@ -2606,7 +3076,6 @@ def collect_gate_inventory(
                 "Inspect USER_ACTION_REQUIRED.md and the detached worktree before closing the gate.",
             )
         )
-    worktree = worktree_state(agent.get("worktree"))
     return {
         "id": agent_id,
         "role": role,
@@ -2620,6 +3089,7 @@ def collect_gate_inventory(
         "artifact": {
             "path": str(artifact_path),
             "state": artifact_state,
+            "location_status": location_status,
             "exists": artifact_state == "present",
             "ready": artifact_ready_now,
             "readiness_reason": readiness_reason,
@@ -2646,6 +3116,10 @@ def collect_advice_inventory(
         status = str(participant.get("status") or "")
         gate_status = agent_gate_status(participant)
         artifact_path = advice_artifact_path(repo, advice_id, participant)
+        participant_worktree = worktree_state(participant.get("worktree"))
+        location_status = artifact_location_status(
+            participant, artifact_path, participant_worktree
+        )
         artifact_meta, artifact_state = safe_frontmatter(artifact_path)
         artifact_ready_now, readiness_reason = artifact_readiness(
             repo, state, combined_id, "advisor", participant, artifact_path
@@ -2664,6 +3138,16 @@ def collect_advice_inventory(
         )
         issues: list[dict[str, str]] = []
         issues.extend(agent_contract_issues(repo, role="advisor", agent_id=combined_id, agent=participant))
+        if location_status == "unexpectedly-missing":
+            issues.append(
+                make_issue(
+                    "P1",
+                    "advisor-artifact-unexpectedly-missing",
+                    f"advisor:{combined_id}",
+                    "Harvested Advisor artifact is missing from the Manager loop path.",
+                    "Restore or re-harvest the canonical Manager artifact before closing the request.",
+                )
+            )
         if gate_status == "running":
             if artifact_ready_now:
                 issues.append(
@@ -2699,11 +3183,12 @@ def collect_advice_inventory(
                 "provider": str(participant.get("agent_provider") or participant.get("provider") or ""),
                 "model": str(participant.get("agent_model") or participant.get("model") or ""),
                 "topic": str(advice.get("topic") or ""),
-                "worktree": worktree_state(participant.get("worktree")),
+                "worktree": participant_worktree,
                 "pane": pane,
                 "artifact": {
                     "path": str(artifact_path),
                     "state": artifact_state,
+                    "location_status": location_status,
                     "exists": artifact_state == "present",
                     "ready": artifact_ready_now,
                     "readiness_reason": readiness_reason,
@@ -2767,6 +3252,59 @@ def collect_loop_inventory(
                 "state",
                 f"Loop phase is `{phase}`.",
                 "Inspect JOURNAL.md, USER_ACTION_REQUIRED.md, and hloop dashboard output.",
+            )
+        )
+    integration_target = current_integration_target(repo, state)
+    final_target = str(state.get("final_target_sha") or "")
+    drift = diagnose_done_target_drift(
+        phase=phase,
+        final_target_sha=final_target,
+        current_target_sha=integration_target,
+        commit_count=advancing_commit_count(repo, final_target, integration_target),
+    )
+    if drift is not None:
+        issues.append(
+            make_issue(
+                str(drift.severity),
+                str(drift.code),
+                "completion-target",
+                str(drift.message),
+                "Start a new run or explicitly supersede the completed run; do not reuse stale evidence.",
+            )
+        )
+    final_gate = final_gate_from_state(state)
+    if isinstance(state.get("final_gate"), dict) and final_gate is None:
+        issues.append(
+            make_issue(
+                "P1",
+                "final-gates-record-invalid",
+                "final-gates",
+                "STATE.json contains an invalid final gate record.",
+                "Inspect the migration and final-gates history before finishing.",
+            )
+        )
+    elif final_gate is not None:
+        for item in validate_final_gate_arm(
+            final_gate, current_target_sha=integration_target
+        ).issues:
+            issues.append(
+                make_issue(
+                    "P1",
+                    item.code,
+                    item.subject or "final-gates",
+                    item.message,
+                    "Create or finish the new task, then arm final gates again for the current target.",
+                )
+            )
+    resume_requirements = lifecycle_resume_requirements(repo, state) if phase == "paused" else []
+    for item in resume_requirements:
+        issues.append(
+            make_issue(
+                "P1",
+                f"resume-{item['code']}",
+                item["subject"] or "resume",
+                item["reason"],
+                "Refresh the named gate or resolve the blocker before `hloop resume`.",
             )
         )
     workers = [
@@ -2856,6 +3394,10 @@ def collect_loop_inventory(
             "base_sha": safe_short_sha(repo, base),
             "integration_branch": integration,
             "integration_sha": safe_short_sha(repo, integration),
+            "integration_target_sha": integration_target,
+            "final_target_sha": final_target,
+            "final_gate": final_gate.to_record() if final_gate else state.get("final_gate"),
+            "resume_requirements": resume_requirements,
             "current_branch": current,
             "branch_strategy": state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY),
             "worker_protocol": state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL),
@@ -3045,6 +3587,172 @@ def gap_gate_passed(state: dict[str, Any]) -> bool:
         and (not target or str(gap.get("closed_head_sha") or gap.get("head_sha") or "") == target)
         for gap in gaps.values()
     )
+
+
+def current_integration_target(repo: Path, state: dict[str, Any]) -> str:
+    branch = str(state.get("integration_branch") or "")
+    if not branch:
+        return ""
+    proc = run_cmd(["git", "-C", str(repo), "rev-parse", branch], check=False)
+    return (proc.stdout or "").strip() if proc.returncode == 0 else ""
+
+
+def advancing_commit_count(repo: Path, old_sha: str, new_sha: str) -> int | None:
+    if not old_sha or not new_sha or not is_ancestor(repo, old_sha, new_sha):
+        return None
+    proc = run_cmd(
+        ["git", "-C", str(repo), "rev-list", "--count", f"{old_sha}..{new_sha}"],
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return int((proc.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def final_gate_from_state(state: dict[str, Any]) -> FinalGateArm | None:
+    record = state.get("final_gate")
+    if not isinstance(record, dict):
+        return None
+    try:
+        return FinalGateArm(
+            generation=normalize_int(record.get("generation"), 0),
+            status=str(record.get("status") or ""),
+            target_sha=str(record.get("target_sha") or ""),
+            armed_at=str(record.get("armed_at") or ""),
+            armed_by=str(record.get("armed_by") or ""),
+            disarmed_at=str(record.get("disarmed_at") or ""),
+            disarmed_by=str(record.get("disarmed_by") or ""),
+            disarm_reason=str(record.get("disarm_reason") or ""),
+        )
+    except ValueError:
+        return None
+
+
+def final_gate_conditions(state: dict[str, Any]) -> FinalGateConditions:
+    batches = state.get("batches", {})
+    current_id = str(state.get("current_batch_id") or "")
+    closed_batches = [
+        batch
+        for batch in batches.values()
+        if isinstance(batch, dict) and str(batch.get("status") or "") in {"closed", "abandoned"}
+    ]
+    batch_closed = not current_id and bool(closed_batches)
+    review_triage_complete = not any(
+        agent_gate_status(review) in {"running", "reported", "reported_unharvested"}
+        for review in state.get("reviews", {}).values()
+    )
+    return FinalGateConditions(
+        current_batch_closed=batch_closed,
+        review_triage_complete=review_triage_complete,
+        pending_fix_task_drafts=tuple(normalize_list(state.get("pending_fix_task_drafts"))),
+    )
+
+
+def disarm_final_gate_for_new_task(state: dict[str, Any], task_id: str) -> None:
+    current = final_gate_from_state(state)
+    if current is None or current.status != "armed":
+        return
+    state["final_gate"] = disarm_final_gates(
+        current,
+        disarmed_by=os.environ.get("HERDR_PANE_ID") or "manager",
+        disarmed_at=now_iso(),
+        reason=f"new task created: {task_id}",
+    ).to_record()
+
+
+def cmd_final_gates_arm(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    if not all_tasks_merged(state):
+        raise HLoopError("cannot arm final gates before all tasks are merged")
+    running = running_agent_ids(state)
+    if running:
+        raise HLoopError("cannot arm final gates while roles are running: " + ", ".join(running))
+    target = current_integration_target(repo, state)
+    try:
+        armed = arm_final_gates(
+            final_gate_from_state(state),
+            target_sha=target,
+            armed_by=args.armed_by or os.environ.get("HERDR_PANE_ID") or "manager",
+            armed_at=now_iso(),
+            conditions=final_gate_conditions(state),
+        )
+    except LifecycleInvariantError as exc:
+        raise HLoopError("cannot arm final gates: " + "; ".join(item.message for item in exc.issues)) from exc
+    state["final_gate"] = armed.to_record()
+    save_state(repo, state)
+    journal(repo, f"Armed final gates generation `{armed.generation}` for `{target}`.")
+    print(f"final gates armed for {target} (generation {armed.generation})")
+    return 0
+
+
+def gate_evidence_for_resume(state: dict[str, Any]) -> tuple[GateEvidence, ...]:
+    validation = state.get("last_validation", {})
+    validation_results = validation.get("results", [])
+    validation_status = (
+        "passed"
+        if validation_results and all(item.get("result") == "passed" for item in validation_results)
+        else ("failed" if validation_results else "")
+    )
+    reviews = list(state.get("reviews", {}).values())
+    gaps = list(state.get("gaps", {}).values())
+    review_record = reviews[-1] if reviews else {}
+    gap_record = gaps[-1] if gaps else {}
+    return (
+        GateEvidence(
+            "validation",
+            validation_status,
+            str(validation.get("head_sha") or ""),
+        ),
+        GateEvidence(
+            "review",
+            "passed" if review_gate_passed(state) else str(agent_gate_status(review_record)),
+            str(review_record.get("closed_head_sha") or review_record.get("head_sha") or ""),
+            required=normalize_int(state.get("max_reviewers"), DEFAULT_MAX_REVIEWERS) > 0,
+        ),
+        GateEvidence(
+            "gap",
+            "passed" if gap_gate_passed(state) else str(agent_gate_status(gap_record)),
+            str(gap_record.get("closed_head_sha") or gap_record.get("head_sha") or ""),
+            required=normalize_int(state.get("max_gap_auditors"), DEFAULT_MAX_GAP_AUDITORS) > 0,
+        ),
+        GateEvidence(
+            "manager-qa",
+            str(state.get("manager_qa_status") or ""),
+            str(state.get("manager_qa_head_sha") or state.get("completion_target_sha") or ""),
+            passing_statuses=("passed", "accepted-risk", "not-required"),
+            required=state_manager_qa_profile(state) != "none",
+        ),
+    )
+
+
+def lifecycle_resume_requirements(repo: Path, state: dict[str, Any]) -> list[dict[str, str]]:
+    target = current_integration_target(repo, state)
+    if not target:
+        return []
+    blockers = [f"decision {item}" for item in normalize_list(state.get("blocking_decisions"))]
+    if state.get("active_merge"):
+        blockers.append("active merge transaction")
+    requirements = compute_resume_requirements(
+        current_target_sha=target,
+        gates=gate_evidence_for_resume(state),
+        active_blockers=blockers,
+        dirty_paths=unsafe_dirty_paths(repo),
+        running_roles=running_agent_ids(state),
+    )
+    return [
+        {
+            "code": item.code,
+            "subject": item.subject,
+            "reason": item.reason,
+            "target_sha": item.target_sha,
+            "observed_sha": item.observed_sha,
+        }
+        for item in requirements
+    ]
 
 
 def review_after_merges(state: dict[str, Any]) -> int:
@@ -3711,6 +4419,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for key, value in checks["optional_skills"].items()
     }
     checks["skills"]["herdr"]["candidates"] = [str(path) for path in herdr_skill_candidates]
+    config_ok = True
+    try:
+        hloop_config.check_python_capability()
+        config_candidate = hloop_config.find_config_file()
+        if config_candidate is not None:
+            config_data = hloop_config.load_config_file(config_candidate.path)
+            hloop_config.validate_config(config_data, base=config_candidate.path.parent)
+            validate_config_semantics(config_data)
+        checks["config"] = {
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "capability": "supported",
+            "path": str(config_candidate.path) if config_candidate else None,
+            "valid": True,
+        }
+    except (hloop_config.ConfigError, HLoopError) as exc:
+        config_ok = False
+        checks["config"] = {
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "capability": "unsupported-or-invalid",
+            "valid": False,
+            "error": str(exc),
+        }
+        checks["warnings"].append(f"config capability check failed: {exc}")
     if not checks["skills"]["herdr"]["exists"]:
         checks["warnings"].append("herdr skill file not found; continuing because the herdr CLI is authoritative")
     if checks["herdr_dev_loop"].get("version_mismatch"):
@@ -3748,7 +4479,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             checks["warnings"].append(f"session inventory unavailable: {exc}")
     herdr_skill_ok = checks["skills"]["herdr"]["exists"] or not args.strict_skills
     required_commands_ok = checks["commands"]["git"] and checks["commands"]["herdr"] and checks["commands"]["codex"]
-    ok = checks["HERDR_ENV"] == "1" and required_commands_ok and herdr_skill_ok
+    ok = checks["HERDR_ENV"] == "1" and required_commands_ok and herdr_skill_ok and config_ok
     checks["ok"] = ok
     if args.json:
         print(json.dumps(checks, ensure_ascii=False, indent=2))
@@ -4412,6 +5143,7 @@ acceptance:
 
 def cmd_init(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
+    config_resolution, config_candidate = resolve_init_config(args, repo)
     archived_loop: Path | None = None
     base = args.base or current_branch(repo) or "main"
     goal_id = args.goal_id or slugify(args.goal, 32)
@@ -4519,6 +5251,7 @@ Manager-owned project profile for branch strategy, implementation protocol, revi
 - Namespace: `{LOOP_NAMESPACE}`
 - Path: `{LOOP_DIR.as_posix()}`
 - Persistence: `{args.persistence}`
+- Config: `{str(config_candidate.path) if config_candidate else "built-in defaults"}`
 
 Legacy `.ai/loop` state is ignored. `local-only` copies Manager artifacts into role worktrees and keeps them out of integration commits; `branch-history` requires committed Manager snapshots.
 
@@ -4651,12 +5384,18 @@ None.
         write_text(journal_path, "# Journal\n")
     state = {
         "state_format_version": STATE_FORMAT_VERSION,
+        "schema_revision": STATE_SCHEMA_REVISION,
         "goal_id": goal_id,
         "run_id": run_id,
         "skill_version": SKILL_VERSION,
         "namespace": LOOP_NAMESPACE,
         "loop_path": LOOP_DIR.as_posix(),
         "persistence": args.persistence,
+        "config_source": {
+            "kind": config_candidate.source if config_candidate else "built-in-default",
+            "path": str(config_candidate.path) if config_candidate else "",
+        },
+        "resolved_config": config_resolution.as_dict(),
         "worktree_setup_commands": worker_setup_commands,
         "worker_setup_commands": worker_setup_commands,
         "reviewer_setup_commands": reviewer_setup_commands,
@@ -4673,6 +5412,7 @@ None.
         "worker_qa_profile": worker_qa_profile,
         "manager_qa_profile": manager_qa_profile,
         "manager_qa_status": "not-required" if manager_qa_profile == "none" else "pending",
+        "manager_qa_evidence_path": (LOOP_DIR / "qa" / "FINAL.md").as_posix(),
         "worker_protocol": args.worker_protocol,
         "review_protocol": args.review_protocol,
         "worker_agent_provider": worker_agent_provider,
@@ -4717,6 +5457,20 @@ None.
         "gaps": {},
         "advice": {},
         "blocking_decisions": [],
+        "attempt_history": [],
+        "cleanup_history": [],
+        "lifecycle_diagnostics": [],
+        "resume_requirements": [],
+        "pending_fix_task_drafts": [],
+        "final_gate": None,
+        "terminal_outcome": {},
+        "artifact_policy": {
+            "role_active": "role-worktree",
+            "role_harvested": "manager-loop",
+            "inputs": "local-only",
+            "inbox": "local-only",
+            "broker": "local-only",
+        },
         "created_at": now_iso(),
     }
     if state_path(repo).exists() and not args.force:
@@ -4727,6 +5481,14 @@ None.
         old.setdefault("namespace", LOOP_NAMESPACE)
         old.setdefault("loop_path", LOOP_DIR.as_posix())
         old.setdefault("persistence", args.persistence)
+        old.setdefault(
+            "config_source",
+            {
+                "kind": config_candidate.source if config_candidate else "built-in-default",
+                "path": str(config_candidate.path) if config_candidate else "",
+            },
+        )
+        old.setdefault("resolved_config", config_resolution.as_dict())
         old.setdefault("worktree_setup_commands", setup_commands)
         old.setdefault("worktree_root", str(worktree_root) if worktree_root else "")
         old.setdefault("branch_strategy", args.branch_strategy)
@@ -5291,6 +6053,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
             dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
         )
         write_batch_artifact(repo, state, resolved_batch_id)
+    disarm_final_gate_for_new_task(state, task_id)
     return task_id
 
 
@@ -5407,6 +6170,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
             dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
         )
         write_batch_artifact(repo, state, resolved_batch_id)
+    disarm_final_gate_for_new_task(state, task_id)
     state["phase"] = "dispatching"
     save_state(repo, state)
     journal(repo, f"Created task `{task_id}`: {args.title}")
@@ -6206,6 +6970,10 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     if not base_sha:
         raise HLoopError(f"manager base_sha is missing for {task_id}")
     committed_result = require_committed_result(worktree, task_id, head_sha)
+    final_result = result_file(repo, task_id)
+    if result.resolve() != final_result.resolve():
+        write_text(final_result, read_text(result))
+        task_state["worktree_result_path_harvested"] = str(result)
     files = normalize_list(meta.get("changed_files")) or changed_files(worktree, base_sha, head_sha)
     validation_recorded = result_validation_recorded(meta)
     if normalize_bool(meta.get("merge_ready")) and not validation_recorded:
@@ -6224,7 +6992,7 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
             "validation_commands": normalize_list(meta.get("validation_commands")),
             "validation_results": normalize_list(meta.get("validation_results")),
             "validation_summary": str(meta.get("validation_summary") or ""),
-            "result_path": str(result),
+            "result_path": str(final_result),
             "committed_result_path": committed_result,
             "harvested_at": now_iso(),
         }
@@ -6262,7 +7030,7 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(state, review_id, review_state, message)
+    _, message = manager_message_envelope(state, task_id, task_state, message)
     try:
         send_agent_tui_message(
             str(task_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -6996,7 +7764,7 @@ def cmd_reviewer_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
-    _, message = manager_message_envelope(state, gap_id, gap_state, message)
+    _, message = manager_message_envelope(state, review_id, review_state, message)
     try:
         send_agent_tui_message(
             str(review_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -7353,11 +8121,9 @@ def cmd_gap_message(args: argparse.Namespace) -> int:
     if not pane_id:
         raise HLoopError(f"gap auditor has no pane_id: {gap_id}")
     message, source = manager_message_from_args(args)
-    _, message = manager_message_envelope(
-        state, f"{args.advice_id}/{args.participant_id}", participant, message
-    )
     if not message.strip():
         raise HLoopError("manager message is empty")
+    _, message = manager_message_envelope(state, gap_id, gap_state, message)
     try:
         send_agent_tui_message(
             str(gap_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -7809,6 +8575,11 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
     if not pane_id:
         raise HLoopError(f"advisor has no pane_id: {args.advice_id}/{args.participant_id}")
     message, source = manager_message_from_args(args)
+    if not message.strip():
+        raise HLoopError("manager message is empty")
+    _, message = manager_message_envelope(
+        state, f"{args.advice_id}/{args.participant_id}", participant, message
+    )
     followups_before, max_rounds = enforce_advisor_message_round_limit(
         state, advice_state, participant
     )
@@ -8030,6 +8801,14 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
     source_state["last_triaged_at"] = now_iso()
     source_state["fix_task_candidate_count"] = len(candidates)
     source_state["rejected_fix_task_candidate_count"] = len(rejected_candidates)
+    draft_rel = str(draft_path.relative_to(repo))
+    pending_drafts = normalize_list(state.get("pending_fix_task_drafts"))
+    if candidates and not created_task_ids:
+        state["pending_fix_task_drafts"] = list(dict.fromkeys([*pending_drafts, draft_rel]))
+    else:
+        state["pending_fix_task_drafts"] = [
+            item for item in pending_drafts if item != draft_rel
+        ]
     save_state(repo, state)
     journal(
         repo,
@@ -8678,8 +9457,7 @@ def agent_artifact_path(
     agent: dict[str, Any],
 ) -> Path:
     if role == "worker":
-        worktree = Path(agent.get("worktree") or default_worktree(repo, agent_id, state)).resolve()
-        return result_file(worktree, agent_id)
+        return worker_artifact_path(repo, state, agent_id, agent)
     if role == "reviewer":
         return review_artifact_path(repo, agent_id, agent)
     if role == "gap":
@@ -8749,12 +9527,16 @@ def artifact_readiness(
             return False, "invalid-status"
         if normalize_bool(meta.get("merge_ready")) and not result_validation_recorded(meta):
             return False, "merge-ready-without-validation"
-        worktree = Path(agent.get("worktree") or path.parents[4]).resolve()
-        commit_state = safe_result_commit_state(
-            worktree, agent_id, str(meta.get("head_sha") or "HEAD")
-        )
-        if commit_state != "committed":
-            return False, commit_state
+        if artifact_was_harvested(agent):
+            if not agent.get("committed_result_path"):
+                return False, "harvested-without-committed-result"
+        else:
+            worktree = Path(agent.get("worktree") or path.parents[4]).resolve()
+            commit_state = safe_result_commit_state(
+                worktree, agent_id, str(meta.get("head_sha") or "HEAD")
+            )
+            if commit_state != "committed":
+                return False, commit_state
     elif role == "reviewer" and str(meta.get("status") or "") not in REVIEW_ARTIFACT_STATUSES:
         return False, "invalid-status"
     elif role == "gap" and str(meta.get("status") or "") not in GAP_ARTIFACT_STATUSES:
@@ -9145,11 +9927,17 @@ def cmd_resume(args: argparse.Namespace) -> int:
     state = load_state(repo)
     if str(state.get("phase") or "") != "paused":
         raise HLoopError(f"loop is not paused: {state.get('phase')}")
-    if unsafe_dirty_paths(repo):
-        raise HLoopError("cannot resume with non-loop dirty files")
+    requirements = lifecycle_resume_requirements(repo, state)
+    if requirements:
+        state["resume_requirements"] = requirements
+        save_state(repo, state)
+        raise HLoopError(
+            "cannot resume: " + "; ".join(item["reason"] for item in requirements)
+        )
     state["phase"] = "dispatching"
     state["resumed_at"] = now_iso()
     state.pop("pause_reason", None)
+    state["resume_requirements"] = []
     save_state(repo, state)
     journal(repo, "Resumed loop after preflight.")
     print("resumed")
@@ -9184,6 +9972,38 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("cleanup is unresolved: " + ", ".join(cleanup_pending))
     if state.get("active_merge"):
         errors.append("a merge transaction is active")
+    final_gate = final_gate_from_state(state)
+    if final_gate is None or final_gate.status != "armed":
+        errors.append("final gates are not armed")
+    else:
+        arm_validation = validate_final_gate_arm(
+            final_gate, current_target_sha=target
+        )
+        errors.extend(item.message for item in arm_validation.issues)
+    for task_id, task in state.get("tasks", {}).items():
+        if artifact_was_harvested(task) and not worker_artifact_path(
+            repo, state, task_id, task
+        ).is_file():
+            errors.append(f"harvested Worker artifact is missing: {task_id}")
+    for review_id, review in state.get("reviews", {}).items():
+        if artifact_was_harvested(review) and not review_artifact_path(
+            repo, review_id, review
+        ).is_file():
+            errors.append(f"harvested Reviewer artifact is missing: {review_id}")
+    for gap_id, gap in state.get("gaps", {}).items():
+        if artifact_was_harvested(gap) and not gap_artifact_path(repo, gap_id, gap).is_file():
+            errors.append(f"harvested Gap artifact is missing: {gap_id}")
+    for advice_id, advice in state.get("advice", {}).items():
+        if not isinstance(advice, dict):
+            continue
+        for participant in advice.get("participants", []):
+            if artifact_was_harvested(participant) and not advice_artifact_path(
+                repo, advice_id, participant
+            ).is_file():
+                participant_id = str(participant.get("participant_id") or "P1")
+                errors.append(
+                    f"harvested Advisor artifact is missing: {advice_id}/{participant_id}"
+                )
     return errors
 
 
@@ -9192,10 +10012,17 @@ def cmd_finish(args: argparse.Namespace) -> int:
     state = preflight_loop(repo, require_integration_branch=True)
     target = git(repo, ["rev-parse", str(state["integration_branch"])])
     if str(state.get("phase") or "") == "done":
-        if str(state.get("final_target_sha") or "") == target:
+        final_target = str(state.get("final_target_sha") or "")
+        diagnostic = diagnose_done_target_drift(
+            phase="done",
+            final_target_sha=final_target,
+            current_target_sha=target,
+            commit_count=advancing_commit_count(repo, final_target, target),
+        )
+        if diagnostic is None:
             print(f"already finished at {target}")
             return 0
-        raise HLoopError("loop was finished at a different target")
+        raise HLoopError(str(diagnostic.message))
     errors = completion_errors(repo, state)
     if errors:
         state["phase"] = "ready_to_finish" if not errors else state.get("phase", "dispatching")
@@ -9204,6 +10031,11 @@ def cmd_finish(args: argparse.Namespace) -> int:
     state["phase"] = "done"
     state["final_target_sha"] = target
     state["finished_at"] = now_iso()
+    state["terminal_outcome"] = {
+        "status": "done",
+        "target_sha": target,
+        "recorded_at": state["finished_at"],
+    }
     save_state(repo, state)
     journal(repo, f"Finished loop at `{target}` after all completion gates passed.")
     report_args = argparse.Namespace(**vars(args))
@@ -9330,6 +10162,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate.set_defaults(func=cmd_migrate)
 
+    config = sub.add_parser("config", help="inspect and initialize hierarchical TOML configuration")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_path = config_sub.add_parser("path", help="show config discovery and selected path")
+    config_path.add_argument("--json", action="store_true")
+    config_path.set_defaults(func=cmd_config_path)
+    config_validate = config_sub.add_parser("validate", help="validate the selected config file")
+    config_validate.add_argument("--path", help="validate this config file instead of discovery")
+    config_validate.add_argument("--json", action="store_true")
+    config_validate.set_defaults(func=cmd_config_validate)
+    config_explain = config_sub.add_parser("explain", help="explain resolved values and sources")
+    config_explain.add_argument("--repo", dest="config_repo", help="repository or directory to match")
+    config_explain.add_argument("--json", action="store_true")
+    config_explain.set_defaults(func=cmd_config_explain)
+    config_init = config_sub.add_parser("init", help="create a minimal secret-free config template")
+    config_init.add_argument("--path", help="write this path instead of the discovered default")
+    config_init.add_argument("--force", action="store_true")
+    config_init.add_argument("--json", action="store_true")
+    config_init.set_defaults(func=cmd_config_init)
+
     init = sub.add_parser("init", help="initialize one namespaced loop")
     init.add_argument("--goal-id")
     init.add_argument("--goal", required=True)
@@ -9339,7 +10190,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--worktree-root",
         help="root directory for all role worktrees; relative paths resolve from the repository root",
     )
-    init.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    init.add_argument("--max-workers", type=int)
     init.add_argument("--max-reviewers", type=int, default=DEFAULT_MAX_REVIEWERS)
     init.add_argument("--max-gap-auditors", type=int, default=DEFAULT_MAX_GAP_AUDITORS)
     init.add_argument("--merge-mode", choices=["squash", "cherry-pick"], default="squash")
@@ -9353,13 +10204,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS), default=DEFAULT_WORKER_PROTOCOL)
     init.add_argument("--review-protocol", choices=sorted(REVIEW_PROTOCOLS), default=DEFAULT_REVIEW_PROTOCOL)
-    init.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
-    init.add_argument("--worker-agent-model", default=DEFAULT_AGENT_MODEL)
-    init.add_argument("--worker-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    init.add_argument("--worker-agent-model")
+    init.add_argument("--worker-agent-effort")
     init.add_argument("--worker-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
-    init.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
-    init.add_argument("--reviewer-agent-model", default=DEFAULT_AGENT_MODEL)
-    init.add_argument("--reviewer-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    init.add_argument("--reviewer-agent-model")
+    init.add_argument("--reviewer-agent-effort")
     init.add_argument("--reviewer-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
     init.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
     init.add_argument("--gap-agent-model", default=DEFAULT_AGENT_MODEL)
@@ -9376,7 +10227,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--worker-runner", choices=["tui", "exec"], default="tui")
     init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="tui")
     init.add_argument("--gap-runner", choices=["exec", "tui"], default="tui")
-    init.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES), default="archive")
+    init.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     init.add_argument("--review-wait-ms", type=int, default=DEFAULT_REVIEW_WAIT_MS)
     init.add_argument("--gap-wait-ms", type=int, default=DEFAULT_GAP_WAIT_MS)
     init.add_argument("--review-after-merges", type=int, default=DEFAULT_REVIEW_AFTER_MERGES)
@@ -9668,6 +10519,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser("resume", help="resume a paused loop after preflight")
     resume.set_defaults(func=cmd_resume)
+
+    final_gates = sub.add_parser("final-gates", help="explicitly arm stable final review/finish gates")
+    final_gates_sub = final_gates.add_subparsers(dest="final_gates_command", required=True)
+    final_gates_arm = final_gates_sub.add_parser("arm", help="arm final gates for the current integration target")
+    final_gates_arm.add_argument("--armed-by", help="Manager identity; defaults to the Herdr pane")
+    final_gates_arm.set_defaults(func=cmd_final_gates_arm)
 
     finish = sub.add_parser("finish", help="mark done only after all current-head gates pass")
     finish.set_defaults(func=cmd_finish)
