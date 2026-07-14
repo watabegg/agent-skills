@@ -1,11 +1,11 @@
 ---
 name: herdr-dev-loop
-description: Orchestrate a bounded Herdr-managed multi-agent coding loop with pump/triage scheduling and interactive Worker, Gap Auditor, Reviewer, and opt-in Advisor panes. Use inside Herdr when a Manager agent needs to run Codex or Claude subordinate agents across git worktrees, persist the goal in explicitly namespaced .ai/herdr-dev-loop artifacts, drain task/fix-task queues with hloop pump, use HLoop-native Worker and Reviewer protocols by default, compare original plan/spec sources against implementation, generate Manager-approved fix-task drafts from review/gap artifacts with hloop triage, optionally consult cross-model Advisors for non-user-blocking specification or fix strategy decisions, adapt branch/review/QA/agent backend strategy through the namespaced PROFILE.md, merge into an integration or project-specific branch flow, monitor agent panes, harvest artifacts from detached worktrees, and stop on blocking specification decisions or unsafe state.
+description: Orchestrate a bounded Herdr-managed multi-agent coding loop with hierarchical config, requirement and decision tracking, structured agent reports, event-driven Manager wake, synthetic release evidence, and single, swarm, dual, or dual-swarm review. Use inside Herdr when a Manager needs Codex or Claude role agents in isolated git worktrees with namespaced durable state, verified artifacts, scoped user-decision blocking, explicit QA and final gates, and safe migration or recovery.
 ---
 
 # Herdr Dev Loop
 
-Use this skill as the Manager Agent for a file-backed development loop. The Manager is the agent currently using this skill. The loop coordinates isolated Worker agents, independent Gap Auditor agents, independent Reviewer agents, and explicit opt-in Advisor agents through git branches, worktrees, Herdr panes, and `.ai/herdr-dev-loop/loops/<namespace>` artifacts. Subordinate role agents default to Codex, but role-specific Codex/Claude provider and model choices can be recorded in `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`.
+Use this skill as the Manager Agent for a file-backed development loop. The Manager is the agent currently using this skill. The loop coordinates isolated Worker agents, independent Gap Auditor agents, Reviewer Coordinators, and explicit opt-in Advisor agents through git branches, worktrees, Herdr panes, structured reports, and `.ai/herdr-dev-loop/loops/<namespace>` artifacts. Subordinate roles default to Codex, but configuration, `PROFILE.md`, task contracts, and explicit start overrides can select Codex or Claude without changing the role protocol.
 
 This skill is intentionally conservative. Prefer one bounded tick at a time until the loop has proven stable for the current repository.
 
@@ -19,9 +19,10 @@ Before starting or continuing a loop:
 4. Run `$HLOOP doctor`.
 5. After installing or updating this skill, run `$HLOOP selftest`.
 6. Confirm `herdr`, `git`, and the configured subordinate agent CLIs are available. Codex is the default fallback provider; Claude is optional unless selected for a role. `$codex-impl` and `$codex-review-multi-v2` are optional compatibility protocols, not default dependencies.
-7. Read the current `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`, `.ai/herdr-dev-loop/loops/<namespace>/PLAN.md`, `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`, `.ai/herdr-dev-loop/loops/<namespace>/STATE.json`, and `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md` if they exist.
-8. Run `$HLOOP dashboard` or `$HLOOP conductor --no-fail` when resuming an existing loop so pane/worktree/artifact drift is visible before mutating state.
-9. Continue from disk state, not from thread memory.
+7. Require Python 3.11 or later. Run `$HLOOP config validate --json` when a config file is selected, then use `$HLOOP config explain --repo <repo> --json` before initializing a new loop.
+8. Read the current `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`, `.ai/herdr-dev-loop/loops/<namespace>/PLAN.md`, `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`, `.ai/herdr-dev-loop/loops/<namespace>/STATE.json`, and `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md` if they exist.
+9. Run `$HLOOP dashboard` and `$HLOOP conductor --no-fail` when resuming. Drain `$HLOOP manager next` before polling role panes.
+10. Continue from namespaced disk state and the durable inbox, not from thread memory or free-form pane output.
 
 If `HERDR_ENV=1` is absent, stop and tell the user this skill requires Herdr.
 
@@ -34,13 +35,18 @@ Use the helper script instead of hand-typing pane prompts:
 ```bash
 HLOOP="python3 <this-skill>/scripts/hloop --namespace <namespace>"
 $HLOOP version
+$HLOOP config validate --json
+$HLOOP config explain --repo <repo> --json
 $HLOOP selftest
 $HLOOP doctor
 $HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --persistence local-only --worktree-root ../wt/<goal-id> --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider codex --reviewer-agent-model auto --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --validation-command '<repo test command>' --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
 $HLOOP batch start "Initial implementation batch"
+$HLOOP input record --source manager-chat --text '<user requirement>'
+$HLOOP requirement new --source-input U0001 --acceptance '<observable result>' --priority P1
 $HLOOP task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 $HLOOP dashboard
 $HLOOP pump --max-transitions 20 --max-workers 3
+$HLOOP final-gates arm
 $HLOOP finish
 ```
 
@@ -56,7 +62,11 @@ Worker, Gap Auditor, Reviewer, and Advisor agents default to interactive TUI pan
 
 When sending additional instructions to a running TUI, use `hloop worker message <task-id> --file <prompt.md>`, `hloop gap message <gap-id> --file <prompt.md>`, `hloop reviewer message <review-id> --file <prompt.md>`, or `hloop advisor message <advice-id> --participant-id P1 --file <prompt.md>`. Do not send prompts directly with `herdr pane run` unless you have manually verified the pane is a ready role-agent TUI. The helper blocks common mistakes: shell panes, pending trust prompts, and busy agent sessions. It sends via `send-text`, waits for the input to appear, pauses before Enter, and verifies that the agent started working or answered; if the first Enter races the TUI, it retries.
 
+Every long-running role uses `hloop agent report` for semantic `ack`, `milestone`, `attention`, and `completion` events. ACK binds the role's understood goal, scope, acceptance, and approach before material edits. A completion report is communication, not proof; harvest still verifies the artifact, SHA, write scope, and validation. See `references/report-protocol.md`.
+
 Inspect running agents with `hloop worker watch <task-id>`, `hloop gap watch <gap-id>`, or `hloop reviewer watch <review-id>`. Use direct `herdr pane read` only for debugging the helper itself.
+
+For ordinary progress, use `hloop inbox list` and `hloop manager next`. When the inbox has no actionable event, register a bounded wake lease with `hloop manager sleep`. The broker provides durable at-least-once delivery, so acknowledge a handled event with `hloop inbox ack <event-id>` and deduplicate by event ID and lease generation.
 
 When Manager is only waiting for an artifact, prefer `hloop wait <task-id-or-gate-id> --harvest` or `hloop wait next --harvest` over hand-written `sleep`, `watch`, and `test -f` polling loops. Use `--timeout-ms`, `--poll-ms`, and `--quiet` to tune long waits.
 
@@ -92,6 +102,10 @@ The durable state lives under `.ai/herdr-dev-loop/loops/<namespace>`:
 - `STATE.json`: current phase, branches, task/review status, pane ids, worktrees
 - `DECISIONS.md`: pending, accepted, and rejected specification decisions that cannot be answered from the original plan/spec alone
 - `USER_ACTION_REQUIRED.md`: blocking questions for the user
+- `inputs/`: redacted local-only user inputs; never checkpointed or committed
+- `STATE.json.requirements`: accepted requirements and evidence-gated progress
+- `STATE.json.decisions`: machine-readable scoped decision records backing the readable `DECISIONS.md` ledger
+- `inbox/` and broker storage: local-only reports, wake records, and recovery spool
 - `tasks/*.md`: Worker task contracts
 - `batches/*.md`: Manager-owned task batches for readable loop-state checkpoint history
 - `results/<task-id>/result.md`: Worker completion artifacts
@@ -159,16 +173,18 @@ python3 skills/herdr-dev-loop/scripts/hloop pump --max-transitions 20 --max-work
 Each tick or pump transition must:
 
 1. Preflight the environment and disk state.
-2. Harvest completed Workers, Gap Auditors, or Reviewers.
-3. Validate result artifacts and write scopes.
-4. Integrate at most one Worker branch according to `PROFILE.md`; built-in automation defaults to squash merge into the integration branch.
-5. Run integration validation.
-6. Triage harvested Gap Auditor or Reviewer artifacts before starting more work from stale assumptions.
-7. Start a Gap Auditor when the gap gate is open; default frequency is lower than review (`gap_after_merges: 3`).
-8. Start a Reviewer when the review gate is open; default frequency is high (`review_after_merges: 1`).
-9. Dispatch queued implementation or fix Workers up to `max_workers` when `write_allow` patterns do not overlap.
-10. Triage gap/review findings into fix tasks, decisions, accepted risk, stale-spec updates, or false positives.
-11. Stop if done, blocked, or unsafe.
+2. Drain broker recovery and the Manager inbox. Process `attention` and `completion` before polling panes.
+3. Harvest completed Workers, Gap Auditors, or Reviewers.
+4. Validate result artifacts, SHAs, write scopes, and validation evidence before updating requirement progress.
+5. Integrate at most one Worker branch according to `PROFILE.md`; built-in automation defaults to squash merge into the integration branch.
+6. Run integration validation.
+7. Triage harvested Gap Auditor or Reviewer artifacts before starting more work from stale assumptions.
+8. Start a Gap Auditor when the gap gate is open; default frequency is lower than review (`gap_after_merges: 3`).
+9. Start a Reviewer when the review gate is open; default frequency is high (`review_after_merges: 1`).
+10. Dispatch queued implementation or fix Workers up to `max_workers` when `write_allow` patterns do not overlap and no scoped decision blocks them.
+11. Record requirement-oriented progress before user-visible updates and before terminal phase changes.
+12. Triage gap/review findings into fix tasks, decisions, accepted risk, stale-spec updates, or false positives.
+13. Arm final gates only after the batch, triage, and fix-task-draft set are stable. Stop if done, externally blocked, or unsafe.
 
 Do not run an unbounded loop. Prefer `tick --once` while inspecting a new repository; use `pump --max-transitions <n>` only after the workflow is stable.
 
@@ -181,6 +197,8 @@ Default protocols are native to this skill:
 - Workers follow the HLoop Worker Protocol: inspect context, implement inside write scope, self-review, run repo-appropriate validation/QA, write the result artifact, and commit.
 - Reviewers follow the HLoop Native Review Protocol: review task/result artifacts, write-scope and merge safety, product correctness, risk, and validation/QA evidence. Use `$codex-review-multi-v2` only when `review_protocol: codex-review-multi-v2` is intentionally selected.
 - `$codex-impl` is only a Worker compatibility mode. Use it only when `worker_protocol: codex-impl` is intentionally selected.
+
+Review topology is independent of Reviewer protocol. `single` is the low-cost path, `swarm` uses four to eight discovery lanes on one provider, `dual` uses one lane per Codex and Claude, and `dual-swarm` uses four to eight lanes per provider. All lanes target one SHA. Critical and specification-decision findings require independent verification; budget exhaustion leaves `insufficient_evidence` rather than silently confirming or dropping a candidate.
 
 Agent backend selection is separate from protocol selection:
 
@@ -210,6 +228,11 @@ Load only the reference needed for the current operation:
 - `references/advisor-contract.md`: explicit opt-in Advisor consultation and cross-model dialogue rules
 - `references/decision-policy.md`: blocking decision criteria
 - `references/validation-policy.md`: validation levels and command selection
+- `references/configuration.md`: config discovery, scope matching, precedence, snapshots, and review-mode settings
+- `references/report-protocol.md`: semantic agent reports, durable inbox, wake leases, broker recovery, and privacy
+- `references/requirements-decisions-outcomes.md`: redacted input capture, requirement evidence, scoped decisions, and terminal output
+- `references/review-swarm.md`: single/swarm/dual/dual-swarm topology, normalization, budgets, and manifest gates
+- `references/migration-install.md`: format 3 migration, Codex/Claude install parity, discovery, and rollback
 - `references/public-repo-safety.md`: files and data that must not be committed
 - `references/prompts.md`: prompt templates used by `hloop`
 - `references/cli-notes.md`: local Herdr and Codex CLI assumptions to re-check with `hloop doctor`
@@ -220,7 +243,7 @@ Stop immediately when:
 
 - `HERDR_ENV=1` is not set.
 - `.ai/herdr-dev-loop/loops/<namespace>/STATE.json` is missing for a non-init operation.
-- a blocking user decision exists.
+- every remaining safe task is dependency-blocked by an unresolved `blocking-user` decision. A scoped decision does not stop unrelated work.
 - an unresolved plan/spec choice must be decided from outside the original plan; record it in `DECISIONS.md` and `USER_ACTION_REQUIRED.md`.
 - a Worker changed files outside `write_allow` or inside `write_deny`.
 - a Worker reports `partial`, `blocked`, `failed`, or `merge_ready: false`.

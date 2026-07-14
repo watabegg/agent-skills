@@ -17,6 +17,9 @@ The Worker prompt must say:
 - include the prompt-provided `skill_version` in the result artifact
 - commit the branch
 - print `HERDR_LOOP_TASK_DONE:<task-id>:<done|blocked|failed|partial>`
+- submit a semantic `ack` report after read-only investigation and before material edits
+- submit `milestone` only when achievement, risk, or next action changes; use `attention` when Manager action is required
+- submit `completion` with artifact, head SHA, validation references, residual risks, and handoff before the final sentinel
 
 ## HLoop Worker Protocol
 
@@ -27,12 +30,13 @@ Worker must:
 1. Re-read loop artifacts and the task contract from disk.
 2. Verify the task is still valid against the current code.
 3. Compare acceptance criteria against the implementation before editing.
-4. Implement the smallest coherent change inside `write_allow`.
-5. Self-review the diff for correctness, product behavior, security/privacy, data integrity, UX, and validation risk.
-6. Run validation commands that fit the task and repository.
-7. Apply the Worker QA profile from `PROFILE.md` or task frontmatter.
-8. Write the result artifact with flat frontmatter fields.
-9. Commit the work on the Worker branch.
+4. Submit `hloop agent report --type ack` with the understood goal, scope, acceptance, and approach. Stop before material edits if the contract is wrong.
+5. Implement the smallest coherent change inside `write_allow`.
+6. Self-review the diff for correctness, product behavior, security/privacy, data integrity, UX, and validation risk.
+7. Run validation commands that fit the task and repository.
+8. Apply the Worker QA profile from `PROFILE.md` or task frontmatter.
+9. Write the result artifact with flat frontmatter fields.
+10. Commit the work on the Worker branch and submit a completion report. The report does not replace the committed artifact.
 
 ## Worker QA Profile
 

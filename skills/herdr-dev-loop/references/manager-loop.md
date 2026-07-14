@@ -7,15 +7,17 @@ Manager owns integration and final judgment.
 1. Select one explicit `--namespace`, run `hloop namespaces`, and confirm legacy `.ai/loop` is ignored.
 2. Run `hloop version` before other work and make the first progress message identify the runtime version, namespace, loop version, and run ID.
 3. Run `hloop doctor`.
-4. Read `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`.
-5. Read `.ai/herdr-dev-loop/loops/<namespace>/PLAN.md`.
-6. Read `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`.
-7. Read `.ai/herdr-dev-loop/loops/<namespace>/STATE.json`.
-8. Read `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md`.
-9. Run `hloop dashboard` to inspect phase, queues, pane ids, worktrees, artifacts, and next actions.
-10. Run `hloop conductor --no-fail` when resuming a long-running workspace or when the next action is unclear.
-11. Check current branch and branch strategy against `STATE.json` and `PROFILE.md`.
-12. Check `git status --short`.
+4. Validate the selected `config.toml` and inspect `config explain` before initializing a new namespace.
+5. Read `.ai/herdr-dev-loop/loops/<namespace>/MISSION.md`.
+6. Read `.ai/herdr-dev-loop/loops/<namespace>/PLAN.md`.
+7. Read `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md`.
+8. Read `.ai/herdr-dev-loop/loops/<namespace>/STATE.json`.
+9. Read `.ai/herdr-dev-loop/loops/<namespace>/DECISIONS.md`.
+10. Replay broker recovery if needed and run `hloop manager next`.
+11. Run `hloop dashboard` to inspect phase, queues, pane ids, worktrees, artifacts, and next actions.
+12. Run `hloop conductor --no-fail` when resuming a long-running workspace or when the next action is unclear.
+13. Check current branch and branch strategy against `STATE.json` and `PROFILE.md`.
+14. Check `git status --short`.
 
 `hloop` enforces the same preflight for mutating commands. Treat a preflight failure as an environmental block, not as a reason to continue by hand.
 
@@ -69,6 +71,22 @@ Keep the loop active by default:
 - open the gap gate less often (`gap_after_merges: 3`) and before final completion
 - allow Gap Auditor and Reviewer to run while Workers continue on isolated branches
 - do not merge Worker branches while Gap Auditor or Reviewer is reading the integration branch
+
+## Event-Driven Progress
+
+Role reports are typed as `ack`, `milestone`, `attention`, or `completion`. Require semantic ACK before material edits for long-running work. Treat milestone as inbox-only unless its state change requires intervention. Handle attention promptly. Verify a completion report against the committed artifact, target SHA, write scope, and validation before harvest or requirement progress changes.
+
+Use `hloop inbox list` and `hloop manager next` before reading panes. When no event needs action, use `hloop manager sleep --ttl-seconds <n>` to register a run-bound wake lease. Consume a handled wake with `hloop inbox ack <event-id>`. Delivery is at least once; event ID and lease generation are the idempotency boundary.
+
+If the broker is unavailable, the role writes to the local spool. Use `hloop broker status` and `hloop broker recover`; do not reconstruct or copy report bodies through pane chat. Pane inspection remains a fallback for silent exit, crash, or missing report.
+
+## Requirement And Decision Progress
+
+Record new user input with `hloop input record` before changing requirements. Accept stable requirement IDs with `hloop requirement new`, then use `hloop progress record` only for legal transitions. `verified` requires Manager or HLoop evidence for an artifact and passing test or QA on one head SHA; an agent report alone is insufficient.
+
+Create `advisory`, `deferred-user`, or `blocking-user` decisions with `hloop decision new`. User-decision classes require affected tasks. Continue unrelated work until every safe transition is dependency-blocked. Store the answer with `decision respond` and the Manager-confirmed outcome with `decision resolve`.
+
+Before a user-visible progress reply or terminal phase change, use requirement states to report verified, implemented but unverified, blocked, deferred, and superseded work. Do not use task counts as a substitute for user outcomes.
 
 ## Product Profile
 
@@ -211,3 +229,5 @@ When done, generate `reports/FINAL.md` with:
 - advice status when Advisor was used
 - accepted risks
 - remaining follow-ups
+
+Before `finish`, close the current batch, complete review triage, clear pending fix-task drafts, and run `hloop final-gates arm`. Creating a new task disarms the arm. `finish` must be the only transition to done and must recheck all current-head gates.
