@@ -2,15 +2,140 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Decision Record",
   "type": "object",
-  "required": ["id", "status", "blocking", "question", "options"],
+  "required": ["id", "class", "status", "question", "options", "recommendation", "affected_task_ids"],
   "properties": {
     "id": {"type": "string", "pattern": "^D[0-9]{3}$"},
+    "class": {"enum": ["advisory", "deferred-user", "blocking-user"]},
     "status": {"enum": ["pending", "answered", "accepted", "rejected", "superseded"]},
-    "blocking": {"type": "boolean"},
-    "question": {"type": "string"},
-    "options": {"type": "array", "items": {"type": "string"}},
-    "recommended_default": {"type": "string"},
-    "created_from": {"type": "string"}
+    "blocking": {"type": "boolean", "deprecated": true},
+    "question": {"type": "string", "minLength": 1},
+    "options": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "tradeoffs"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+          "label": {"type": "string", "minLength": 1},
+          "tradeoffs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": ["option_id", "rationale"],
+      "properties": {
+        "option_id": {"type": "string"},
+        "rationale": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "affected_task_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^T[0-9]{3}$"}
+    },
+    "source_findings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "response": {
+      "type": "object",
+      "required": ["responded_by", "responded_at"],
+      "properties": {
+        "responded_by": {"type": "string", "minLength": 1},
+        "responded_at": {"type": "string", "minLength": 1},
+        "selected_option": {"type": "string", "minLength": 1},
+        "free_text": {"type": "string", "minLength": 1}
+      },
+      "anyOf": [
+        {"required": ["selected_option"]},
+        {"required": ["free_text"]}
+      ],
+      "additionalProperties": false
+    },
+    "resolution": {
+      "type": "object",
+      "required": ["outcome", "rationale", "resolved_by", "resolved_at"],
+      "properties": {
+        "outcome": {"enum": ["accepted", "rejected", "superseded"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "resolved_by": {"type": "string", "minLength": 1},
+        "resolved_at": {"type": "string", "minLength": 1},
+        "selected_option": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "created_from": {"type": "string", "minLength": 1}
   },
+  "allOf": [
+    {
+      "if": {"properties": {"class": {"enum": ["deferred-user", "blocking-user"]}}},
+      "then": {"properties": {"affected_task_ids": {"minItems": 1}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "answered"}}},
+      "then": {"required": ["response"], "not": {"required": ["resolution"]}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "pending"}}},
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["response"]},
+            {"required": ["resolution"]}
+          ]
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "accepted"}}},
+      "then": {
+        "required": ["resolution"],
+        "properties": {
+          "resolution": {
+            "required": ["selected_option"],
+            "properties": {"outcome": {"const": "accepted"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "class": {"enum": ["deferred-user", "blocking-user"]},
+          "status": {"const": "accepted"}
+        }
+      },
+      "then": {"required": ["response"]}
+    },
+    {
+      "if": {"properties": {"status": {"const": "rejected"}}},
+      "then": {
+        "required": ["resolution"],
+        "properties": {
+          "resolution": {"properties": {"outcome": {"const": "rejected"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "superseded"}}},
+      "then": {
+        "required": ["resolution"],
+        "properties": {
+          "resolution": {"properties": {"outcome": {"const": "superseded"}}}
+        }
+      }
+    }
+  ],
   "additionalProperties": true
 }
