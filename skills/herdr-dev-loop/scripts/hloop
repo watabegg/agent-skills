@@ -41,6 +41,7 @@ from hloop_lib import events as hloop_events
 from hloop_lib import hooks as hloop_hooks
 from hloop_lib import providers as hloop_providers
 from hloop_lib import requirements as hloop_requirements
+from hloop_lib import reports as hloop_reports
 from hloop_lib import review as hloop_review
 from hloop_lib.decisions import (
     DECISION_ACCEPTED,
@@ -96,6 +97,7 @@ LOOP_DIR = LOOP_HOME / "loops" / LOOP_NAMESPACE
 EXPERIENCE_DIR = LOOP_HOME / "experience"
 LEGACY_LOOP_DIR = Path(".ai") / "loop"
 TASK_STATUSES_FINAL = {"done", "partial", "blocked", "failed", "abandoned"}
+RUN_TERMINAL_PHASES = {"done", "blocked", "superseded", "handoff", "abandoned_by_user"}
 SESSION_CLEANUP_MODES = {"none", "archive", "delete"}
 DEFAULT_REVIEW_WAIT_MS = 600_000
 DEFAULT_GAP_WAIT_MS = 600_000
@@ -937,6 +939,118 @@ def cmd_config_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def flattened_mapping(value: dict[str, Any], prefix: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Return dotted config leaves for stable apply previews."""
+
+    leaves: dict[str, Any] = {}
+    for key, item in value.items():
+        path = (*prefix, str(key))
+        if isinstance(item, dict):
+            leaves.update(flattened_mapping(item, path))
+        else:
+            leaves[".".join(path)] = item
+    return leaves
+
+
+def config_apply_changes(
+    previous: dict[str, Any], resolved: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Describe config snapshot changes without mutating either mapping."""
+
+    before = flattened_mapping(previous)
+    after = flattened_mapping(resolved)
+    return [
+        {"key": key, "before": before.get(key), "after": after.get(key)}
+        for key in sorted(set(before) | set(after))
+        if before.get(key) != after.get(key)
+    ]
+
+
+def apply_resolved_config_to_state(
+    state: dict[str, Any],
+    resolved: dict[str, Any],
+    candidate: hloop_config.ConfigCandidate | None,
+) -> None:
+    """Replace the explicit loop snapshot and its runtime-facing leaves."""
+
+    state["config_source"] = {
+        "kind": candidate.source if candidate else "built-in-default",
+        "path": str(candidate.path) if candidate else "",
+    }
+    state["resolved_config"] = resolved
+    state["max_workers"] = resolved["max_workers"]
+    state["session_cleanup"] = resolved["session_cleanup"]
+    for role in ("worker", "reviewer"):
+        role_config = resolved.get(role) or {}
+        state[f"{role}_agent_provider"] = normalize_agent_provider(
+            role_config.get("provider")
+        )
+        state[f"{role}_agent_model"] = normalize_agent_model(role_config.get("model"))
+        state[f"{role}_agent_effort"] = normalize_agent_effort(
+            role_config.get("effort")
+        )
+
+
+def cmd_config_apply(args: argparse.Namespace) -> int:
+    """Preview or explicitly apply a newly resolved config to an idle loop."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    try:
+        candidate = hloop_config.find_config_file()
+        if candidate is not None:
+            data = hloop_config.load_config_file(candidate.path)
+            hloop_config.validate_config(data, base=candidate.path.parent)
+            validate_config_semantics(data)
+        resolution, candidate = hloop_config.load_and_resolve(
+            BUILT_IN_CONFIG_DEFAULTS,
+            target_dir=repo,
+        )
+    except hloop_config.ConfigError as exc:
+        raise HLoopError(str(exc)) from exc
+
+    resolved = resolution.as_dict()
+    changes = config_apply_changes(state.get("resolved_config") or {}, resolved)
+    next_source = {
+        "kind": candidate.source if candidate else "built-in-default",
+        "path": str(candidate.path) if candidate else "",
+    }
+    source_changed = state.get("config_source") != next_source
+    payload = {
+        "mode": "apply" if args.apply else "dry-run",
+        "config_path": str(candidate.path) if candidate else None,
+        "config_source": candidate.source if candidate else "built-in-default",
+        "changes": changes,
+        "source_changed": source_changed,
+        "changed": bool(changes) or source_changed,
+    }
+    if not args.apply:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    active_roles = running_agent_ids(state)
+    if active_roles:
+        raise HLoopError(
+            "cannot apply config while roles are running: " + ", ".join(active_roles)
+        )
+    if state.get("active_merge"):
+        raise HLoopError("cannot apply config while a merge transaction is active")
+    if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
+        raise HLoopError(f"cannot apply config to a terminal run: {state.get('phase')}")
+    if changes or source_changed:
+        apply_resolved_config_to_state(state, resolved, candidate)
+        state["config_applied_at"] = now_iso()
+        save_state(repo, state)
+        journal(
+            repo,
+            "Applied resolved config snapshot: "
+            + (", ".join(item["key"] for item in changes) or "config_source"),
+        )
+    payload["applied"] = bool(changes) or source_changed
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
 def init_config_override(args: argparse.Namespace) -> dict[str, Any]:
     override: dict[str, Any] = {}
     if getattr(args, "max_workers", None) is not None:
@@ -1074,6 +1188,14 @@ def retire_legacy_loop_lock(repo: Path) -> None:
 
 def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
+    if command == "config":
+        return getattr(args, "config_command", "") == "apply" and bool(
+            getattr(args, "apply", False)
+        )
+    if command == "outcome":
+        return getattr(args, "outcome_command", "") == "blocked"
+    if command == "completion":
+        return True
     if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish", "final-gates", "cleanup"}:
         return True
     if command == "batch":
@@ -1101,6 +1223,8 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     if command == "input":
         return True
     if command == "requirement":
+        return True
+    if command == "context":
         return True
     if command == "progress":
         return True
@@ -3717,16 +3841,17 @@ def collect_loop_inventory(
         if action and action not in next_actions:
             next_actions.append(action)
 
-    for item in issues:
-        add_next_action(item.get("action", ""))
-    if state.get("needs_gap_check") and not pending_gap_exists(state):
-        add_next_action("hloop gap start")
-    if state.get("needs_review") and not pending_review_exists(state):
-        add_next_action("hloop reviewer start")
-    if last_validation_passed(state) and should_open_gap_gate(state):
-        add_next_action("hloop tick --once # open gap gate")
-    if last_validation_passed(state) and should_open_review_gate(state):
-        add_next_action("hloop tick --once # open review gate")
+    if phase not in RUN_TERMINAL_PHASES:
+        for item in issues:
+            add_next_action(item.get("action", ""))
+        if state.get("needs_gap_check") and not pending_gap_exists(state):
+            add_next_action("hloop gap start")
+        if state.get("needs_review") and not pending_review_exists(state):
+            add_next_action("hloop reviewer start")
+        if last_validation_passed(state) and should_open_gap_gate(state):
+            add_next_action("hloop tick --once # open gap gate")
+        if last_validation_passed(state) and should_open_review_gate(state):
+            add_next_action("hloop tick --once # open review gate")
     running_workers = [item["id"] for item in workers if item.get("status") == "running"]
     running_reviewers = [item["id"] for item in reviewers if item.get("gate_status") == "running"]
     running_gaps = [item["id"] for item in gaps if item.get("gate_status") == "running"]
@@ -4827,6 +4952,7 @@ def cmd_version(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
+    role_state = load_state(repo) if state_path(repo).exists() else {}
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     herdr_skill_candidates = []
     if os.environ.get("HERDR_SKILL_PATH"):
@@ -4895,6 +5021,43 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "error": str(exc),
         }
         checks["warnings"].append(f"config capability check failed: {exc}")
+    role_capabilities_ok = True
+    role_capabilities: dict[str, Any] = {}
+    for role in ("worker", "reviewer", "gap", "advisor"):
+        config = role_agent_config(role_state, role)
+        runner = str(role_state.get(f"{role}_runner") or "tui")
+        try:
+            invocation = agent_provider_invocation(
+                provider=config["provider"],
+                model=config["model"],
+                runner=runner,
+                sandbox="workspace-write",
+                prompt_rel=LOOP_DIR / "prompts" / f"_doctor-{role}.md",
+                cwd=repo,
+                effort=config.get("effort", DEFAULT_AGENT_EFFORT),
+                claude_permission_mode=config.get(
+                    "claude_permission_mode", DEFAULT_CLAUDE_PERMISSION_MODE
+                ),
+            )
+            capability = hloop_providers.probe_provider_capability(invocation)
+            role_capabilities[role] = capability.as_record()
+            if not capability.launch_allowed:
+                role_capabilities_ok = False
+                checks["warnings"].append(
+                    f"{role} provider capability failed: {capability.reason}"
+                )
+        except (HLoopError, hloop_providers.ProviderError) as exc:
+            role_capabilities_ok = False
+            role_capabilities[role] = {
+                "provider": config.get("provider"),
+                "runner": runner,
+                "model": config.get("model"),
+                "capability": "unsupported",
+                "launch_allowed": False,
+                "reason": str(exc),
+            }
+            checks["warnings"].append(f"{role} provider capability failed: {exc}")
+    checks["role_capabilities"] = role_capabilities
     if not checks["skills"]["herdr"]["exists"]:
         checks["warnings"].append("herdr skill file not found; continuing because the herdr CLI is authoritative")
     if checks["herdr_dev_loop"].get("version_mismatch"):
@@ -4932,7 +5095,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             checks["warnings"].append(f"session inventory unavailable: {exc}")
     herdr_skill_ok = checks["skills"]["herdr"]["exists"] or not args.strict_skills
     required_commands_ok = checks["commands"]["git"] and checks["commands"]["herdr"] and checks["commands"]["codex"]
-    ok = checks["HERDR_ENV"] == "1" and required_commands_ok and herdr_skill_ok and config_ok
+    ok = (
+        checks["HERDR_ENV"] == "1"
+        and required_commands_ok
+        and herdr_skill_ok
+        and config_ok
+        and role_capabilities_ok
+    )
     checks["ok"] = ok
     if args.json:
         print(json.dumps(checks, ensure_ascii=False, indent=2))
@@ -5915,6 +6084,9 @@ None.
         "gaps": {},
         "advice": {},
         "decisions": {},
+        "requirements": {},
+        "manager_context": [],
+        "progress_sequence": 0,
         "attempt_history": [],
         "cleanup_history": [],
         "lifecycle_diagnostics": [],
@@ -5981,9 +6153,18 @@ None.
         old.setdefault("gaps", {})
         old.setdefault("batches", {})
         old.setdefault("decisions", {})
+        old.setdefault("requirements", {})
+        old.setdefault("manager_context", [])
+        old.setdefault("progress_sequence", 0)
+        write_requirement_artifacts(repo, old)
+        write_manager_context_artifact(repo, old)
+        write_decision_artifacts(repo, old)
         save_state(repo, old)
         print(f"STATE.json already exists: {state_path(repo)}")
         return 0
+    write_requirement_artifacts(repo, state)
+    write_manager_context_artifact(repo, state)
+    write_decision_artifacts(repo, state)
     save_state(repo, state)
     archive_note = f" Archived previous loop at `{archived_loop}`." if archived_loop else ""
     journal(repo, f"Initialized loop `{goal_id}` run `{run_id}` on integration branch `{integration}`.{archive_note}")
@@ -6411,6 +6592,172 @@ def require_decision(state: dict[str, Any], decision_id: str) -> DecisionRecord:
         raise HLoopError(f"invalid decision record {decision_id}: {exc}") from exc
 
 
+def decision_question_text(record: DecisionRecord, state: dict[str, Any]) -> str:
+    option_lines: list[str] = []
+    for index, option in enumerate(record.options, 1):
+        option_lines.extend(
+            [
+                f"{index}. {option.label}",
+                *[f"   - 利点・注意点: {tradeoff}" for tradeoff in option.tradeoffs],
+            ]
+        )
+    recommended = next(
+        item.label
+        for item in record.options
+        if item.option_id == record.recommendation.option_id
+    )
+    blocked = set(build_decision_scheduler(state).decision_blocked_task_ids)
+    queued = {
+        task_id
+        for task_id, task in (state.get("tasks") or {}).items()
+        if str(task.get("status") or "") == "queued"
+    }
+    independent = sorted(queued - blocked)
+    if independent:
+        later = (
+            "この判断に依存しない作業は継続できます。"
+            f" 現在進められる作業候補は {', '.join(independent)} です。"
+        )
+    else:
+        later = "安全に進められる独立作業がなくなるため、回答を待ちます。"
+    reason = {
+        DECISION_ADVISORY: "元の仕様を変えない範囲の選択ですが、理由を残す必要があります。",
+        DECISION_DEFERRED_USER: "影響する作業だけを保留し、その他の作業を安全に続けるためです。",
+        DECISION_BLOCKING_USER: "影響する作業を推測で進めず、安全な範囲を確定するためです。",
+    }[record.decision_class]
+    return "\n".join(
+        [
+            "# 判断のお願い",
+            "",
+            "## 何が決まっていないか",
+            "",
+            record.question,
+            "",
+            "## 今決める必要がある理由",
+            "",
+            reason,
+            "",
+            "## 選択肢",
+            "",
+            *option_lines,
+            "",
+            "## 推奨案",
+            "",
+            f"{recommended} — {record.recommendation.rationale}",
+            "",
+            "## 判断を後回しにした場合",
+            "",
+            later,
+            "",
+            "## 回答方法",
+            "",
+            "上の選択肢を選ぶか、希望する進め方を自由入力で伝えてください。",
+            "",
+        ]
+    )
+
+
+def write_decision_artifacts(repo: Path, state: dict[str, Any]) -> None:
+    """Refresh canonical decision questions, responses, and Manager fallback."""
+
+    records = decision_records_from_state(state)
+    for decision_id, record in records.items():
+        directory = loop_path(repo) / "decisions" / decision_id
+        directory.mkdir(parents=True, exist_ok=True)
+        question_fields = {
+            "decision_id": decision_id,
+            "class": record.decision_class,
+            "status": record.status,
+            "affected_task_ids": list(record.affected_task_ids),
+            "source_findings": list(record.source_findings),
+        }
+        write_text(
+            directory / "QUESTION.md",
+            frontmatter(question_fields)
+            + "\n"
+            + decision_question_text(record, state),
+        )
+        if record.response is not None:
+            response_fields = {
+                "decision_id": decision_id,
+                "responded_by": record.response.responded_by,
+                "responded_at": record.response.responded_at,
+                "selected_option": record.response.selected_option,
+            }
+            response_body = record.response.free_text or "選択肢を回答済みです。"
+            write_text(
+                directory / "RESPONSE.md",
+                frontmatter(response_fields) + "\n# 回答\n\n" + response_body + "\n",
+            )
+
+    sections: dict[str, list[DecisionRecord]] = {
+        "Pending Decisions": [],
+        "Accepted Decisions": [],
+        "Rejected Decisions": [],
+        "Superseded Decisions": [],
+    }
+    for record in records.values():
+        if record.status in {DECISION_PENDING, DECISION_ANSWERED}:
+            sections["Pending Decisions"].append(record)
+        elif record.status == DECISION_ACCEPTED:
+            sections["Accepted Decisions"].append(record)
+        elif record.status == DECISION_REJECTED:
+            sections["Rejected Decisions"].append(record)
+        else:
+            sections["Superseded Decisions"].append(record)
+    ledger = [
+        "# Decisions",
+        "",
+        "Manager-owned record for specification choices and their scoped effects.",
+        "",
+    ]
+    for heading, items in sections.items():
+        ledger.extend([f"## {heading}", ""])
+        if not items:
+            ledger.extend(["None.", ""])
+            continue
+        for record in sorted(items, key=lambda item: item.decision_id):
+            ledger.append(
+                f"- `{record.decision_id}` [{record.decision_class}/{record.status}] "
+                f"{record.question} (affects: {', '.join(record.affected_task_ids) or '-'})"
+            )
+        ledger.append("")
+    write_text(loop_path(repo) / "DECISIONS.md", "\n".join(ledger))
+
+    pending_user = [
+        record
+        for record in records.values()
+        if record.unresolved and record.decision_class in hloop_decisions.USER_DECISION_CLASSES
+    ]
+    action_lines = ["# User Action Required", ""]
+    if not pending_user:
+        action_lines.append("利用者の判断待ちはありません。\n")
+    else:
+        action_lines.extend(
+            [
+                "次の判断を待っています。判断に依存しない作業は引き続き進めます。",
+                "",
+            ]
+        )
+        for record in sorted(pending_user, key=lambda item: item.decision_id):
+            action_lines.extend(
+                [
+                    f"## {record.question}",
+                    "",
+                    f"詳しい選択肢: `decisions/{record.decision_id}/QUESTION.md`",
+                    "",
+                ]
+            )
+    write_text(loop_path(repo) / "USER_ACTION_REQUIRED.md", "\n".join(action_lines))
+
+    state["decision_liaison"] = {
+        "mode": "manager-fallback",
+        "status": "waiting" if pending_user else "idle",
+        "pending_decision_ids": [record.decision_id for record in pending_user],
+        "updated_at": now_iso(),
+    }
+
+
 def cmd_decision_new(args: argparse.Namespace) -> int:
     """Fallback Specification Scout entry point.
 
@@ -6427,13 +6774,16 @@ def cmd_decision_new(args: argparse.Namespace) -> int:
     decision_id = args.id or next_id("D", decisions_state)
     if decision_id in decisions_state:
         raise HLoopError(f"decision already exists: {decision_id}")
-    option_labels = args.option or ["accept-recommendation", "reject-recommendation"]
+    option_labels = args.option or ["推奨案を採用する", "別案を選ぶ"]
     if not 2 <= len(option_labels) <= 3:
         raise HLoopError("a decision requires 2 or 3 --option values")
     option_ids = [f"opt_{index}" for index in range(1, len(option_labels) + 1)]
+    tradeoffs = getattr(args, "tradeoff", None) or option_labels
+    if len(tradeoffs) != len(option_labels):
+        raise HLoopError("provide exactly one --tradeoff for each --option")
     options = [
-        {"id": option_id, "label": label, "tradeoffs": [label]}
-        for option_id, label in zip(option_ids, option_labels)
+        {"id": option_id, "label": label, "tradeoffs": [tradeoff]}
+        for option_id, label, tradeoff in zip(option_ids, option_labels, tradeoffs)
     ]
     recommend_option = args.recommend_option or option_ids[0]
     if recommend_option not in option_ids:
@@ -6441,7 +6791,7 @@ def cmd_decision_new(args: argparse.Namespace) -> int:
     recommendation = {
         "option_id": recommend_option,
         "rationale": args.recommend_rationale
-        or "No explicit Manager recommendation captured; defaults to the first listed option.",
+        or "repository evidence を踏まえ、最初の選択肢を暫定の推奨案とします。",
     }
     affected = normalize_list(args.affects)
     try:
@@ -6453,11 +6803,14 @@ def cmd_decision_new(args: argparse.Namespace) -> int:
             options=tuple(options),
             recommendation=recommendation,
             affected_task_ids=tuple(affected),
-            created_from="hloop decision new",
+            source_findings=tuple(getattr(args, "source_finding", None) or ()),
+            created_from=getattr(args, "created_from", None)
+            or "specification-scout/manager fallback",
         )
     except DecisionValidationError as exc:
         raise HLoopError(str(exc)) from exc
     decisions_state[decision_id] = record.to_record()
+    write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(
         repo,
@@ -6529,6 +6882,7 @@ def cmd_decision_respond(args: argparse.Namespace) -> int:
     except (DecisionValidationError, DecisionTransitionError) as exc:
         raise HLoopError(str(exc)) from exc
     decisions_state[args.id] = updated.to_record()
+    write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Recorded response to decision `{args.id}`: {args.text}")
     print(f"responded {args.id}: status={updated.status}")
@@ -6553,6 +6907,7 @@ def cmd_decision_resolve(args: argparse.Namespace) -> int:
     except (DecisionValidationError, DecisionTransitionError) as exc:
         raise HLoopError(str(exc)) from exc
     decisions_state[args.id] = updated.to_record()
+    write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Resolved decision `{args.id}` as `{args.outcome}`: {rationale}")
     print(f"resolved {args.id}: status={updated.status}")
@@ -6569,6 +6924,7 @@ def cmd_decision_reclassify(args: argparse.Namespace) -> int:
     except (DecisionValidationError, DecisionTransitionError) as exc:
         raise HLoopError(str(exc)) from exc
     decisions_state[args.id] = updated.to_record()
+    write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Reclassified decision `{args.id}` as `{args.decision_class}`.")
     print(f"reclassified {args.id}: class={updated.decision_class}")
@@ -9705,16 +10061,36 @@ def cmd_advisor_close(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_herdr=True, require_integration_branch=True)
     advice_state = require_advice_state(state, args.advice_id)
-    if str(advice_state.get("gate_status") or advice_state.get("status")) != "reported":
+    gate_status = str(advice_state.get("gate_status") or advice_state.get("status"))
+    if gate_status == "triaged":
+        if (
+            str(advice_state.get("verdict") or "") == args.verdict
+            and str(advice_state.get("triage_reason") or "") == args.reason
+        ):
+            print(f"already closed {args.advice_id}: {args.verdict}")
+            return 0
+        raise HLoopError(
+            f"advice request is already closed with a different verdict or reason: {args.advice_id}"
+        )
+    if gate_status != "reported":
         raise HLoopError(
             f"advice request is not ready for close: {args.advice_id}; "
             "harvest participant artifacts before closing"
         )
+    triaged_at = now_iso()
+    for participant in advice_state.get("participants", []):
+        participant_status = str(
+            participant.get("gate_status") or participant.get("status") or ""
+        )
+        if participant_status == "reported":
+            participant["status"] = "consumed"
+            participant["gate_status"] = "consumed"
+            participant["consumed_at"] = triaged_at
     advice_state["status"] = "triaged"
     advice_state["gate_status"] = "triaged"
     advice_state["verdict"] = args.verdict
     advice_state["triage_reason"] = args.reason
-    advice_state["triaged_at"] = now_iso()
+    advice_state["triaged_at"] = triaged_at
     state["phase"] = "dispatching"
     save_state(repo, state)
     journal(repo, f"Closed Advisor request `{args.advice_id}` with verdict `{args.verdict}`: {args.reason}")
@@ -10094,6 +10470,9 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if str(state.get("phase") or "") == "paused":
         print("loop is paused; run `hloop resume` before tick/pump")
         return 0
+    if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
+        print(f"loop is terminal: phase={state.get('phase')}")
+        return 0
     if str(state.get("phase") or "") in {
         "blocked_environment",
         "blocked_conflict",
@@ -10393,8 +10772,8 @@ def pump_stop_reason(state: dict[str, Any], args: argparse.Namespace) -> tuple[s
         "no_progress",
     } and not retryable_preflight_block:
         return (f"phase is {phase}", 2)
-    if phase == "done":
-        return ("loop is done", 0)
+    if phase in RUN_TERMINAL_PHASES:
+        return (f"loop is terminal: {phase}", 0)
     if phase == "ready_to_finish":
         return ("loop is ready; run hloop finish", 0)
     if phase == "paused":
@@ -11114,6 +11493,151 @@ def local_sensitive_input_dir(repo: Path) -> Path:
     return directory
 
 
+def requirement_progress_from_state(
+    state: dict[str, Any], requirement_id: str
+) -> hloop_requirements.RequirementProgress:
+    raw = (state.get("requirements") or {}).get(requirement_id, {}).get("progress")
+    if raw:
+        return hloop_requirements.RequirementProgress.from_record(raw)
+    requirement = require_requirement(state, requirement_id)
+    status = "superseded" if requirement.status == "superseded" else "not_started"
+    return hloop_requirements.RequirementProgress(
+        requirement_id=requirement_id, status=status
+    )
+
+
+def write_requirement_artifacts(repo: Path, state: dict[str, Any]) -> None:
+    """Refresh the accepted ledger and user-facing progress status."""
+
+    requirements_dir = loop_path(repo) / "requirements"
+    requirements_dir.mkdir(parents=True, exist_ok=True)
+    records = [
+        require_requirement(state, requirement_id)
+        for requirement_id in sorted((state.get("requirements") or {}).keys())
+    ]
+    ledger_lines = [
+        "# Requirements",
+        "",
+        "| ID | Priority | Status | Source | Acceptance | Dependencies | Supersedes |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for record in records:
+        ledger_lines.append(
+            "| "
+            + " | ".join(
+                (
+                    record.requirement_id,
+                    record.priority,
+                    record.status,
+                    ", ".join(record.source_inputs),
+                    "<br>".join(record.acceptance),
+                    ", ".join(record.dependencies) or "-",
+                    ", ".join(record.supersedes) or "-",
+                )
+            )
+            + " |"
+        )
+    if not records:
+        ledger_lines.append("| - | - | - | - | No requirements accepted. | - | - |")
+    write_text(requirements_dir / "REQUIREMENTS.md", "\n".join(ledger_lines) + "\n")
+
+    progress_rows = [
+        requirement_progress_from_state(state, record.requirement_id) for record in records
+    ]
+    counts = {
+        status: sum(item.status == status for item in progress_rows)
+        for status in sorted(hloop_requirements.PROGRESS_STATUSES)
+    }
+    summary = (
+        f"{len(progress_rows)}要件中{counts['verified']}件を検証済み、"
+        f"{counts['implemented_unverified']}件は実装済み・未検証、"
+        f"{counts['blocked']}件は判断または外部条件待ちです。"
+    )
+    status_lines = [
+        "# Requirement Status",
+        "",
+        summary,
+        "",
+        "| Requirement | Status | Tasks | Evidence | Remaining work / blockers |",
+        "|---|---|---|---|---|",
+    ]
+    for item in progress_rows:
+        evidence = "<br>".join(ref.reference for ref in item.evidence) or "-"
+        remaining = item.remaining_work or "; ".join(item.blockers) or "-"
+        status_lines.append(
+            f"| {item.requirement_id} | {item.status} | "
+            f"{', '.join(item.task_ids) or '-'} | {evidence} | {remaining} |"
+        )
+    if not progress_rows:
+        status_lines.append("| - | not_started | - | - | Accept requirements first. |")
+    write_text(requirements_dir / "STATUS.md", "\n".join(status_lines) + "\n")
+
+
+def next_progress_id(state: dict[str, Any]) -> str:
+    sequence = int(state.get("progress_sequence") or 0) + 1
+    state["progress_sequence"] = sequence
+    return f"P{sequence:04d}"
+
+
+def write_progress_artifact(repo: Path, state: dict[str, Any]) -> Path:
+    progress_id = next_progress_id(state)
+    snapshot = hloop_requirements.ProgressSnapshot(
+        progress_id=progress_id,
+        created_at=now_iso(),
+        requirements=tuple(
+            requirement_progress_from_state(state, requirement_id)
+            for requirement_id in sorted((state.get("requirements") or {}).keys())
+        ),
+    )
+    progress_dir = loop_path(repo) / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["# Progress", "", snapshot.summary(), "", "## Requirements", ""]
+    for item in snapshot.requirements:
+        suffix = item.remaining_work or "; ".join(item.blockers) or "完了条件を確認中"
+        lines.append(f"- {item.requirement_id}: `{item.status}` — {suffix}")
+    if not snapshot.requirements:
+        lines.append("- 受け入れ済み要件はありません。")
+    path = progress_dir / f"{progress_id}.md"
+    content = frontmatter(
+        {
+            "progress_id": progress_id,
+            "created_at": snapshot.created_at,
+            "requirement_count": len(snapshot.requirements),
+        }
+    ) + "\n" + "\n".join(lines) + "\n"
+    write_text(path, content)
+    write_text(progress_dir / "LATEST.md", content)
+    state["latest_progress_artifact"] = path.relative_to(repo).as_posix()
+    return path
+
+
+def write_manager_context_artifact(repo: Path, state: dict[str, Any]) -> Path:
+    context_dir = loop_path(repo) / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Manager Context",
+        "",
+        "繰り返し参照する制約・判断・repository 固有の注意だけを記録します。",
+        "",
+    ]
+    for item in state.get("manager_context") or []:
+        lines.extend(
+            [
+                f"## {item['id']}",
+                "",
+                item["text"],
+                "",
+                f"Source: `{item['source']}` / recorded `{item['recorded_at']}`",
+                "",
+            ]
+        )
+    if not state.get("manager_context"):
+        lines.append("繰り返し参照する Manager context はまだありません。\n")
+    path = context_dir / "MANAGER_CONTEXT.md"
+    write_text(path, "\n".join(lines))
+    return path
+
+
 def cmd_input_record(args: argparse.Namespace) -> int:
     """Capture raw user input as a redacted, checkpoint-excluded local record."""
 
@@ -11142,6 +11666,24 @@ def cmd_input_record(args: argparse.Namespace) -> int:
     input_path.write_text(
         json.dumps(record.to_record(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    input_md = local_sensitive_input_dir(repo) / f"{input_id}.md"
+    write_text(
+        input_md,
+        frontmatter(
+            {
+                "input_id": input_id,
+                "received_at": record.received_at,
+                "source": record.source,
+                "prompt_digest": record.prompt_digest,
+                "artifact_class": record.artifact_class,
+                "checkpoint_included": False,
+                "product_commit_included": False,
+            }
+        )
+        + "\n# User Input\n\n"
+        + record.raw_input
+        + "\n",
+    )
     inputs_index[input_id] = {
         "prompt_digest": record.prompt_digest,
         "redactions": list(record.redactions),
@@ -11168,6 +11710,14 @@ def cmd_requirement_new(args: argparse.Namespace) -> int:
     requirement_id = args.id or next_requirement_id(requirements_state)
     if requirement_id in requirements_state:
         raise HLoopError(f"requirement already exists: {requirement_id}")
+    unknown_inputs = sorted(
+        set(args.source_input) - set((state.get("inputs_index") or {}).keys())
+    )
+    if unknown_inputs:
+        raise HLoopError(
+            "requirement source input is not recorded: " + ", ".join(unknown_inputs)
+        )
+    supersedes = tuple(getattr(args, "supersedes", None) or ())
     try:
         requirement = hloop_requirements.Requirement(
             requirement_id=requirement_id,
@@ -11176,13 +11726,81 @@ def cmd_requirement_new(args: argparse.Namespace) -> int:
             priority=args.priority,
             dependencies=tuple(args.depends_on or ()),
             accepted_at=now_iso(),
+            supersedes=supersedes,
+        )
+        existing_records = tuple(
+            hloop_requirements.Requirement.from_record(raw)
+            for raw in requirements_state.values()
+        )
+        ledger = hloop_requirements.RequirementLedger(existing_records).accept(
+            requirement
         )
     except hloop_requirements.RequirementModelError as exc:
         raise HLoopError(str(exc)) from exc
-    requirements_state[requirement_id] = requirement.to_record()
+    prior_progress = {
+        key: raw.get("progress")
+        for key, raw in requirements_state.items()
+        if isinstance(raw, dict) and raw.get("progress")
+    }
+    requirements_state.clear()
+    for item in ledger.requirements:
+        raw = item.to_record()
+        if item.requirement_id in prior_progress:
+            progress = hloop_requirements.RequirementProgress.from_record(
+                prior_progress[item.requirement_id]
+            )
+            if item.status == "superseded" and progress.status != "superseded":
+                progress = hloop_requirements.transition_progress(
+                    progress, "superseded", blockers=()
+                )
+            raw["progress"] = progress.to_record()
+        requirements_state[item.requirement_id] = raw
+    write_requirement_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Accepted requirement `{requirement_id}` ({requirement.priority}).")
     print(f"created {requirement_id}")
+    return 0
+
+
+def cmd_requirement_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    write_requirement_artifacts(repo, state)
+    path = loop_path(repo) / "requirements" / "STATUS.md"
+    if getattr(args, "json", False):
+        payload = {
+            requirement_id: requirement_progress_from_state(state, requirement_id).to_record()
+            for requirement_id in sorted((state.get("requirements") or {}).keys())
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(path)
+    return 0
+
+
+def cmd_context_update(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    if not str(args.source or "").strip() or not str(args.text or "").strip():
+        raise HLoopError("context source and text must not be empty")
+    context = state.setdefault("manager_context", [])
+    item_id = f"CTX-{len(context) + 1:03d}"
+    safe_text, redactions = hloop_requirements.redact_sensitive_text_with_kinds(
+        args.text.strip()
+    )
+    context.append(
+        {
+            "id": item_id,
+            "source": args.source,
+            "text": safe_text,
+            "redactions": list(redactions),
+            "recorded_at": now_iso(),
+        }
+    )
+    path = write_manager_context_artifact(repo, state)
+    save_state(repo, state)
+    journal(repo, f"Updated Manager context `{item_id}` from `{args.source}`.")
+    print(path)
     return 0
 
 
@@ -11223,13 +11841,15 @@ def cmd_progress_record(args: argparse.Namespace) -> int:
     except (hloop_requirements.RequirementModelError, hloop_requirements.ProgressEvidenceError) as exc:
         raise HLoopError(str(exc)) from exc
     requirements_state[requirement.requirement_id]["progress"] = updated.to_record()
+    write_requirement_artifacts(repo, state)
+    progress_path = write_progress_artifact(repo, state)
     save_state(repo, state)
     journal(
         repo,
         f"Requirement `{requirement.requirement_id}` progress -> {updated.status} "
         f"({len(updated.evidence)} evidence ref(s)).",
     )
-    print(f"{requirement.requirement_id}: {updated.status}")
+    print(f"{requirement.requirement_id}: {updated.status} ({progress_path.name})")
     return 0
 
 
@@ -11248,6 +11868,46 @@ def cmd_outcome_show(args: argparse.Namespace) -> int:
         "progress": progress.to_record(),
     }
     print(json.dumps(outcome, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_outcome_blocked(args: argparse.Namespace) -> int:
+    """Finalize BLOCKED only from a concrete loop-level blocking phase."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    phase = str(state.get("phase") or "")
+    blocker_phases = {
+        "blocked_user_decision",
+        "blocked_environment",
+        "blocked_conflict",
+        "blocked_agent",
+        "failed_validation",
+        "failed_manager_qa",
+        "no_progress",
+    }
+    if phase not in blocker_phases and not build_decision_scheduler(state).loop_blocked:
+        raise HLoopError(
+            "external blocked outcome requires a concrete loop-level blocker; "
+            f"current phase is {phase or 'unknown'}"
+        )
+    report = build_outcome_report(
+        repo, state, kind="BLOCKED", blocking_reason=args.reason
+    )
+    write_requirement_artifacts(repo, state)
+    write_progress_artifact(repo, state)
+    path = write_outcome_report(repo, report)
+    state["phase"] = "blocked"
+    state["terminal_outcome"] = {
+        "status": "blocked",
+        "reason": args.reason,
+        "target_sha": report.integration_target_sha,
+        "recorded_at": report.generated_at,
+        "report": path.relative_to(repo).as_posix(),
+    }
+    save_state(repo, state)
+    journal(repo, f"Finalized external blocked outcome: {args.reason}")
+    print(path)
     return 0
 
 
@@ -11746,11 +12406,144 @@ def cmd_qa_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def assert_run_terminal_transition_safe(state: dict[str, Any]) -> None:
+    active = running_agent_ids(state)
+    if active:
+        raise HLoopError(
+            "cannot record a run-level outcome while roles are running: "
+            + ", ".join(active)
+        )
+    if state.get("active_merge"):
+        raise HLoopError("cannot record a run-level outcome during an active merge")
+
+
+def record_run_terminal_outcome(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    target_sha: str,
+    next_namespace: str = "",
+) -> Path:
+    if not str(reason or "").strip():
+        raise HLoopError("run-level outcome reason must not be empty")
+    previous = state.get("terminal_outcome")
+    if previous:
+        state.setdefault("terminal_outcome_history", []).append(previous)
+    recorded_at = now_iso()
+    filename = {
+        "superseded": "SUPERSEDED.md",
+        "handoff": "HANDOFF.md",
+        "abandoned_by_user": "ABANDONED.md",
+    }[status]
+    path = loop_path(repo) / "reports" / filename
+    fields = {
+        "run_id": str(state.get("run_id") or ""),
+        "status": status,
+        "target_sha": target_sha,
+        "reason": reason,
+        "recorded_at": recorded_at,
+        "next_namespace": next_namespace,
+    }
+    title = {
+        "superseded": "Superseded Run",
+        "handoff": "Run Handoff",
+        "abandoned_by_user": "Run Abandoned by User",
+    }[status]
+    body = [
+        f"# {title}",
+        "",
+        f"- Reason: {reason}",
+        f"- Target SHA: `{target_sha}`",
+    ]
+    if next_namespace:
+        body.append(f"- Next namespace: `{next_namespace}`")
+    write_text(path, frontmatter(fields) + "\n" + "\n".join(body) + "\n")
+    state["phase"] = status
+    state["terminal_outcome"] = {
+        **fields,
+        "report": path.relative_to(repo).as_posix(),
+    }
+    save_state(repo, state)
+    journal(repo, f"Recorded run-level outcome `{status}`: {reason}")
+    return path
+
+
+def cmd_completion_supersede(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    if str(state.get("phase") or "") != "done":
+        raise HLoopError("only a completed run can be superseded")
+    assert_run_terminal_transition_safe(state)
+    current = git(repo, ["rev-parse", str(state["integration_branch"])])
+    if args.head_sha != current:
+        raise HLoopError(
+            f"--head-sha must match the current integration head {current}"
+        )
+    if args.next_namespace and not re.fullmatch(
+        r"[a-z0-9][a-z0-9._-]{0,63}", args.next_namespace
+    ):
+        raise HLoopError("invalid successor namespace")
+    path = record_run_terminal_outcome(
+        repo,
+        state,
+        status="superseded",
+        reason=args.reason,
+        target_sha=current,
+        next_namespace=args.next_namespace or "",
+    )
+    print(path)
+    return 0
+
+
+def cmd_completion_handoff(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
+        raise HLoopError(f"run is already terminal: {state.get('phase')}")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", args.next_namespace):
+        raise HLoopError("invalid successor namespace")
+    assert_run_terminal_transition_safe(state)
+    current = git(repo, ["rev-parse", str(state["integration_branch"])])
+    head_sha = args.head_sha or current
+    if head_sha != current:
+        raise HLoopError(f"handoff SHA must match the current integration head {current}")
+    path = record_run_terminal_outcome(
+        repo,
+        state,
+        status="handoff",
+        reason=args.reason,
+        target_sha=current,
+        next_namespace=args.next_namespace,
+    )
+    print(path)
+    return 0
+
+
+def cmd_completion_abandon(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
+        raise HLoopError(f"run is already terminal: {state.get('phase')}")
+    assert_run_terminal_transition_safe(state)
+    current = git(repo, ["rev-parse", str(state["integration_branch"])])
+    path = record_run_terminal_outcome(
+        repo,
+        state,
+        status="abandoned_by_user",
+        reason=args.reason,
+        target_sha=current,
+    )
+    print(path)
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
-    if str(state.get("phase") or "") == "done":
-        raise HLoopError("cannot pause a completed loop")
+    if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
+        raise HLoopError(f"cannot pause a terminal loop: {state.get('phase')}")
     state["phase"] = "paused"
     state["pause_reason"] = args.reason
     state["paused_at"] = now_iso()
@@ -11801,6 +12594,19 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("current completion target lacks a closed gap gate")
     if not manager_qa_passed(state):
         errors.append("current completion target lacks passing Manager QA")
+    requirement_ids = sorted((state.get("requirements") or {}).keys())
+    if not requirement_ids:
+        errors.append("no accepted requirements are recorded")
+    for requirement_id in requirement_ids:
+        try:
+            progress = requirement_progress_from_state(state, requirement_id)
+        except hloop_requirements.RequirementModelError as exc:
+            errors.append(f"invalid requirement progress for {requirement_id}: {exc}")
+            continue
+        if progress.status not in hloop_reports.TERMINAL_REQUIREMENT_STATUSES:
+            errors.append(
+                f"requirement {requirement_id} is not terminal: {progress.status}"
+            )
     cleanup_pending = [
         task_id for task_id, task in state.get("tasks", {}).items() if task.get("cleanup_pending")
     ]
@@ -11850,6 +12656,207 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
     return errors
 
 
+def outcome_gate(
+    name: str,
+    *,
+    status: str,
+    target_sha: str,
+    evidence_refs: list[str] | tuple[str, ...] = (),
+    required: bool = True,
+) -> hloop_reports.OutcomeGate:
+    verified_by = "hloop" if status in {"passed", "accepted-risk"} else ""
+    return hloop_reports.OutcomeGate(
+        name=name,
+        status=status,
+        evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+        target_sha=target_sha if status != "not-required" else "",
+        verified_by=verified_by,
+        required=required,
+    )
+
+
+def build_outcome_report(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    kind: str,
+    blocking_reason: str = "",
+) -> hloop_reports.OutcomeReport:
+    target = git(repo, ["rev-parse", str(state["integration_branch"])])
+    current = git(repo, ["rev-parse", "HEAD"])
+    validation_results = list((state.get("last_validation") or {}).get("results") or [])
+    validation_refs = [
+        str(item.get("log") or item.get("command") or "validation")
+        for item in validation_results
+    ]
+    validation_status = "passed" if last_validation_passed(state) else (
+        "failed" if any(item.get("result") == "failed" for item in validation_results) else "pending"
+    )
+    gates = [
+        outcome_gate(
+            "integration-validation",
+            status=validation_status,
+            target_sha=target,
+            evidence_refs=validation_refs,
+        )
+    ]
+
+    review_required = int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) > 0
+    review_refs = [
+        str(review.get("review_path") or review_id)
+        for review_id, review in (state.get("reviews") or {}).items()
+        if agent_gate_status(review) in {"triaged", "passed"}
+    ]
+    gates.append(
+        outcome_gate(
+            "review",
+            status=(
+                "not-required"
+                if not review_required
+                else "passed" if review_gate_passed(state) else "pending"
+            ),
+            target_sha=target,
+            evidence_refs=review_refs,
+            required=review_required,
+        )
+    )
+
+    gap_required = int(state.get("max_gap_auditors", DEFAULT_MAX_GAP_AUDITORS)) > 0
+    gap_refs = [
+        str(gap.get("gap_path") or gap_id)
+        for gap_id, gap in (state.get("gaps") or {}).items()
+        if agent_gate_status(gap) in {"triaged", "passed"}
+    ]
+    gates.append(
+        outcome_gate(
+            "gap-audit",
+            status=(
+                "not-required"
+                if not gap_required
+                else "passed" if gap_gate_passed(state) else "pending"
+            ),
+            target_sha=target,
+            evidence_refs=gap_refs,
+            required=gap_required,
+        )
+    )
+
+    qa_required = manager_qa_required(state)
+    qa_status = str(state.get("manager_qa_status") or "pending")
+    gates.append(
+        outcome_gate(
+            "manager-qa",
+            status="not-required" if not qa_required else qa_status,
+            target_sha=target,
+            evidence_refs=[str(state.get("manager_qa_artifact") or "")]
+            if state.get("manager_qa_artifact")
+            else [],
+            required=qa_required,
+        )
+    )
+
+    final_gate = final_gate_from_state(state)
+    final_gate_passed = final_gate is not None and final_gate.status == "armed"
+    gates.append(
+        outcome_gate(
+            "final-gate-arm",
+            status="passed" if final_gate_passed else "pending",
+            target_sha=target,
+            evidence_refs=["STATE.json:final_gate"] if final_gate_passed else [],
+        )
+    )
+    cleanup_ok = not running_agent_ids(state) and not any(
+        unresolved_cleanup_failures(role_state)
+        for _, _, role_state in iter_all_roles(state)
+    )
+    gates.append(
+        outcome_gate(
+            "cleanup",
+            status="passed" if cleanup_ok else "pending",
+            target_sha=target,
+            evidence_refs=["STATE.json:cleanup"] if cleanup_ok else [],
+        )
+    )
+    if kind == "BLOCKED":
+        gates.append(
+            outcome_gate(
+                "external-goal",
+                status="blocked",
+                target_sha=target,
+                evidence_refs=["USER_ACTION_REQUIRED.md"],
+            )
+        )
+
+    requirement_progress = tuple(
+        requirement_progress_from_state(state, requirement_id)
+        for requirement_id in sorted((state.get("requirements") or {}).keys())
+    )
+    validation_evidence = tuple(
+        hloop_requirements.EvidenceRef(
+            kind="test",
+            reference=str(item.get("log") or item.get("command") or "validation"),
+            verified_by="hloop",
+            head_sha=target,
+            result=str(item.get("result") or ""),
+        )
+        for item in validation_results
+    )
+    resolved_decisions: list[str] = []
+    unresolved_decisions: list[str] = []
+    for record in decision_records_from_state(state).values():
+        summary = f"{record.decision_id}: {record.question} ({record.status})"
+        (unresolved_decisions if record.unresolved else resolved_decisions).append(summary)
+    user_changes = list(
+        dict.fromkeys(
+            str(task.get("title") or f"Task {task_id}")
+            for task_id, task in (state.get("tasks") or {}).items()
+            if str(task.get("status") or "") == "merged"
+        )
+    )
+    kwargs = {
+        "run_id": str(state.get("run_id") or "local"),
+        "goal": str(state.get("goal") or state.get("goal_id") or "HLoop goal"),
+        "generated_at": now_iso(),
+        "requirement_progress": requirement_progress,
+        "gates": tuple(gates),
+        "integration_target_sha": target,
+        "current_branch_sha": current,
+        "user_changes": tuple(user_changes),
+        "validation_evidence": validation_evidence,
+        "decisions": tuple(resolved_decisions),
+        "unresolved_items": tuple(unresolved_decisions),
+        "cleanup_status": "passed" if cleanup_ok else "pending",
+        "session_status": "closed" if not running_agent_ids(state) else "active",
+        "next_user_actions": (
+            ("Resolve the recorded blocking condition and start or resume a run.",)
+            if kind == "BLOCKED"
+            else (f"Review the integration branch {state.get('integration_branch')}",)
+        ),
+        "blocking_reason": blocking_reason,
+    }
+    try:
+        if kind == "FINAL":
+            return hloop_reports.final_outcome(**kwargs)
+        if kind == "BLOCKED":
+            return hloop_reports.blocked_outcome(
+                external_goal_blocked=True, **kwargs
+            )
+        return hloop_reports.draft_outcome(**kwargs)
+    except hloop_reports.OutcomeModelError as exc:
+        raise HLoopError(f"cannot build {kind} outcome: {exc}") from exc
+
+
+def write_outcome_report(repo: Path, report: hloop_reports.OutcomeReport) -> Path:
+    filename = {
+        "DRAFT": "DRAFT.md",
+        "FINAL": "FINAL.md",
+        "BLOCKED": "BLOCKED.md",
+    }[report.kind]
+    path = loop_path(repo) / "reports" / filename
+    write_text(path, hloop_reports.render_outcome_markdown(report))
+    return path
+
+
 def cmd_finish(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
@@ -11866,11 +12873,16 @@ def cmd_finish(args: argparse.Namespace) -> int:
             print(f"already finished at {target}")
             return 0
         raise HLoopError(str(diagnostic.message))
+    if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
+        raise HLoopError(f"cannot finish a terminal run: {state.get('phase')}")
     errors = completion_errors(repo, state)
     if errors:
         state["phase"] = "ready_to_finish" if not errors else state.get("phase", "dispatching")
         save_state(repo, state)
         raise HLoopError("cannot finish: " + "; ".join(errors))
+    outcome = build_outcome_report(repo, state, kind="FINAL")
+    write_requirement_artifacts(repo, state)
+    write_progress_artifact(repo, state)
     state["phase"] = "done"
     state["final_target_sha"] = target
     state["finished_at"] = now_iso()
@@ -11878,77 +12890,20 @@ def cmd_finish(args: argparse.Namespace) -> int:
         "status": "done",
         "target_sha": target,
         "recorded_at": state["finished_at"],
+        "report": (LOOP_DIR / "reports" / "FINAL.md").as_posix(),
     }
+    report_path = write_outcome_report(repo, outcome)
     save_state(repo, state)
     journal(repo, f"Finished loop at `{target}` after all completion gates passed.")
-    report_args = argparse.Namespace(**vars(args))
-    cmd_report(report_args)
-    print(f"finished at {target}")
+    print(f"finished at {target}; report: {report_path}")
     return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
-    lines = [
-        "# Final Report",
-        "",
-        f"- Goal ID: {state.get('goal_id')}",
-        f"- Phase: {state.get('phase')}",
-        f"- Base branch: {state.get('base_branch')}",
-        f"- Integration branch: {state.get('integration_branch')}",
-        f"- Branch strategy: {state_value(state, 'branch_strategy', DEFAULT_BRANCH_STRATEGY)}",
-        f"- Worker protocol: {state_value(state, 'worker_protocol', DEFAULT_WORKER_PROTOCOL)}",
-        f"- Review protocol: {state_value(state, 'review_protocol', DEFAULT_REVIEW_PROTOCOL)}",
-        f"- Worker agent: {agent_display(role_agent_config(state, 'worker'))}",
-        f"- Reviewer agent: {agent_display(role_agent_config(state, 'reviewer'))}",
-        f"- Gap Auditor agent: {agent_display(role_agent_config(state, 'gap'))}",
-        f"- Advisor agent: {agent_display(role_agent_config(state, 'advisor'))}",
-        f"- Worker QA profile: {state_worker_qa_profile(state)}",
-        f"- Manager final QA profile: {state_manager_qa_profile(state)}",
-        f"- Manager final QA status: {state.get('manager_qa_status', '')}",
-        "",
-        "## Tasks",
-    ]
-    for task_id, task in state.get("tasks", {}).items():
-        cleanup = "cleaned" if task.get("cleanup_done") else "cleanup pending"
-        lines.append(
-            f"- {task_id}: {task.get('status')} ({task.get('branch', '')}, {cleanup})"
-        )
-    lines.extend(["", "## Reviews"])
-    for review_id, review in state.get("reviews", {}).items():
-        artifact_status = review.get("artifact_status", "")
-        suffix = f" ({artifact_status})" if artifact_status else ""
-        lines.append(f"- {review_id}: {agent_gate_status(review)}{suffix}")
-    lines.extend(["", "## Gap Audits"])
-    for gap_id, gap in state.get("gaps", {}).items():
-        artifact_status = gap.get("artifact_status", "")
-        suffix = f" ({artifact_status})" if artifact_status else ""
-        lines.append(f"- {gap_id}: {agent_gate_status(gap)}{suffix}")
-    lines.extend(["", "## Advice"])
-    for advice_id, advice in state.get("advice", {}).items():
-        if not isinstance(advice, dict):
-            continue
-        lines.append(f"- {advice_id}: {advice.get('gate_status', advice.get('status', ''))} {advice.get('verdict', '')}".rstrip())
-        for participant in advice.get("participants", []):
-            participant_id = participant.get("participant_id", "P1")
-            lines.append(
-                f"  - {participant_id}: {agent_gate_status(participant)} "
-                f"{agent_display({'provider': str(participant.get('agent_provider') or participant.get('provider') or DEFAULT_AGENT_PROVIDER), 'model': str(participant.get('agent_model') or participant.get('model') or DEFAULT_AGENT_MODEL)})}"
-            )
-    lines.extend(["", "## Validation"])
-    for item in state.get("last_validation", {}).get("results", []):
-        lines.append(f"- `{item.get('command')}`: {item.get('result')}")
-    lines.extend(["", "## Manager Final QA"])
-    qa_artifact = state.get("manager_qa_artifact")
-    if qa_artifact:
-        lines.append(f"- Artifact: `{qa_artifact}`")
-    else:
-        lines.append("- Artifact: not recorded")
-    lines.append(f"- Status: {state.get('manager_qa_status', '')}")
-    lines.append("")
-    path = loop_path(repo) / "reports" / "FINAL.md"
-    write_text(path, "\n".join(lines))
+    outcome = build_outcome_report(repo, state, kind="DRAFT")
+    path = write_outcome_report(repo, outcome)
     print(path)
     return 0
 
@@ -12023,6 +12978,17 @@ def build_parser() -> argparse.ArgumentParser:
     config_init.add_argument("--force", action="store_true")
     config_init.add_argument("--json", action="store_true")
     config_init.set_defaults(func=cmd_config_init)
+    config_apply = config_sub.add_parser(
+        "apply", help="preview or explicitly apply resolved config to an idle loop"
+    )
+    config_apply_mode = config_apply.add_mutually_exclusive_group(required=True)
+    config_apply_mode.add_argument(
+        "--dry-run", action="store_true", help="show snapshot changes without writing"
+    )
+    config_apply_mode.add_argument(
+        "--apply", action="store_true", help="write the new snapshot after safety checks"
+    )
+    config_apply.set_defaults(func=cmd_config_apply)
 
     init = sub.add_parser("init", help="initialize one namespaced loop")
     init.add_argument("--goal-id")
@@ -12261,7 +13227,22 @@ def build_parser() -> argparse.ArgumentParser:
     requirement_new.add_argument("--acceptance", action="append", required=True)
     requirement_new.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], required=True)
     requirement_new.add_argument("--depends-on", action="append")
+    requirement_new.add_argument(
+        "--supersedes", action="append", help="accepted requirement id replaced by this one"
+    )
     requirement_new.set_defaults(func=cmd_requirement_new)
+    requirement_status = requirement_sub.add_parser(
+        "status", help="refresh and show the requirement-oriented status artifact"
+    )
+    requirement_status.add_argument("--json", action="store_true")
+    requirement_status.set_defaults(func=cmd_requirement_status)
+
+    context_cmd = sub.add_parser("context", help="source-linked durable Manager context")
+    context_sub = context_cmd.add_subparsers(dest="context_command", required=True)
+    context_update = context_sub.add_parser("update", help="append one context item")
+    context_update.add_argument("--source", required=True, help="input or decision source")
+    context_update.add_argument("--text", required=True)
+    context_update.set_defaults(func=cmd_context_update)
 
     progress = sub.add_parser("progress", help="requirement progress, evidence-gated")
     progress_sub = progress.add_subparsers(dest="progress_command", required=True)
@@ -12298,6 +13279,11 @@ def build_parser() -> argparse.ArgumentParser:
     outcome_show = outcome_sub.add_parser("show", help="print one requirement's outcome")
     outcome_show.add_argument("--requirement-id", required=True)
     outcome_show.set_defaults(func=cmd_outcome_show)
+    outcome_blocked = outcome_sub.add_parser(
+        "blocked", help="finalize reports/BLOCKED.md for an external goal blocker"
+    )
+    outcome_blocked.add_argument("--reason", required=True)
+    outcome_blocked.set_defaults(func=cmd_outcome_blocked)
 
     batch = sub.add_parser("batch", help="batch operations for grouping tasks and loop checkpoints")
     batch_sub = batch.add_subparsers(dest="batch_command", required=True)
@@ -12390,8 +13376,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="an option label; requires 2 or 3 (repeatable, default accept/reject)",
     )
+    decision_new.add_argument(
+        "--tradeoff",
+        action="append",
+        help="plain-language tradeoff matching each --option (repeatable)",
+    )
     decision_new.add_argument("--recommend-option", help="option id (opt_1, opt_2, ...) to recommend")
     decision_new.add_argument("--recommend-rationale", help="rationale for the recommended option")
+    decision_new.add_argument("--source-finding", action="append")
+    decision_new.add_argument("--created-from", help="Specification Scout or other source")
     decision_new.set_defaults(func=cmd_decision_new)
     decision_list = decision_sub.add_parser("list", help="list decision records")
     decision_list.add_argument("--json", action="store_true")
@@ -12590,6 +13583,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     finish = sub.add_parser("finish", help="mark done only after all current-head gates pass")
     finish.set_defaults(func=cmd_finish)
+
+    completion = sub.add_parser("completion", help="explicit run-level terminal outcomes")
+    completion_sub = completion.add_subparsers(dest="completion_command", required=True)
+    completion_supersede = completion_sub.add_parser(
+        "supersede", help="retire a completed run after integration advances"
+    )
+    completion_supersede.add_argument("--head-sha", required=True)
+    completion_supersede.add_argument("--reason", required=True)
+    completion_supersede.add_argument("--next-namespace")
+    completion_supersede.set_defaults(func=cmd_completion_supersede)
+    completion_handoff = completion_sub.add_parser(
+        "handoff", help="retire this run in favor of a named successor namespace"
+    )
+    completion_handoff.add_argument("--next-namespace", required=True)
+    completion_handoff.add_argument("--head-sha")
+    completion_handoff.add_argument("--reason", required=True)
+    completion_handoff.set_defaults(func=cmd_completion_handoff)
+    completion_abandon = completion_sub.add_parser(
+        "abandon", help="record explicit user abandonment of this run"
+    )
+    completion_abandon.add_argument("--reason", required=True)
+    completion_abandon.set_defaults(func=cmd_completion_abandon)
 
     cleanup = sub.add_parser("cleanup", help="cleanup gate operations")
     cleanup_sub = cleanup.add_subparsers(dest="cleanup_command", required=True)
