@@ -1,0 +1,523 @@
+from __future__ import annotations
+
+import hashlib
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from typing import Any
+
+
+SCRIPTS = Path(__file__).parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from hloop_lib import broker, events, hooks, providers, supervisor  # noqa: E402
+
+
+CREATED_AT = "2026-07-15T00:00:00+00:00"
+
+
+def client_event(event_id: str = "28b79cf0-8e32-4b89-88af-e332ee5a5dbe"):
+    return events.prepare_client_event(
+        {
+            "run_id": "run-011",
+            "role_id": "T011",
+            "attempt_id": "T011-A001",
+            "task_contract_digest": hashlib.sha256(b"contract").hexdigest(),
+            "type": "ack",
+            "stage": "prepared",
+            "summary": "supervisor契約を確認しました",
+            "understood_goal": "foreground supervisorを実装する",
+            "scope": ["supervisor.py"],
+            "acceptance": ["reportでManagerが起きる"],
+            "approach": "spoolを正本としてsocketはwake signalだけにする",
+            "next": "実装を開始します",
+            "needs_manager": True,
+            "evidence_refs": ["tasks/T011.md"],
+            "created_at": CREATED_AT,
+        },
+        event_id=event_id,
+    )
+
+
+class ProviderPrimitiveTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.prompt = self.root / "prompt.md"
+        self.output = self.root / "last.txt"
+        self.prompt.write_text("bounded prompt", encoding="utf-8")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_fake_codex_records_final_argv_and_model_capability(self):
+        invocation = providers.build_provider_invocation(
+            provider="codex",
+            runner="exec",
+            sandbox="workspace-write",
+            prompt_path=self.prompt,
+            output_path=self.output,
+            model="gpt-test",
+            effort="high",
+            writable_dirs=[self.root],
+        )
+        expected = (
+            "codex",
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "--model",
+            "gpt-test",
+            "-c",
+            "model_reasoning_effort=high",
+            "--add-dir",
+            str(self.root),
+            "--output-last-message",
+            str(self.output),
+            "-",
+        )
+        self.assertEqual(invocation.argv, expected)
+        calls: list[list[str]] = []
+
+        def fake_codex(argv, **kwargs):
+            calls.append(argv)
+            self.assertTrue(kwargs["capture_output"])
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="--sandbox --model -c --add-dir --output-last-message",
+                stderr="",
+            )
+
+        def validate_model(value):
+            self.assertEqual(value.argv, expected)
+            return providers.ModelProbeResult(
+                "supported",
+                "fake Codex accepted the resolved model",
+                ("/fake/codex", "model", "validate", value.model),
+                0,
+            )
+
+        result = providers.probe_provider_capability(
+            invocation,
+            executable_finder=lambda name: f"/fake/{name}",
+            command_runner=fake_codex,
+            model_validator=validate_model,
+        )
+
+        self.assertEqual(calls, [["/fake/codex", "exec", "--help"]])
+        self.assertEqual(result.capability, "supported")
+        self.assertTrue(result.launch_allowed)
+        self.assertEqual(result.as_record()["argv"], list(expected))
+        self.assertEqual(result.as_record()["permission_mode"], "never")
+        self.assertEqual(result.as_record()["sandbox"], "workspace-write")
+        self.assertEqual(result.as_record()["model_probe"]["returncode"], 0)
+
+    def test_fake_claude_never_silently_falls_back_from_unknown_or_bad_model(self):
+        invocation = providers.build_provider_invocation(
+            provider="claude",
+            runner="exec",
+            sandbox="workspace-write",
+            prompt_path=self.prompt,
+            model="claude-test",
+            effort="high",
+            permission_mode="acceptEdits",
+        )
+
+        def fake_claude(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="--print --permission-mode --model --effort",
+                stderr="",
+            )
+
+        unknown = providers.probe_provider_capability(
+            invocation,
+            executable_finder=lambda name: f"/fake/{name}",
+            command_runner=fake_claude,
+        )
+        self.assertEqual(unknown.capability, "unknown")
+        self.assertEqual(unknown.invocation.model, "claude-test")
+        self.assertNotIn("fallback", unknown.as_record())
+
+        rejected = providers.probe_provider_capability(
+            invocation,
+            executable_finder=lambda name: f"/fake/{name}",
+            command_runner=fake_claude,
+            model_validator=lambda value: providers.ModelProbeResult(
+                "unsupported", f"model {value.model} is unavailable", returncode=2
+            ),
+        )
+        self.assertEqual(rejected.capability, "unsupported")
+        self.assertFalse(rejected.launch_allowed)
+        self.assertEqual(rejected.invocation.model, "claude-test")
+
+    def test_missing_provider_flag_is_unsupported_before_launch(self):
+        invocation = providers.build_provider_invocation(
+            provider="claude",
+            runner="exec",
+            sandbox="workspace-write",
+            prompt_path=self.prompt,
+            effort="high",
+        )
+        result = providers.probe_provider_capability(
+            invocation,
+            executable_finder=lambda name: f"/fake/{name}",
+            command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 0, stdout="--print --permission-mode", stderr=""
+            ),
+        )
+        self.assertEqual(result.capability, "unsupported")
+        self.assertIn("--effort", result.reason)
+
+
+class SupervisorPrimitiveTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.store = broker.BrokerStore(self.root / "broker")
+        self.socket_path = self.root / "runtime" / "run.sock"
+        self.metadata_path = self.root / "broker" / "owner.json"
+        self.spool = self.root / "broker" / "spool"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def make_supervisor(self, **overrides):
+        values: dict[str, Any] = {
+            "namespace": "namespace",
+            "run_id": "run-011",
+            "runtime_version": "0.5.0",
+            "manager_session_id": "session-manager",
+            "pane_id": "wH:p1",
+            "socket_path": self.socket_path,
+            "owner_metadata_path": self.metadata_path,
+            "spool_directory": self.spool,
+        }
+        values.update(overrides)
+        return supervisor.ManagerSleepSupervisor(self.store, **values)
+
+    def test_stale_socket_is_recovered_and_owned_paths_are_cleaned(self):
+        self.socket_path.parent.mkdir(parents=True)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(self.socket_path))
+        stale.close()
+        stale_inode = self.socket_path.stat().st_ino
+
+        owned = self.make_supervisor()
+        metadata = owned.acquire()
+        self.assertNotEqual(self.socket_path.stat().st_ino, stale_inode)
+        self.assertEqual(self.socket_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(broker.read_owner_metadata(self.metadata_path), metadata)
+        owned.release()
+
+        self.assertFalse(self.socket_path.exists())
+        self.assertFalse(self.metadata_path.exists())
+
+    def test_duplicate_owner_is_rejected_without_disturbing_live_owner(self):
+        first = self.make_supervisor()
+        second = self.make_supervisor(manager_session_id="session-other")
+        first.acquire()
+        with self.assertRaises(supervisor.DuplicateOwnerError):
+            second.acquire()
+        self.assertTrue(self.socket_path.exists())
+        first.release()
+
+    def test_non_socket_path_is_never_removed_as_stale_runtime_state(self):
+        self.socket_path.parent.mkdir(parents=True)
+        self.socket_path.write_text("user data", encoding="utf-8")
+        with self.assertRaises(supervisor.UnsafeSocketError):
+            self.make_supervisor().acquire()
+        self.assertEqual(self.socket_path.read_text(encoding="utf-8"), "user data")
+
+    def test_report_signal_drains_spool_and_wakes_manager(self):
+        event = client_event()
+        errors: list[BaseException] = []
+
+        def report_from_role():
+            try:
+                deadline = time.monotonic() + 2
+                while not self.socket_path.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("supervisor socket was not created")
+                    time.sleep(0.005)
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(1)
+                try:
+                    client.connect(str(self.socket_path))
+                    broker.spool_client_event(self.spool, event)
+                    client.sendall(supervisor.WAKE_SIGNAL)
+                finally:
+                    client.close()
+            except BaseException as exc:
+                errors.append(exc)
+
+        reporter = threading.Thread(target=report_from_role, daemon=True)
+        reporter.start()
+        result = self.make_supervisor().sleep(
+            timeout_seconds=2,
+            poll_interval_seconds=0.5,
+        )
+        reporter.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(result.reason, "report")
+        self.assertEqual(result.event_ids, (event["event_id"],))
+        self.assertEqual(result.drained_reports, 1)
+        self.assertEqual(list(self.spool.glob("*.json")), [])
+        self.assertFalse(self.socket_path.exists())
+        with self.store.transaction() as transaction:
+            self.assertEqual(
+                [item["event_id"] for item in self.store.inbox(transaction)],
+                [event["event_id"]],
+            )
+
+    def test_timeout_invalidates_lease_and_cleans_foreground_owner(self):
+        result = self.make_supervisor().sleep(
+            timeout_seconds=0.05,
+            poll_interval_seconds=0.01,
+        )
+        self.assertEqual(result.reason, "timeout")
+        self.assertIsNotNone(result.lease_generation)
+        self.assertFalse(self.socket_path.exists())
+        self.assertFalse(self.metadata_path.exists())
+        with self.store.transaction() as transaction:
+            self.assertFalse(
+                self.store.lease_generation_matches(
+                    transaction,
+                    run_id="run-011",
+                    generation=result.lease_generation,
+                    manager_session_id="session-manager",
+                    pane_id="wH:p1",
+                )
+            )
+
+    def test_report_present_before_sleep_is_returned_without_lost_wake(self):
+        event = client_event()
+        broker.spool_client_event(self.spool, event)
+        result = self.make_supervisor().sleep(timeout_seconds=1)
+
+        self.assertEqual(result.reason, "report")
+        self.assertEqual(result.event_ids, (event["event_id"],))
+        self.assertEqual(result.drained_reports, 1)
+        with self.store.transaction() as transaction:
+            self.assertFalse(
+                self.store.lease_generation_matches(
+                    transaction,
+                    run_id="run-011",
+                    generation=result.lease_generation,
+                    manager_session_id="session-manager",
+                    pane_id="wH:p1",
+                )
+            )
+
+    def test_timeout_terminates_hookless_herdr_wait_process(self):
+        processes = []
+
+        class PendingWaitProcess:
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return 0 if self.terminated or self.killed else None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout):
+                return 0
+
+            def kill(self):
+                self.killed = True
+
+        def fake_popen(argv, **kwargs):
+            process = PendingWaitProcess()
+            processes.append(process)
+            return process
+
+        result = self.make_supervisor(popen_factory=fake_popen).sleep(
+            timeout_seconds=0.05,
+            fallback_watches=[supervisor.FallbackWatch("wH:p9", "done")],
+            poll_interval_seconds=0.01,
+        )
+
+        self.assertEqual(result.reason, "timeout")
+        self.assertTrue(processes[0].terminated)
+        self.assertFalse(processes[0].killed)
+        self.assertFalse(self.socket_path.exists())
+
+    def test_hookless_mode_uses_herdr_blocking_wait_fallback(self):
+        hook_plan = hooks.plan_stop_hook(
+            provider="codex",
+            helper_path=self.root / "hloop",
+            namespace="namespace",
+            enabled=False,
+        )
+        self.assertFalse(hook_plan.installable)
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+
+        class FakeWaitProcess:
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                raise AssertionError("completed fallback must not be terminated")
+
+        def fake_popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return FakeWaitProcess()
+
+        result = self.make_supervisor(popen_factory=fake_popen).sleep(
+            timeout_seconds=1,
+            fallback_watches=[supervisor.FallbackWatch("wH:p9", "done")],
+        )
+
+        self.assertEqual(result.reason, "herdr-fallback")
+        self.assertEqual(result.fallback.pane_id, "wH:p9")
+        self.assertEqual(
+            calls[0][0],
+            [
+                "herdr",
+                "wait",
+                "agent-status",
+                "wH:p9",
+                "--status",
+                "done",
+                "--timeout",
+                calls[0][0][-1],
+            ],
+        )
+        self.assertGreater(int(calls[0][0][-1]), 0)
+        self.assertFalse(self.socket_path.exists())
+
+
+class HookPrimitiveTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = Path("/opt/herdr-dev-loop/scripts/hloop")
+        self.user_settings = {
+            "theme": "dark",
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python3 /home/user/check.py",
+                                "timeout": 30,
+                            }
+                        ]
+                    }
+                ],
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "echo user"}],
+                    }
+                ],
+            },
+        }
+
+    def test_claude_merge_is_idempotent_and_uninstall_preserves_user_hooks(self):
+        plan = hooks.plan_stop_hook(
+            provider="claude",
+            helper_path=self.helper,
+            namespace="namespace",
+            enabled=True,
+        )
+        self.assertTrue(plan.installable)
+        self.assertTrue(plan.reload_required)
+        merged = hooks.merge_stop_hook(self.user_settings, plan)
+        self.assertTrue(merged.changed)
+        self.assertEqual(
+            hooks.owned_stop_hook_count(merged.settings, provider="claude"), 1
+        )
+        self.assertEqual(
+            self.user_settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "python3 /home/user/check.py",
+        )
+
+        merged_again = hooks.merge_stop_hook(merged.settings, plan)
+        self.assertFalse(merged_again.changed)
+        self.assertEqual(merged_again.settings, merged.settings)
+
+        uninstalled = hooks.uninstall_stop_hook(
+            merged.settings, provider="claude"
+        )
+        self.assertTrue(uninstalled.changed)
+        self.assertEqual(uninstalled.settings, self.user_settings)
+
+    def test_codex_unknown_capability_stays_hookless_until_probe_succeeds(self):
+        unknown = hooks.plan_stop_hook(
+            provider="codex",
+            helper_path=self.helper,
+            namespace="namespace",
+            enabled=True,
+            codex_continuation_capability="unknown",
+        )
+        self.assertFalse(unknown.installable)
+        self.assertEqual(unknown.fallback, "herdr")
+        self.assertFalse(hooks.merge_stop_hook(self.user_settings, unknown).changed)
+
+        supported = hooks.plan_stop_hook(
+            provider="codex",
+            helper_path=self.helper,
+            namespace="namespace",
+            enabled=True,
+            codex_continuation_capability="supported",
+        )
+        self.assertTrue(supported.installable)
+        self.assertTrue(supported.trust_required)
+        self.assertNotIn("args", supported.handler)
+        merged = hooks.merge_stop_hook(self.user_settings, supported)
+        self.assertEqual(
+            hooks.owned_stop_hook_count(merged.settings, provider="codex"), 1
+        )
+
+    def test_uninstall_requires_exact_owner_marker_and_guard_shape(self):
+        lookalike = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    "echo 'herdr-dev-loop:manager-sleep-guard:v1 ' "
+                                    "hooks guard --provider claude"
+                                ),
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        unchanged = hooks.uninstall_stop_hook(lookalike, provider="claude")
+        self.assertFalse(unchanged.changed)
+        self.assertEqual(unchanged.settings, lookalike)
+
+    def test_guard_response_contains_only_fixed_sleep_instruction(self):
+        self.assertEqual(
+            hooks.render_stop_guard_response(
+                provider="claude", active_roles=False, valid_wake_lease=False
+            ),
+            {},
+        )
+        response = hooks.render_stop_guard_response(
+            provider="claude", active_roles=True, valid_wake_lease=False
+        )
+        self.assertEqual(
+            response["hookSpecificOutput"]["hookEventName"], "Stop"
+        )
+        self.assertIn("hloop manager sleep", str(response))
+        self.assertNotIn("role output", str(response))
+
+
+if __name__ == "__main__":
+    unittest.main()
