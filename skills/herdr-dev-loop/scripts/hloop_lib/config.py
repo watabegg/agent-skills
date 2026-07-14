@@ -20,12 +20,27 @@ from typing import Any, Iterable, Mapping, Sequence
 
 CONFIG_FILENAME = "config.toml"
 MIN_PYTHON = (3, 11)
+SUPPORTED_CONFIG_VERSIONS = (1,)
 SUPPORTED_MATCH_KINDS = ("repo", "cwd")
 DEFAULT_MATCH_KIND = "repo"
+SUPPORTED_AGENT_PROVIDERS = ("codex", "claude")
+SUPPORTED_SESSION_CLEANUP_MODES = ("archive", "none", "delete")
+SUPPORTED_REVIEW_MODES = ("single", "swarm", "dual", "dual-swarm")
+MIN_REVIEW_PROBES = 4
+MAX_REVIEW_PROBES = 8
 _KNOWN_TOP_LEVEL_KEYS = ("version", "defaults", "scope")
-_STR_ROLE_KEYS = ("provider", "model", "effort", "mode")
-_INT_ROLE_KEYS = ("probe_count", "probes_per_provider")
-_LIST_STR_ROLE_KEYS = ("providers",)
+_DEFAULT_KEYS = ("max_workers", "session_cleanup", "worker", "reviewer")
+_SCOPE_KEYS = ("path", "match", *_DEFAULT_KEYS)
+_WORKER_ROLE_KEYS = ("provider", "model", "effort")
+_REVIEWER_ROLE_KEYS = (
+    "provider",
+    "model",
+    "effort",
+    "mode",
+    "probe_count",
+    "providers",
+    "probes_per_provider",
+)
 
 
 class ConfigError(Exception):
@@ -161,63 +176,150 @@ def _expect_type(desc: str, key: str, value: Any, expected: type | tuple[type, .
     return True
 
 
-def _validate_role_table(desc: str, table: Any, errors: list[str]) -> None:
+def _reject_unknown_keys(desc: str, table: Mapping, allowed: Sequence[str], errors: list[str]) -> None:
+    unknown_keys = sorted(set(table) - set(allowed))
+    if unknown_keys:
+        errors.append(f"{desc} has unknown or forbidden key(s): {', '.join(unknown_keys)}")
+
+
+def _validate_enum(desc: str, key: str, value: Any, allowed: Sequence[str], errors: list[str]) -> None:
+    if _expect_type(desc, key, value, str, errors) and value not in allowed:
+        errors.append(f"{desc}.{key} must be one of {tuple(allowed)}, got {value!r}")
+
+
+def _validate_non_empty_string(desc: str, key: str, value: Any, errors: list[str]) -> None:
+    if _expect_type(desc, key, value, str, errors) and not value.strip():
+        errors.append(f"{desc}.{key} must not be empty")
+
+
+def _validate_int_range(
+    desc: str,
+    key: str,
+    value: Any,
+    errors: list[str],
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> None:
+    if not _expect_type(desc, key, value, int, errors):
+        return
+    if value < minimum or maximum is not None and value > maximum:
+        expected = f">= {minimum}" if maximum is None else f"between {minimum} and {maximum}"
+        errors.append(f"{desc}.{key} must be {expected}, got {value}")
+
+
+def _validate_role_table(desc: str, table: Any, errors: list[str], *, role: str) -> None:
     if not isinstance(table, Mapping):
         errors.append(f"{desc} must be a table")
         return
-    for key in _STR_ROLE_KEYS:
+    allowed_keys = _WORKER_ROLE_KEYS if role == "worker" else _REVIEWER_ROLE_KEYS
+    _reject_unknown_keys(desc, table, allowed_keys, errors)
+
+    if "provider" in table:
+        _validate_enum(desc, "provider", table["provider"], SUPPORTED_AGENT_PROVIDERS, errors)
+    for key in ("model", "effort"):
         if key in table:
-            _expect_type(desc, key, table[key], str, errors)
-    for key in _INT_ROLE_KEYS:
+            _validate_non_empty_string(desc, key, table[key], errors)
+
+    if role != "reviewer":
+        return
+    if "mode" in table:
+        _validate_enum(desc, "mode", table["mode"], SUPPORTED_REVIEW_MODES, errors)
+    for key in ("probe_count", "probes_per_provider"):
         if key in table:
-            _expect_type(desc, key, table[key], int, errors)
-    for key in _LIST_STR_ROLE_KEYS:
-        if key in table and key in table:
-            value = table[key]
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                errors.append(f"{desc}.{key} must be a list of strings")
+            _validate_int_range(
+                desc,
+                key,
+                table[key],
+                errors,
+                minimum=MIN_REVIEW_PROBES,
+                maximum=MAX_REVIEW_PROBES,
+            )
+    if "providers" in table:
+        value = table["providers"]
+        if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+            errors.append(f"{desc}.providers must be a non-empty list of strings")
+        else:
+            invalid = sorted(set(value) - set(SUPPORTED_AGENT_PROVIDERS))
+            if invalid:
+                errors.append(
+                    f"{desc}.providers entries must be one of {SUPPORTED_AGENT_PROVIDERS}, "
+                    f"got {', '.join(invalid)}"
+                )
 
 
 def _validate_defaults_table(desc: str, table: Any, errors: list[str]) -> None:
     if not isinstance(table, Mapping):
         errors.append(f"{desc} must be a table")
         return
+    _reject_unknown_keys(desc, table, _DEFAULT_KEYS, errors)
     if "max_workers" in table:
-        _expect_type(desc, "max_workers", table["max_workers"], int, errors)
+        _validate_int_range(desc, "max_workers", table["max_workers"], errors, minimum=1)
     if "session_cleanup" in table:
-        _expect_type(desc, "session_cleanup", table["session_cleanup"], str, errors)
+        _validate_enum(
+            desc,
+            "session_cleanup",
+            table["session_cleanup"],
+            SUPPORTED_SESSION_CLEANUP_MODES,
+            errors,
+        )
     for role_key in ("worker", "reviewer"):
         if role_key in table:
-            _validate_role_table(f"{desc}.{role_key}", table[role_key], errors)
+            _validate_role_table(f"{desc}.{role_key}", table[role_key], errors, role=role_key)
 
 
 def _validate_scope_entry(desc: str, entry: Any, errors: list[str]) -> None:
     if not isinstance(entry, Mapping):
         errors.append(f"{desc} must be a table")
         return
+    _reject_unknown_keys(desc, entry, _SCOPE_KEYS, errors)
     if "path" not in entry:
         errors.append(f"{desc}.path is required")
-    elif not _expect_type(desc, "path", entry["path"], str, errors):
-        pass
+    elif _expect_type(desc, "path", entry["path"], str, errors):
+        try:
+            expanded_path = Path(entry["path"]).expanduser()
+        except RuntimeError:
+            errors.append(f"{desc}.path cannot expand user home: {entry['path']!r}")
+        else:
+            if not expanded_path.is_absolute():
+                errors.append(
+                    f"{desc}.path must be absolute (or start with '~'); relative paths are cwd-dependent"
+                )
     if "match" in entry:
         match_kind = entry["match"]
         if not isinstance(match_kind, str) or match_kind not in SUPPORTED_MATCH_KINDS:
             errors.append(
                 f"{desc}.match must be one of {SUPPORTED_MATCH_KINDS}, got {match_kind!r}"
             )
+    if "max_workers" in entry:
+        _validate_int_range(desc, "max_workers", entry["max_workers"], errors, minimum=1)
+    if "session_cleanup" in entry:
+        _validate_enum(
+            desc,
+            "session_cleanup",
+            entry["session_cleanup"],
+            SUPPORTED_SESSION_CLEANUP_MODES,
+            errors,
+        )
     for role_key in ("worker", "reviewer"):
         if role_key in entry:
-            _validate_role_table(f"{desc}.{role_key}", entry[role_key], errors)
+            _validate_role_table(f"{desc}.{role_key}", entry[role_key], errors, role=role_key)
 
 
-def _scope_dedupe_key(entry: Mapping, base: str | os.PathLike | None) -> tuple[str, Path] | None:
+def _scope_dedupe_key(entry: Mapping, _base: str | os.PathLike | None) -> tuple[str, Path] | None:
     path_value = entry.get("path")
     if not isinstance(path_value, str):
+        return None
+    try:
+        expanded_path = Path(path_value).expanduser()
+    except RuntimeError:
+        return None
+    if not expanded_path.is_absolute():
         return None
     match_kind = entry.get("match", DEFAULT_MATCH_KIND)
     if not isinstance(match_kind, str):
         return None
-    return (match_kind, canonicalize_path(path_value, base))
+    return (match_kind, canonicalize_path(expanded_path))
 
 
 def validate_config(data: Mapping, *, base: str | os.PathLike | None = None) -> None:
@@ -239,7 +341,11 @@ def validate_config(data: Mapping, *, base: str | os.PathLike | None = None) -> 
     if "version" not in data:
         errors.append("version is required")
     else:
-        _expect_type("config", "version", data["version"], int, errors)
+        version = data["version"]
+        if _expect_type("config", "version", version, int, errors) and version not in SUPPORTED_CONFIG_VERSIONS:
+            errors.append(
+                f"config.version must be one of {SUPPORTED_CONFIG_VERSIONS}, got {version}"
+            )
 
     if "defaults" in data:
         _validate_defaults_table("defaults", data["defaults"], errors)

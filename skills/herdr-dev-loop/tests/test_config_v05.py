@@ -170,6 +170,11 @@ class ValidateConfigTests(unittest.TestCase):
         with self.assertRaises(config.ConfigValidationError):
             config.validate_config({"version": "1"})
 
+    def test_unsupported_version_is_error(self):
+        for version in (0, 2):
+            with self.subTest(version=version), self.assertRaises(config.ConfigValidationError):
+                config.validate_config({"version": version})
+
     def test_bool_rejected_for_int_field(self):
         with self.assertRaises(config.ConfigValidationError):
             config.validate_config({"version": 1, "defaults": {"max_workers": True}})
@@ -178,6 +183,57 @@ class ValidateConfigTests(unittest.TestCase):
         with self.assertRaises(config.ConfigValidationError):
             config.validate_config({"version": 1, "bogus": {}})
 
+    def test_unknown_or_forbidden_nested_keys_are_errors(self):
+        invalid_configs = {
+            "defaults": {"version": 1, "defaults": {"bogus": True}},
+            "worker": {"version": 1, "defaults": {"worker": {"setup_command": "echo unsafe"}}},
+            "worker-review-option": {"version": 1, "defaults": {"worker": {"mode": "single"}}},
+            "reviewer": {"version": 1, "defaults": {"reviewer": {"bogus": True}}},
+            "scope": {"version": 1, "scope": [{"path": "/tmp", "bogus": True}]},
+            "scope-role": {
+                "version": 1,
+                "scope": [{"path": "/tmp", "reviewer": {"setup_command": "echo unsafe"}}],
+            },
+        }
+        for name, data in invalid_configs.items():
+            with self.subTest(name=name), self.assertRaises(config.ConfigValidationError):
+                config.validate_config(data)
+
+    def test_invalid_enum_values_are_errors(self):
+        invalid_configs = {
+            "cleanup": {"version": 1, "defaults": {"session_cleanup": "later"}},
+            "worker-provider": {"version": 1, "defaults": {"worker": {"provider": "other"}}},
+            "reviewer-provider": {"version": 1, "defaults": {"reviewer": {"provider": "other"}}},
+            "reviewer-providers": {
+                "version": 1,
+                "defaults": {"reviewer": {"providers": ["codex", "other"]}},
+            },
+            "review-mode": {"version": 1, "defaults": {"reviewer": {"mode": "many"}}},
+            "scoped-cleanup": {"version": 1, "scope": [{"path": "/tmp", "session_cleanup": "later"}]},
+        }
+        for name, data in invalid_configs.items():
+            with self.subTest(name=name), self.assertRaises(config.ConfigValidationError):
+                config.validate_config(data)
+
+    def test_invalid_integer_ranges_are_errors(self):
+        invalid_configs = {
+            "zero-workers": {"version": 1, "defaults": {"max_workers": 0}},
+            "negative-scope-workers": {"version": 1, "scope": [{"path": "/tmp", "max_workers": -1}]},
+            "too-few-probes": {"version": 1, "defaults": {"reviewer": {"probe_count": 3}}},
+            "too-many-probes": {"version": 1, "defaults": {"reviewer": {"probe_count": 9}}},
+            "too-few-provider-probes": {
+                "version": 1,
+                "defaults": {"reviewer": {"probes_per_provider": 3}},
+            },
+            "too-many-provider-probes": {
+                "version": 1,
+                "defaults": {"reviewer": {"probes_per_provider": 9}},
+            },
+        }
+        for name, data in invalid_configs.items():
+            with self.subTest(name=name), self.assertRaises(config.ConfigValidationError):
+                config.validate_config(data)
+
     def test_scope_missing_path_is_error(self):
         with self.assertRaises(config.ConfigValidationError):
             config.validate_config({"version": 1, "scope": [{"match": "repo"}]})
@@ -185,6 +241,16 @@ class ValidateConfigTests(unittest.TestCase):
     def test_scope_invalid_match_is_error(self):
         with self.assertRaises(config.ConfigValidationError):
             config.validate_config({"version": 1, "scope": [{"path": "~/x", "match": "bogus"}]})
+
+    def test_relative_scope_path_is_error_regardless_of_base(self):
+        data = {"version": 1, "scope": [{"path": "."}, {"path": "."}]}
+        messages = []
+        for base in ("/tmp/repo", "/tmp/repo/nested"):
+            with self.subTest(base=base), self.assertRaises(config.ConfigValidationError) as ctx:
+                config.validate_config(data, base=base)
+            messages.append(str(ctx.exception))
+        self.assertIn("relative paths are cwd-dependent", messages[0])
+        self.assertEqual(messages[0], messages[1])
 
     def test_duplicate_scope_same_match_and_path_is_error(self):
         data = {
@@ -356,6 +422,17 @@ class ResolveConfigTests(unittest.TestCase):
         self.assertEqual(resolution.get("worker", "model"), "opus")
         self.assertEqual(resolution.source_of("worker", "model"), "task-override")
 
+    def test_scope_can_override_valid_default_values(self):
+        config_data = {
+            "version": 1,
+            "defaults": {"max_workers": 2, "session_cleanup": "archive"},
+            "scope": [{"path": str(self.root), "max_workers": 4, "session_cleanup": "none"}],
+        }
+        resolution = config.resolve_config({}, config_data, target_dir=self.nested)
+        self.assertEqual(resolution.get("max_workers"), 4)
+        self.assertEqual(resolution.get("session_cleanup"), "none")
+        self.assertTrue(resolution.source_of("max_workers").startswith("scope:repo:"))
+
     def test_repo_scope_independent_of_subdirectory(self):
         config_data = {"version": 1, "scope": [{"path": str(self.root), "worker": {"provider": "claude"}}]}
         deeper = self.nested / "deeper"
@@ -364,6 +441,14 @@ class ResolveConfigTests(unittest.TestCase):
         resolution_deep = config.resolve_config({}, config_data, target_dir=deeper)
         self.assertEqual(resolution_shallow.get("worker", "provider"), "claude")
         self.assertEqual(resolution_deep.get("worker", "provider"), "claude")
+
+    def test_relative_scope_cannot_change_result_by_invocation_directory(self):
+        config_data = {"version": 1, "scope": [{"path": ".", "worker": {"provider": "claude"}}]}
+        deeper = self.nested / "deeper"
+        deeper.mkdir()
+        for target_dir in (self.root, deeper):
+            with self.subTest(target_dir=target_dir), self.assertRaises(config.ConfigValidationError):
+                config.resolve_config({}, config_data, target_dir=target_dir)
 
     def test_cwd_scope_only_matches_explicit_directory(self):
         config_data = {
