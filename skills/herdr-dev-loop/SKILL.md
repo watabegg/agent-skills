@@ -64,6 +64,8 @@ When sending additional instructions to a running TUI, use `hloop worker message
 
 Every long-running role uses `hloop agent report` for semantic `ack`, `milestone`, `attention`, and `completion` events. ACK binds the role's understood goal, scope, acceptance, and approach before material edits. A completion report is communication, not proof; harvest still verifies the artifact, SHA, write scope, and validation. See `references/report-protocol.md`.
 
+Treat agents running under the same OS UID as trusted collaborators. Attempt credentials prevent accidental report misdelivery, stale-attempt reuse, and role-identity mix-ups; they do not isolate secrets from a malicious same-UID process, cryptographically authenticate the Manager, or create a strong sandbox boundary. Role launch commands inherit a best-effort context marker. From that context, `hloop inbox list|show|ack` and `hloop manager next|sleep` refuse accidental use and try to journal the rejection in the Manager checkout, but this guard is not a security boundary. Semantic ACK is an integration gate for finalize, harvest, and merge, not OS-level prevention of pre-ACK filesystem writes.
+
 Inspect running agents with `hloop worker watch <task-id>`, `hloop gap watch <gap-id>`, or `hloop reviewer watch <review-id>`. Use direct `herdr pane read` only for debugging the helper itself.
 
 For ordinary progress, use `hloop inbox list` and `hloop manager next`. When the inbox has no actionable event, register a bounded wake lease with `hloop manager sleep`. The broker provides durable at-least-once delivery, so acknowledge a handled event with `hloop inbox ack <event-id>` and deduplicate by event ID and lease generation.

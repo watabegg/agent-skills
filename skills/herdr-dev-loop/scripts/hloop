@@ -169,6 +169,10 @@ DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
 DEFAULT_PUMP_SLEEP_MS = 2_000
 DEFAULT_WAIT_TIMEOUT_MS = 300_000
 DEFAULT_WAIT_POLL_MS = 5_000
+ROLE_CONTEXT_ENV = "HLOOP_ROLE_CONTEXT"
+ROLE_ID_ENV = "HLOOP_ROLE_ID"
+ROLE_ATTEMPT_ID_ENV = "HLOOP_ROLE_ATTEMPT_ID"
+MANAGER_REPO_ENV = "HLOOP_MANAGER_REPO"
 REVIEW_ARTIFACT_STATUSES = {"reported", "blocked", "failed"}
 GAP_ARTIFACT_STATUSES = {"aligned", "gaps-found", "blocked", "failed"}
 FIX_TASK_PRIORITIES = {"P0", "P1", "P2", "P3"}
@@ -8578,6 +8582,8 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=role_id,
+        attempt_id=attempt_id,
         output_rel=artifact_rel if runner == "exec" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {command_text}"
@@ -8856,6 +8862,8 @@ def start_decision_liaison(
         runner="tui",
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=role_id,
+        attempt_id=attempt_id,
     )
     command = f"cd {shlex.quote(str(worktree))} && {command_text}"
     worktree_preexisting = worktree.exists()
@@ -11656,6 +11664,8 @@ def role_agent_command(
     runner: str,
     prompt_rel: Path,
     cwd: Path,
+    role_id: str,
+    attempt_id: str,
     output_rel: Path | None = None,
 ) -> tuple[str, hloop_providers.ProviderInvocation]:
     writable = [git_common_dir(repo)] if config["provider"] == "codex" else []
@@ -11677,7 +11687,14 @@ def role_agent_command(
     command = agent_command_from_invocation(
         invocation, provider=provider, runner=runner, prompt_rel=prompt_rel, output_rel=output_rel
     )
-    return command, invocation
+    context = {
+        ROLE_CONTEXT_ENV: "1",
+        ROLE_ID_ENV: role_id,
+        ROLE_ATTEMPT_ID_ENV: attempt_id,
+        MANAGER_REPO_ENV: str(repo.resolve()),
+    }
+    prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in context.items())
+    return f"{prefix} {command}", invocation
 
 
 def ensure_worker_attempt(
@@ -11721,7 +11738,9 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     task_state.setdefault("root_branch", branch)
     integration = state["integration_branch"]
     current_base_sha = git(repo, ["rev-parse", integration])
-    ensure_worker_attempt(task_id, task_state, task_meta, integration, current_base_sha)
+    attempt_id, _ = ensure_worker_attempt(
+        task_id, task_state, task_meta, integration, current_base_sha
+    )
     require_role_snapshot(repo, state, integration, worker_snapshot_paths(task_id))
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id, state)
     prompt = render_worker_prompt(task_id, task_meta, worktree, branch, state)
@@ -11737,7 +11756,13 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
         },
     )
     agent_command, preview_invocation = role_agent_command(
-        repo, agent_config, runner=runner, prompt_rel=prompt_rel, cwd=worktree
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        role_id=task_id,
+        attempt_id=attempt_id,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if args.dry_run:
@@ -11781,7 +11806,13 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
         },
     )
     agent_command, provider_invocation = role_agent_command(
-        repo, agent_config, runner=runner, prompt_rel=prompt_rel, cwd=worktree
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        role_id=task_id,
+        attempt_id=attempt_id,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     if not branch_exists(repo, integration):
@@ -13938,6 +13969,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     )
     mode = topology["mode"]
     review_id = args.review_id or next_id("R", state.setdefault("reviews", {}))
+    attempt_id = f"{review_id}-A001"
     if review_id in state["reviews"]:
         raise HLoopError(f"review already exists: {review_id}")
     base = args.base or state["base_branch"]
@@ -13992,6 +14024,8 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=review_id,
+        attempt_id=attempt_id,
         output_rel=review_rel if runner == "exec" and mode == "single" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -14042,7 +14076,6 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         if mode != "single"
         else review_file(repo, review_id)
     )
-    attempt_id = f"{review_id}-A001"
     prompt_without_identity = render_reviewer_prompt(
         review_id,
         base,
@@ -14059,6 +14092,8 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=review_id,
+        attempt_id=attempt_id,
         output_rel=review_rel if runner == "exec" and mode == "single" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -14523,6 +14558,8 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=gap_id,
+        attempt_id=attempt_id,
         output_rel=gap_rel if runner == "exec" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -14570,6 +14607,8 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=gap_id,
+        attempt_id=attempt_id,
         output_rel=gap_rel if runner == "exec" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -15033,6 +15072,8 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     advice_id = args.advice_id
     advice_state = require_advice_state(state, advice_id)
     participant_id = args.participant_id
+    role_id = f"{advice_id}/{participant_id}"
+    attempt_id = f"{advice_id}-{participant_id}-A001"
     participant = find_advisor_participant(advice_state, participant_id)
     if participant.get("status") not in {"queued", "failed"}:
         raise HLoopError(
@@ -15074,6 +15115,8 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=role_id,
+        attempt_id=attempt_id,
         output_rel=advice_rel if runner == "exec" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -15094,8 +15137,6 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     participant["model"] = agent_config["model"]
     prepare_advisor_dialogue_start(state, advice_state, participant)
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
-    role_id = f"{advice_id}/{participant_id}"
-    attempt_id = f"{advice_id}-{participant_id}-A001"
     prompt_without_identity = render_advisor_prompt(
         advice_id,
         participant,
@@ -15111,6 +15152,8 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
         runner=runner,
         prompt_rel=prompt_rel,
         cwd=worktree,
+        role_id=role_id,
+        attempt_id=attempt_id,
         output_rel=advice_rel if runner == "exec" else None,
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -17167,7 +17210,71 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def manager_consumer_preflight(args: argparse.Namespace, command: str) -> None:
+    """Reject accidental Manager-consumer use inherited from a subordinate role.
+
+    This context is an ordinary same-UID environment marker, not an
+    authentication boundary.  A same-UID process can remove or replace it.
+    """
+
+    if os.environ.get(ROLE_CONTEXT_ENV) != "1":
+        return
+
+    role_id = str(os.environ.get(ROLE_ID_ENV) or "")
+    attempt_id = str(os.environ.get(ROLE_ATTEMPT_ID_ENV) or "")
+    manager_repo_raw = str(os.environ.get(MANAGER_REPO_ENV) or "")
+    manager_repo: Path | None = None
+    reason = "subordinate-context"
+
+    if not role_id or not attempt_id:
+        reason = "malformed-role-context"
+    elif not manager_repo_raw:
+        reason = "manager-context-unavailable"
+    else:
+        try:
+            manager_repo = Path(manager_repo_raw).expanduser().resolve()
+            manager_state = load_state(manager_repo)
+            try:
+                _, role_state = resolve_agent_state(manager_state, role_id)
+            except HLoopError:
+                reason = "wrong-role"
+            else:
+                active_attempt = str(
+                    role_state.get("attempt_id")
+                    or role_state.get("active_attempt_id")
+                    or ""
+                )
+                if not active_attempt or active_attempt != attempt_id:
+                    reason = "stale-attempt"
+        except (HLoopError, OSError, json.JSONDecodeError):
+            reason = "manager-context-unavailable"
+
+    audit = {
+        "command": command,
+        "reason": reason,
+        "role_id": role_id or "missing",
+        "attempt_id": attempt_id or "missing",
+        "requested_repo": str(getattr(args, "repo", ".")),
+    }
+    if manager_repo is not None:
+        try:
+            journal_path = loop_path(manager_repo) / "JOURNAL.md"
+            if journal_path.is_file():
+                journal(
+                    manager_repo,
+                    "Rejected Manager consumer command from subordinate role context: "
+                    + json.dumps(audit, sort_keys=True),
+                )
+        except Exception:  # best-effort audit must never weaken the rejection
+            pass
+    raise HLoopError(
+        f"Manager consumer command `{command}` is unavailable from subordinate "
+        f"role context ({reason}: {role_id or 'unknown'}/{attempt_id or 'unknown'})"
+    )
+
+
 def cmd_inbox_list(args: argparse.Namespace) -> int:
+    manager_consumer_preflight(args, "inbox list")
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     store = _open_broker_store(repo)
@@ -17184,6 +17291,7 @@ def cmd_inbox_list(args: argparse.Namespace) -> int:
 
 
 def cmd_inbox_show(args: argparse.Namespace) -> int:
+    manager_consumer_preflight(args, "inbox show")
     repo = repo_root(Path(args.repo).resolve())
     store = _open_broker_store(repo)
     with store.transaction() as txn:
@@ -17195,6 +17303,7 @@ def cmd_inbox_show(args: argparse.Namespace) -> int:
 
 
 def cmd_inbox_ack(args: argparse.Namespace) -> int:
+    manager_consumer_preflight(args, "inbox ack")
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     store = _open_broker_store(repo)
@@ -17212,6 +17321,7 @@ def cmd_inbox_ack(args: argparse.Namespace) -> int:
 
 
 def cmd_manager_sleep(args: argparse.Namespace) -> int:
+    manager_consumer_preflight(args, "manager sleep")
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     run_id = str(state.get("run_id") or "local")
@@ -17306,6 +17416,7 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
 
 
 def cmd_manager_next(args: argparse.Namespace) -> int:
+    manager_consumer_preflight(args, "manager next")
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     store = _open_broker_store(repo)
