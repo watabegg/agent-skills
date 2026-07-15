@@ -19,6 +19,7 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 
@@ -725,12 +726,383 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def scenario_scout_liaison_reports(ctx: dict[str, Any]) -> dict[str, Any]:
+    root: Path = ctx["root"]
+    repo: Path = ctx["repo"]
+    env: dict[str, str] = ctx["env"]
+    namespace: str = ctx["namespace"]
+    path = state_path(repo, namespace)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    previous_namespace = hloop.LOOP_NAMESPACE
+    hloop.configure_loop_namespace(namespace)
+    try:
+        identities: dict[str, tuple[str, str, Path]] = {}
+        state.setdefault("decision_liaisons", {})
+        for role_id, attempt_id in (
+            ("S001", "S001-A001"),
+            ("L-D001", "L-D001-A001"),
+        ):
+            digest = hashlib.sha256(role_id.encode("utf-8")).hexdigest()
+            credential, floor = hloop.register_role_report_identity_and_ack_floor(
+                repo,
+                state,
+                role_id=role_id,
+                attempt_id=attempt_id,
+                task_contract_digest=digest,
+            )
+            require(
+                stat.S_IMODE(credential.stat().st_mode) == 0o600,
+                f"{role_id} credential is not mode 0600",
+            )
+            role_state = {
+                "role_id": role_id,
+                "status": "running",
+                "gate_status": "running",
+                "attempt_no": 1,
+                "attempt_id": attempt_id,
+                "skill_version": ctx["runtime_version"],
+                "task_contract_digest": digest,
+            }
+            hloop.arm_initial_semantic_ack_barrier(
+                role_state,
+                attempt_id=attempt_id,
+                contract_digest=digest,
+                required_reack_after_sequence=floor,
+            )
+            if role_id == "S001":
+                state["specification_scout_run"] = role_state
+            else:
+                state["decision_liaisons"]["D001"] = {
+                    **role_state,
+                    "decision_id": "D001",
+                }
+            identities[role_id] = (attempt_id, digest, credential)
+        hloop.save_state(repo, state)
+
+        def send_report(role_id: str, report_type: str, label: str) -> str:
+            attempt_id, digest, credential = identities[role_id]
+            event_id = str(uuid.uuid4())
+            completion = report_type == "completion"
+            attention = report_type == "attention"
+            command = hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "report",
+                "--role-id",
+                role_id,
+                "--attempt-id",
+                attempt_id,
+                "--run-id",
+                state["run_id"],
+                "--task-contract-digest",
+                digest,
+                "--report-credential-file",
+                str(credential),
+                "--event-id",
+                event_id,
+                "--type",
+                report_type,
+                "--stage",
+                "completed" if completion else ("blocked" if attention else "planning"),
+                "--summary",
+                label,
+                "--next",
+                "Manager handoff" if completion else "wait for Manager",
+                "--evidence-ref",
+                "skills/herdr-dev-loop/scripts/hloop:1",
+            )
+            if report_type == "ack":
+                command.extend(
+                    [
+                        "--understood-goal",
+                        f"perform {role_id}",
+                        "--scope",
+                        "decision artifact only",
+                        "--acceptance",
+                        "Manager approves before material work",
+                        "--approach",
+                        "use the shared report contract",
+                    ]
+                )
+            elif attention:
+                command.extend(
+                    [
+                        "--impact",
+                        "Manager must inspect the decision role",
+                        "--attempted",
+                        "persisted role evidence",
+                        "--option-text",
+                        "inspect the durable report",
+                        "--recommendation",
+                        "inspect and respond",
+                        "--blocked-scope",
+                        "decision role",
+                    ]
+                )
+            else:
+                command.extend(
+                    [
+                        "--artifact",
+                        "decisions/artifact.md",
+                        "--head-sha",
+                        "a" * 40,
+                        "--validation-result-ref",
+                        "synthetic role validation",
+                        "--residual-risk",
+                        "none",
+                        "--handoff",
+                        "Manager may harvest",
+                    ]
+                )
+            run(command, cwd=root, env=env)
+            return event_id
+
+        send_report("S001", "ack", "Scout contract understood")
+        run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "S001",
+                "--decision",
+                "approve",
+                "--reason",
+                "Scout scope confirmed",
+            ),
+            cwd=root,
+            env=env,
+        )
+
+        send_report("L-D001", "ack", "Liaison first ACK")
+        run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "L-D001",
+                "--decision",
+                "reject",
+                "--reason",
+                "question wording incomplete",
+            ),
+            cwd=root,
+            env=env,
+        )
+        stale = run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "L-D001",
+                "--decision",
+                "approve",
+                "--reason",
+                "stale ACK must fail",
+            ),
+            cwd=root,
+            env=env,
+            expected={1, 2},
+        )
+        require("corrected semantic ACK" in stale.stderr, "reject did not require re-ACK")
+        send_report("L-D001", "ack", "Liaison corrected ACK")
+        run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "L-D001",
+                "--decision",
+                "approve",
+                "--reason",
+                "corrected ACK accepted",
+            ),
+            cwd=root,
+            env=env,
+        )
+
+        state = json.loads(path.read_text(encoding="utf-8"))
+        liaison = state["decision_liaisons"]["D001"]
+        liaison["pane_id"] = "synthetic-liaison-pane"
+        hloop.save_state(repo, state)
+        original_preflight = hloop.preflight_loop
+        original_send = hloop.send_agent_tui_message
+        try:
+            hloop.preflight_loop = lambda *_args, **_kwargs: state
+            hloop.send_agent_tui_message = lambda *_args, **_kwargs: None
+            hloop.cmd_agent_message(
+                SimpleNamespace(
+                    repo=str(repo),
+                    agent_id="L-D001",
+                    message="Use the revised public wording",
+                    file=None,
+                    timeout_ms=10,
+                    input_settle_ms=0,
+                    submit_verify_ms=1,
+                    submit_attempts=1,
+                    contract_changing=True,
+                )
+            )
+        finally:
+            hloop.preflight_loop = original_preflight
+            hloop.send_agent_tui_message = original_send
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["decision_liaisons"]["D001"].pop("pane_id", None)
+        hloop.save_state(repo, state)
+        run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "L-D001",
+                "--decision",
+                "timeout",
+                "--reason",
+                "Manager approval timed out",
+            ),
+            cwd=root,
+            env=env,
+        )
+        timed_out = run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "L-D001",
+                "--decision",
+                "approve",
+                "--reason",
+                "pre-timeout ACK must fail",
+            ),
+            cwd=root,
+            env=env,
+            expected={1, 2},
+        )
+        require("corrected semantic ACK" in timed_out.stderr, "timeout did not require re-ACK")
+        send_report("L-D001", "ack", "Liaison ACK after timeout")
+        run(
+            hloop_command(
+                repo,
+                namespace,
+                "agent",
+                "ack",
+                "resolve",
+                "L-D001",
+                "--decision",
+                "approve",
+                "--reason",
+                "fresh ACK after timeout",
+            ),
+            cwd=root,
+            env=env,
+        )
+
+        attention_ids = {
+            role_id: send_report(role_id, "attention", f"{role_id} needs attention")
+            for role_id in identities
+        }
+        completion_ids = {
+            role_id: send_report(role_id, "completion", f"{role_id} completed")
+            for role_id in identities
+        }
+        pending = run(
+            hloop_command(repo, namespace, "manager", "next"), cwd=root, env=env
+        )
+        require("S001" in pending.stdout, "Scout completion did not reach Manager inbox")
+        require("L-D001" in pending.stdout, "Liaison completion did not reach Manager inbox")
+
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["specification_scout_run"].update(
+            {"attempt_id": "S001-A002", "pane_id": "synthetic-scout", "status": "running"}
+        )
+        state["decision_liaisons"]["D001"].update(
+            {
+                "attempt_id": "L-D001-A002",
+                "pane_id": "synthetic-liaison",
+                "status": "running",
+            }
+        )
+        hloop.save_state(repo, state)
+        captured: dict[str, Any] = {}
+
+        class FakeSleepSupervisor:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def sleep(self, *, timeout_seconds, fallback_watches):
+                captured["watches"] = list(fallback_watches)
+                return SimpleNamespace(
+                    lease_generation=1,
+                    reason="fallback",
+                    event_ids=(),
+                    drained_reports=0,
+                    fallback=SimpleNamespace(
+                        pane_id="synthetic-scout", status="done", returncode=0
+                    ),
+                )
+
+        original_supervisor = hloop.hloop_supervisor.ManagerSleepSupervisor
+        try:
+            hloop.hloop_supervisor.ManagerSleepSupervisor = FakeSleepSupervisor
+            hloop.cmd_manager_sleep(
+                SimpleNamespace(
+                    repo=str(repo),
+                    ttl_seconds=1,
+                    manager_session_id="synthetic-manager",
+                    pane_id="synthetic-manager-pane",
+                )
+            )
+        finally:
+            hloop.hloop_supervisor.ManagerSleepSupervisor = original_supervisor
+        watches = {(item.pane_id, item.status) for item in captured["watches"]}
+        for pane_id in ("synthetic-scout", "synthetic-liaison"):
+            require(
+                {status for pane, status in watches if pane == pane_id}
+                == set(hloop.hloop_supervisor.FALLBACK_STATUSES),
+                f"no-report fallback watches missing for {pane_id}",
+            )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        for role_id in ("S001", "L-D001"):
+            hloop.revoke_active_role_report_identity(repo, state, role_id)
+        state["specification_scout_run"].update(
+            {"status": "aborted", "gate_status": "aborted"}
+        )
+        state["specification_scout_run"].pop("pane_id", None)
+        state["decision_liaisons"].pop("D001", None)
+        hloop.save_state(repo, state)
+        return {
+            "scout_ack_approved": True,
+            "liaison_reject_reack": True,
+            "liaison_timeout_reack": True,
+            "contract_changing_message": True,
+            "attention_events": attention_ids,
+            "completion_events": completion_ids,
+            "no_report_fallback_roles": ["S001", "L-D001"],
+        }
+    finally:
+        hloop.configure_loop_namespace(previous_namespace)
+
+
 def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
     root: Path = ctx["root"]
     repo: Path = ctx["repo"]
     env: dict[str, str] = ctx["env"]
     namespace: str = ctx["namespace"]
     path = state_path(repo, namespace)
+    no_herdr_env = dict(env)
+    no_herdr_env.pop("HERDR_ENV", None)
     secret = "synthetic-secret-abcdefghijklmnop"
     run(
         hloop_command(
@@ -862,13 +1234,20 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
             "safer migration",
         ),
         cwd=root,
-        env=env,
+        env=no_herdr_env,
     )
     question_path = path.parent / "decisions" / "D001" / "QUESTION.md"
     require(question_path.is_file(), "decision question artifact missing")
     require("# 判断のお願い" in question_path.read_text(encoding="utf-8"), "liaison question is not plain Japanese")
-    no_herdr_env = dict(env)
-    no_herdr_env.pop("HERDR_ENV", None)
+    attention_state = json.loads(path.read_text(encoding="utf-8"))
+    require(
+        attention_state["decision_attention"]["D001"]["status"] == "manager-fallback",
+        "decision attention fallback was not recorded",
+    )
+    require(
+        len(attention_state.get("decision_attention_events") or []) == 1,
+        "decision attention was not emitted exactly once",
+    )
     run(
         hloop_command(
             repo,
@@ -952,6 +1331,10 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
     )
     final_state = json.loads(path.read_text(encoding="utf-8"))
     require(final_state["decisions"]["D001"]["status"] == "accepted", "decision not resolved")
+    require(
+        len(final_state.get("decision_attention_events") or []) == 1,
+        "decision attention was duplicated by response or resolution refresh",
+    )
     artifact_paths = [
         path.parent / "requirements" / "REQUIREMENTS.md",
         path.parent / "requirements" / "STATUS.md",
@@ -968,6 +1351,7 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
         "decision_status": final_state["decisions"]["D001"]["status"],
         "scout_status": final_state["specification_scout_run"]["status"],
         "liaison_mode": final_state["decision_liaisons"]["D001"]["mode"],
+        "decision_attention_idempotent": True,
     }
 
 
@@ -1164,6 +1548,7 @@ SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = 
     ("merge-conflict-recovery", scenario_merge_conflict_recovery),
     ("cleanup-gate-resolution", scenario_cleanup_gate_resolution),
     ("report-broker-sleep-wake-recovery", scenario_report_broker),
+    ("scout-liaison-report-ack-attention", scenario_scout_liaison_reports),
     ("requirements-decisions-outcomes", scenario_requirements_decisions),
     ("dual-review-and-budget", scenario_review_budget),
     ("final-gate-and-finish", scenario_finish),
