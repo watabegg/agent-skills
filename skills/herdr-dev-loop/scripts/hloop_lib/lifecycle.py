@@ -230,7 +230,7 @@ _MERGE_OPERATIONS = {
 
 @dataclass(frozen=True, slots=True)
 class MergeTransaction:
-    """Immutable merge observations plus the transaction's current status."""
+    """Merge identity plus append-only cherry-pick progress observations."""
 
     transaction_id: str
     task_id: str
@@ -242,6 +242,10 @@ class MergeTransaction:
     index_state: str
     changed_paths: tuple[str, ...]
     status: str = MERGE_ACTIVE
+    mode: str = "squash"
+    source_commits: tuple[str, ...] = ()
+    applied_commits: tuple[str, ...] = ()
+    applied_head: str = ""
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -257,17 +261,44 @@ class MergeTransaction:
             _required_text(getattr(self, field_name), field_name)
         if self.status not in _MERGE_TRANSITIONS:
             raise ValueError(f"unknown merge transaction status: {self.status}")
+        if self.mode not in {"squash", "cherry-pick"}:
+            raise ValueError(f"unknown merge transaction mode: {self.mode}")
         if any(not isinstance(path, str) or not path.strip() for path in self.changed_paths):
             raise ValueError("changed_paths must not contain empty paths")
         if len(set(self.changed_paths)) != len(self.changed_paths):
             raise ValueError("changed_paths must be unique")
+        if any(not isinstance(commit, str) or not commit.strip() for commit in self.source_commits):
+            raise ValueError("source_commits must not contain empty commits")
+        if len(set(self.source_commits)) != len(self.source_commits):
+            raise ValueError("source_commits must be unique")
+        if any(
+            not isinstance(commit, str) or not commit.strip()
+            for commit in self.applied_commits
+        ):
+            raise ValueError("applied_commits must not contain empty commits")
+        if self.mode == "squash" and (self.source_commits or self.applied_commits):
+            raise ValueError("squash transactions cannot record cherry-pick commits")
+        if self.mode == "cherry-pick" and not self.source_commits:
+            raise ValueError("cherry-pick transactions require source_commits")
+        if self.applied_commits != self.source_commits[: len(self.applied_commits)]:
+            raise ValueError("applied_commits must be a prefix of source_commits")
+        if self.status == MERGE_COMPLETED and self.mode == "cherry-pick":
+            if self.applied_commits != self.source_commits:
+                raise ValueError("completed cherry-pick must record the full applied prefix")
         object.__setattr__(self, "changed_paths", tuple(sorted(self.changed_paths)))
+        object.__setattr__(self, "applied_head", self.applied_head or self.pre_merge_head)
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "MergeTransaction":
         paths = record.get("changed_paths") or ()
         if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
             raise ValueError("changed_paths must be a sequence")
+        source_commits = record.get("source_commits") or ()
+        if isinstance(source_commits, (str, bytes)) or not isinstance(source_commits, Sequence):
+            raise ValueError("source_commits must be a sequence")
+        applied_commits = record.get("applied_commits") or ()
+        if isinstance(applied_commits, (str, bytes)) or not isinstance(applied_commits, Sequence):
+            raise ValueError("applied_commits must be a sequence")
         return cls(
             transaction_id=_required_text(record.get("transaction_id"), "transaction_id"),
             task_id=_required_text(record.get("task_id"), "task_id"),
@@ -281,6 +312,12 @@ class MergeTransaction:
             ),
             changed_paths=tuple(sorted(str(path) for path in paths)),
             status=str(record.get("status") or MERGE_ACTIVE),
+            mode=str(record.get("mode") or "squash"),
+            source_commits=tuple(str(commit) for commit in source_commits),
+            applied_commits=tuple(str(commit) for commit in applied_commits),
+            applied_head=str(
+                record.get("applied_head") or record.get("pre_merge_head") or ""
+            ),
         )
 
     def immutable_identity(self) -> tuple[Any, ...]:
@@ -294,6 +331,8 @@ class MergeTransaction:
             self.result_head,
             self.index_state,
             self.changed_paths,
+            self.mode,
+            self.source_commits,
         )
 
     def to_record(self) -> dict[str, Any]:
@@ -308,6 +347,10 @@ class MergeTransaction:
             "index_state": self.index_state,
             "changed_paths": list(self.changed_paths),
             "status": self.status,
+            "mode": self.mode,
+            "source_commits": list(self.source_commits),
+            "applied_commits": list(self.applied_commits),
+            "applied_head": self.applied_head,
         }
 
 
@@ -360,6 +403,34 @@ def validate_merge_transaction(
             LifecycleIssue(
                 "manual-integration-trace",
                 "merge transaction identity or recorded Git observations changed outside the transaction",
+                prior.transaction_id,
+                severity="P0",
+            )
+        )
+    if candidate.applied_commits[: len(prior.applied_commits)] != prior.applied_commits:
+        issues.append(
+            LifecycleIssue(
+                "manual-integration-trace",
+                "merge transaction applied prefix was rewritten or truncated",
+                prior.transaction_id,
+                severity="P0",
+            )
+        )
+    elif candidate.applied_commits == prior.applied_commits:
+        if candidate.applied_head != prior.applied_head:
+            issues.append(
+                LifecycleIssue(
+                    "manual-integration-trace",
+                    "merge transaction HEAD changed without extending the applied prefix",
+                    prior.transaction_id,
+                    severity="P0",
+                )
+            )
+    elif candidate.applied_head == prior.applied_head:
+        issues.append(
+            LifecycleIssue(
+                "manual-integration-trace",
+                "merge transaction applied prefix advanced without a new HEAD",
                 prior.transaction_id,
                 severity="P0",
             )

@@ -18,6 +18,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -2070,6 +2071,16 @@ def manager_message_submitted(
             return True
         if agent_output_after_message(provider, message, text):
             return True
+        if (
+            normalize_agent_provider(provider) == "codex"
+            and text != typed_snapshot
+            and message_visible_in_text(message, text)
+        ):
+            # Codex can move the submitted input into the transcript before it
+            # exposes a Working marker or assistant bullet.  The changed pane
+            # snapshot plus the still-visible exact input is transport evidence;
+            # classifying it as undelivered would make a retry duplicate work.
+            return True
         if session_id and session_id != initial_session_id and text != typed_snapshot:
             return True
         if time.monotonic() >= deadline:
@@ -2111,28 +2122,43 @@ def send_agent_tui_message(
     check_herdr_env()
     initial_pane, _ = wait_agent_tui_ready(provider, pane_id, timeout_ms)
     initial_session_id = extract_agent_session_id(initial_pane)
-    run_cmd(["herdr", "pane", "send-text", pane_id, message], check=True, capture=True)
-    typed_snapshot = wait_manager_message_visible(
-        pane_id,
-        message,
-        max(input_settle_ms, 1_000),
-    )
+    try:
+        run_cmd(["herdr", "pane", "send-text", pane_id, message], check=True, capture=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise HLoopError("manager message could not be typed into the agent pane") from exc
+    try:
+        typed_snapshot = wait_manager_message_visible(
+            pane_id,
+            message,
+            max(input_settle_ms, 1_000),
+        )
+    except HLoopError as exc:
+        raise ManagerMessageDeliveryUnknown(
+            "send-text succeeded but input visibility could not be confirmed; "
+            "delivery is unknown and must not be auto-retried"
+        ) from exc
     if input_settle_ms > 0:
         time.sleep(input_settle_ms / 1000)
     attempts = max(1, submit_attempts)
-    for attempt in range(attempts):
-        run_cmd(["herdr", "pane", "send-keys", pane_id, "Enter"], check=True, capture=True)
-        if manager_message_submitted(
-            provider,
-            pane_id,
-            message,
-            typed_snapshot,
-            initial_session_id,
-            submit_verify_ms,
-        ):
-            return
-        if attempt + 1 < attempts and input_settle_ms > 0:
-            time.sleep(input_settle_ms / 1000)
+    try:
+        for attempt in range(attempts):
+            run_cmd(["herdr", "pane", "send-keys", pane_id, "Enter"], check=True, capture=True)
+            if manager_message_submitted(
+                provider,
+                pane_id,
+                message,
+                typed_snapshot,
+                initial_session_id,
+                submit_verify_ms,
+            ):
+                return
+            if attempt + 1 < attempts and input_settle_ms > 0:
+                time.sleep(input_settle_ms / 1000)
+    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
+        raise ManagerMessageDeliveryUnknown(
+            "manager message was visibly typed before submission verification failed; "
+            "delivery is unknown and must not be auto-retried"
+        ) from exc
     raise ManagerMessageDeliveryUnknown(
         f"manager message was typed and Enter was sent {attempts} time(s), but submission "
         "could not be visually confirmed"
@@ -5265,7 +5291,7 @@ def render_advisor_prompt(
     state: dict[str, Any],
     output_rel: Path,
     head_sha: str = "",
-    report_token: str = "",
+    report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
 ) -> str:
@@ -5314,7 +5340,7 @@ Source artifacts or code references:
 
 Peer advice artifacts for bounded cross-model dialogue:
 {peer_lines}
-{report_contract_text(f"{advice_id}/{participant_id}", attempt_id or f"{advice_id}-{participant_id}-A001", state, report_token=report_token, task_contract_digest=task_contract_digest)}
+{report_contract_text(f"{advice_id}/{participant_id}", attempt_id or f"{advice_id}-{participant_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 
 Rules:
 - Do not edit code.
@@ -5346,18 +5372,19 @@ def report_contract_text(
     attempt_id: str,
     state: dict[str, Any],
     *,
-    report_token: str,
+    report_credential_file: str,
     task_contract_digest: str,
 ) -> str:
-    if not report_token:
+    if not report_credential_file:
         return ""
     run_id = str(state.get("run_id") or "local")
+    credential_ref = shlex.quote(str(report_credential_file))
     return f"""
 Reporting: send ack, milestone, attention, and completion reports as your understanding, risk, or progress changes (see skills/herdr-dev-loop/references/report-protocol.md). Every report must include the exact identity below:
 ```
 python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent report \\
   --role-id {role_id} --attempt-id {attempt_id} --run-id {run_id} \\
-  --task-contract-digest {task_contract_digest} --report-token {report_token} \\
+  --task-contract-digest {task_contract_digest} --report-credential-file {credential_ref} \\
   --type ack --stage <stage> --summary '<summary>' --next '<next action>' ...
 ```
 After the initial read-only investigation, send the semantic `ack` and stop before material work. Resume only after the Manager explicitly approves that ACK and sends the approval notice. A reject or timeout requires a corrected, new ACK event.
@@ -5374,7 +5401,7 @@ def register_role_report_identity(
 ) -> str:
     """Register one fail-closed report identity and return its attempt-scoped token."""
 
-    token, _ = register_role_report_identity_and_ack_floor(
+    token, _ = _register_role_report_identity_and_ack_floor(
         repo,
         state,
         role_id=role_id,
@@ -5391,8 +5418,35 @@ def register_role_report_identity_and_ack_floor(
     role_id: str,
     attempt_id: str,
     task_contract_digest: str,
+) -> tuple[Path, int]:
+    """Register an identity and persist its credential outside the worktree."""
+
+    token, ack_floor = _register_role_report_identity_and_ack_floor(
+        repo,
+        state,
+        role_id=role_id,
+        attempt_id=attempt_id,
+        task_contract_digest=task_contract_digest,
+    )
+    credential_file = write_role_report_credential(
+        repo,
+        state,
+        role_id=role_id,
+        attempt_id=attempt_id,
+        token=token,
+    )
+    return credential_file, ack_floor
+
+
+def _register_role_report_identity_and_ack_floor(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+    task_contract_digest: str,
 ) -> tuple[str, int]:
-    """Register an identity and return the token plus its prior ACK watermark."""
+    """Register an identity and return its in-memory token and ACK watermark."""
 
     token = secrets.token_hex(32)
     store = _open_broker_store(repo)
@@ -5514,7 +5568,7 @@ def render_worker_prompt(
     branch: str,
     state: dict[str, Any],
     *,
-    report_token: str = "",
+    report_credential_file: str = "",
     task_contract_digest: str = "",
 ) -> str:
     worker_protocol = str(task_meta.get("worker_protocol") or state_value(state, "worker_protocol", DEFAULT_WORKER_PROTOCOL))
@@ -5554,7 +5608,7 @@ Loop profile:
 - Agent backend: {agent_display(agent_config)}
 - Run ID: {str(state.get("run_id") or "")}
 - Fixed Worker base SHA: {str(task_meta.get("base_sha") or "")}
-{report_contract_text(task_id, str(task_meta.get("attempt_id") or task_id), state, report_token=report_token, task_contract_digest=task_contract_digest)}
+{report_contract_text(task_id, str(task_meta.get("attempt_id") or task_id), state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 {protocol}
 
 Rules:
@@ -5676,7 +5730,7 @@ def render_reviewer_prompt(
     agent_config: dict[str, str] | None = None,
     head_sha: str = "",
     review_plan: hloop_review.ReviewGroupPlan | None = None,
-    report_token: str = "",
+    report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
 ) -> str:
@@ -5765,7 +5819,7 @@ Review profile:
 - Review lanes: {", ".join(lanes)}
 - Review mode: {mode}
 - Agent backend: {agent_display(agent_config)}
-{report_contract_text(review_id, attempt_id or f"{review_id}-A001", state, report_token=report_token, task_contract_digest=task_contract_digest)}
+{report_contract_text(review_id, attempt_id or f"{review_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 
 {protocol}
 
@@ -5795,7 +5849,7 @@ def render_gap_prompt(
     state: dict[str, Any] | None = None,
     agent_config: dict[str, str] | None = None,
     head_sha: str = "",
-    report_token: str = "",
+    report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
 ) -> str:
@@ -5829,7 +5883,7 @@ Read:
 
 Spec sources:
 {source_lines}
-{report_contract_text(gap_id, attempt_id or f"{gap_id}-A001", state or {}, report_token=report_token, task_contract_digest=task_contract_digest)}
+{report_contract_text(gap_id, attempt_id or f"{gap_id}-A001", state or {}, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 
 Rules:
 - Do not edit code.
@@ -9561,7 +9615,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
         prepare_role_worktree(repo, worktree, state, role="worker", agent_id=task_id)
         ensure_task_visible_in_worktree(worktree, task_id)
         ensure_worktree_parent_dirs(worktree, prompt_rel, LOOP_DIR / "results" / task_id / "result.md")
-        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+        report_credential_file, initial_ack_floor = register_role_report_identity_and_ack_floor(
             repo,
             state,
             role_id=task_id,
@@ -9574,7 +9628,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             worktree,
             branch,
             state,
-            report_token=report_token,
+            report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
         )
         write_text(worktree / prompt_rel, prompt)
@@ -9976,6 +10030,8 @@ def build_merge_transaction(
     index_state: str,
     changed_paths: Sequence[str],
     status: str = MERGE_ACTIVE,
+    mode: str = "squash",
+    source_commits: Sequence[str] = (),
 ) -> MergeTransaction:
     return MergeTransaction(
         transaction_id=f"M-{task_id}-{attempt_id}",
@@ -9988,28 +10044,116 @@ def build_merge_transaction(
         index_state=index_state,
         changed_paths=tuple(changed_paths),
         status=status,
+        mode=mode,
+        source_commits=tuple(source_commits),
+        applied_head=pre_merge_head,
     )
 
 
-def observed_merge_transaction(repo: Path, transaction: MergeTransaction) -> MergeTransaction:
+def merge_git_dir(repo: Path) -> Path:
+    return Path(git(repo, ["rev-parse", "--path-format=absolute", "--git-dir"])).resolve()
+
+
+def cherry_pick_todo_commits(repo: Path, todo_path: Path) -> tuple[str, ...]:
+    commits: list[str] = []
+    for raw_line in read_text(todo_path).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2 or fields[0] != "pick":
+            raise HLoopError("cherry-pick sequencer todo was modified outside HLoop")
+        commits.append(git(repo, ["rev-parse", f"{fields[1]}^{{commit}}"]))
+    return tuple(commits)
+
+
+def observe_cherry_pick_progress(
+    repo: Path,
+    transaction: MergeTransaction,
+    *,
+    allow_completed: bool,
+) -> tuple[tuple[str, ...], str]:
+    """Bind live sequencer state to the immutable source commit sequence."""
+
+    start_head = transaction.pre_merge_head
+    current_head = git(repo, ["rev-parse", "HEAD"])
+    git_dir = merge_git_dir(repo)
+    sequencer = git_dir / "sequencer"
+    source_commits = transaction.source_commits
+    if sequencer.is_dir():
+        try:
+            sequencer_head = read_text(sequencer / "head").strip()
+            abort_safety = read_text(sequencer / "abort-safety").strip()
+            remaining = cherry_pick_todo_commits(repo, sequencer / "todo")
+        except HLoopError:
+            raise
+        except OSError as exc:
+            raise HLoopError("cherry-pick sequencer metadata is incomplete") from exc
+        if sequencer_head != start_head:
+            raise HLoopError("cherry-pick sequencer start HEAD does not match the transaction")
+        if abort_safety != current_head:
+            raise HLoopError("cherry-pick sequencer abort-safety was modified outside HLoop")
+        applied_count = len(source_commits) - len(remaining)
+        if applied_count < 0 or remaining != source_commits[applied_count:]:
+            raise HLoopError("cherry-pick sequencer todo is not the expected source suffix")
+        cherry_pick_head = git_dir / "CHERRY_PICK_HEAD"
+        if cherry_pick_head.exists():
+            current_source = read_text(cherry_pick_head).strip()
+            if not remaining or current_source != remaining[0]:
+                raise HLoopError("CHERRY_PICK_HEAD does not match the sequencer todo")
+        elif transaction.status == MERGE_CONTENT_CONFLICT:
+            raise HLoopError("conflicted cherry-pick is missing CHERRY_PICK_HEAD")
+        applied = source_commits[:applied_count]
+    else:
+        if transaction.status == MERGE_CONTENT_CONFLICT and not allow_completed:
+            raise HLoopError("conflicted cherry-pick sequencer is missing")
+        if current_head == start_head:
+            applied = ()
+        elif allow_completed:
+            applied = source_commits
+        else:
+            raise HLoopError("cherry-pick HEAD advanced without an active sequencer")
+    if not is_ancestor(repo, start_head, current_head):
+        raise HLoopError("cherry-pick HEAD is no longer descended from the transaction start")
+    applied_count = int(
+        git(repo, ["rev-list", "--first-parent", "--count", f"{start_head}..{current_head}"])
+    )
+    if applied_count != len(applied):
+        raise HLoopError(
+            "cherry-pick applied prefix does not match first-parent HEAD progress"
+        )
+    return tuple(applied), current_head
+
+
+def observed_merge_transaction(
+    repo: Path,
+    transaction: MergeTransaction,
+    *,
+    allow_completed: bool = False,
+) -> MergeTransaction:
     """Recompute the transaction's Git-observed identity fields right now.
 
     Used to detect an out-of-band reset, manual commit, or Worker-branch merge
     that happened outside the transaction while a merge was active or conflicted.
     """
 
-    head = git(repo, ["rev-parse", "HEAD"])
     worker_head = (
         git(repo, ["rev-parse", transaction.branch])
         if branch_exists(repo, transaction.branch)
         else transaction.worker_head
     )
-    index_state = merge_transaction_index_state(repo, "HEAD")
+    if transaction.mode == "cherry-pick":
+        applied_commits, applied_head = observe_cherry_pick_progress(
+            repo, transaction, allow_completed=allow_completed
+        )
+    else:
+        applied_commits = transaction.applied_commits
+        applied_head = git(repo, ["rev-parse", "HEAD"])
     return dataclass_replace(
         transaction,
-        pre_merge_head=head,
         worker_head=worker_head,
-        index_state=index_state,
+        applied_commits=applied_commits,
+        applied_head=applied_head,
     )
 
 
@@ -10021,8 +10165,25 @@ def preflight_merge_transaction(repo: Path, active: dict[str, Any], op: str) -> 
     observations no longer match the recorded transaction identity.
     """
 
+    record = dict(active)
+    if str(record.get("mode") or "squash") == "cherry-pick" and not record.get(
+        "source_commits"
+    ):
+        # A pre-0.5 transaction already stored the immutable Worker base and
+        # head but not the source sequence.  Reconstruct that sequence before
+        # validating live progress so an in-flight recovery can be upgraded
+        # without weakening the prefix/sequencer checks.
+        worker_base = str(record.get("worker_base_sha") or "")
+        worker_head = str(record.get("worker_head") or "")
+        if not worker_base or not worker_head:
+            raise HLoopError(
+                "legacy cherry-pick transaction is missing Worker base/head identity"
+            )
+        record["source_commits"] = git(
+            repo, ["rev-list", "--reverse", f"{worker_base}..{worker_head}"]
+        ).splitlines()
     try:
-        prior = MergeTransaction.from_record(active)
+        prior = MergeTransaction.from_record(record)
     except (TypeError, ValueError) as exc:
         raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
     allowed = allowed_merge_operations(prior.status)
@@ -10042,9 +10203,14 @@ def preflight_merge_transaction(repo: Path, active: dict[str, Any], op: str) -> 
 
 
 def transition_merge_transaction(
-    repo: Path, state: dict[str, Any], prior: MergeTransaction, status: str
+    repo: Path,
+    state: dict[str, Any],
+    prior: MergeTransaction,
+    status: str,
+    *,
+    observed: MergeTransaction | None = None,
 ) -> MergeTransaction:
-    candidate = dataclass_replace(prior, status=status)
+    candidate = dataclass_replace(observed or prior, status=status)
     result = validate_merge_transaction(prior, candidate)
     result.raise_for_errors()
     if status in (MERGE_ABORTED, MERGE_COMPLETED):
@@ -10061,7 +10227,13 @@ def cmd_merge_abort(repo: Path, state: dict[str, Any], task_id: str) -> int:
     if str(active.get("task_id") or "") != task_id:
         raise HLoopError(f"no active merge transaction for {task_id}")
     prior = preflight_merge_transaction(repo, active, "abort")
-    git(repo, ["reset", "--merge", prior.pre_merge_head])
+    if prior.mode == "cherry-pick" and (merge_git_dir(repo) / "sequencer").is_dir():
+        git(repo, ["cherry-pick", "--abort"])
+    else:
+        git(repo, ["reset", "--merge", prior.pre_merge_head])
+    restored_head = git(repo, ["rev-parse", "HEAD"])
+    if restored_head != prior.pre_merge_head:
+        raise HLoopError("merge abort did not restore the transaction start HEAD")
     transition_merge_transaction(repo, state, prior, MERGE_ABORTED)
     state["tasks"][task_id]["status"] = "result_reported"
     state["tasks"][task_id].pop("merge_error", None)
@@ -10087,8 +10259,35 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
     if not staged:
         raise HLoopError("merge continue has no staged changes")
     mode = str(active.get("mode") or state.get("merge_mode") or "squash")
-    git(repo, ["commit", "-m", f"ai-loop({task_id}): {mode} {state['tasks'][task_id]['branch']}"])
-    transition_merge_transaction(repo, state, prior, MERGE_COMPLETED)
+    if mode == "cherry-pick":
+        try:
+            git(repo, ["cherry-pick", "--continue"])
+        except subprocess.CalledProcessError as exc:
+            observed = observed_merge_transaction(repo, prior)
+            transition_merge_transaction(
+                repo,
+                state,
+                prior,
+                MERGE_CONTENT_CONFLICT,
+                observed=observed,
+            )
+            state["tasks"][task_id]["status"] = "blocked_merge_conflict"
+            state["tasks"][task_id]["merge_error"] = command_error_detail(exc)
+            state["phase"] = "blocked_conflict"
+            save_state(repo, state)
+            journal(
+                repo,
+                f"Cherry-pick continue for `{task_id}` reached another conflict after "
+                f"{len(observed.applied_commits)} applied commit(s).",
+            )
+            raise
+        observed = observed_merge_transaction(repo, prior, allow_completed=True)
+        transition_merge_transaction(
+            repo, state, prior, MERGE_COMPLETED, observed=observed
+        )
+    else:
+        git(repo, ["commit", "-m", f"ai-loop({task_id}): {mode} {state['tasks'][task_id]['branch']}"])
+        transition_merge_transaction(repo, state, prior, MERGE_COMPLETED)
     complete_merge_state(repo, state, task_id, mode)
     print(f"continued merge {task_id}")
     return 0
@@ -10195,6 +10394,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
             commits = git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"])
             print(f"DRY RUN git cherry-pick {' '.join(commits.splitlines())}")
         return 0
+    commits = (
+        git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"]).splitlines()
+        if mode == "cherry-pick"
+        else []
+    )
+    if mode == "cherry-pick" and not commits:
+        raise HLoopError(f"no commits to cherry-pick for {task_id}")
     attempt_id = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or f"{task_id}-A001")
     pre_merge_head = git(repo, ["rev-parse", "HEAD"])
     transaction = build_merge_transaction(
@@ -10205,6 +10411,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         worker_head=actual_head,
         index_state=merge_transaction_index_state(repo, "HEAD"),
         changed_paths=files,
+        mode=mode,
+        source_commits=commits,
     )
     state["active_merge"] = {
         **transaction.to_record(),
@@ -10230,14 +10438,18 @@ def cmd_merge(args: argparse.Namespace) -> int:
                     )
             git(repo, ["commit", "-m", f"ai-loop({task_id}): squash {branch}"])
         else:
-            commits = git(repo, ["rev-list", "--reverse", f"{base_sha}..{actual_head}"]).splitlines()
-            if not commits:
-                raise HLoopError(f"no commits to cherry-pick for {task_id}")
             git(repo, ["cherry-pick", *commits])
     except subprocess.CalledProcessError as exc:
         detail = command_error_detail(exc)
+        observed = observed_merge_transaction(repo, transaction)
         if is_environment_git_error(detail):
-            transition_merge_transaction(repo, state, transaction, MERGE_ENVIRONMENT_FAILURE)
+            transition_merge_transaction(
+                repo,
+                state,
+                transaction,
+                MERGE_ENVIRONMENT_FAILURE,
+                observed=observed,
+            )
             task_state["status"] = "blocked_environment"
             task_state["merge_error"] = detail
             state["phase"] = "blocked_environment"
@@ -10251,7 +10463,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
                 f"```text\n{detail}\n```\n",
             )
             raise HLoopError(f"merge blocked by git/environment state for {task_id}: {detail}") from exc
-        transition_merge_transaction(repo, state, transaction, MERGE_CONTENT_CONFLICT)
+        transition_merge_transaction(
+            repo,
+            state,
+            transaction,
+            MERGE_CONTENT_CONFLICT,
+            observed=observed,
+        )
         task_state["status"] = "blocked_merge_conflict"
         state["phase"] = "blocked_conflict"
         save_state(repo, state)
@@ -10261,7 +10479,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
             f"\n## Merge conflict for {task_id}\n\nResolve or abort the merge for `{branch}`.\n",
         )
         raise exc
-    transition_merge_transaction(repo, state, transaction, MERGE_COMPLETED)
+    if mode == "cherry-pick":
+        observed = observed_merge_transaction(repo, transaction, allow_completed=True)
+        transition_merge_transaction(
+            repo, state, transaction, MERGE_COMPLETED, observed=observed
+        )
+    else:
+        transition_merge_transaction(repo, state, transaction, MERGE_COMPLETED)
     complete_merge_state(repo, state, task_id, mode)
     print(f"merged {task_id}")
     return 0
@@ -10756,7 +10980,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         prepare_role_worktree(repo, worktree, state, role="reviewer", agent_id=review_id)
         ensure_review_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, review_rel)
-        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+        report_credential_file, initial_ack_floor = register_role_report_identity_and_ack_floor(
             repo,
             state,
             role_id=review_id,
@@ -10771,7 +10995,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             agent_config=agent_config,
             head_sha=head_sha,
             review_plan=review_plan,
-            report_token=report_token,
+            report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
         )
@@ -11267,7 +11491,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         prepare_role_worktree(repo, worktree, state, role="gap", agent_id=gap_id)
         ensure_gap_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, gap_rel)
-        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+        report_credential_file, initial_ack_floor = register_role_report_identity_and_ack_floor(
             repo,
             state,
             role_id=gap_id,
@@ -11282,7 +11506,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             state,
             agent_config=agent_config,
             head_sha=head_sha,
-            report_token=report_token,
+            report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
         )
@@ -11809,7 +12033,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
         )
         ensure_advisor_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, advice_rel)
-        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+        report_credential_file, initial_ack_floor = register_role_report_identity_and_ack_floor(
             repo,
             state,
             role_id=role_id,
@@ -11823,7 +12047,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             state,
             advice_rel,
             head_sha=head_sha,
-            report_token=report_token,
+            report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
         )
@@ -13142,6 +13366,161 @@ def broker_transport_root(repo: Path) -> Path:
     return git_common_dir(repo) / "herdr-dev-loop-broker" / LOOP_NAMESPACE
 
 
+def report_credential_root(repo: Path) -> Path:
+    """Return the private, worktree-shared directory for role credentials."""
+
+    directory = broker_transport_root(repo) / "credentials"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise HLoopError("report credential directory must not be a symlink")
+    try:
+        directory.chmod(0o700)
+    except OSError as exc:
+        raise HLoopError(f"cannot secure report credential directory: {exc}") from exc
+    metadata = directory.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise HLoopError("report credential directory must be owned by the current user with mode 0700")
+    return directory
+
+
+def role_report_credential_path(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+) -> Path:
+    identity = "\0".join(
+        (
+            LOOP_NAMESPACE,
+            str(state.get("run_id") or "local"),
+            role_id,
+            attempt_id,
+        )
+    )
+    name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
+    return report_credential_root(repo) / name
+
+
+def write_role_report_credential(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+    token: str,
+) -> Path:
+    """Atomically persist one attempt credential without a world-readable window."""
+
+    destination = role_report_credential_path(
+        repo, state, role_id=role_id, attempt_id=attempt_id
+    )
+    payload = {
+        "schema_version": 1,
+        "namespace": LOOP_NAMESPACE,
+        "run_id": str(state.get("run_id") or "local"),
+        "role_id": role_id,
+        "attempt_id": attempt_id,
+        "token": token,
+    }
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(payload, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        destination.chmod(0o600)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return destination.resolve()
+
+
+def read_role_report_credential(
+    repo: Path,
+    credential_file: str,
+    *,
+    run_id: str,
+    role_id: str,
+    attempt_id: str,
+) -> str:
+    """Load and bind a private credential without echoing its secret in errors."""
+
+    root = report_credential_root(repo).resolve()
+    path = Path(credential_file).expanduser().resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HLoopError("report credential file is outside the local credential store") from exc
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise HLoopError(f"cannot open report credential file: {exc.strerror or exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HLoopError("report credential file must be a regular file")
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise HLoopError(
+                "report credential file must be owned by the current user with mode 0600"
+            )
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            payload = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HLoopError("report credential file is unreadable or invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    expected = {
+        "schema_version": 1,
+        "namespace": LOOP_NAMESPACE,
+        "run_id": run_id,
+        "role_id": role_id,
+        "attempt_id": attempt_id,
+    }
+    if not isinstance(payload, dict) or any(payload.get(key) != value for key, value in expected.items()):
+        raise HLoopError("report credential identity does not match this report")
+    token = str(payload.get("token") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        raise HLoopError("report credential token is invalid")
+    return token
+
+
+def remove_role_report_credential(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+) -> None:
+    path = role_report_credential_path(repo, state, role_id=role_id, attempt_id=attempt_id)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def broker_root(repo: Path) -> Path:
     return broker_transport_root(repo) / "store"
 
@@ -13295,9 +13674,17 @@ def cmd_hooks_guard(args: argparse.Namespace) -> int:
 def revoke_active_role_report_identity(repo: Path, state: dict[str, Any], role_id: str) -> None:
     """Revoke a role before completing a lifecycle transition, or fail closed."""
 
+    attempt_id = ""
     try:
         store = _open_broker_store(repo)
         with store.transaction() as txn:
+            current = store._latest_active_role(  # noqa: SLF001 - same-runtime storage contract
+                txn,
+                run_id=str(state.get("run_id") or "local"),
+                role_id=role_id,
+            )
+            if current is not None:
+                attempt_id = str(current.get("attempt_id") or "")
             store.revoke_active_role(
                 txn, run_id=str(state.get("run_id") or "local"), role_id=role_id
             )
@@ -13305,6 +13692,15 @@ def revoke_active_role_report_identity(repo: Path, state: dict[str, Any], role_i
         raise HLoopError(
             f"could not revoke report identity for {role_id}; lifecycle transition is blocked: {exc}"
         ) from exc
+    if attempt_id:
+        try:
+            remove_role_report_credential(
+                repo, state, role_id=role_id, attempt_id=attempt_id
+            )
+        except OSError as exc:
+            raise HLoopError(
+                f"could not remove report credential for {role_id}: {exc.strerror or exc}"
+            ) from exc
 
 
 def cmd_agent_report(args: argparse.Namespace) -> int:
@@ -13315,6 +13711,19 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
     # broker transport lives outside `LOOP_DIR`, see `broker_transport_root`),
     # so only fall back to reading it when the caller omitted --run-id.
     run_id = args.run_id or (str(load_state(repo).get("run_id") or "local") if _has_local_state(repo) else "local")
+    direct_token = str(getattr(args, "report_token", None) or "")
+    credential_file = str(getattr(args, "report_credential_file", None) or "")
+    if direct_token and credential_file:
+        raise HLoopError("use only one report credential source")
+    report_token = direct_token
+    if credential_file:
+        report_token = read_role_report_credential(
+            repo,
+            credential_file,
+            run_id=run_id,
+            role_id=str(args.role_id or ""),
+            attempt_id=str(args.attempt_id or ""),
+        )
     report_type = args.type
     report: dict[str, Any] = {
         "run_id": run_id,
@@ -13366,13 +13775,13 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
     try:
         store = _open_broker_store(repo)
         with store.transaction() as txn:
-            if not getattr(args, "report_token", None) or not store.authenticate_role_report(
+            if not report_token or not store.authenticate_role_report(
                 txn,
                 run_id=client_event["run_id"],
                 role_id=client_event["role_id"],
                 attempt_id=client_event["attempt_id"],
                 task_contract_digest=client_event["task_contract_digest"],
-                token=str(args.report_token or ""),
+                token=report_token,
             ):
                 raise _Unauthenticated(
                     "report does not match a registered active "
@@ -13406,7 +13815,7 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
                 "role_id": client_event["role_id"],
                 "attempt_id": client_event["attempt_id"],
                 "task_contract_digest": client_event["task_contract_digest"],
-                "token": str(args.report_token or ""),
+                "token": report_token,
             },
         )
         try:
@@ -15484,9 +15893,14 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument("--run-id")
     agent_report.add_argument("--event-id")
     agent_report.add_argument("--task-contract-digest")
-    agent_report.add_argument(
+    report_credential = agent_report.add_mutually_exclusive_group()
+    report_credential.add_argument(
         "--report-token",
-        help="private token issued at role start; required for every role report",
+        help="legacy direct token input; generated prompts use a private credential file",
+    )
+    report_credential.add_argument(
+        "--report-credential-file",
+        help="0600 attempt credential issued in local-only storage at role start",
     )
     agent_report.add_argument(
         "--type", choices=["ack", "milestone", "attention", "completion"], required=True

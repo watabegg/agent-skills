@@ -11,7 +11,7 @@ herdr-dev-loop 0.5.0 treats role progress as structured input to the Manager. Re
 
 Every report is bound to `run_id`, role and attempt identity, task contract digest, stage, summary, next action, evidence references, timestamp, and a client event UUID. The broker assigns the monotonic sequence. Reusing the same event ID with different content is rejected.
 
-Every long-running Worker, Reviewer, Gap Auditor, and Advisor participant receives a registered report token in its rendered prompt. Reports from an unknown role, revoked role, stale attempt, mismatched contract digest, or wrong token fail closed. The fallback spool is local-only and carries the same private authentication envelope; replay reauthenticates it before accepting the event.
+Every long-running Worker, Reviewer, Gap Auditor, and Advisor participant receives an attempt-scoped credential file path in its rendered prompt. The token itself is stored under the repository Git common directory in a local-only file owned by the current user with mode `0600`; it never appears in a repository prompt, checkpoint, state diagnostic, or provider command. Reports from an unknown role, revoked role, stale attempt, mismatched contract digest, unreadable or over-permissive credential file, or wrong token fail closed. The fallback spool is local-only and carries the same private authentication envelope; replay reauthenticates it before accepting the event.
 
 ## Sending a semantic report
 
@@ -20,6 +20,7 @@ The role submits reports through the repository-local helper. The following ACK 
 ```bash
 $HLOOP agent report \
   --role-id T001 --attempt-id T001-A001 \
+  --report-credential-file /private/local-only/credential.json \
   --type ack --stage planning \
   --summary '契約と実装範囲を確認した' \
   --understood-goal '対象機能を契約どおり実装する' \
@@ -64,6 +65,6 @@ Manager messages durably distinguish `delivered`, `acknowledged`, `applied`, `un
 
 ## Recovery and privacy
 
-`hloop broker status` reports event, inbox, spool, and owner counts. `hloop broker recover` is the supported recovery path after an interrupted broker. Broker databases, sockets, spool files, raw inputs, inbox records, tokens, and process metadata are local-only artifacts. They must not enter `branch-history` checkpoints, product commits, public test fixtures, or release bundles.
+`hloop broker status` reports event, inbox, spool, and owner counts. `hloop broker recover` is the supported recovery path after an interrupted broker. Broker databases, sockets, spool files, credential files, raw inputs, inbox records, tokens, and process metadata are local-only artifacts. Credential files must remain `0600`; diagnostics may identify a credential path or permission problem but must not print the token. These artifacts must not enter `branch-history` checkpoints, product commits, public test fixtures, or release bundles.
 
 Herdr pane inspection remains a fallback for a role that exits, crashes, or never sends a report. It is not a substitute for the structured report protocol and must not become periodic progress polling.

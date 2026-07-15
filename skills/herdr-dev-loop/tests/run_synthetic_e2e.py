@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -539,16 +540,28 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
     previous_namespace = hloop.LOOP_NAMESPACE
     hloop.configure_loop_namespace(namespace)
     try:
+        t001_credential, _ = hloop.register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id="T001",
+            attempt_id="T001-A001",
+            task_contract_digest=t001_digest,
+        )
+        t001_token = json.loads(t001_credential.read_text(encoding="utf-8"))["token"]
+        require(
+            stat.S_IMODE(t001_credential.stat().st_mode) == 0o600,
+            "role report credential is not mode 0600",
+        )
+        report_contract = hloop.report_contract_text(
+            "T001",
+            "T001-A001",
+            state,
+            report_credential_file=str(t001_credential),
+            task_contract_digest=t001_digest,
+        )
+        require(t001_token not in report_contract, "report token leaked into role prompt")
         store = hloop._open_broker_store(repo)
         with store.transaction() as transaction:
-            store.register_active_role(
-                transaction,
-                run_id=state["run_id"],
-                role_id="T001",
-                attempt_id="T001-A001",
-                task_contract_digest=t001_digest,
-                token="synthetic-t001-token",
-            )
             store.register_active_role(
                 transaction,
                 run_id=state["run_id"],
@@ -574,8 +587,8 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
             state["run_id"],
             "--task-contract-digest",
             t001_digest,
-            "--report-token",
-            "synthetic-t001-token",
+            "--report-credential-file",
+            str(t001_credential),
             "--event-id",
             event_id,
             "--type",
