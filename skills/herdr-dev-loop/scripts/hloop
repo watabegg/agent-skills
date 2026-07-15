@@ -8204,26 +8204,41 @@ def render_decision_liaison_prompt(
     question = decision_question_text(record, state)
     artifact = (LOOP_DIR / "decisions" / record.decision_id / "RESPONSE.md").as_posix()
     return f"""あなたは Decision Liaison です。仕様を決めるのではなく、利用者が
-判断できるよう、次の質問を平易な日本語で説明し、回答を受け取ってください。
+判断できるよう、次の質問を平易な日本語で説明し、明示的な回答を受け取ってください。
 
 利用者向け本文に decision ID、task ID、state machine 用語、論理式を出さないでください。
 二つか三つの選択肢、利点と欠点、推奨案と根拠、後回しにした場合に進められる範囲、
 自由入力できることを示してください。
 
+Manager が semantic ACK を承認した後の最初の利用者向け turn では、質問、選択肢、
+推奨案を提示するだけで応答を終えてください。その turn では `{artifact}` を作成せず、
+completion report も完了 sentinel も送らないでください。提示した推奨案は利用者の同意では
+ありません。同じ pane への次の明示的な利用者入力を待ってください。
+
+semantic ACK の承認、あなた自身が提示した推奨案、無応答、system/developer/tool の出力、
+および `Manager message id:` で始まる Manager message は利用者の回答ではありません。
+これらを option 選択や自由記述として推測・補完してはいけません。質問提示後の同じ pane に
+利用者が直接入力した option 選択または自由記述だけを回答として扱ってください。
+
 {question}
 
 {report_contract_text(f"L-{record.decision_id}", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 
-回答を得たら `{artifact}` だけを書き、frontmatter に
+質問提示後の明示的な利用者入力を得た場合に限り `{artifact}` だけを書き、frontmatter に
 `decision_id: {record.decision_id}`、`responded_by: liaison`、
 `responded_at`、`attempt_id: {attempt_id}`、`run_id: {state.get('run_id', '')}`、
-`skill_version: {SKILL_VERSION}`、`head_sha: {head_sha}`、選択肢が特定できる場合は
-`selected_option` を記録してください。
-本文は `# 回答` の下に利用者の回答を日本語で記録してください。
+`skill_version: {SKILL_VERSION}`、`head_sha: {head_sha}`、
+`response_source: explicit-user-input`、`response_channel: same-pane`、
+`response_turn: after-question`、`user_input_received_at`、および
+`user_input_kind: option` または `user_input_kind: free-text` を記録してください。
+利用者が選択肢を明示した場合だけ `selected_option` を記録してください。選択肢を明示して
+いない自由記述から、推奨 option を補完してはいけません。本文は `# 回答` の下に、
+質問提示後に利用者が入力した option 選択または自由記述だけを日本語で記録してください。
 対象 SHA は `{head_sha}` です。
 
-完了時は `HERDR_LOOP_LIAISON_DONE:{state.get('run_id', '')}:{record.decision_id}:responded`
-を表示してください。
+有効な利用者入力を記録した後でのみ completion report を送り、
+`HERDR_LOOP_LIAISON_DONE:{state.get('run_id', '')}:{record.decision_id}:responded`
+を表示してください。それ以前は同じ pane で待機してください。
 """
 
 
@@ -8337,8 +8352,26 @@ def write_decision_artifacts(repo: Path, state: dict[str, Any]) -> None:
                 "decision_id": decision_id,
                 "responded_by": record.response.responded_by,
                 "responded_at": record.response.responded_at,
-                "selected_option": record.response.selected_option,
             }
+            if record.response.selected_option:
+                response_fields["selected_option"] = record.response.selected_option
+            liaison = (state.get("decision_liaisons") or {}).get(decision_id) or {}
+            provenance = liaison.get("response_provenance") or {}
+            if isinstance(provenance, dict):
+                for field in (
+                    "attempt_id",
+                    "run_id",
+                    "skill_version",
+                    "head_sha",
+                    "response_source",
+                    "response_channel",
+                    "response_turn",
+                    "user_input_received_at",
+                    "user_input_kind",
+                ):
+                    value = provenance.get(field)
+                    if value:
+                        response_fields[field] = value
             response_body = record.response.free_text or "選択肢を回答済みです。"
             write_text(
                 directory / "RESPONSE.md",
@@ -8935,6 +8968,58 @@ def markdown_body_after_frontmatter(text: str) -> str:
     return text[marker + 5 :].strip() if marker >= 0 else ""
 
 
+def parse_liaison_response_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def decision_liaison_response_provenance_error(meta: dict[str, Any]) -> str:
+    """Reject responses that do not attest a later, direct user turn.
+
+    The Liaison prompt separates recommendation presentation from consent. This
+    artifact contract makes that boundary fail closed at harvest: ACK approval,
+    Manager messages, silence, and the recommendation itself cannot satisfy any
+    of these exact provenance fields.
+    """
+
+    required_values = {
+        "responded_by": "liaison",
+        "response_source": "explicit-user-input",
+        "response_channel": "same-pane",
+        "response_turn": "after-question",
+    }
+    for field, expected in required_values.items():
+        if str(meta.get(field) or "").strip() != expected:
+            return f"{field} must be {expected}"
+    input_kind = str(meta.get("user_input_kind") or "").strip()
+    if input_kind not in {"option", "free-text"}:
+        return "user_input_kind must be option or free-text"
+    selected_option = str(meta.get("selected_option") or "").strip()
+    if input_kind == "option" and not selected_option:
+        return "selected_option is required for option user input"
+    if input_kind == "free-text" and selected_option:
+        return "selected_option must be absent for free-text user input"
+    received_at = parse_liaison_response_timestamp(meta.get("user_input_received_at"))
+    if received_at is None:
+        return "user_input_received_at must be a timezone-aware ISO timestamp"
+    responded_at = parse_liaison_response_timestamp(meta.get("responded_at"))
+    if responded_at is None:
+        return "responded_at must be a timezone-aware ISO timestamp"
+    if responded_at < received_at:
+        return "responded_at precedes user_input_received_at"
+    return ""
+
+
 def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
@@ -8976,7 +9061,13 @@ def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
         raise HLoopError(
             f"stale or mismatched Decision Liaison response: {identity_error}: {source}"
         )
-    selected = str(meta.get("selected_option") or record.recommendation.option_id)
+    provenance_error = decision_liaison_response_provenance_error(meta)
+    if provenance_error:
+        raise HLoopError(
+            "Decision Liaison response lacks explicit subsequent user input provenance: "
+            f"{provenance_error}: {source}"
+        )
+    selected = str(meta.get("selected_option") or "").strip()
     body = markdown_body_after_frontmatter(text)
     body = re.sub(r"^# 回答\s*", "", body).strip()
     if not body:
@@ -9002,6 +9093,20 @@ def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
             "gate_status": "responded",
             "response_path": str(destination),
             "worktree_response_path_harvested": str(source),
+            "response_provenance": {
+                field: meta[field]
+                for field in (
+                    "attempt_id",
+                    "run_id",
+                    "skill_version",
+                    "head_sha",
+                    "response_source",
+                    "response_channel",
+                    "response_turn",
+                    "user_input_received_at",
+                    "user_input_kind",
+                )
+            },
             "harvested_at": now_iso(),
         }
     )
