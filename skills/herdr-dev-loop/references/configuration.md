@@ -1,6 +1,6 @@
 # Configuration Contract
 
-herdr-dev-loop 0.5.0 requires Python 3.11 or later and uses the standard-library `tomllib` parser. A missing configuration file is valid and preserves the built-in defaults. Configuration files must not contain credentials, provider tokens, arbitrary setup commands, or other secrets.
+herdr-dev-loop 0.5.1 requires Python 3.11 or later and uses the standard-library `tomllib` parser. A missing configuration file is valid and preserves the built-in defaults. Configuration files must not contain credentials, provider tokens, arbitrary setup commands, or other secrets.
 
 ## Discovery
 
@@ -35,7 +35,7 @@ Values resolve from lowest to highest precedence in this order:
 4. task override
 5. explicit role-start override
 
-`config explain` returns the final value and source for every leaf. `init` stores `config_source` and `resolved_config` in `STATE.json`; a later global configuration edit does not silently rewrite an existing loop. The 0.5.0 CLI does not expose an in-place `config apply` command. To change an active loop, use the supported task or role-specific update command, or initialize a new namespace after reviewing `config explain`.
+`config explain` returns the final value and source for every leaf. `init` stores `config_source` and `resolved_config` in `STATE.json`; a later global configuration edit does not silently rewrite an existing loop. The 0.5.1 CLI does not expose an in-place `config apply` command. To change an active loop, use the supported task or role-specific update command, or initialize a new namespace after reviewing `config explain`.
 
 ## Review modes
 

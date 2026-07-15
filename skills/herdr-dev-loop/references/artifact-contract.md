@@ -87,7 +87,7 @@ Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pa
 
 Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r1 state.
 
-The current 0.5.0 contract is `state_format_version: 3` and `schema_revision: 1`. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned backup, and applies every declared revision rather than rebinding old evidence to the new schema.
+The current 0.5.1 contract is `state_format_version: 3` and `schema_revision: 1`. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned backup, and applies every declared revision rather than rebinding old evidence to the new schema.
 
 `persistence: local-only` copies the namespace snapshot to role worktrees and excludes loop artifacts from integration commits. `persistence: branch-history` requires Manager-owned inputs to be committed at the audited ref. `worktree_setup_commands` contains the ordered repository-specific bootstrap contract applied before role launch; run outcomes are stored separately under `.ai/herdr-dev-loop/experience/worktree-setup.json`.
 
@@ -130,7 +130,7 @@ Recommended optional fields:
 
 Raw or redacted input bodies, inbox events, broker databases, sockets, spooled reports, and provider credentials are never checkpoint-eligible. `STATE.json` may retain safe digests, IDs, counts, and resolved non-secret configuration, but not the underlying prompt or transport secret.
 
-Accepted requirements, their progress, and machine-readable decision records currently live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. The 0.5.0 CLI does not create separate `requirements/`, `progress/`, `context/`, or `decisions/` directories.
+Accepted requirements, their progress, and machine-readable decision records currently live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. The 0.5.1 CLI does not create separate `requirements/`, `progress/`, `context/`, or `decisions/` directories.
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 

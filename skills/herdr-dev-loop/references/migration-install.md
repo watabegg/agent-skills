@@ -1,6 +1,6 @@
 # Migration And Install Parity
 
-herdr-dev-loop 0.5.0 uses `state_format_version: 3` and `schema_revision: 1`. The runtime reads format 2 and earlier format 3 revision 0 for migration, but mutating commands reject a future format or revision.
+herdr-dev-loop 0.5.1 uses `state_format_version: 3` and `schema_revision: 1`. The runtime reads format 2 and earlier format 3 revision 0 for migration, but mutating commands reject a future format or revision.
 
 ## Migrating an existing namespace
 
@@ -43,18 +43,23 @@ rsync -a --delete "$SKILL_DIR/" "$CODEX_SKILL_DIR/"
 rsync -a --delete "$SKILL_DIR/" "$CLAUDE_SKILL_DIR/"
 ```
 
-Then verify byte parity, skill discovery, and runtime identity separately:
+First verify static byte parity. This proves that the distributed files match; it does not execute a provider or the Python runtime:
 
 ```bash
 diff -qr "$SKILL_DIR" "$CODEX_SKILL_DIR"
 diff -qr "$SKILL_DIR" "$CLAUDE_SKILL_DIR"
+```
+
+Then verify runtime identity and Python selftest for each installed copy. These checks execute the skill's Python code, but they are not Codex or Claude live-provider E2E:
+
+```bash
 python3 "$CODEX_SKILL_DIR/scripts/hloop" version --json
 python3 "$CLAUDE_SKILL_DIR/scripts/hloop" version --json
 python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
 python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
 ```
 
-Start a fresh Codex and Claude session after synchronization if an existing session cached skill discovery. In each client, invoke or list `herdr-dev-loop` and confirm that its first progress output reports 0.5.0.
+For an ordinary distribution, start fresh Codex and Claude sessions after synchronization if an existing session cached skill discovery, then confirm that both clients report 0.5.1. For this 0.5.1 candidate gate, only fresh Codex discovery is executed. Fresh Claude discovery is a separate live-provider check; because it is not executed in this release run, do not infer success from file parity or Python selftest.
 
 ## Rollback
 
