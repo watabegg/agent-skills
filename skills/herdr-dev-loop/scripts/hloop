@@ -10828,15 +10828,24 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         result_path, result_rel, state, task_id, task_state, expected_attempt
     )
     dirty = porcelain_paths_no_renames(worktree)
-    if not dirty:
+    result_pending = result_rel.as_posix() in dirty
+    if not result_pending:
+        # `git status` never reports a path that matches an ignore rule, even
+        # when it is genuinely new or modified relative to HEAD -- if the
+        # loop namespace is git-excluded in this repository, a result-only
+        # handoff's `result.md` never shows up in `dirty` at all, and a
+        # naive "worktree has no pending handoff changes" check below would
+        # misreport `nothing to seal`. The read-only precheck above already
+        # confirmed the artifact exists, is well-formed, and belongs to the
+        # active attempt, so compare it directly against what HEAD already
+        # has to tell a genuine pending handoff from one that was already
+        # sealed with identical content.
+        result_pending = safe_result_commit_state(worktree, task_id, "") != "committed"
+    if not dirty and not result_pending:
         raise HLoopError(f"nothing to seal for {task_id}: worktree has no pending handoff changes")
-    if result_rel.as_posix() not in dirty:
-        # The result artifact may be invisible to `git status` if `.ai` is
-        # gitignored in this repository -- the read-only precheck above
-        # already confirmed it exists, is well-formed, and belongs to the
-        # active attempt, so treat it as part of the pending handoff
-        # regardless of ignore status. It is force-staged below (`git add
-        # -f`); if it turns out to introduce no actual diff (e.g. it was
+    if result_pending and result_rel.as_posix() not in dirty:
+        # It is force-staged below (`git add -f`) regardless of ignore
+        # status; if it turns out to introduce no actual diff (e.g. it was
         # already sealed with identical content), the post-staging
         # re-verification below still fails closed on a staged/expected
         # mismatch.
