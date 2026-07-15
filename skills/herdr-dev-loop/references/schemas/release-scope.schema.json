@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/release-scope.schema.json",
+  "title": "Herdr Dev Loop Release Scope Lock",
+  "type": "object",
+  "required": [
+    "status",
+    "source_refs",
+    "source_digests",
+    "scope_revision",
+    "source_snapshot_revision",
+    "scope_digest",
+    "locked_at",
+    "last_user_input_id",
+    "amendment_refs",
+    "plan_item_refs",
+    "requirement_refs",
+    "release_scope_refs"
+  ],
+  "properties": {
+    "status": {
+      "enum": ["unlocked", "locked", "legacy-unlocked"]
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "source_digests": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^.+$": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "scope_revision": {"type": "integer", "minimum": 0},
+    "source_snapshot_revision": {"type": "integer", "minimum": 0},
+    "scope_digest": {"$ref": "#/$defs/optional-digest"},
+    "locked_at": {"$ref": "#/$defs/optional-timestamp"},
+    "last_user_input_id": {"$ref": "#/$defs/optional-input-id"},
+    "amendment_refs": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^A[0-9]{3}$"},
+      "uniqueItems": true
+    },
+    "plan_item_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "requirement_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "release_scope_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "locked"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "source_refs": {"minItems": 1},
+          "scope_revision": {"minimum": 1},
+          "source_snapshot_revision": {"minimum": 1},
+          "scope_digest": {"$ref": "#/$defs/digest"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "legacy-unlocked"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "scope_revision": {"const": 0},
+          "source_snapshot_revision": {"const": 0}
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "optional-digest": {
+      "anyOf": [
+        {"const": ""},
+        {"$ref": "#/$defs/digest"}
+      ]
+    },
+    "optional-input-id": {
+      "anyOf": [
+        {"const": ""},
+        {"type": "string", "pattern": "^U[0-9]{4}$"}
+      ]
+    },
+    "optional-timestamp": {
+      "anyOf": [
+        {"const": ""},
+        {"type": "string", "minLength": 1}
+      ]
+    },
+    "amendment": {
+      "type": "object",
+      "required": [
+        "amendment_id",
+        "kind",
+        "previous_scope_revision",
+        "new_scope_revision",
+        "previous_source_snapshot_revision",
+        "new_source_snapshot_revision",
+        "previous_source_digests",
+        "new_source_digests",
+        "previous_scope_digest",
+        "new_scope_digest",
+        "reason",
+        "basis_refs",
+        "user_input_id",
+        "affected_task_ids",
+        "created_at",
+        "semantic_equivalence"
+      ],
+      "properties": {
+        "amendment_id": {"type": "string", "pattern": "^A[0-9]{3}$"},
+        "kind": {"enum": ["editorial", "clarification", "scope-change"]},
+        "previous_scope_revision": {"type": "integer", "minimum": 0},
+        "new_scope_revision": {"type": "integer", "minimum": 0},
+        "previous_source_snapshot_revision": {"type": "integer", "minimum": 0},
+        "new_source_snapshot_revision": {"type": "integer", "minimum": 0},
+        "previous_source_digests": {
+          "type": "object",
+          "patternProperties": {"^.+$": {"$ref": "#/$defs/digest"}},
+          "additionalProperties": false
+        },
+        "new_source_digests": {
+          "type": "object",
+          "patternProperties": {"^.+$": {"$ref": "#/$defs/digest"}},
+          "additionalProperties": false
+        },
+        "previous_scope_digest": {"$ref": "#/$defs/digest"},
+        "new_scope_digest": {"$ref": "#/$defs/digest"},
+        "reason": {"type": "string", "minLength": 1},
+        "basis_refs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "user_input_id": {"$ref": "#/$defs/optional-input-id"},
+        "affected_task_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^T[0-9]{3}$"},
+          "uniqueItems": true
+        },
+        "created_at": {"$ref": "#/$defs/optional-timestamp"},
+        "semantic_equivalence": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
