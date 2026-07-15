@@ -27,6 +27,145 @@ loader.exec_module(hloop)
 hloop_broker = hloop.hloop_broker
 
 
+class RepositoryLockRuntimeTests(unittest.TestCase):
+    """Exercises the private cross-worktree repository transaction lock."""
+
+    def setUp(self):
+        self.previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-repository-lock")
+
+    def tearDown(self):
+        hloop.configure_loop_namespace(self.previous_namespace)
+
+    def init_worktrees(self, root: Path) -> tuple[Path, Path]:
+        repo = root / "repo"
+        linked = root / "linked"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "linked", str(linked), "HEAD"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return repo, linked
+
+    def test_lock_path_is_private_shared_and_outside_protected_git_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, linked = self.init_worktrees(root)
+            runtime_base = root / "runtime"
+            linked_git_dir = Path(
+                hloop.git(linked, ["rev-parse", "--path-format=absolute", "--git-dir"])
+            )
+            protected_mode = stat.S_IMODE(linked_git_dir.stat().st_mode)
+
+            with mock.patch.dict(os.environ, {"HLOOP_RUNTIME_DIR": str(runtime_base)}):
+                repo_path = hloop.repo_lock_path(repo)
+                linked_path = hloop.repo_lock_path(linked)
+                self.assertEqual(repo_path, linked_path)
+                self.assertTrue(repo_path.is_relative_to(runtime_base))
+                self.assertFalse(repo_path.is_relative_to(hloop.git_common_dir(repo)))
+                expected_digest = hashlib.sha256(
+                    f"{hloop.git_common_dir(repo)}\0{hloop.LOOP_NAMESPACE}".encode("utf-8")
+                ).hexdigest()
+                self.assertEqual(repo_path.name, f"{expected_digest}.lock")
+
+                linked_git_dir.chmod(0o500)
+                try:
+                    with hloop.loop_lock(linked):
+                        self.assertTrue(repo_path.exists())
+                finally:
+                    linked_git_dir.chmod(protected_mode)
+
+                self.assertEqual(stat.S_IMODE(repo_path.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(repo_path.stat().st_mode), 0o600)
+                self.assertEqual(repo_path.stat().st_uid, os.geteuid())
+                old_lock = linked_git_dir / "hloop.lock"
+                self.assertFalse(old_lock.exists())
+
+                hloop.configure_loop_namespace("test-repository-lock-other")
+                try:
+                    self.assertNotEqual(hloop.repo_lock_path(repo), repo_path)
+                finally:
+                    hloop.configure_loop_namespace("test-repository-lock")
+
+    def test_linked_worktrees_contend_on_the_same_flock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, linked = self.init_worktrees(root)
+            runtime_base = root / "runtime"
+            first_acquired = threading.Event()
+            release_first = threading.Event()
+            second_called_flock = threading.Event()
+            second_acquired = threading.Event()
+            errors = []
+            real_flock = hloop.fcntl.flock
+
+            def observed_flock(descriptor, operation):
+                if (
+                    threading.current_thread().name == "second-lock"
+                    and operation & hloop.fcntl.LOCK_EX
+                ):
+                    second_called_flock.set()
+                return real_flock(descriptor, operation)
+
+            def hold_first():
+                try:
+                    with hloop.loop_lock(repo):
+                        first_acquired.set()
+                        if not release_first.wait(timeout=2):
+                            raise TimeoutError("first lock was not released")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def acquire_second():
+                try:
+                    with hloop.loop_lock(linked):
+                        second_acquired.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch.dict(
+                os.environ, {"HLOOP_RUNTIME_DIR": str(runtime_base)}
+            ), mock.patch.object(hloop.fcntl, "flock", side_effect=observed_flock):
+                first = threading.Thread(target=hold_first, name="first-lock")
+                second = threading.Thread(target=acquire_second, name="second-lock")
+                first.start()
+                self.assertTrue(first_acquired.wait(timeout=2))
+                second.start()
+                self.assertTrue(second_called_flock.wait(timeout=2))
+                self.assertFalse(second_acquired.wait(timeout=0.1))
+                release_first.set()
+                self.assertTrue(second_acquired.wait(timeout=2))
+                first.join(timeout=2)
+                second.join(timeout=2)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+
+
 class ProviderPreflightIntegrationTests(unittest.TestCase):
     """Exercises the hloop_lib.providers wiring inside preflight_loop."""
 

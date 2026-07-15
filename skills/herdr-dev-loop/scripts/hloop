@@ -21,6 +21,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Sequence
@@ -1329,13 +1330,41 @@ def resolve_init_config(
     return resolution, selected
 
 
+def _private_runtime_directory(path: Path) -> Path:
+    """Create or repair one current-user-only HLoop runtime directory."""
+
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise HLoopError(f"cannot prepare HLoop runtime directory {path}: {exc}") from exc
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise HLoopError(f"HLoop runtime directory must be a real directory: {path}")
+    if metadata.st_uid != os.geteuid():
+        raise HLoopError(f"HLoop runtime directory must be owned by the current user: {path}")
+    try:
+        path.chmod(0o700)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise HLoopError(f"cannot secure HLoop runtime directory {path}: {exc}") from exc
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise HLoopError(f"HLoop runtime directory must have mode 0700: {path}")
+    return path
+
+
 def repo_lock_path(repo: Path) -> Path:
-    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--git-path", "hloop.lock"], check=False)
-    if proc.returncode != 0:
-        raise HLoopError((proc.stderr or proc.stdout or "failed to resolve git lock path").strip())
-    raw = (proc.stdout or "").strip()
-    path = Path(raw)
-    return path if path.is_absolute() else (repo / path)
+    """Return one private cross-worktree lock path for this repo/namespace."""
+
+    configured = os.environ.get("HLOOP_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR")
+    runtime_base = Path(configured).expanduser() if configured else Path(tempfile.gettempdir())
+    if not runtime_base.is_absolute():
+        raise HLoopError("HLoop runtime directory must be absolute")
+    uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
+    runtime_root = _private_runtime_directory(runtime_base / f"herdr-dev-loop-{uid}")
+    lock_directory = _private_runtime_directory(runtime_root / "locks")
+    identity = f"{git_common_dir(repo)}\0{LOOP_NAMESPACE}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return lock_directory / f"{digest}.lock"
 
 
 def state_path(repo: Path) -> Path:
@@ -1392,14 +1421,35 @@ def append_text(path: Path, text: str) -> None:
 @contextmanager
 def loop_lock(repo: Path):
     lock_path = repo_lock_path(repo)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise HLoopError(f"cannot open HLoop repository lock {lock_path}: {exc}") from exc
+    locked = False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise HLoopError("HLoop repository lock must be a regular file owned by the current user")
+        os.fchmod(descriptor, 0o600)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+            raise HLoopError("HLoop repository lock must have mode 0600")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
         try:
             retire_legacy_loop_lock(repo)
             yield
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            locked = False
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def retire_legacy_loop_lock(repo: Path) -> None:
