@@ -27,8 +27,8 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
 
 # HLoop is commonly executed from its source checkout.  Keep importing its
 # local modules from creating repository-local bytecode before validation even
@@ -1683,7 +1683,12 @@ def yaml_scalar(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     text = str(value)
-    if text == "" or re.search(r"[:#\[\]{}]|^\s|\s$", text):
+    # A bare string equal to "true"/"false" (e.g. a validation command
+    # literally named `false`) would otherwise round-trip as a Python `bool`
+    # through `parse_scalar`'s case-insensitive boolean recognition -- quote
+    # it like any other syntactically ambiguous scalar so readers get back
+    # the exact string that was written.
+    if text == "" or text.lower() in {"true", "false"} or re.search(r"[:#\[\]{}]|^\s|\s$", text):
         return json.dumps(text, ensure_ascii=False)
     return text
 
@@ -4220,7 +4225,7 @@ def collect_worker_inventory(
                     "worker-seal-required",
                     f"worker:{task_id}",
                     f"Worker {task_id} left a valid uncommitted handoff awaiting Manager seal.",
-                    f"hloop worker seal {task_id}",
+                    seal_required_action_text(task_id),
                 )
             )
         else:
@@ -9241,7 +9246,7 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     if handoff:
         print(
             "no Git metadata was written; ask the Manager to run "
-            f"`hloop worker seal {task_id}` to validate and commit this handoff"
+            f"`{seal_required_action_text(task_id)}` to validate and commit this handoff"
         )
     if not handoff and not args.no_commit:
         # Loop artifacts are intentionally gitignored in some repositories. The
@@ -9267,6 +9272,19 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def seal_required_action_text(task_id: str) -> str:
+    """The concrete command a Manager should run to seal a pending handoff.
+
+    A status-`done` seal requires at least one Manager-measured
+    `--validation-command`, so every seal-required user-facing action must
+    show a concrete placeholder for it -- not just the bare `hloop worker
+    seal <task-id>`, which a Manager could otherwise run and have fail on the
+    missing-validation-command check without any hint why.
+    """
+
+    return f"hloop worker seal {task_id} --validation-command '<manager-approved-command>'"
+
+
 def run_seal_validation_command(worktree: Path, command: str) -> tuple[bool, str]:
     validation_env = os.environ.copy()
     validation_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -9282,8 +9300,75 @@ def run_seal_validation_command(worktree: Path, command: str) -> tuple[bool, str
     return proc.returncode == 0, proc.stdout or ""
 
 
-def rollback_validation_command_side_effects(worktree: Path, pre_validation_scope: set[str]) -> None:
-    """Undo whatever a failing Manager validation command left behind.
+def snapshot_worktree_paths(worktree: Path, paths: Iterable[str]) -> dict[str, dict[str, str]]:
+    """Capture exact byte-for-byte pre-validation state for each dirty path.
+
+    Records enough to restore each path exactly as it was before a Manager
+    validation command runs: file content (via a Git blob, so restoration is
+    byte-for-byte regardless of encoding), executable mode, symlink target,
+    or absence (an already-dirty tracked deletion). Covers every path in
+    `pre_validation_scope`, not just ones a validation command later
+    introduces -- a validation command may also further mutate content the
+    Worker had already changed (e.g. a formatter reformatting a file the
+    Worker edited), and that must roll back too.
+    """
+
+    snapshot: dict[str, dict[str, str]] = {}
+    for rel in paths:
+        full = worktree / rel
+        if full.is_symlink():
+            snapshot[rel] = {"kind": "symlink", "target": os.readlink(full)}
+        elif full.is_file():
+            mode = "100755" if os.access(full, os.X_OK) else "100644"
+            blob = git(worktree, ["hash-object", "-w", "--", rel])
+            snapshot[rel] = {"kind": "file", "mode": mode, "blob": blob}
+        else:
+            snapshot[rel] = {"kind": "absent"}
+    return snapshot
+
+
+def restore_worktree_paths_snapshot(worktree: Path, snapshot: dict[str, dict[str, str]]) -> None:
+    """Restore paths to the exact byte-for-byte state captured by `snapshot_worktree_paths`."""
+
+    for rel, entry in snapshot.items():
+        full = worktree / rel
+        # A validation command may have replaced a file or symlink with a
+        # directory (or vice versa). `Path.unlink()` raises `IsADirectoryError`
+        # on a real directory, so clear a directory with `shutil.rmtree`
+        # first -- otherwise restoring the recorded file/symlink/absent state
+        # underneath it would fail outright.
+        if full.is_symlink():
+            full.unlink()
+        elif full.is_dir():
+            shutil.rmtree(full)
+        elif full.exists():
+            full.unlink()
+        kind = entry.get("kind")
+        if kind == "absent":
+            continue
+        full.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "symlink":
+            os.symlink(entry["target"], full)
+        elif kind == "file":
+            # Binary-safe: read the blob's raw bytes directly rather than
+            # through the text-mode `git()`/`run_cmd()` helpers, which decode
+            # stdout as text and would corrupt non-UTF-8 content.
+            proc = subprocess.run(
+                [TRUSTED_GIT_PATH, "-C", str(worktree), "cat-file", "blob", entry["blob"]],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            full.write_bytes(proc.stdout)
+            os.chmod(full, 0o755 if entry.get("mode") == "100755" else 0o644)
+
+
+def rollback_validation_command_side_effects(
+    worktree: Path,
+    pre_validation_scope: set[str],
+    pre_validation_snapshot: dict[str, dict[str, str]],
+) -> None:
+    """Undo whatever a failing Manager validation command left behind, byte for byte.
 
     A validation command run during `hloop worker seal` may mutate the
     worktree (formatters, generated files, partial build output) even when
@@ -9292,16 +9377,176 @@ def rollback_validation_command_side_effects(worktree: Path, pre_validation_scop
     closed forever on "stale handoff artifact" with no way to recover short
     of a human deleting files by hand. Restore the worktree to exactly its
     pre-validation dirty state instead: delete any newly introduced
-    untracked path and restore any newly modified or deleted tracked path
-    from `HEAD`.
+    untracked/modified path (restoring a previously-clean tracked path from
+    `HEAD`), and restore every already-dirty path from `pre_validation_snapshot`
+    exactly -- content, executable mode, symlink target, and deletion state
+    -- rather than trusting that only "new" paths need repair.
     """
 
     current = set(porcelain_paths_no_renames(worktree))
     new_paths = sorted(current - pre_validation_scope)
-    if not new_paths:
-        return
-    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "clean", "-f", "--", *new_paths], check=False)
-    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "checkout", "HEAD", "--", *new_paths], check=False)
+    if new_paths:
+        # `-d` is required to remove a newly introduced *untracked directory*
+        # (e.g. a validation command creating a build output directory) --
+        # plain `-f` only removes untracked files and silently leaves
+        # directories behind. `git status --untracked-files=all` reports the
+        # individual files inside a wholly new untracked directory rather
+        # than the directory itself, so also pass every ancestor directory of
+        # each new path as a clean pathspec -- harmless for directories that
+        # also contain tracked content (clean never touches tracked files),
+        # and it is what actually clears an empty untracked directory left
+        # behind once its files are gone.
+        ancestor_dirs: set[str] = set()
+        for rel in new_paths:
+            parent = PurePosixPath(rel).parent
+            while str(parent) not in {"", "."}:
+                ancestor_dirs.add(str(parent))
+                parent = parent.parent
+        clean_targets = set(new_paths) | ancestor_dirs
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(worktree), "clean", "-fd", "--", *sorted(clean_targets)],
+            check=False,
+        )
+        # `git clean` can leave an emptied ancestor directory behind when both
+        # the directory and a file inside it are passed as pathspecs together
+        # in the same invocation. Every path in `ancestor_dirs` is guaranteed
+        # to be entirely new (outside `pre_validation_scope`), so sweep any
+        # that still exist directly -- removing them outright is safe.
+        for rel in sorted(ancestor_dirs, key=len, reverse=True):
+            full = worktree / rel
+            if full.is_dir():
+                shutil.rmtree(full, ignore_errors=True)
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "checkout", "HEAD", "--", *new_paths], check=False)
+    restore_worktree_paths_snapshot(worktree, pre_validation_snapshot)
+
+
+def worker_result_contract_error(
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    expected_attempt: str,
+    artifact_noun: str = "result",
+) -> str:
+    """One shared, fail-closed validator for the Worker result artifact contract.
+
+    Used identically by the seal precheck (`read_worker_handoff_artifact`),
+    `artifact_readiness`, and `cmd_worker_harvest` so a Worker result
+    artifact can never be treated as valid by one call site and invalid (or
+    validated more loosely) by another. Checks identity (task_id/run_id/
+    skill_version), the exact active `attempt_id`, presence and *strict* type
+    of every field `references/schemas/result.schema.json` marks `required`
+    (`task_id`, `run_id`, `skill_version`, `attempt_id`, `status`,
+    `merge_ready`, `branch`, `head_sha`, `base_sha`, `changed_files`,
+    `validation_recorded`, `blocking_questions`), the type of every optional
+    field the schema constrains when present, internal validation-record
+    consistency, and the schema's `merge_ready` guard (only true for a
+    `done` status with `validation_recorded` true and non-empty,
+    equal-length, all-`passed` `validation_commands`/`validation_results`).
+    Deliberately does not use `normalize_bool`/`normalize_list`, which
+    silently coerce near-miss values (e.g. the string `"true"`, or a dict)
+    into a bool/list -- the runtime contract must reject those outright
+    rather than accept them loosely. `artifact_noun` only changes wording
+    (e.g. "handoff" vs "result") to match each call site's established
+    messages. Returns an empty string when the contract holds, otherwise a
+    short, machine-checkable reason.
+    """
+
+    identity_error = artifact_identity_error(state, task_id, "worker", task_state, meta)
+    if identity_error:
+        return f"stale or mismatched Worker {artifact_noun} artifact: {identity_error}"
+
+    # Required string fields (schema `required`, `type: string`).
+    # `attempt_id` is required too, but is validated below against the exact
+    # active attempt instead of a bare presence/type check, so an empty or
+    # mismatched value fails closed with a distinct, more specific reason.
+    for field in ("task_id", "run_id", "skill_version", "status", "branch", "head_sha", "base_sha"):
+        value = meta.get(field)
+        if type(value) is not str or not value.strip():
+            return f"missing or invalid {field} in {artifact_noun} artifact"
+
+    # An empty/missing `attempt_id` must fail closed exactly like a
+    # mismatched one -- it must never be silently treated as belonging to
+    # the active attempt. Only compared when the caller can name an active
+    # attempt to compare against.
+    if expected_attempt:
+        raw_attempt = meta.get("attempt_id")
+        reported_attempt = raw_attempt if type(raw_attempt) is str else ""
+        if reported_attempt != expected_attempt:
+            return (
+                f"{artifact_noun} attempt_id mismatch: expected active attempt {expected_attempt}, "
+                f"got {reported_attempt or '(empty)'}"
+            )
+
+    # Required boolean fields (schema `required`, `type: boolean`).
+    for field in ("merge_ready", "validation_recorded"):
+        if type(meta.get(field)) is not bool:
+            return f"missing or invalid {field} in {artifact_noun} artifact"
+
+    # Required string-array fields (schema `required`, `type: array` of
+    # `string`).
+    for field in ("changed_files", "blocking_questions"):
+        value = meta.get(field)
+        if type(value) is not list or not all(type(item) is str for item in value):
+            return f"missing or invalid {field} in {artifact_noun} artifact"
+
+    # Optional fields the schema still constrains by type when present.
+    if "validation_commands" in meta:
+        value = meta.get("validation_commands")
+        if type(value) is not list or not all(type(item) is str for item in value):
+            return f"invalid validation_commands in {artifact_noun} artifact"
+    if "validation_results" in meta:
+        value = meta.get("validation_results")
+        if type(value) is not list or not all(
+            type(item) is str and item in WORKER_VALIDATION_RESULTS for item in value
+        ):
+            return f"invalid validation_results in {artifact_noun} artifact"
+    if "validation_summary" in meta and type(meta.get("validation_summary")) is not str:
+        return f"invalid validation_summary in {artifact_noun} artifact"
+    if "handoff" in meta and type(meta.get("handoff")) is not bool:
+        return f"invalid handoff in {artifact_noun} artifact"
+
+    status = meta["status"]
+    if status not in TASK_STATUSES_FINAL:
+        return f"invalid {artifact_noun} status: {status}"
+
+    commands = meta.get("validation_commands") or []
+    results = meta.get("validation_results") or []
+    validation_recorded = meta["validation_recorded"]
+    if validation_recorded:
+        if not commands or not results:
+            return (
+                f"invalid validation record in {artifact_noun} artifact: validation_recorded "
+                "requires non-empty commands and results"
+            )
+        if len(commands) != len(results):
+            return (
+                f"invalid validation record in {artifact_noun} artifact: validation command "
+                "and result counts do not match"
+            )
+    elif commands or results:
+        return (
+            f"invalid validation record in {artifact_noun} artifact: validation evidence is "
+            "present while validation_recorded is false"
+        )
+
+    # Schema `merge_ready` guard: true only for a `done` status with a
+    # complete, fully passing, count-matched validation record.
+    merge_ready = meta["merge_ready"]
+    if merge_ready:
+        if status != "done":
+            return f"merge_ready is true for a non-done {artifact_noun} status"
+        if not validation_recorded:
+            return f"merge_ready is true without validation_recorded in {artifact_noun} artifact"
+        if not commands or not results or len(commands) != len(results):
+            return (
+                f"merge_ready is true without complete, matching validation commands/results "
+                f"in {artifact_noun} artifact"
+            )
+        if any(result != "passed" for result in results):
+            return f"merge_ready is true with a non-passed validation result in {artifact_noun} artifact"
+    return ""
 
 
 def read_worker_handoff_artifact(
@@ -9328,23 +9573,11 @@ def read_worker_handoff_artifact(
         raise HLoopError(
             f"result artifact is not a durable handoff (missing handoff: true): {result_rel.as_posix()}"
         )
-    identity_error = artifact_identity_error(state, task_id, "worker", task_state, handoff_meta)
-    if identity_error:
-        raise HLoopError(
-            f"stale or mismatched Worker handoff artifact: {identity_error}: {result_rel.as_posix()}"
-        )
-    # An empty/missing `attempt_id` must fail closed exactly like a mismatched
-    # one -- it must never be silently treated as belonging to the active
-    # attempt.
-    reported_attempt = str(handoff_meta.get("attempt_id") or "")
-    if reported_attempt != expected_attempt:
-        raise HLoopError(
-            f"handoff attempt_id mismatch: expected active attempt {expected_attempt}, "
-            f"got {reported_attempt or '(empty)'}"
-        )
-    status = str(handoff_meta.get("status") or "")
-    if status not in TASK_STATUSES_FINAL:
-        raise HLoopError(f"invalid handoff status in {result_rel.as_posix()}: {status}")
+    contract_error = worker_result_contract_error(
+        state, task_id, task_state, handoff_meta, expected_attempt=expected_attempt, artifact_noun="handoff"
+    )
+    if contract_error:
+        raise HLoopError(f"{contract_error}: {result_rel.as_posix()}")
     return handoff_meta
 
 
@@ -9387,6 +9620,20 @@ def resume_staged_seal_transaction(
         return None
     if set(pre_staged) != set(expected_scope):
         return None
+    # `staged_tree` is only written *after* `git add -A` finished and the
+    # staged scope was re-verified (see `cmd_worker_seal` below) -- it is the
+    # durable marker that the exact tree identity for this transaction was
+    # persisted before any crash. A transaction recorded without it means the
+    # process died during or before that verification: the staged paths may
+    # match by name alone (e.g. a partial `git add -A`, or a crash right as
+    # it started) without the content actually being what was validated.
+    # Refuse to resume-commit such a transaction -- fail closed so the caller
+    # raises "already has staged changes" and a human/Manager must inspect
+    # and re-run the full seal (including validation) rather than trusting an
+    # unverified tree.
+    expected_tree = str(transaction.get("staged_tree") or "")
+    if not expected_tree:
+        return None
 
     # `pre_staged` already matches the recorded scope exactly, so the prior
     # `git add -A` ran to completion before the crash -- restaging is
@@ -9396,10 +9643,23 @@ def resume_staged_seal_transaction(
     # before completing the commit.
     remaining_dirty = porcelain_paths_no_renames(worktree)
     cached_files = cached_diff_paths_no_renames(worktree)
-    if remaining_dirty or set(cached_files) != set(expected_scope):
+    observed_tree = git(worktree, ["write-tree"])
+    if remaining_dirty or set(cached_files) != set(expected_scope) or observed_tree != expected_tree:
         run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "reset"], check=False)
         task_state.pop("seal_transaction", None)
         save_state(repo, state)
+        if not remaining_dirty and set(cached_files) == set(expected_scope) and observed_tree != expected_tree:
+            # Same paths, different content: the index was re-staged (or
+            # tampered with) after the crash to match the recorded path
+            # names exactly, but the durable tree identity captured before
+            # the crash no longer matches. Report this distinctly from an
+            # ordinary "worktree changed" race so it is never mistaken for
+            # routine churn.
+            raise HLoopError(
+                f"seal resume aborted for {task_id}: staged tree identity {observed_tree} does not "
+                f"match the recorded transaction's tree {expected_tree} for the same staged paths "
+                f"{sorted(expected_scope)}; refusing to trust re-staged or tampered content"
+            )
         raise HLoopError(
             f"seal resume aborted for {task_id}: worktree changed since the crashed seal "
             f"attempt staged this transaction (remaining dirty: {remaining_dirty}; staged "
@@ -9496,9 +9756,16 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     if not dirty:
         raise HLoopError(f"nothing to seal for {task_id}: worktree has no pending handoff changes")
     if result_rel.as_posix() not in dirty:
-        raise HLoopError(
-            f"result artifact is not part of the pending handoff: {result_rel.as_posix()}"
-        )
+        # The result artifact may be invisible to `git status` if `.ai` is
+        # gitignored in this repository -- the read-only precheck above
+        # already confirmed it exists, is well-formed, and belongs to the
+        # active attempt, so treat it as part of the pending handoff
+        # regardless of ignore status. It is force-staged below (`git add
+        # -f`); if it turns out to introduce no actual diff (e.g. it was
+        # already sealed with identical content), the post-staging
+        # re-verification below still fails closed on a staged/expected
+        # mismatch.
+        dirty = [*dirty, result_rel.as_posix()]
 
     # Only now that a real handoff is confirmed: make sure the Worker pane is
     # quiesced and close it, so nothing can still be mutating the worktree
@@ -9566,6 +9833,7 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 "--validation-command"
             )
         pre_validation_scope = set(full_scope)
+        pre_validation_snapshot = snapshot_worktree_paths(worktree, pre_validation_scope)
         for command in manager_validation_commands:
             passed, output = run_seal_validation_command(worktree, command)
             manager_validation_results.append("passed" if passed else "failed")
@@ -9577,7 +9845,9 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 # `changed_files` again -- otherwise a retried seal would
                 # fail closed forever on "stale handoff artifact" with no
                 # way to recover short of manual cleanup.
-                rollback_validation_command_side_effects(worktree, pre_validation_scope)
+                rollback_validation_command_side_effects(
+                    worktree, pre_validation_scope, pre_validation_snapshot
+                )
                 raise HLoopError(
                     f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
                     + output
@@ -9654,7 +9924,18 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     }
     save_state(repo, state)
 
-    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-A", "--", *dirty], check=True)
+    # The namespaced result artifact is the Worker/Manager hand-off contract
+    # and must land in the seal commit even in repositories that gitignore
+    # `.ai` -- stage it explicitly with `-f`. Every other path keeps normal
+    # `git add -A` semantics (respecting .gitignore, honoring deletions) so
+    # product paths are never force-staged past a repository's own ignore
+    # rules.
+    other_paths = [path for path in dirty if path != result_rel.as_posix()]
+    if other_paths:
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-A", "--", *other_paths], check=True)
+    run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-f", "--", result_rel.as_posix()], check=True
+    )
 
     # Re-verify nothing changed underneath staging (a genuine TOCTOU window,
     # however small) before committing: no unstaged/untracked path may
@@ -9669,6 +9950,16 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
             f"seal aborted for {task_id}: worktree changed while staging (remaining dirty: "
             f"{remaining_dirty}; staged {sorted(cached_files)} != expected {sorted(dirty)})"
         )
+
+    # Persist the exact staged tree identity as a second durable checkpoint,
+    # *after* staging is confirmed to match the scanned scope exactly. Only a
+    # transaction carrying this hash is eligible for crash-recovery resume
+    # (see `resume_staged_seal_transaction`): if the process dies before this
+    # save lands, the next seal attempt finds no `staged_tree` and fails
+    # closed instead of resume-committing an unverified tree.
+    staged_tree = git(worktree, ["write-tree"])
+    task_state["seal_transaction"]["staged_tree"] = staged_tree
+    save_state(repo, state)
 
     run_cmd(
         [
@@ -10341,25 +10632,18 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     if not result.exists():
         raise HLoopError(f"result not found: {result}")
     meta = read_frontmatter(result)
-    identity_error = artifact_identity_error(state, task_id, "worker", task_state, meta)
-    if identity_error:
-        raise HLoopError(f"stale or mismatched Worker artifact: {identity_error}: {result}")
     expected_attempt = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or "")
-    reported_attempt = str(meta.get("attempt_id") or "")
-    if expected_attempt and reported_attempt != expected_attempt:
-        # An empty/missing `attempt_id` on the artifact must fail closed here
-        # too, exactly like a mismatched one -- a stale result left over from
-        # a superseded attempt must never be silently harvested as current.
-        raise HLoopError(
-            f"result attempt_id mismatch: expected active attempt {expected_attempt}, "
-            f"got {reported_attempt or '(empty)'}: {result}"
-        )
+    # An empty/missing `attempt_id` (and every other contract field) on the
+    # artifact must fail closed here exactly as it does at seal precheck and
+    # artifact readiness -- a stale result left over from a superseded
+    # attempt, or one missing a required field, must never be silently
+    # harvested as current.
+    contract_error = worker_result_contract_error(
+        state, task_id, task_state, meta, expected_attempt=expected_attempt, artifact_noun="result"
+    )
+    if contract_error:
+        raise HLoopError(f"{contract_error}: {result}")
     status = str(meta.get("status", ""))
-    if status not in TASK_STATUSES_FINAL:
-        raise HLoopError(f"invalid result status in {result}: {status}")
-    reported_task_id = str(meta.get("task_id") or "")
-    if reported_task_id and reported_task_id != task_id:
-        raise HLoopError(f"result task_id mismatch: expected {task_id}, got {reported_task_id}")
     raw_head_sha = str(meta.get("head_sha") or "")
     head_sha = git(worktree, ["rev-parse", "HEAD"]) if raw_head_sha in {"", "HEAD"} else raw_head_sha
     manager_base_sha = str(task_state.get("base_sha") or "")
@@ -10371,14 +10655,9 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     final_result = result_file(repo, task_id)
     files = normalize_list(meta.get("changed_files")) or changed_files(worktree, base_sha, head_sha)
     validation_recorded = result_validation_recorded(meta)
+    # Already verified above by the shared `worker_result_contract_error`
+    # check (same require_recorded/require_passing gating on merge_ready).
     reported_merge_ready = normalize_bool(meta.get("merge_ready"))
-    validation_error = worker_validation_error(
-        meta,
-        require_recorded=reported_merge_ready,
-        require_passing=reported_merge_ready,
-    )
-    if validation_error:
-        raise HLoopError(f"invalid Worker validation in {result}: {validation_error}")
     if result.resolve() != final_result.resolve():
         write_text(final_result, read_text(result))
         task_state["worktree_result_path_harvested"] = str(result)
@@ -13673,7 +13952,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
         if seal_required_workers:
             print(
                 "seal required: "
-                + ", ".join(f"hloop worker seal {task_id}" for task_id in seal_required_workers)
+                + ", ".join(seal_required_action_text(task_id) for task_id in seal_required_workers)
             )
         print("waiting for worker result: " + ", ".join(running_workers))
         return 0
@@ -15569,21 +15848,13 @@ def artifact_readiness(
         return False, f"invalid:{exc}"
     if not text.strip() or not meta:
         return False, "empty-or-missing-frontmatter"
-    identity_error = artifact_identity_error(state, agent_id, role, agent, meta)
-    if identity_error:
-        return False, identity_error
     if role == "worker":
-        status = str(meta.get("status") or "")
-        if status not in TASK_STATUSES_FINAL:
-            return False, "invalid-status"
-        merge_ready = normalize_bool(meta.get("merge_ready"))
-        validation_error = worker_validation_error(
-            meta,
-            require_recorded=merge_ready,
-            require_passing=merge_ready,
+        expected_attempt = str(agent.get("active_attempt_id") or agent.get("attempt_id") or "")
+        contract_error = worker_result_contract_error(
+            state, agent_id, agent, meta, expected_attempt=expected_attempt, artifact_noun="result"
         )
-        if validation_error:
-            return False, f"invalid-worker-validation:{validation_error}"
+        if contract_error:
+            return False, contract_error
         if artifact_was_harvested(agent):
             if not agent.get("committed_result_path"):
                 return False, "harvested-without-committed-result"
@@ -15604,12 +15875,16 @@ def artifact_readiness(
                     # terminal agent with no artifact.
                     return False, "seal-required"
                 return False, commit_state
-    elif role == "reviewer" and str(meta.get("status") or "") not in REVIEW_ARTIFACT_STATUSES:
-        return False, "invalid-status"
-    elif role == "gap" and str(meta.get("status") or "") not in GAP_ARTIFACT_STATUSES:
-        return False, "invalid-status"
-    elif role == "advisor" and str(meta.get("status") or "") not in ADVISOR_ARTIFACT_STATUSES:
-        return False, "invalid-status"
+    else:
+        identity_error = artifact_identity_error(state, agent_id, role, agent, meta)
+        if identity_error:
+            return False, identity_error
+        if role == "reviewer" and str(meta.get("status") or "") not in REVIEW_ARTIFACT_STATUSES:
+            return False, "invalid-status"
+        elif role == "gap" and str(meta.get("status") or "") not in GAP_ARTIFACT_STATUSES:
+            return False, "invalid-status"
+        elif role == "advisor" and str(meta.get("status") or "") not in ADVISOR_ARTIFACT_STATUSES:
+            return False, "invalid-status"
     return True, "ready"
 
 
@@ -15692,7 +15967,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
             item = seal_required[0]
             print(
                 f"seal required: {item['id']} ({item['role']}) has a valid uncommitted "
-                f"handoff; run `hloop worker seal {item['id']}` to validate and commit it"
+                f"handoff; run `{seal_required_action_text(item['id'])}` to validate and commit it"
             )
             return 3
         terminal = [item for item in last_statuses if item.get("terminal_without_artifact")]
@@ -17242,7 +17517,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "write a durable handoff without any Git write (tolerates in-scope dirty product "
-            "paths); ask the Manager to run `hloop worker seal <task-id>` to validate and commit"
+            "paths); ask the Manager to run `hloop worker seal <task-id> --validation-command "
+            "'<manager-approved-command>'` to validate and commit"
         ),
     )
     worker_finalize.set_defaults(func=cmd_worker_finalize)
