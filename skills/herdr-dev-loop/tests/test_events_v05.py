@@ -560,6 +560,55 @@ class BrokerStorageTests(unittest.TestCase):
             self.assertEqual(replayed[0].event["sequence"], 1)
         self.assertEqual(list(spool.glob("*.json")), [])
 
+    def test_spool_replay_quarantines_conflict_and_replays_later_valid_entry(self):
+        spool = self.root / "spool"
+        conflict_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        stored = client_event(event_id=conflict_id)
+        conflicting = client_event(
+            event_id=conflict_id,
+            summary="same id, different spooled report",
+        )
+        valid = client_event(event_id="00000000-0000-4000-8000-000000000001")
+
+        with self.store.transaction() as transaction:
+            self.store.accept_report(transaction, stored)
+        broker.spool_client_event(
+            spool,
+            conflicting,
+            authentication=report_authentication(conflicting, self.report_token),
+        )
+        broker.spool_client_event(
+            spool,
+            valid,
+            authentication=report_authentication(valid, self.report_token),
+        )
+
+        with self.store.transaction() as transaction:
+            replayed = self.store.replay_spool(transaction, spool)
+        self.assertEqual(
+            [item.event["event_id"] for item in replayed],
+            [valid["event_id"]],
+        )
+        with self.store.transaction() as transaction:
+            self.assertEqual(
+                [item["event_id"] for item in self.store.events(transaction)],
+                [stored["event_id"], valid["event_id"]],
+            )
+        self.assertEqual(list(spool.glob("*.json")), [])
+        quarantine_dir = spool / "quarantine"
+        quarantined = [
+            path
+            for path in quarantine_dir.glob("*.json")
+            if not path.name.endswith(".audit.json")
+        ]
+        self.assertEqual([path.name for path in quarantined], [f"{conflict_id}.json"])
+        audit = json.loads(
+            (quarantine_dir / f"{conflict_id}.json.audit.json").read_text()
+        )
+        self.assertEqual(audit["reason"], "idempotency-conflict")
+        self.assertEqual(audit["event_id"], conflict_id)
+        self.assertIn("different digest", audit["detail"])
+
     def test_spool_replay_quarantines_unknown_role_and_stale_attempt_without_blocking_valid_entries(self):
         spool = self.root / "spool"
         unknown = client_event()

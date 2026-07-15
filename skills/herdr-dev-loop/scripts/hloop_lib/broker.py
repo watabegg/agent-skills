@@ -821,10 +821,10 @@ class BrokerStore:
     ) -> list[StoredEvent]:
         """Replay a spool batch and remove files only after a successful commit.
 
-        A poison entry (invalid content, stale-run, revoked-attempt, or a
-        digest/token mismatch) is quarantined with audit metadata instead of
-        aborting the whole batch, so later valid entries still replay in the
-        same recovery pass.
+        A poison entry (invalid content, stale-run, revoked-attempt, a
+        digest/token mismatch, or a per-entry storage rejection) is
+        quarantined with audit metadata instead of aborting the whole batch,
+        so later valid entries still replay in the same recovery pass.
         """
 
         transaction.require_active(self)
@@ -855,7 +855,22 @@ class BrokerStore:
                     )
                 )
                 continue
-            stored = self.accept_report(transaction, event)
+            try:
+                stored = self.accept_report(transaction, event)
+            except BrokerStorageError as exc:
+                reason = (
+                    "idempotency-conflict"
+                    if isinstance(exc, IdempotencyConflict)
+                    else "storage-error"
+                )
+                transaction.after_commit(
+                    lambda path=path, reason=reason, detail=str(exc), event_id=event[
+                        "event_id"
+                    ]: _quarantine_spool_entry(
+                        path, directory, reason=reason, detail=detail, event_id=event_id
+                    )
+                )
+                continue
             replayed.append(stored)
             expected_digest = event["payload_digest"]
             transaction.after_commit(
