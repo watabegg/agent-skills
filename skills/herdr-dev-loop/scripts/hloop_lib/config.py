@@ -1,4 +1,4 @@
-"""Hierarchical TOML config primitives for herdr-dev-loop 0.5.1.
+"""Hierarchical TOML config primitives for herdr-dev-loop 0.5.2.
 
 Implements config file discovery, stdlib TOML loading, repo-default and
 explicit cwd directory scopes with canonical symlink-safe matching,
@@ -27,8 +27,40 @@ SUPPORTED_AGENT_PROVIDERS = ("codex", "claude")
 SUPPORTED_SESSION_CLEANUP_MODES = ("archive", "none", "delete")
 SUPPORTED_REVIEW_MODES = ("single", "swarm", "dual", "dual-swarm")
 SUPPORTED_SPECIFICATION_SCOUT_MODES = ("auto", "always", "off")
+SUPPORTED_REVIEW_CADENCES = ("batch", "merge-count")
+SUPPORTED_REVIEW_PROTOCOLS = ("native", "codex-review-multi-v2")
+SUPPORTED_SCOPE_EXPANSION_ACTIONS = (
+    "follow_up",
+    "disable_feature",
+    "mark_experimental",
+    "user_decision",
+)
+SUPPORTED_FINAL_REQUIREMENTS = ("complete_zero_verified_actionable_findings",)
 MIN_REVIEW_PROBES = 4
 MAX_REVIEW_PROBES = 8
+MIN_REVIEW_LANES = 4
+MAX_REVIEW_LANES = 8
+MAX_REVIEW_FIX_ROUNDS = 2
+_REVIEW_POLICY_KEYS = (
+    "cadence",
+    "pre_final_protocol",
+    "manual_final_protocol",
+    "max_fix_rounds",
+    "scope_expansion_action",
+    "final_required",
+    "lane_count",
+)
+REVIEW_POLICY_DEFAULTS = {
+    "cadence": "batch",
+    "pre_final_protocol": "codex-review-multi-v2",
+    "manual_final_protocol": "codex-review-multi-v2",
+    "max_fix_rounds": 2,
+    "scope_expansion_action": "follow_up",
+    "final_required": "complete_zero_verified_actionable_findings",
+    "lane_count": "auto",
+}
+# Public alias for callers that use the older constant naming convention.
+DEFAULT_REVIEW_POLICY = REVIEW_POLICY_DEFAULTS
 _KNOWN_TOP_LEVEL_KEYS = ("version", "defaults", "scope")
 _DEFAULT_KEYS = (
     "max_workers",
@@ -36,6 +68,7 @@ _DEFAULT_KEYS = (
     "specification_scout",
     "worker",
     "reviewer",
+    "review",
 )
 _SCOPE_KEYS = ("path", "match", *_DEFAULT_KEYS)
 _WORKER_ROLE_KEYS = ("provider", "model", "effort")
@@ -260,6 +293,70 @@ def _validate_role_table(desc: str, table: Any, errors: list[str], *, role: str)
                 )
 
 
+def _validate_review_policy_table(desc: str, table: Any, errors: list[str]) -> None:
+    """Validate the review policy fields shared by defaults and scopes.
+
+    The safety-critical rules remain in the review/convergence state machine;
+    this table only accepts the bounded policy knobs approved for configuration.
+    ``lane_count`` deliberately accepts ``"auto"`` as well as the explicit
+    4--8 lane range used by the review plan.
+    """
+    if not isinstance(table, Mapping):
+        errors.append(f"{desc} must be a table")
+        return
+    _reject_unknown_keys(desc, table, _REVIEW_POLICY_KEYS, errors)
+
+    if "cadence" in table:
+        _validate_enum(desc, "cadence", table["cadence"], SUPPORTED_REVIEW_CADENCES, errors)
+    for key in ("pre_final_protocol", "manual_final_protocol"):
+        if key in table:
+            _validate_enum(desc, key, table[key], SUPPORTED_REVIEW_PROTOCOLS, errors)
+    if "max_fix_rounds" in table:
+        _validate_int_range(
+            desc,
+            "max_fix_rounds",
+            table["max_fix_rounds"],
+            errors,
+            minimum=0,
+            maximum=MAX_REVIEW_FIX_ROUNDS,
+        )
+    if "scope_expansion_action" in table:
+        _validate_enum(
+            desc,
+            "scope_expansion_action",
+            table["scope_expansion_action"],
+            SUPPORTED_SCOPE_EXPANSION_ACTIONS,
+            errors,
+        )
+    if "final_required" in table:
+        _validate_enum(
+            desc,
+            "final_required",
+            table["final_required"],
+            SUPPORTED_FINAL_REQUIREMENTS,
+            errors,
+        )
+    if "lane_count" not in table:
+        return
+    lane_count = table["lane_count"]
+    if isinstance(lane_count, str):
+        if lane_count != "auto":
+            errors.append(
+                f"{desc}.lane_count must be 'auto' or an integer between "
+                f"{MIN_REVIEW_LANES} and {MAX_REVIEW_LANES}, got {lane_count!r}"
+            )
+    elif isinstance(lane_count, bool) or not isinstance(lane_count, int):
+        errors.append(
+            f"{desc}.lane_count must be 'auto' or an integer between "
+            f"{MIN_REVIEW_LANES} and {MAX_REVIEW_LANES}, got {type(lane_count).__name__}"
+        )
+    elif lane_count < MIN_REVIEW_LANES or lane_count > MAX_REVIEW_LANES:
+        errors.append(
+            f"{desc}.lane_count must be 'auto' or an integer between "
+            f"{MIN_REVIEW_LANES} and {MAX_REVIEW_LANES}, got {lane_count}"
+        )
+
+
 def _validate_defaults_table(desc: str, table: Any, errors: list[str]) -> None:
     if not isinstance(table, Mapping):
         errors.append(f"{desc} must be a table")
@@ -286,6 +383,8 @@ def _validate_defaults_table(desc: str, table: Any, errors: list[str]) -> None:
     for role_key in ("worker", "reviewer"):
         if role_key in table:
             _validate_role_table(f"{desc}.{role_key}", table[role_key], errors, role=role_key)
+    if "review" in table:
+        _validate_review_policy_table(f"{desc}.review", table["review"], errors)
 
 
 def _validate_scope_entry(desc: str, entry: Any, errors: list[str]) -> None:
@@ -332,6 +431,8 @@ def _validate_scope_entry(desc: str, entry: Any, errors: list[str]) -> None:
     for role_key in ("worker", "reviewer"):
         if role_key in entry:
             _validate_role_table(f"{desc}.{role_key}", entry[role_key], errors, role=role_key)
+    if "review" in entry:
+        _validate_review_policy_table(f"{desc}.review", entry["review"], errors)
 
 
 def _scope_dedupe_key(entry: Mapping, _base: str | os.PathLike | None) -> tuple[str, Path] | None:

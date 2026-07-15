@@ -1,4 +1,4 @@
-# herdr-dev-loop 0.5.1 configuration example.
+# herdr-dev-loop 0.5.2 configuration example.
 # Copy to one of the locations shown by `hloop config path --json`.
 version = 1
 
@@ -17,6 +17,15 @@ provider = "codex"
 model = "auto"
 effort = "auto"
 probe_count = 6
+
+[defaults.review]
+cadence = "batch"
+pre_final_protocol = "codex-review-multi-v2"
+manual_final_protocol = "codex-review-multi-v2"
+max_fix_rounds = 2
+scope_expansion_action = "follow_up"
+final_required = "complete_zero_verified_actionable_findings"
+lane_count = "auto"
 
 # `match = "repo"` is the default. The canonical repository root is matched,
 # so running hloop from a nested directory does not change the result.
