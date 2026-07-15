@@ -23,9 +23,9 @@ $HLOOP namespaces
 
 `namespaces` lists coexisting loops and reports `.ai/loop` only as `legacy ignored`. `agent abort` and `agent requeue` recover roles that exited without artifacts. `experience show` and `experience recommend` expose the repo-local worktree setup history below `.ai/herdr-dev-loop/experience/`.
 
-Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revision 0 state. herdr-dev-loop 0.5.0 writes format 3 revision 1 and rejects mutation from an unknown future revision. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
+Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revision 0 state. herdr-dev-loop 0.5.1 writes format 3 revision 1 and rejects mutation from an unknown future revision. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
 
-Use `config path`, `config validate`, `config explain`, and `config init` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; 0.5.0 has no in-place `config apply` subcommand.
+Use `config path`, `config validate`, `config explain`, and `config init` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; 0.5.1 has no in-place `config apply` subcommand.
 
 Mutating helper commands take `/tmp/herdr-dev-loop-<uid>/locks/<sha256>.lock` and write files atomically. The digest is derived from the canonical Git common directory and namespace. The fixed `/tmp` root does not follow `HLOOP_RUNTIME_DIR`, `XDG_RUNTIME_DIR`, or `TMPDIR`; its UID directory is secured to mode `0700`, lock files are mode `0600` and opened without following symlinks where the platform supports `O_NOFOLLOW`, and all lock state remains outside Git metadata. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 

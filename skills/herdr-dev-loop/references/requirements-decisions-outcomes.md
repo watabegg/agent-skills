@@ -1,6 +1,6 @@
 # Requirements, Decisions, And Outcomes
 
-herdr-dev-loop 0.5.0 separates user intent, specification decisions, task execution, and terminal evidence. A task can finish while its requirement remains unverified, and one unresolved decision can block only the dependent tasks while unrelated work continues.
+herdr-dev-loop 0.5.1 separates user intent, specification decisions, task execution, and terminal evidence. A task can finish while its requirement remains unverified, and one unresolved decision can block only the dependent tasks while unrelated work continues.
 
 ## User inputs and requirements
 

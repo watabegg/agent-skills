@@ -1,6 +1,6 @@
 # Agent Report And Manager Wake Contract
 
-herdr-dev-loop 0.5.0 treats role progress as structured input to the Manager. Reports do not prove completion: harvest still verifies the artifact, target SHA, write scope, and validation evidence.
+herdr-dev-loop 0.5.1 treats role progress as structured input to the Manager. Reports do not prove completion: harvest still verifies the artifact, target SHA, write scope, and validation evidence.
 
 ## Report types
 

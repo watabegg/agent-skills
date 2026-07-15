@@ -1,4 +1,4 @@
-"""Hierarchical TOML config primitives for herdr-dev-loop 0.5.0.
+"""Hierarchical TOML config primitives for herdr-dev-loop 0.5.1.
 
 Implements config file discovery, stdlib TOML loading, repo-default and
 explicit cwd directory scopes with canonical symlink-safe matching,

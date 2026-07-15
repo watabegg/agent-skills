@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the HLoop 0.5.0 release scenarios without live provider calls."""
+"""Run the HLoop 0.5.1 release scenarios without live provider calls."""
 
 from __future__ import annotations
 

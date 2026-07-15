@@ -1,4 +1,4 @@
-# herdr-dev-loop 0.5.0 configuration example.
+# herdr-dev-loop 0.5.1 configuration example.
 # Copy to one of the locations shown by `hloop config path --json`.
 version = 1
 

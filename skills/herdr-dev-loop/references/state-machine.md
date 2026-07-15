@@ -16,7 +16,7 @@ For `persistence: local-only`, committed snapshot checks are replaced by copying
 
 An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again with a new attempt id. The original attempt base is immutable; an unmerged branch with commits is archived instead of silently reused or deleted. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
 
-State format 3 revision 1 is required by herdr-dev-loop 0.5.0. For format 2 or format 3 revision 0, first run `hloop migrate --dry-run`, inspect the complete revision path, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
+State format 3 revision 1 is required by herdr-dev-loop 0.5.1. For format 2 or format 3 revision 0, first run `hloop migrate --dry-run`, inspect the complete revision path, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
 
 ## Phases
 

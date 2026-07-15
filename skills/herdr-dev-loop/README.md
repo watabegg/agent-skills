@@ -2,7 +2,7 @@
 
 `herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/herdr-dev-loop/loops/<namespace>` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
 
-このREADMEは0.5.0運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、厳格なreviewは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。
+このREADMEは0.5.1運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、厳格なreviewは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。
 
 ## 最初に確認すること
 
@@ -36,14 +36,14 @@ Skillを使うManagerは、ほかの調査や変更より先に `hloop version` 
 新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
 
 ```text
-herdr-dev-loop 0.5.0 / namespace <namespace> を使用します（loop_skill_version: 0.5.0, run_id: 20260714T...-goal）
+herdr-dev-loop 0.5.1 / namespace <namespace> を使用します（loop_skill_version: 0.5.1, run_id: 20260714T...-goal）
 ```
 
 `hloop namespaces` は同居するloopを列挙し、旧 `.ai/loop` が存在する場合は `legacy ignored` と表示します。
 
 ## `config.toml` の設定
 
-0.5.0はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
+0.5.1はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
 
 ```bash
 hloop config path --json
@@ -59,7 +59,7 @@ hloop config explain --repo <repo> --json
 
 ## 永続化とworktree初期化経験
 
-既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。format 2または古いformat 3のstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。0.5.0の現行stateはformat 3、revision 1です。
+既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。format 2または古いformat 3のstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。0.5.1の現行stateはformat 3、revision 1です。
 
 worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
 
@@ -177,7 +177,7 @@ hloop decision new \
 
 ## Agent報告とevent-driven Manager
 
-0.5.0のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
+0.5.1のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
 
 Managerはpaneを巡回する前にdurable inboxを処理します。
 
@@ -402,7 +402,7 @@ Managerがdraftを確認した後、必要なものだけ `--create-tasks` でqu
 
 Managerは mission、plan、profile、state、decisionを所有します。Workerは自分のブランチと自分のresult artifactだけを書きます。Reviewerは `reviews/`、Gap Auditorは `gaps/`、Advisorは `advice/` の自分のartifactだけを書きます。
 
-Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.0 CLIは`requirements/`、`progress/`、`context/`、`decisions/`の個別directoryを生成しません。
+Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.1 CLIは`requirements/`、`progress/`、`context/`、`decisions/`の個別directoryを生成しません。
 
 Workerの結果をManagerが書き換えて `done` にすることはできません。`partial`、`blocked`、`failed`、`merge_ready: false` の場合は、原因を記録して再実行またはfix taskへ進みます。
 
@@ -457,7 +457,7 @@ python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
 python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
 ```
 
-同期後は新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.0表示を確認します。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。移行済みnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/RELEASE-0.5.0.md`](docs/RELEASE-0.5.0.md)にあります。
+通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.1表示を確認します。今回の0.5.1 candidateではfresh Codex discoveryだけをrelease evidenceとして取得し、未実施のfresh Claude discoveryを成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。移行済みnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/RELEASE-0.5.1.md`](docs/RELEASE-0.5.1.md)にあります。
 
 ## 公開時の注意
 

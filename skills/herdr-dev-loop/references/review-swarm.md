@@ -1,6 +1,6 @@
 # Review Swarm And Dual Review Contract
 
-herdr-dev-loop 0.5.0 supports `single`, `swarm`, `dual`, and `dual-swarm`. A **review group** pins every discovery lane and verifier to one integration head SHA. A Coordinator owns the provider-native sub-agents and returns one manifest; individual sub-agents do not write HLoop artifacts or close gates.
+herdr-dev-loop 0.5.1 supports `single`, `swarm`, `dual`, and `dual-swarm`. A **review group** pins every discovery lane and verifier to one integration head SHA. A Coordinator owns the provider-native sub-agents and returns one manifest; individual sub-agents do not write HLoop artifacts or close gates.
 
 ## Discovery topology
 
