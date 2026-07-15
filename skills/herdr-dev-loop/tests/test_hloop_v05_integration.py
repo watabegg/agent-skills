@@ -5,12 +5,14 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -747,7 +749,7 @@ effort = "medium"
                 hloop.save_state(repo, state)
                 hloop.save_state(worktree, worker_state)
 
-                with mock.patch.object(hloop, "porcelain_paths", return_value=[]):
+                with mock.patch.object(hloop, "porcelain_paths", return_value=[]), mock.patch.object(hloop, "porcelain_paths_no_renames", return_value=[]):
                     with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
                         hloop.cmd_worker_finalize(
                             argparse.Namespace(
@@ -765,7 +767,7 @@ effort = "medium"
                 state["tasks"]["T001"]["semantic_ack_barrier"] = {"status": "approved"}
                 hloop.save_state(repo, state)
 
-                with mock.patch.object(hloop, "porcelain_paths", return_value=[]):
+                with mock.patch.object(hloop, "porcelain_paths", return_value=[]), mock.patch.object(hloop, "porcelain_paths_no_renames", return_value=[]):
                     with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
                         hloop.cmd_worker_finalize(
                             argparse.Namespace(
@@ -817,6 +819,736 @@ effort = "medium"
                                 dry_run=False,
                             )
                         )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def make_worker_seal_fixture(self, root: Path, *, namespace: str, status: str = "done"):
+        """Build a Worker worktree with an uncommitted (workspace-write-style) handoff.
+
+        Seeds a tracked file the Worker will modify, a tracked file the Worker
+        will delete, and leaves an untracked file plus `result.md` dirty --
+        exactly what `hloop worker finalize --handoff` produces without ever
+        invoking Git. The Worker pane is recorded as already quiesced and
+        closed (`pane_closed_at` set) since that is a separate, dedicated
+        precondition covered by its own tests.
+        """
+
+        hloop.configure_loop_namespace(namespace)
+        repo = self.make_repo(root)
+        (repo / "keep.txt").write_text("base\n", encoding="utf-8")
+        (repo / "drop.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "keep.txt", "drop.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed files"], cwd=repo, check=True, capture_output=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        worktree = root / "worker"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "worker-seal", str(worktree), "master"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        run_id = f"run-{namespace}"
+        task_meta = {
+            "id": "T001",
+            "run_id": run_id,
+            "kind": "fix",
+            "status": "running",
+            "branch": "worker-seal",
+            "base_ref": "master",
+            "base_sha": base_sha,
+            "write_allow": ["keep.txt", "drop.txt", "new.txt"],
+            "write_deny": [],
+            "acceptance": ["handoff seals cleanly"],
+        }
+        hloop.write_text(hloop.task_file(repo, "T001"), hloop.frontmatter(task_meta) + "\n\n# Task T001\n")
+
+        # Simulate a workspace-write sandbox: only file edits, never Git.
+        (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
+        (worktree / "drop.txt").unlink()
+        (worktree / "new.txt").write_text("untracked\n", encoding="utf-8")
+        result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+        result_meta = {
+            "task_id": "T001",
+            "run_id": run_id,
+            "skill_version": hloop.SKILL_VERSION,
+            "attempt_id": "T001-A001",
+            "status": status,
+            "merge_ready": False,
+            "branch": "worker-seal",
+            "head_sha": "HEAD",
+            "base_sha": base_sha,
+            "changed_files": ["keep.txt", "drop.txt", "new.txt", result_rel.as_posix()],
+            "validation_recorded": False,
+            "validation_commands": [],
+            "validation_results": [],
+            "validation_summary": "",
+            "blocking_questions": [],
+            "handoff": True,
+        }
+        hloop.write_text(
+            worktree / result_rel,
+            hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n",
+        )
+        task_state = {
+            **task_meta,
+            "worktree": str(worktree),
+            "attempt_id": "T001-A001",
+            "active_attempt_id": "T001-A001",
+            "worker_base_sha": base_sha,
+            "skill_version": hloop.SKILL_VERSION,
+            "semantic_ack_barrier": {"status": "approved"},
+            "pane_closed_at": "2026-01-01T00:00:00+00:00",
+        }
+        state = {
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "namespace": hloop.LOOP_NAMESPACE,
+            "run_id": run_id,
+            "skill_version": hloop.SKILL_VERSION,
+            "phase": "running",
+            "integration_branch": "master",
+            "merge_mode": "squash",
+            "persistence": "local-only",
+            "tasks": {"T001": task_state},
+        }
+        return repo, worktree, state, result_rel
+
+    def seal_args(self, repo, *, attempt_id=None, validation_command=None, validation_summary=None):
+        return argparse.Namespace(
+            repo=str(repo),
+            task_id="T001",
+            attempt_id=attempt_id,
+            validation_command=validation_command,
+            validation_summary=validation_summary,
+        )
+
+    def test_worker_seal_commits_handoff_with_tracked_untracked_and_deleted_changes(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-success"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=["exit 0"], validation_summary="ok")
+                        )
+                self.assertEqual(code, 0)
+                # Everything -- tracked edit, tracked deletion, untracked add,
+                # and the result artifact -- must be sealed into one commit.
+                self.assertEqual(hloop.porcelain_paths(worktree), [])
+                head_message = subprocess.run(
+                    ["git", "log", "-1", "--format=%s"],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                self.assertIn("seal worker handoff", head_message)
+                self.assertIn("T001-A001", head_message)
+                self.assertEqual((worktree / "keep.txt").read_text(encoding="utf-8"), "changed\n")
+                self.assertFalse((worktree / "drop.txt").exists())
+                self.assertEqual((worktree / "new.txt").read_text(encoding="utf-8"), "untracked\n")
+                sealed = hloop.read_frontmatter(worktree / result_rel)
+                self.assertTrue(hloop.normalize_bool(sealed["merge_ready"]))
+                self.assertEqual(sealed["validation_commands"], ["exit 0"])
+                self.assertEqual(sealed["validation_results"], ["passed"])
+                self.assertEqual(sealed["validation_summary"], "ok")
+
+                # A sealed handoff must flow through the existing harvest path unchanged.
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        harvest_code = hloop.cmd_worker_harvest(
+                            argparse.Namespace(
+                                repo=str(repo),
+                                task_id="T001",
+                                keep_pane=False,
+                                session_cleanup=None,
+                            )
+                        )
+                self.assertEqual(harvest_code, 0)
+                harvested = hloop.read_frontmatter(hloop.result_file(repo, "T001"))
+                self.assertEqual(harvested["status"], "done")
+                self.assertTrue(hloop.normalize_bool(harvested["merge_ready"]))
+                self.assertIn("keep.txt", harvested["changed_files"])
+                self.assertIn("drop.txt", harvested["changed_files"])
+                self.assertIn("new.txt", harvested["changed_files"])
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_out_of_scope_dirty_path(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-scope", status="partial"
+                )
+                (worktree / "out-of-scope.txt").write_text("nope\n", encoding="utf-8")
+                # Keep the handoff's declared changed_files matching what is
+                # actually on disk so this test isolates the scope check from
+                # the (separately tested) stale-artifact check.
+                result_path = worktree / result_rel
+                result_meta = hloop.parse_frontmatter_text(hloop.read_text(result_path))
+                result_meta["changed_files"] = [*result_meta["changed_files"], "out-of-scope.txt"]
+                hloop.write_text(result_path, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n")
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "write-scope violations"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                # Fail closed: nothing may be staged or committed.
+                self.assertIn("out-of-scope.txt", hloop.porcelain_paths(worktree))
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_out_of_scope_rename_source(self):
+        """A rename's source path must not escape scope checking behind its destination."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                hloop.configure_loop_namespace("worker-seal-rename-source")
+                repo = self.make_repo(root)
+                (repo / "secret.txt").write_text("classified\n", encoding="utf-8")
+                subprocess.run(["git", "add", "secret.txt"], cwd=repo, check=True)
+                subprocess.run(["git", "commit", "-m", "seed secret"], cwd=repo, check=True, capture_output=True)
+                base_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                worktree = root / "worker"
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", "worker-seal-rename", str(worktree), "master"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                run_id = "run-rename-source"
+                task_meta = {
+                    "id": "T001",
+                    "run_id": run_id,
+                    "kind": "fix",
+                    "status": "running",
+                    "branch": "worker-seal-rename",
+                    "base_ref": "master",
+                    "base_sha": base_sha,
+                    "write_allow": ["allowed.txt"],
+                    "write_deny": [],
+                    "acceptance": ["x"],
+                }
+                hloop.write_text(hloop.task_file(repo, "T001"), hloop.frontmatter(task_meta) + "\n\n# Task T001\n")
+                # Rename an out-of-scope tracked file straight into an
+                # in-scope destination name, with content unchanged -- the
+                # shape Git's rename heuristic detects most eagerly.
+                (worktree / "secret.txt").rename(worktree / "allowed.txt")
+                result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+                result_meta = {
+                    "task_id": "T001",
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "attempt_id": "T001-A001",
+                    "status": "partial",
+                    "merge_ready": False,
+                    "branch": "worker-seal-rename",
+                    "head_sha": "HEAD",
+                    "base_sha": base_sha,
+                    "changed_files": ["secret.txt", "allowed.txt", result_rel.as_posix()],
+                    "validation_recorded": False,
+                    "validation_commands": [],
+                    "validation_results": [],
+                    "validation_summary": "",
+                    "blocking_questions": [],
+                    "handoff": True,
+                }
+                hloop.write_text(
+                    worktree / result_rel, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n"
+                )
+                task_state = {
+                    **task_meta,
+                    "worktree": str(worktree),
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "worker_base_sha": base_sha,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "semantic_ack_barrier": {"status": "approved"},
+                    "pane_closed_at": "2026-01-01T00:00:00+00:00",
+                }
+                state = {
+                    "state_format_version": hloop.STATE_FORMAT_VERSION,
+                    "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                    "namespace": hloop.LOOP_NAMESPACE,
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "phase": "running",
+                    "integration_branch": "master",
+                    "merge_mode": "squash",
+                    "persistence": "local-only",
+                    "tasks": {"T001": task_state},
+                }
+                # Git only collapses a rename's source/destination once the
+                # change is staged, so the source must still be individually
+                # scope-checked once `git add -A` runs during sealing.
+                self.assertIn("secret.txt", hloop.porcelain_paths_no_renames(worktree))
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "write-scope violations"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertIn("secret.txt", hloop.porcelain_paths_no_renames(worktree))
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_stale_declared_changed_files(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-stale-scope", status="partial"
+                )
+                result_path = worktree / result_rel
+                result_meta = hloop.parse_frontmatter_text(hloop.read_text(result_path))
+                # Understate reality: drop "drop.txt" from the declared scope
+                # even though it is actually deleted on disk.
+                result_meta["changed_files"] = ["keep.txt", "new.txt", result_rel.as_posix()]
+                hloop.write_text(result_path, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n")
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "stale handoff artifact"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_stale_attempt(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-stale-attempt", status="partial"
+                )
+                state["tasks"]["T001"]["active_attempt_id"] = "T001-A002"
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "handoff attempt_id mismatch"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_when_semantic_ack_not_approved(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-ack", status="partial"
+                )
+                state["tasks"]["T001"]["semantic_ack_barrier"] = {
+                    "status": "awaiting_ack",
+                    "message_id": "task-contract:" + "a" * 64,
+                }
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_non_handoff_artifact(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-non-handoff", status="partial"
+                )
+                result_path = worktree / result_rel
+                result_meta = hloop.parse_frontmatter_text(hloop.read_text(result_path))
+                result_meta["handoff"] = False
+                hloop.write_text(
+                    result_path,
+                    hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n",
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "not a durable handoff"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_missing_manager_validation_command(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-missing-validation", status="done"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "without at least one Manager"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_does_not_commit_when_manager_validation_fails_even_with_mutation(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-validation-fail", status="done"
+                )
+                head_before = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                mutate_and_fail = (
+                    f"echo side-effect > {shlex.quote(str(worktree / 'side-effect.txt'))}; exit 1"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "Manager validation command failed"):
+                        hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=[mutate_and_fail])
+                        )
+                head_after = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                self.assertEqual(head_before, head_after)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+                # The mutation from the failed command is left uncommitted, not silently absorbed.
+                self.assertTrue((worktree / "side-effect.txt").exists())
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_rejects_out_of_scope_mutation_from_passing_validation_command(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-validation-mutation", status="done"
+                )
+                head_before = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                mutate_and_pass = (
+                    f"echo side-effect > {shlex.quote(str(worktree / 'side-effect.txt'))}"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(
+                        hloop.HLoopError, "write-scope violations introduced by Manager validation"
+                    ):
+                        hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=[mutate_and_pass])
+                        )
+                head_after = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                self.assertEqual(head_before, head_after)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+                self.assertTrue((worktree / "side-effect.txt").exists())
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_aborts_and_resets_when_worktree_changes_while_staging(self):
+        """Simulate the TOCTOU window between the pre-stage scan and `git add`."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-toctou", status="partial"
+                )
+                real_dirty = hloop.porcelain_paths_no_renames(worktree)
+                raced_dirty = [*real_dirty, "late-arriving.txt"]
+                with mock.patch.object(
+                    hloop, "porcelain_paths_no_renames", side_effect=[real_dirty, raced_dirty]
+                ):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with self.assertRaisesRegex(hloop.HLoopError, "worktree changed while staging"):
+                            hloop.cmd_worker_seal(self.seal_args(repo))
+                # Fail closed: the race must abort with everything unstaged and uncommitted.
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_on_branch_mismatch(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-branch", status="partial"
+                )
+                state["tasks"]["T001"]["branch"] = "some-other-branch"
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "Worker branch mismatch"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_without_pending_handoff(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-clean", status="partial"
+                )
+                subprocess.run(["git", "add", "-A"], cwd=worktree, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "worker committed everything already"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "nothing to seal"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_without_pane_evidence(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-no-pane", status="partial"
+                )
+                del state["tasks"]["T001"]["pane_closed_at"]
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "no pane_id on record"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_when_pane_is_manager_pane(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-manager-pane", status="partial"
+                )
+                del state["tasks"]["T001"]["pane_closed_at"]
+                state["tasks"]["T001"]["pane_id"] = "pane-123"
+                with mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "pane-123"}):
+                    with mock.patch.object(hloop, "command_exists", return_value=True):
+                        with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                            with self.assertRaisesRegex(
+                                hloop.HLoopError, "is the current Manager pane"
+                            ):
+                                hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertNotEqual(hloop.porcelain_paths(worktree), [])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_fails_closed_when_pane_close_fails(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-close-fails", status="partial"
+                )
+                del state["tasks"]["T001"]["pane_closed_at"]
+                state["tasks"]["T001"]["pane_id"] = "pane-999"
+
+                real_run_cmd = hloop.run_cmd
+
+                def fake_run_cmd(cmd, *args, **kwargs):
+                    if cmd[:3] == ["herdr", "pane", "close"]:
+                        return SimpleNamespace(returncode=1, stdout="", stderr="pane busy")
+                    return real_run_cmd(cmd, *args, **kwargs)
+
+                with mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "manager-pane"}):
+                    with mock.patch.object(hloop, "command_exists", return_value=True):
+                        with mock.patch.object(
+                            hloop, "pane_info", return_value={"agent": "codex", "agent_status": "idle"}
+                        ):
+                            with mock.patch.object(hloop, "pane_text", return_value=""):
+                                with mock.patch.object(hloop, "run_cmd", side_effect=fake_run_cmd):
+                                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                                        with self.assertRaisesRegex(
+                                            hloop.HLoopError, "failed to close Worker pane"
+                                        ):
+                                            hloop.cmd_worker_seal(self.seal_args(repo))
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_finalize_handoff_records_both_rename_sides_and_seal_succeeds(self):
+        """A legitimate in-scope rename must seal end to end via finalize --handoff."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                hloop.configure_loop_namespace("worker-seal-rename-ok")
+                repo = self.make_repo(root)
+                # Loop artifacts are not part of the product; exclude them the
+                # way a properly configured repository would so they never
+                # show up as dirty product paths for scope checking.
+                (repo / ".git" / "info" / "exclude").write_text(
+                    ".ai/herdr-dev-loop/loops/worker-seal-rename-ok/STATE.json\n"
+                    ".ai/herdr-dev-loop/loops/worker-seal-rename-ok/tasks/\n",
+                    encoding="utf-8",
+                )
+                (repo / "old-name.txt").write_text("payload\n", encoding="utf-8")
+                subprocess.run(["git", "add", "old-name.txt"], cwd=repo, check=True)
+                subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True)
+                base_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                worktree = root / "worker"
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", "worker-seal-rename-ok", str(worktree), "master"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                run_id = "run-rename-ok"
+                task_meta = {
+                    "id": "T001",
+                    "run_id": run_id,
+                    "kind": "fix",
+                    "status": "running",
+                    "branch": "worker-seal-rename-ok",
+                    "base_ref": "master",
+                    "base_sha": base_sha,
+                    "write_allow": ["old-name.txt", "new-name.txt"],
+                    "write_deny": [],
+                    "acceptance": ["rename handoff seals"],
+                }
+                task_text = hloop.frontmatter(task_meta) + "\n\n# Task T001\n"
+                hloop.write_text(hloop.task_file(repo, "T001"), task_text)
+                hloop.write_text(hloop.task_file(worktree, "T001"), task_text)
+
+                task_state = {
+                    **task_meta,
+                    "worktree": str(worktree),
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "worker_base_sha": base_sha,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "semantic_ack_barrier": {"status": "approved"},
+                }
+                manager_state = {
+                    "state_format_version": hloop.STATE_FORMAT_VERSION,
+                    "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                    "namespace": hloop.LOOP_NAMESPACE,
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "phase": "running",
+                    "integration_branch": "master",
+                    "merge_mode": "squash",
+                    "persistence": "local-only",
+                    "tasks": {"T001": task_state},
+                }
+                hloop.save_state(repo, manager_state)
+                hloop.save_state(worktree, json.loads(json.dumps(manager_state)))
+
+                # Simulate the workspace-write sandbox: rename via plain file
+                # ops only, never Git.
+                (worktree / "old-name.txt").rename(worktree / "new-name.txt")
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    finalize_code = hloop.cmd_worker_finalize(
+                        argparse.Namespace(
+                            repo=str(worktree),
+                            task_id="T001",
+                            status="partial",
+                            validation_command=[],
+                            validation_result=[],
+                            validation_summary=None,
+                            blocking_question=[],
+                            no_commit=False,
+                            handoff=True,
+                        )
+                    )
+                self.assertEqual(finalize_code, 0)
+
+                result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+                finalized_meta = hloop.read_frontmatter(worktree / result_rel)
+                self.assertTrue(hloop.normalize_bool(finalized_meta["handoff"]))
+                self.assertIn("old-name.txt", finalized_meta["changed_files"])
+                self.assertIn("new-name.txt", finalized_meta["changed_files"])
+                # finalize --handoff must never touch Git.
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+
+                seal_state = json.loads(json.dumps(manager_state))
+                seal_state["tasks"]["T001"]["pane_closed_at"] = "2026-01-01T00:00:00+00:00"
+                with mock.patch.object(hloop, "preflight_loop", return_value=seal_state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        seal_code = hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertEqual(seal_code, 0)
+                self.assertEqual(hloop.porcelain_paths(worktree), [])
+                self.assertFalse((worktree / "old-name.txt").exists())
+                self.assertEqual((worktree / "new-name.txt").read_text(encoding="utf-8"), "payload\n")
+                sealed_meta = hloop.read_frontmatter(worktree / result_rel)
+                self.assertIn("old-name.txt", sealed_meta["changed_files"])
+                self.assertIn("new-name.txt", sealed_meta["changed_files"])
         finally:
             hloop.configure_loop_namespace(previous)
 

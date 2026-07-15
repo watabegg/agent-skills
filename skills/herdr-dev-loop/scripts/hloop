@@ -1492,7 +1492,7 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     if command == "task":
         return getattr(args, "task_command", "") in {"new", "update"}
     if command == "worker":
-        return getattr(args, "worker_command", "") in {"start", "harvest", "message", "finalize"}
+        return getattr(args, "worker_command", "") in {"start", "harvest", "message", "finalize", "seal"}
     if command == "reviewer":
         return getattr(args, "reviewer_command", "") in {"start", "harvest", "close", "message"}
     if command == "gap":
@@ -2908,6 +2908,58 @@ def cleanup_completed_agent_pane(
         )
 
 
+def require_worker_pane_quiesced_and_closed(
+    repo: Path, task_id: str, task_state: dict[str, Any]
+) -> None:
+    """Confirm the Worker's pane is idle and close it before any Git/validation work.
+
+    Sealing reads and mutates the Worker's live worktree. If the Worker's TUI
+    pane is still open and could still be running, staging or committing its
+    files races the agent process. Fail closed rather than best-effort: an
+    already-closed pane (or one this Manager cannot confirm quiesced) is not
+    good enough to proceed.
+    """
+
+    if task_state.get("pane_closed_at"):
+        return
+    pane_id = str(task_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(
+            f"cannot seal {task_id}: no pane_id on record and the pane was never closed; "
+            "cannot confirm the Worker is quiesced"
+        )
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        raise HLoopError(
+            f"cannot seal {task_id}: Herdr is required to confirm and close Worker pane `{pane_id}` "
+            "before sealing"
+        )
+    try:
+        current = current_pane_id()
+    except HLoopError as exc:
+        raise HLoopError(
+            f"cannot seal {task_id}: could not determine the current Manager pane: {exc}"
+        ) from exc
+    if pane_id == current:
+        raise HLoopError(
+            f"cannot seal {task_id}: Worker pane `{pane_id}` is the current Manager pane"
+        )
+    pane = pane_info(pane_id)
+    if pane is not None:
+        provider = str(task_state.get("agent_provider") or task_state.get("provider") or DEFAULT_AGENT_PROVIDER)
+        text = pane_text(pane_id, lines=200)
+        blocker = agent_tui_blocker(provider, pane, text)
+        if blocker:
+            raise HLoopError(f"cannot seal {task_id}: Worker pane is not quiesced: {blocker}")
+        close_proc = run_cmd(["herdr", "pane", "close", pane_id], check=False)
+        if close_proc.returncode != 0:
+            message = (close_proc.stderr or close_proc.stdout or "").strip()
+            raise HLoopError(f"cannot seal {task_id}: failed to close Worker pane `{pane_id}`: {message}")
+    task_state["pane_closed_at"] = now_iso()
+    task_state["pane_cleanup_status"] = "closed" if pane is not None else "already-closed"
+    task_state["closed_pane_id"] = pane_id
+    task_state.pop("pane_id", None)
+
+
 def current_pane_id() -> str:
     if os.environ.get("HERDR_PANE_ID"):
         return str(os.environ["HERDR_PANE_ID"])
@@ -3439,6 +3491,37 @@ def parse_porcelain_paths(text: str) -> list[str]:
         if path:
             paths.append(path)
     return paths
+
+
+def porcelain_paths_no_renames(repo: Path) -> list[str]:
+    """Unstaged/untracked paths (tracked modified/deleted, untracked) with rename detection off.
+
+    `porcelain_paths` collapses a rename to only its destination path, which
+    would let an out-of-scope source path escape write-scope validation.
+    Passing ``--no-renames`` makes Git report the source and destination as
+    independent delete/add lines instead, so both sides are checked. Only the
+    worktree-status column is consulted, so a path that is fully staged (and
+    therefore clean in the worktree) does not keep showing up as "still
+    dirty" after `git add` -- callers that need staged names use
+    `cached_diff_paths_no_renames` instead.
+    """
+
+    proc = run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(repo), "status", "--porcelain", "--untracked-files=all", "--no-renames"],
+        check=False,
+    )
+    paths = []
+    for line in (proc.stdout or "").splitlines():
+        if len(line) > 1 and line[1] != " ":
+            path = line[3:] if len(line) > 3 else ""
+            if path:
+                paths.append(path)
+    return paths
+
+
+def cached_diff_paths_no_renames(repo: Path) -> list[str]:
+    out = git(repo, ["diff", "--cached", "--no-renames", "--name-status"], check=False)
+    return parse_changed_files_name_status(out)
 
 
 def porcelain_paths_for(repo: Path, pathspec: str) -> list[str]:
@@ -6499,6 +6582,26 @@ validation_commands: ["npm test -- --grep foo,bar"]
         ]
     )
     check(parsed_finalize.worker_command == "finalize", "worker finalize command did not parse")
+    parsed_finalize_handoff = build_parser().parse_args(
+        ["worker", "finalize", "T001", "--status", "done", "--handoff"]
+    )
+    check(parsed_finalize_handoff.handoff, "worker finalize --handoff did not parse")
+    parsed_seal = build_parser().parse_args(
+        [
+            "worker",
+            "seal",
+            "T001",
+            "--attempt-id",
+            "T001-A001",
+            "--validation-command",
+            "npm test",
+            "--validation-summary",
+            "passed",
+        ]
+    )
+    check(parsed_seal.worker_command == "seal", "worker seal command did not parse")
+    check(parsed_seal.attempt_id == "T001-A001", "worker seal --attempt-id did not parse")
+    check(parsed_seal.validation_command == ["npm test"], "worker seal --validation-command did not parse")
     parsed_checkpoint = build_parser().parse_args(["checkpoint", "--message", "ai-loop: checkpoint"])
     check(parsed_checkpoint.command == "checkpoint", "checkpoint command did not parse")
     parsed_rollup = build_parser().parse_args(
@@ -9054,12 +9157,20 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         if block_reason:
             raise HLoopError(f"cannot finalize status done for {task_id}: {block_reason}")
     result_rel = LOOP_DIR / "results" / task_id / "result.md"
-    dirty = [path for path in porcelain_paths(repo) if path != result_rel.as_posix()]
-    if dirty:
+    handoff = bool(getattr(args, "handoff", False))
+    # Rename detection is disabled so a legitimate rename's source and
+    # destination are both recorded as changed, rather than only the
+    # destination surviving into `changed_files`.
+    dirty_product = [path for path in porcelain_paths_no_renames(repo) if path != result_rel.as_posix()]
+    if dirty_product and not handoff:
         raise HLoopError(
             "worker finalize requires product changes to be committed first; dirty paths: "
-            + ", ".join(dirty)
+            + ", ".join(dirty_product)
         )
+    if handoff:
+        handoff_violations = validate_change_scope(task_id, meta, dirty_product)
+        if handoff_violations:
+            raise HLoopError("write-scope violations: " + "; ".join(handoff_violations))
     validation_commands = args.validation_command or []
     validation_results = args.validation_result or []
     blocking_questions = args.blocking_question or []
@@ -9093,7 +9204,7 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         raise HLoopError(f"active attempt base is not an ancestor of HEAD: {base_sha}")
     head_sha = git(repo, ["rev-parse", "HEAD"])
     files = changed_files(repo, base_sha, head_sha)
-    files = list(dict.fromkeys([*files, result_rel.as_posix()]))
+    files = list(dict.fromkeys([*files, *dirty_product, result_rel.as_posix()]))
     violations = validate_change_scope(task_id, meta, files)
     if violations:
         raise HLoopError("write-scope violations: " + "; ".join(violations))
@@ -9113,10 +9224,16 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         "validation_results": validation_results,
         "validation_summary": args.validation_summary or "",
         "blocking_questions": blocking_questions,
+        "handoff": handoff,
     }
     body = f"# Worker Result {task_id}\n\nGenerated by `hloop worker finalize`.\n"
     write_text(repo / result_rel, frontmatter(fields) + "\n" + body)
-    if not args.no_commit:
+    if handoff:
+        print(
+            "no Git metadata was written; ask the Manager to run "
+            f"`hloop worker seal {task_id}` to validate and commit this handoff"
+        )
+    if not handoff and not args.no_commit:
         # Loop artifacts are intentionally gitignored in some repositories. The
         # committed artifact is still the Worker/Manager hand-off contract, so
         # stage this one known path explicitly even in local-only loop setups.
@@ -9137,6 +9254,274 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     print(
         f"HERDR_LOOP_ROLE_DONE:{fields['run_id']}:{task_id}:{fields['attempt_id']}:{status}"
     )
+    return 0
+
+
+def run_seal_validation_command(worktree: Path, command: str) -> tuple[bool, str]:
+    validation_env = os.environ.copy()
+    validation_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proc = subprocess.run(
+        command,
+        cwd=str(worktree),
+        text=True,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=validation_env,
+    )
+    return proc.returncode == 0, proc.stdout or ""
+
+
+def read_worker_handoff_artifact(
+    result_path: Path,
+    result_rel: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    expected_attempt: str,
+) -> dict[str, Any]:
+    """Read-only: parse and validate a handoff `result.md` without mutating anything.
+
+    Used both before the Worker pane is touched (so a genuinely incomplete
+    handoff never causes an in-progress Worker's pane to be closed) and again
+    right after, to detect the artifact having changed underneath the close.
+    """
+
+    if not result_path.exists():
+        raise HLoopError(f"no handoff result artifact found to seal: {result_rel.as_posix()}")
+    handoff_meta = parse_frontmatter_text(read_text(result_path))
+    if not handoff_meta:
+        raise HLoopError(f"handoff result artifact has no frontmatter: {result_rel.as_posix()}")
+    if not normalize_bool(handoff_meta.get("handoff")):
+        raise HLoopError(
+            f"result artifact is not a durable handoff (missing handoff: true): {result_rel.as_posix()}"
+        )
+    identity_error = artifact_identity_error(state, task_id, "worker", task_state, handoff_meta)
+    if identity_error:
+        raise HLoopError(
+            f"stale or mismatched Worker handoff artifact: {identity_error}: {result_rel.as_posix()}"
+        )
+    reported_attempt = str(handoff_meta.get("attempt_id") or "")
+    if reported_attempt and reported_attempt != expected_attempt:
+        raise HLoopError(
+            f"handoff attempt_id mismatch: expected active attempt {expected_attempt}, "
+            f"got {reported_attempt}"
+        )
+    status = str(handoff_meta.get("status") or "")
+    if status not in TASK_STATUSES_FINAL:
+        raise HLoopError(f"invalid handoff status in {result_rel.as_posix()}: {status}")
+    return handoff_meta
+
+
+def cmd_worker_seal(args: argparse.Namespace) -> int:
+    """Manager-only: validate and commit a Worker's uncommitted handoff.
+
+    A workspace-write Codex Worker may run ``hloop worker finalize --handoff``
+    to write ``result.md`` and leave in-scope product changes on disk without
+    ever invoking Git. This command performs the Manager-side validation --
+    quiesced/closed Worker pane, exact active attempt, semantic ACK,
+    branch/worktree identity, full (committed + dirty, rename-source-aware)
+    write scope, a non-stale artifact, and real Manager-measured validation
+    for `status: done` -- fail-closed before staging or committing anything.
+    A successful seal produces exactly the same shape of commit a
+    self-committing Worker would have produced, so `hloop worker harvest`
+    and merge require no changes.
+    """
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_herdr=True, require_integration_branch=True)
+    task_id = args.task_id
+    task_state = state.get("tasks", {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    if str(task_state.get("status") or "") != "running":
+        raise HLoopError(f"cannot seal {task_id}: task has no active running attempt")
+    block_reason = semantic_ack_barrier_blocking(task_state)
+    if block_reason:
+        raise HLoopError(f"cannot seal {task_id}: {block_reason}")
+    expected_attempt = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or "")
+    if not expected_attempt:
+        raise HLoopError(f"cannot seal {task_id}: no active attempt is recorded")
+    if args.attempt_id and args.attempt_id != expected_attempt:
+        raise HLoopError(
+            f"attempt mismatch for {task_id}: expected active attempt {expected_attempt}, "
+            f"got {args.attempt_id}"
+        )
+
+    worktree = Path(task_state.get("worktree") or default_worktree(repo, task_id, state)).resolve()
+    if not worktree.is_dir():
+        raise HLoopError(f"worker worktree not found: {worktree}")
+    expected_branch = str(task_state.get("branch") or "")
+    branch = current_branch(worktree)
+    if expected_branch and branch != expected_branch:
+        raise HLoopError(f"Worker branch mismatch: expected {expected_branch}, got {branch}")
+
+    pre_staged = cached_diff_paths_no_renames(worktree)
+    if pre_staged:
+        raise HLoopError(
+            f"cannot seal {task_id}: worktree index already has staged changes, which a "
+            f"durable handoff must never produce: {sorted(pre_staged)}"
+        )
+
+    meta = read_frontmatter(task_file(repo, task_id))
+    if str(meta.get("id") or "") != task_id:
+        raise HLoopError(f"task file mismatch for {task_id}")
+
+    result_rel = LOOP_DIR / "results" / task_id / "result.md"
+    result_path = worktree / result_rel
+
+    # Read-only precheck: confirm there is a genuinely complete, well-formed
+    # handoff before doing anything that could disrupt a Worker that has not
+    # actually finished -- closing its pane chief among them.
+    precheck_meta = read_worker_handoff_artifact(
+        result_path, result_rel, state, task_id, task_state, expected_attempt
+    )
+    dirty = porcelain_paths_no_renames(worktree)
+    if not dirty:
+        raise HLoopError(f"nothing to seal for {task_id}: worktree has no pending handoff changes")
+    if result_rel.as_posix() not in dirty:
+        raise HLoopError(
+            f"result artifact is not part of the pending handoff: {result_rel.as_posix()}"
+        )
+
+    # Only now that a real handoff is confirmed: make sure the Worker pane is
+    # quiesced and close it, so nothing can still be mutating the worktree
+    # while seal reads, stages, or commits it.
+    require_worker_pane_quiesced_and_closed(repo, task_id, task_state)
+    save_state(repo, state)
+
+    # Re-read and re-validate the artifact now that the pane is closed. If it
+    # changed during the close window, the precheck snapshot is stale --
+    # refuse rather than seal a moving target.
+    handoff_meta = read_worker_handoff_artifact(
+        result_path, result_rel, state, task_id, task_state, expected_attempt
+    )
+    if handoff_meta != precheck_meta:
+        raise HLoopError(
+            f"handoff result artifact for {task_id} changed while closing the Worker pane; "
+            "refusing to seal a moving target"
+        )
+    status = str(handoff_meta.get("status") or "")
+    blocking_questions = normalize_list(handoff_meta.get("blocking_questions"))
+
+    base_ref = str(task_state.get("base_ref") or meta.get("base_ref") or state.get("integration_branch") or "")
+    if not base_ref:
+        raise HLoopError(f"task base_ref is missing: {task_id}")
+    base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
+    if not base_sha:
+        base_proc = run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(worktree), "merge-base", "HEAD", base_ref], check=False
+        )
+        if base_proc.returncode != 0 or not (base_proc.stdout or "").strip():
+            raise HLoopError(f"cannot resolve Worker branch point against {base_ref}")
+        base_sha = (base_proc.stdout or "").strip()
+    if not is_ancestor(worktree, base_sha, "HEAD"):
+        raise HLoopError(f"active attempt base is not an ancestor of HEAD: {base_sha}")
+
+    # The complete write scope is whatever the Worker already committed on top
+    # of base_sha, plus whatever remains dirty in this durable handoff. Trust
+    # neither in isolation: a partially self-committing Worker could still
+    # leave out-of-scope files dirty, or could have committed out-of-scope
+    # files before switching to a handoff for the rest. Rename detection is
+    # disabled throughout so a rename's source path cannot escape scope
+    # checking by hiding behind its destination.
+    committed_files = changed_files(worktree, base_sha, "HEAD")
+    full_scope = list(dict.fromkeys([*committed_files, *dirty]))
+
+    declared_changed_files = normalize_list(handoff_meta.get("changed_files"))
+    if set(declared_changed_files) != set(full_scope):
+        raise HLoopError(
+            f"stale handoff artifact: declared changed_files does not match the measured write "
+            f"scope for {task_id}; declared={sorted(declared_changed_files)} "
+            f"measured={sorted(full_scope)}"
+        )
+
+    violations = validate_change_scope(task_id, meta, full_scope)
+    if violations:
+        raise HLoopError("write-scope violations: " + "; ".join(violations))
+
+    manager_validation_commands: list[str] = []
+    manager_validation_results: list[str] = []
+    if status == "done":
+        manager_validation_commands = normalize_list(getattr(args, "validation_command", None))
+        if not manager_validation_commands:
+            raise HLoopError(
+                f"cannot seal {task_id} as status done without at least one Manager "
+                "--validation-command"
+            )
+        for command in manager_validation_commands:
+            passed, output = run_seal_validation_command(worktree, command)
+            manager_validation_results.append("passed" if passed else "failed")
+            if not passed:
+                raise HLoopError(
+                    f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
+                    + output
+                )
+
+        # The validation run itself may have mutated the tree (formatters,
+        # lockfiles, generated files). Re-scan and scope-check only the delta
+        # it introduced; nothing may be committed unless every changed path,
+        # old and new, is in scope.
+        post_dirty = porcelain_paths_no_renames(worktree)
+        post_committed = changed_files(worktree, base_sha, "HEAD")
+        post_scope = list(dict.fromkeys([*post_committed, *post_dirty]))
+        new_paths = sorted(set(post_scope) - set(full_scope))
+        if new_paths:
+            new_violations = validate_change_scope(task_id, meta, new_paths)
+            if new_violations:
+                raise HLoopError(
+                    "write-scope violations introduced by Manager validation commands: "
+                    + "; ".join(new_violations)
+                )
+        full_scope = post_scope
+        dirty = post_dirty
+
+    merge_ready = status == "done" and bool(manager_validation_commands) and not blocking_questions and all(
+        result == "passed" for result in manager_validation_results
+    )
+    replace_frontmatter(
+        result_path,
+        {
+            "changed_files": full_scope,
+            "validation_recorded": bool(manager_validation_commands),
+            "validation_commands": manager_validation_commands,
+            "validation_results": manager_validation_results,
+            "validation_summary": args.validation_summary or handoff_meta.get("validation_summary") or "",
+            "merge_ready": merge_ready,
+        },
+    )
+    if result_rel.as_posix() not in dirty:
+        dirty = [*dirty, result_rel.as_posix()]
+
+    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-A", "--", *dirty], check=True)
+
+    # Re-verify nothing changed underneath staging (a genuine TOCTOU window,
+    # however small) before committing: no unstaged/untracked path may
+    # remain, and the staged (cached) diff must be exactly what was scanned.
+    remaining_dirty = porcelain_paths_no_renames(worktree)
+    cached_files = cached_diff_paths_no_renames(worktree)
+    if remaining_dirty or set(cached_files) != set(dirty):
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "reset"], check=False)
+        raise HLoopError(
+            f"seal aborted for {task_id}: worktree changed while staging (remaining dirty: "
+            f"{remaining_dirty}; staged {sorted(cached_files)} != expected {sorted(dirty)})"
+        )
+
+    run_cmd(
+        [
+            TRUSTED_GIT_PATH,
+            "-C",
+            str(worktree),
+            "commit",
+            "-m",
+            f"ai-loop({task_id}): seal worker handoff ({expected_attempt})",
+        ],
+        check=True,
+        capture=False,
+    )
+    head_sha = git(worktree, ["rev-parse", "HEAD"])
+    journal(repo, f"Sealed Worker handoff for `{task_id}` at attempt `{expected_attempt}` ({head_sha}).")
+    print(f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha}")
     return 0
 
 
@@ -16642,12 +17027,39 @@ def build_parser() -> argparse.ArgumentParser:
     worker_finalize.add_argument("--validation-summary")
     worker_finalize.add_argument("--blocking-question", action="append")
     worker_finalize.add_argument("--no-commit", action="store_true")
+    worker_finalize.add_argument(
+        "--handoff",
+        action="store_true",
+        help=(
+            "write a durable handoff without any Git write (tolerates in-scope dirty product "
+            "paths); ask the Manager to run `hloop worker seal <task-id>` to validate and commit"
+        ),
+    )
     worker_finalize.set_defaults(func=cmd_worker_finalize)
     worker_harvest = worker_sub.add_parser("harvest")
     worker_harvest.add_argument("task_id")
     worker_harvest.add_argument("--keep-pane", action="store_true")
     worker_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     worker_harvest.set_defaults(func=cmd_worker_harvest)
+    worker_seal = worker_sub.add_parser(
+        "seal",
+        help=(
+            "Manager-only: validate and commit a Worker's durable handoff "
+            "(result.md plus any in-scope dirty product changes) at Worker HEAD"
+        ),
+    )
+    worker_seal.add_argument("task_id")
+    worker_seal.add_argument(
+        "--attempt-id",
+        help="expected active attempt id; seal fails if it does not match the Manager's record",
+    )
+    worker_seal.add_argument(
+        "--validation-command",
+        action="append",
+        help="required at least once for status:done; executed for real before sealing",
+    )
+    worker_seal.add_argument("--validation-summary")
+    worker_seal.set_defaults(func=cmd_worker_seal)
     worker_watch = worker_sub.add_parser("watch")
     worker_watch.add_argument("task_id")
     worker_watch.add_argument("--lines", type=int, default=120)

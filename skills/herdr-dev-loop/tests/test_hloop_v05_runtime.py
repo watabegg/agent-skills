@@ -2130,7 +2130,7 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             approved = hloop.load_state(repo)["tasks"]["T001"]["semantic_ack_barrier"]
             self.assertEqual(approved["status"], "approved")
 
-            with mock.patch.object(hloop, "porcelain_paths", return_value=[]):
+            with mock.patch.object(hloop, "porcelain_paths", return_value=[]), mock.patch.object(hloop, "porcelain_paths_no_renames", return_value=[]):
                 with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
                     hloop.cmd_worker_finalize(
                         SimpleNamespace(
