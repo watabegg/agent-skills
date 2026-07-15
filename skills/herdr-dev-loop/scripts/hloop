@@ -135,6 +135,7 @@ DEFAULT_REVIEW_LANES = [
 ]
 BRANCH_STRATEGIES = {"integration", "pr-per-task", "custom"}
 QA_PROFILES = {"repo-default", "local", "staging", "preview", "none", "custom"}
+WORKER_VALIDATION_RESULTS = frozenset({"passed", "failed", "blocked"})
 MANAGER_QA_PASSING_STATUSES = {"passed", "accepted-risk", "not-required"}
 WORKER_PROTOCOLS = {"native", "codex-impl"}
 REVIEW_PROTOCOLS = {"native", "codex-review-multi-v2"}
@@ -2474,6 +2475,15 @@ def resolve_semantic_ack_barrier(
         raise HLoopError(
             "a corrected semantic ACK report is required after the previous reject/timeout"
         )
+    if (
+        decision == "approve"
+        and str(barrier.get("kind") or "") == "task-contract"
+        and str((latest_ack or {}).get("task_contract_digest") or "")
+        != str(barrier.get("digest") or "")
+    ):
+        raise HLoopError(
+            "the corrected semantic ACK does not match the active task contract digest"
+        )
     if decision == "approve":
         barrier["status"] = "approved"
         barrier["ack_event_id"] = latest_ack["event_id"]
@@ -3090,6 +3100,68 @@ def changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
     return parse_changed_files_name_status(out)
 
 
+def git_worktree_paths(repo: Path) -> list[Path]:
+    """Return every checkout sharing this repository's common Git directory."""
+
+    output = git(repo, ["worktree", "list", "--porcelain"])
+    return [
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def canonical_worker_contract_source(
+    worker_repo: Path,
+    task_id: str,
+    local_state: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    """Locate the active Manager checkout that owns a Worker's live contract.
+
+    A local-only role worktree intentionally receives a point-in-time loop
+    snapshot. Contract changes and semantic ACK approval are Manager-owned
+    state, so ``worker finalize`` must not trust that stale snapshot when the
+    active integration checkout is available through the shared Git worktree
+    inventory.
+    """
+
+    worker_repo = worker_repo.resolve()
+    expected_run_id = str(local_state.get("run_id") or "")
+    for candidate in git_worktree_paths(worker_repo):
+        if candidate == worker_repo or not state_path(candidate).is_file():
+            continue
+        try:
+            candidate_state = load_state(candidate)
+        except (HLoopError, OSError, json.JSONDecodeError):
+            continue
+        if expected_run_id and str(candidate_state.get("run_id") or "") != expected_run_id:
+            continue
+        task_state = (candidate_state.get("tasks") or {}).get(task_id)
+        if not isinstance(task_state, dict) or str(task_state.get("status") or "") != "running":
+            continue
+        worktree_raw = str(task_state.get("worktree") or "")
+        if not worktree_raw or Path(worktree_raw).resolve() != worker_repo:
+            continue
+        integration_branch = str(candidate_state.get("integration_branch") or "")
+        if integration_branch and current_branch(candidate) != integration_branch:
+            continue
+        return candidate, candidate_state
+    local_task = (local_state.get("tasks") or {}).get(task_id)
+    local_integration = str(local_state.get("integration_branch") or "")
+    local_worktree = str((local_task or {}).get("worktree") or "")
+    if (
+        isinstance(local_task, dict)
+        and local_integration
+        and current_branch(worker_repo) != local_integration
+        and local_worktree
+        and Path(local_worktree).resolve() == worker_repo
+    ):
+        raise HLoopError(
+            f"canonical Manager task contract is unavailable for active Worker {task_id}"
+        )
+    return worker_repo, local_state
+
+
 def git_show(repo: Path, ref_path: str) -> str:
     proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "show", ref_path], check=False)
     if proc.returncode != 0:
@@ -3168,6 +3240,35 @@ def require_committed_result(worktree: Path, task_id: str, head_sha: str) -> str
 
 def result_validation_recorded(meta: dict[str, Any]) -> bool:
     return normalize_bool(meta.get("validation_recorded"))
+
+
+def worker_validation_error(
+    meta: dict[str, Any],
+    *,
+    require_recorded: bool = False,
+    require_passing: bool = False,
+) -> str:
+    """Return a fail-closed error for one Worker validation record."""
+
+    recorded = result_validation_recorded(meta)
+    commands = normalize_list(meta.get("validation_commands"))
+    results = normalize_list(meta.get("validation_results"))
+    if not recorded:
+        if commands or results:
+            return "validation evidence is present while validation_recorded is false"
+        return "validation is not recorded" if require_recorded else ""
+    if not commands or not results:
+        return "validation_recorded requires non-empty commands and results"
+    if len(commands) != len(results):
+        return "validation command and result counts do not match"
+    invalid = [result for result in results if result not in WORKER_VALIDATION_RESULTS]
+    if invalid:
+        return "unsupported validation result(s): " + ", ".join(invalid)
+    if require_passing:
+        non_passing = [result for result in results if result != "passed"]
+        if non_passing:
+            return "validation did not pass: " + ", ".join(non_passing)
+    return ""
 
 
 def escape_literal_brackets(pattern: str) -> str:
@@ -3819,7 +3920,11 @@ def agent_contract_issues(
                     "Run hloop worker harvest again; do not merge until the result is committed at branch HEAD.",
                 )
             )
-        if path_under_repo_loop_results(repo, agent.get("result_path")) and str(agent.get("worktree") or ""):
+        if (
+            not artifact_was_harvested(agent)
+            and path_under_repo_loop_results(repo, agent.get("result_path"))
+            and str(agent.get("worktree") or "")
+        ):
             issues.append(
                 make_issue(
                     "P1",
@@ -5310,6 +5415,94 @@ def register_role_report_identity_and_ack_floor(
     return token, int((latest_ack or {}).get("sequence") or 0)
 
 
+def rebind_role_report_contract_digest(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+    task_contract_digest: str,
+) -> int:
+    """Append a new digest binding while preserving the attempt's secret token."""
+
+    store = _open_broker_store(repo)
+    run_id = str(state.get("run_id") or "local")
+    with store.transaction() as transaction:
+        current = store._latest_active_role(  # noqa: SLF001 - same-runtime storage contract
+            transaction, run_id=run_id, role_id=role_id
+        )
+        if current is None or not normalize_bool(current.get("active")):
+            raise HLoopError(f"active report identity is missing for {role_id}")
+        if str(current.get("attempt_id") or "") != attempt_id:
+            raise HLoopError(
+                f"active report identity attempt mismatch for {role_id}: "
+                f"expected {attempt_id}, got {current.get('attempt_id')}"
+            )
+        latest_ack = store.latest_role_event(
+            transaction,
+            run_id=run_id,
+            role_id=role_id,
+            attempt_id=attempt_id,
+            report_type="ack",
+        )
+        transaction.connection.execute(
+            """
+            INSERT INTO active_roles(
+                run_id, role_id, attempt_id, task_contract_digest,
+                token_digest, active, registered_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                run_id,
+                role_id,
+                attempt_id,
+                task_contract_digest.lower(),
+                current["token_digest"],
+                now_iso(),
+            ),
+        )
+    return int((latest_ack or {}).get("sequence") or 0)
+
+
+def refresh_running_worker_contract_snapshot(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    *,
+    task_contract_digest: str,
+) -> None:
+    """Refresh the role-visible contract identity without copying Manager state."""
+
+    prompt_raw = str(task_state.get("prompt") or "")
+    if prompt_raw:
+        prompt = Path(prompt_raw)
+        if not prompt.is_file():
+            raise HLoopError(f"running Worker prompt is missing: {prompt}")
+        prompt_text = read_text(prompt)
+        updated_prompt, replacements = re.subn(
+            r"(--task-contract-digest )[0-9a-f]{64}",
+            rf"\g<1>{task_contract_digest}",
+            prompt_text,
+        )
+        if replacements != 1:
+            raise HLoopError(
+                f"running Worker prompt has {replacements} task contract digest fields: {prompt}"
+            )
+        write_text(prompt, updated_prompt)
+
+    if state_persistence(state) != "local-only":
+        return
+    worktree_raw = str(task_state.get("worktree") or "")
+    if not worktree_raw:
+        return
+    worktree = Path(worktree_raw).resolve()
+    if not worktree.is_dir():
+        raise HLoopError(f"running Worker worktree is missing: {worktree}")
+    visible_task = task_file(worktree, task_id)
+    write_text(visible_task, read_text(task_file(repo, task_id)))
+
+
 def prompt_contract_digest(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
@@ -5936,12 +6129,15 @@ def schema_has_merge_ready_guard(schema: dict[str, Any]) -> bool:
         props = then.get("properties", {})
         if not isinstance(props, dict):
             continue
+        validation_items = props.get("validation_results", {}).get("items", {})
         if {
             "status",
             "validation_recorded",
             "validation_commands",
             "validation_results",
-        }.issubset(required) and props.get("status", {}).get("const") == "done":
+        }.issubset(required) and props.get("status", {}).get("const") == "done" and (
+            validation_items.get("const") == "passed"
+        ):
             return True
     return False
 
@@ -6042,6 +6238,18 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             f"{schema_name} lacks required skill_version",
         )
     check(schema_has_merge_ready_guard(result_schema), "result.schema.json lacks merge_ready guard")
+    validation_result_enum = set(
+        normalize_list(
+            result_schema.get("properties", {})
+            .get("validation_results", {})
+            .get("items", {})
+            .get("enum")
+        )
+    )
+    check(
+        validation_result_enum == WORKER_VALIDATION_RESULTS,
+        "result.schema.json validation result enum drifted",
+    )
     check(schema_has_write_allow_guard(task_schema), "task.schema.json lacks write_allow guard")
     review_status_enum = set(normalize_list(review_schema.get("properties", {}).get("status", {}).get("enum")))
     gap_status_enum = set(normalize_list(gap_schema.get("properties", {}).get("status", {}).get("enum")))
@@ -8632,13 +8840,58 @@ def cmd_task_update(args: argparse.Namespace) -> int:
         task_state["agent_provider"] = normalize_agent_provider(updates["worker_agent_provider"])
     if "worker_agent_model" in updates:
         task_state["agent_model"] = normalize_agent_model(updates["worker_agent_model"])
+    task_contract_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    task_state["task_contract_digest"] = task_contract_digest
     task_state["contract_updated_at"] = now_iso()
+    if task_state.get("status") == "running":
+        attempt_id = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or "")
+        if not attempt_id:
+            raise HLoopError(f"running task has no active attempt identity: {task_id}")
+        try:
+            ack_floor = rebind_role_report_contract_digest(
+                repo,
+                state,
+                role_id=task_id,
+                attempt_id=attempt_id,
+                task_contract_digest=task_contract_digest,
+            )
+        except (HLoopError, hloop_broker.BrokerStorageError, OSError) as exc:
+            arm_semantic_ack_barrier(
+                task_state,
+                message_id=f"task-contract:{task_contract_digest}",
+                digest=task_contract_digest,
+                kind="task-contract",
+            )
+            task_state["semantic_ack_barrier"]["status"] = "identity_rebind_failed"
+            task_state["semantic_ack_barrier"]["error"] = str(exc)
+            save_state(repo, state)
+            raise HLoopError(
+                f"task contract changed but report identity rebinding failed for {task_id}; "
+                "finalize, harvest, and merge remain blocked"
+            ) from exc
+        arm_semantic_ack_barrier(
+            task_state,
+            message_id=f"task-contract:{task_contract_digest}",
+            digest=task_contract_digest,
+            kind="task-contract",
+            required_reack_after_sequence=ack_floor,
+        )
     save_state(repo, state)
+    if task_state.get("status") == "running":
+        refresh_running_worker_contract_snapshot(
+            repo,
+            state,
+            task_id,
+            task_state,
+            task_contract_digest=task_contract_digest,
+        )
     journal(repo, f"Updated task contract `{task_id}`: {', '.join(sorted(updates))}.")
     print(f"updated {task_id}: {', '.join(sorted(updates))}")
     if task_state.get("status") == "running":
         print(
-            "warning: Worker is already running; checkpoint the Manager contract and send the changed requirements with `hloop worker message`."
+            "Worker contract digest changed to "
+            f"{task_contract_digest}; a corrected semantic ACK and Manager approval are required "
+            "before finalize, harvest, or merge. Send the changed requirements with `hloop worker message`."
         )
     else:
         print("checkpoint required before starting this task")
@@ -8647,12 +8900,13 @@ def cmd_task_update(args: argparse.Namespace) -> int:
 
 def cmd_worker_finalize(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
-    state = load_state(repo)
+    local_state = load_state(repo)
     task_id = args.task_id
+    contract_repo, state = canonical_worker_contract_source(repo, task_id, local_state)
     task_state = state.get("tasks", {}).get(task_id)
     if not isinstance(task_state, dict):
         raise HLoopError(f"unknown task: {task_id}")
-    meta = read_frontmatter(task_file(repo, task_id))
+    meta = read_frontmatter(task_file(contract_repo, task_id))
     if str(meta.get("id") or "") != task_id:
         raise HLoopError(f"task file mismatch for {task_id}")
     branch = current_branch(repo)
@@ -8684,9 +8938,18 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     validation_recorded = bool(validation_commands and validation_results)
     if len(validation_commands) != len(validation_results):
         raise HLoopError("--validation-command and --validation-result counts must match")
+    validation_error = worker_validation_error(
+        {
+            "validation_recorded": validation_recorded,
+            "validation_commands": validation_commands,
+            "validation_results": validation_results,
+        },
+        require_recorded=status == "done",
+        require_passing=status == "done",
+    )
+    if validation_error:
+        raise HLoopError(f"invalid Worker validation for status {status}: {validation_error}")
     merge_ready = status == "done" and validation_recorded and not blocking_questions
-    if status == "done" and not validation_recorded:
-        raise HLoopError("status done requires at least one validation command and result")
     base_ref = str(task_state.get("base_ref") or meta.get("base_ref") or state.get("integration_branch") or "")
     if not base_ref:
         raise HLoopError(f"task base_ref is missing: {task_id}")
@@ -9365,6 +9628,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "sandbox": "workspace-write",
             "started_at": now_iso(),
             "provider_invocation": provider_invocation.as_record(),
+            "task_contract_digest": task_contract_digest,
         }
     )
     arm_initial_semantic_ack_barrier(
@@ -9417,18 +9681,24 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
         raise HLoopError(f"manager base_sha is missing for {task_id}")
     committed_result = require_committed_result(worktree, task_id, head_sha)
     final_result = result_file(repo, task_id)
+    files = normalize_list(meta.get("changed_files")) or changed_files(worktree, base_sha, head_sha)
+    validation_recorded = result_validation_recorded(meta)
+    reported_merge_ready = normalize_bool(meta.get("merge_ready"))
+    validation_error = worker_validation_error(
+        meta,
+        require_recorded=reported_merge_ready,
+        require_passing=reported_merge_ready,
+    )
+    if validation_error:
+        raise HLoopError(f"invalid Worker validation in {result}: {validation_error}")
     if result.resolve() != final_result.resolve():
         write_text(final_result, read_text(result))
         task_state["worktree_result_path_harvested"] = str(result)
-    files = normalize_list(meta.get("changed_files")) or changed_files(worktree, base_sha, head_sha)
-    validation_recorded = result_validation_recorded(meta)
-    if normalize_bool(meta.get("merge_ready")) and not validation_recorded:
-        raise HLoopError(f"merge_ready result does not record validation: {result}")
     task_state.update(
         {
             "status": "result_reported" if status == "done" else status,
             "result_status": status,
-            "merge_ready": normalize_bool(meta.get("merge_ready")),
+            "merge_ready": reported_merge_ready,
             "head_sha": head_sha,
             "base_sha": base_sha,
             "reported_base_sha": reported_base_sha,
@@ -9438,7 +9708,7 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
             "validation_commands": normalize_list(meta.get("validation_commands")),
             "validation_results": normalize_list(meta.get("validation_results")),
             "validation_summary": str(meta.get("validation_summary") or ""),
-            "result_path": str(final_result),
+            "result_path": committed_result,
             "committed_result_path": committed_result,
             "harvested_at": now_iso(),
         }
@@ -9482,14 +9752,21 @@ def send_manager_message_and_record(
         state, agent_id, agent_state, message, contract_changing=contract_changing
     )
     if contract_changing:
-        arm_semantic_ack_barrier(
-            agent_state,
-            message_id=message_id,
-            digest=message_digest(message),
-            required_reack_after_sequence=latest_semantic_ack_sequence(
-                repo, state, role_id=agent_id, agent_state=agent_state
-            ),
+        existing_barrier = agent_state.get("semantic_ack_barrier")
+        pending_task_contract = (
+            isinstance(existing_barrier, dict)
+            and str(existing_barrier.get("kind") or "") == "task-contract"
+            and str(existing_barrier.get("status") or "") != "approved"
         )
+        if not pending_task_contract:
+            arm_semantic_ack_barrier(
+                agent_state,
+                message_id=message_id,
+                digest=message_digest(message),
+                required_reack_after_sequence=latest_semantic_ack_sequence(
+                    repo, state, role_id=agent_id, agent_state=agent_state
+                ),
+            )
     try:
         send_agent_tui_message(
             str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER),
@@ -9857,8 +10134,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
         raise HLoopError(f"task is not merge ready: {task_id}")
     if normalize_list(task_state.get("blocking_questions")):
         raise HLoopError(f"task has blocking questions: {task_id}")
-    if not task_state.get("validation_recorded"):
-        raise HLoopError(f"task result does not record validation: {task_id}")
+    validation_error = worker_validation_error(
+        task_state,
+        require_recorded=True,
+        require_passing=True,
+    )
+    if validation_error:
+        raise HLoopError(f"task validation does not permit merge for {task_id}: {validation_error}")
     branch = task_state["branch"]
     mode = getattr(args, "mode", None) or state.get("merge_mode", "squash")
     if mode not in {"squash", "cherry-pick"}:
@@ -14007,8 +14289,14 @@ def artifact_readiness(
         status = str(meta.get("status") or "")
         if status not in TASK_STATUSES_FINAL:
             return False, "invalid-status"
-        if normalize_bool(meta.get("merge_ready")) and not result_validation_recorded(meta):
-            return False, "merge-ready-without-validation"
+        merge_ready = normalize_bool(meta.get("merge_ready"))
+        validation_error = worker_validation_error(
+            meta,
+            require_recorded=merge_ready,
+            require_passing=merge_ready,
+        )
+        if validation_error:
+            return False, f"invalid-worker-validation:{validation_error}"
         if artifact_was_harvested(agent):
             if not agent.get("committed_result_path"):
                 return False, "harvested-without-committed-result"
@@ -15604,7 +15892,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--status", choices=sorted(TASK_STATUSES_FINAL), default="done"
     )
     worker_finalize.add_argument("--validation-command", action="append")
-    worker_finalize.add_argument("--validation-result", action="append")
+    worker_finalize.add_argument(
+        "--validation-result",
+        action="append",
+        choices=sorted(WORKER_VALIDATION_RESULTS),
+    )
     worker_finalize.add_argument("--validation-summary")
     worker_finalize.add_argument("--blocking-question", action="append")
     worker_finalize.add_argument("--no-commit", action="store_true")
