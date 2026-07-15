@@ -43,6 +43,7 @@ from hloop_lib import providers as hloop_providers
 from hloop_lib import requirements as hloop_requirements
 from hloop_lib import reports as hloop_reports
 from hloop_lib import review as hloop_review
+from hloop_lib import supervisor as hloop_supervisor
 from hloop_lib.decisions import (
     DECISION_ACCEPTED,
     DECISION_ADVISORY,
@@ -247,6 +248,7 @@ SKILL_VERSION = read_skill_version()
 MESSAGE_DELIVERY_STATUSES = frozenset(
     {"delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"}
 )
+REPORT_WAKE_TYPES = hloop_supervisor.WAKE_REPORT_TYPES
 
 
 def configure_loop_namespace(value: str | None) -> str:
@@ -1260,11 +1262,15 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     if command == "advisor":
         return getattr(args, "advisor_command", "") in {"request", "start", "harvest", "close", "message"}
     if command == "agent":
+        return getattr(args, "agent_command", "") != "report"
+    if command == "message":
         return True
     if command == "inbox":
         return getattr(args, "inbox_command", "") == "ack"
     if command == "manager":
-        return True
+        # The blocking sleep must release the repo lock so role reports can be
+        # accepted while the Manager is suspended in the foreground.
+        return getattr(args, "manager_command", "") != "sleep"
     if command == "broker":
         return getattr(args, "broker_command", "") == "recover"
     if command == "input":
@@ -1997,10 +2003,14 @@ def resend_pending_manager_messages(
         pending_path = entry.get("pending_path")
         full_path = repo / pending_path if pending_path else None
         if full_path is None or not full_path.exists():
+            entry["error"] = "pending Manager message file is missing"
+            remaining.append(entry)
             continue
         content = read_text(full_path)
         offset = content.find(marker)
         message = content[offset + len(marker) :] if offset != -1 else content
+        message_id = str(entry.get("message_id") or "")
+        original = manager_message_by_id(agent_state, message_id) if message_id else None
         try:
             send_agent_tui_message(
                 str(agent_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -2012,11 +2022,28 @@ def resend_pending_manager_messages(
                 submit_attempts,
             )
         except ManagerMessageDeliveryUnknown as exc:
-            record_manager_message(
-                agent_state, "drain", message, delivery_status="unknown", delivery_error=str(exc)
-            )
+            if original is not None:
+                transition_manager_message(
+                    agent_state,
+                    original,
+                    delivery_status="unknown",
+                    error=str(exc),
+                )
+            else:
+                original = record_manager_message(
+                    agent_state,
+                    "drain",
+                    message,
+                    delivery_status="unknown",
+                    delivery_error=str(exc),
+                )
             agent_state.setdefault("unknown_manager_messages", []).append(
-                {"at": now_iso(), "source": "drain", "error": str(exc)}
+                {
+                    "at": now_iso(),
+                    "source": "drain",
+                    "message_id": original.get("message_id"),
+                    "error": str(exc),
+                }
             )
             try:
                 full_path.unlink()
@@ -2026,7 +2053,12 @@ def resend_pending_manager_messages(
         except HLoopError:
             remaining.append(entry)
             continue
-        record_manager_message(agent_state, "drain", message)
+        if original is not None:
+            transition_manager_message(
+                agent_state, original, delivery_status="delivered"
+            )
+        else:
+            record_manager_message(agent_state, "drain", message)
         try:
             full_path.unlink()
         except OSError:
@@ -2110,10 +2142,80 @@ def record_manager_message(
     return entry
 
 
-SEMANTIC_ACK_DECISIONS = frozenset({"approve", "reject"})
+def manager_message_by_id(
+    target_state: dict[str, Any], message_id: str
+) -> dict[str, Any] | None:
+    for entry in reversed(target_state.get("manager_messages") or []):
+        if entry.get("message_id") == message_id:
+            return entry
+    return None
 
 
-def arm_semantic_ack_barrier(agent_state: dict[str, Any], *, message_id: str, digest: str) -> None:
+def transition_manager_message(
+    target_state: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    delivery_status: str,
+    result: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Persist a legal transport/application status transition and its history."""
+
+    if delivery_status not in MESSAGE_DELIVERY_STATUSES:
+        raise HLoopError(f"unsupported message delivery status: {delivery_status}")
+    previous = str(entry.get("delivery_status") or "delivered")
+    allowed = {
+        "delivered": {"acknowledged", "applied", "unknown", "superseded"},
+        "acknowledged": {"applied", "unknown", "superseded"},
+        "applied": set(),
+        "undelivered": {"delivered", "unknown", "superseded"},
+        "unknown": {"acknowledged", "applied", "undelivered", "superseded"},
+        "superseded": set(),
+    }
+    if delivery_status == previous:
+        return entry
+    if delivery_status not in allowed.get(previous, set()):
+        raise HLoopError(
+            f"invalid message status transition: {previous} -> {delivery_status}"
+        )
+    if delivery_status == "applied" and not str(result or "").strip():
+        raise HLoopError("applied message resolution requires a non-empty result")
+    changed_at = now_iso()
+    entry["delivery_status"] = delivery_status
+    if delivery_status == "acknowledged":
+        entry["acknowledged_at"] = changed_at
+    elif delivery_status == "applied":
+        entry.setdefault("acknowledged_at", changed_at)
+        entry["applied_at"] = changed_at
+        entry["result"] = str(result).strip()
+    elif delivery_status == "superseded":
+        entry["superseded_at"] = changed_at
+    if error:
+        entry["delivery_error"] = error
+    target_state.setdefault("manager_message_events", []).append(
+        {
+            "message_id": entry.get("message_id"),
+            "from": previous,
+            "to": delivery_status,
+            "at": changed_at,
+            "result": entry.get("result"),
+            "error": error,
+        }
+    )
+    return entry
+
+
+SEMANTIC_ACK_DECISIONS = frozenset({"approve", "reject", "timeout"})
+
+
+def arm_semantic_ack_barrier(
+    agent_state: dict[str, Any],
+    *,
+    message_id: str,
+    digest: str,
+    kind: str = "message",
+    required_reack_after_sequence: int = 0,
+) -> None:
     """(Re-)arm the semantic ACK barrier for a contract-changing Manager message.
 
     Any existing barrier -- pending, approved, or rejected -- is replaced, so a
@@ -2124,32 +2226,98 @@ def arm_semantic_ack_barrier(agent_state: dict[str, Any], *, message_id: str, di
     agent_state["semantic_ack_barrier"] = {
         "message_id": message_id,
         "digest": digest,
-        "status": "pending",
+        "kind": kind,
+        "status": "awaiting_ack",
         "armed_at": now_iso(),
+        "required_reack_after_sequence": required_reack_after_sequence,
     }
+
+
+def arm_initial_semantic_ack_barrier(
+    agent_state: dict[str, Any],
+    *,
+    attempt_id: str,
+    contract_digest: str,
+    required_reack_after_sequence: int = 0,
+) -> None:
+    arm_semantic_ack_barrier(
+        agent_state,
+        message_id=f"initial:{attempt_id}",
+        digest=contract_digest,
+        kind="initial",
+        required_reack_after_sequence=required_reack_after_sequence,
+    )
+
+
+def latest_semantic_ack_sequence(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    agent_state: dict[str, Any],
+) -> int:
+    attempt_id = str(
+        agent_state.get("attempt_id") or agent_state.get("active_attempt_id") or ""
+    )
+    if not attempt_id:
+        return 0
+    store = _open_broker_store(repo)
+    with store.transaction() as transaction:
+        latest = store.latest_role_event(
+            transaction,
+            run_id=str(state.get("run_id") or "local"),
+            role_id=role_id,
+            attempt_id=attempt_id,
+            report_type="ack",
+        )
+    return int((latest or {}).get("sequence") or 0)
 
 
 def semantic_ack_barrier_blocking(agent_state: dict[str, Any]) -> str:
     """Return a non-empty block reason while material work must wait, else ""."""
 
     barrier = agent_state.get("semantic_ack_barrier")
-    if not isinstance(barrier, dict) or barrier.get("status") != "pending":
+    if not isinstance(barrier, dict) or barrier.get("status") == "approved":
         return ""
     return (
-        f"message `{barrier.get('message_id')}` is a contract-changing message "
-        "awaiting semantic ACK approval; resolve it with `hloop agent ack resolve`"
+        f"semantic ACK barrier `{barrier.get('message_id')}` is "
+        f"{barrier.get('status') or 'awaiting_ack'}; a fresh authenticated ACK "
+        "must be approved with `hloop agent ack resolve`"
     )
 
 
 def resolve_semantic_ack_barrier(
-    agent_state: dict[str, Any], *, decision: str, reason: str
+    agent_state: dict[str, Any],
+    *,
+    decision: str,
+    reason: str,
+    latest_ack: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if decision not in SEMANTIC_ACK_DECISIONS:
         raise HLoopError(f"unsupported semantic ACK decision: {decision}")
     barrier = agent_state.get("semantic_ack_barrier")
-    if not isinstance(barrier, dict) or barrier.get("status") != "pending":
+    if not isinstance(barrier, dict):
         raise HLoopError("no pending semantic ACK barrier to resolve")
-    barrier["status"] = "approved" if decision == "approve" else "rejected"
+    if barrier.get("status") == "approved":
+        raise HLoopError("semantic ACK barrier is already approved")
+    latest_sequence = int((latest_ack or {}).get("sequence") or 0)
+    required_after = int(barrier.get("required_reack_after_sequence") or 0)
+    if decision in {"approve", "reject"} and latest_ack is None:
+        raise HLoopError("no authenticated semantic ACK report is available")
+    if decision == "approve" and latest_sequence <= required_after:
+        raise HLoopError(
+            "a corrected semantic ACK report is required after the previous reject/timeout"
+        )
+    if decision == "approve":
+        barrier["status"] = "approved"
+        barrier["ack_event_id"] = latest_ack["event_id"]
+        barrier["ack_sequence"] = latest_sequence
+    else:
+        barrier["status"] = "rejected" if decision == "reject" else "timed_out"
+        barrier["required_reack_after_sequence"] = max(required_after, latest_sequence)
+        if latest_ack is not None:
+            barrier["rejected_ack_event_id"] = latest_ack["event_id"]
+            barrier["rejected_ack_sequence"] = latest_sequence
     barrier["resolved_at"] = now_iso()
     barrier["resolution_reason"] = reason
     return barrier
@@ -2209,7 +2377,7 @@ def record_pending_manager_message(
         error=detail,
     )
     pending_path = pending_rel.as_posix()
-    record_manager_message(
+    recorded = record_manager_message(
         agent_state,
         source,
         message,
@@ -2226,6 +2394,7 @@ def record_pending_manager_message(
             "pending_path": pending_path,
             "error": detail,
             "status": "undelivered",
+            "message_id": recorded.get("message_id"),
         }
     )
     save_state(repo, state)
@@ -2260,7 +2429,7 @@ def record_unknown_manager_message(
     """
 
     detail = str(error)
-    record_manager_message(
+    recorded = record_manager_message(
         agent_state,
         source,
         message,
@@ -2269,7 +2438,12 @@ def record_unknown_manager_message(
     )
     agent_state["last_manager_message_error"] = detail
     agent_state.setdefault("unknown_manager_messages", []).append(
-        {"at": now_iso(), "source": source, "error": detail}
+        {
+            "at": now_iso(),
+            "source": source,
+            "message_id": recorded.get("message_id"),
+            "error": detail,
+        }
     )
     save_state(repo, state)
     journal(
@@ -2294,9 +2468,15 @@ def supersede_pending_manager_messages(repo: Path, agent_state: dict[str, Any]) 
 
     messages = agent_state.get("manager_messages") or []
     for entry in messages:
-        if entry.get("delivery_status") in {"undelivered", "unknown"}:
-            entry["delivery_status"] = "superseded"
-            entry["superseded_at"] = now_iso()
+        if entry.get("delivery_status") in {
+            "delivered",
+            "acknowledged",
+            "undelivered",
+            "unknown",
+        }:
+            transition_manager_message(
+                agent_state, entry, delivery_status="superseded"
+            )
     for entry in agent_state.get("pending_manager_messages") or []:
         pending_path = entry.get("pending_path")
         if not pending_path:
@@ -4770,6 +4950,9 @@ def render_advisor_prompt(
     state: dict[str, Any],
     output_rel: Path,
     head_sha: str = "",
+    report_token: str = "",
+    task_contract_digest: str = "",
+    attempt_id: str = "",
 ) -> str:
     participant_id = str(participant.get("participant_id") or "P1")
     provider = str(participant.get("provider") or DEFAULT_AGENT_PROVIDER)
@@ -4816,6 +4999,7 @@ Source artifacts or code references:
 
 Peer advice artifacts for bounded cross-model dialogue:
 {peer_lines}
+{report_contract_text(f"{advice_id}/{participant_id}", attempt_id or f"{advice_id}-{participant_id}-A001", state, report_token=report_token, task_contract_digest=task_contract_digest)}
 
 Rules:
 - Do not edit code.
@@ -4843,8 +5027,8 @@ HERDR_LOOP_ADVICE_DONE:{advice_id}:{participant_id}:<advised|blocked|failed>
 
 
 def report_contract_text(
-    task_id: str,
-    task_meta: dict[str, Any],
+    role_id: str,
+    attempt_id: str,
     state: dict[str, Any],
     *,
     report_token: str,
@@ -4853,16 +5037,71 @@ def report_contract_text(
     if not report_token:
         return ""
     run_id = str(state.get("run_id") or "local")
-    attempt_id = str(task_meta.get("attempt_id") or task_id)
     return f"""
 Reporting: send ack, milestone, attention, and completion reports as your understanding, risk, or progress changes (see skills/herdr-dev-loop/references/report-protocol.md). Every report must include the exact identity below:
 ```
 python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent report \\
-  --role-id {task_id} --attempt-id {attempt_id} --run-id {run_id} \\
+  --role-id {role_id} --attempt-id {attempt_id} --run-id {run_id} \\
   --task-contract-digest {task_contract_digest} --report-token {report_token} \\
   --type ack --stage <stage> --summary '<summary>' --next '<next action>' ...
 ```
+After the initial read-only investigation, send the semantic `ack` and stop before material work. Resume only after the Manager explicitly approves that ACK and sends the approval notice. A reject or timeout requires a corrected, new ACK event.
 """
+
+
+def register_role_report_identity(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+    task_contract_digest: str,
+) -> str:
+    """Register one fail-closed report identity and return its attempt-scoped token."""
+
+    token, _ = register_role_report_identity_and_ack_floor(
+        repo,
+        state,
+        role_id=role_id,
+        attempt_id=attempt_id,
+        task_contract_digest=task_contract_digest,
+    )
+    return token
+
+
+def register_role_report_identity_and_ack_floor(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+    task_contract_digest: str,
+) -> tuple[str, int]:
+    """Register an identity and return the token plus its prior ACK watermark."""
+
+    token = secrets.token_hex(32)
+    store = _open_broker_store(repo)
+    with store.transaction() as transaction:
+        latest_ack = store.latest_role_event(
+            transaction,
+            run_id=str(state.get("run_id") or "local"),
+            role_id=role_id,
+            attempt_id=attempt_id,
+            report_type="ack",
+        )
+        store.register_active_role(
+            transaction,
+            run_id=str(state.get("run_id") or "local"),
+            role_id=role_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+            token=token,
+        )
+    return token, int((latest_ack or {}).get("sequence") or 0)
+
+
+def prompt_contract_digest(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
 def render_worker_prompt(
@@ -4912,7 +5151,7 @@ Loop profile:
 - Agent backend: {agent_display(agent_config)}
 - Run ID: {str(state.get("run_id") or "")}
 - Fixed Worker base SHA: {str(task_meta.get("base_sha") or "")}
-{report_contract_text(task_id, task_meta, state, report_token=report_token, task_contract_digest=task_contract_digest)}
+{report_contract_text(task_id, str(task_meta.get("attempt_id") or task_id), state, report_token=report_token, task_contract_digest=task_contract_digest)}
 {protocol}
 
 Rules:
@@ -4967,6 +5206,9 @@ def render_reviewer_prompt(
     agent_config: dict[str, str] | None = None,
     head_sha: str = "",
     review_plan: hloop_review.ReviewGroupPlan | None = None,
+    report_token: str = "",
+    task_contract_digest: str = "",
+    attempt_id: str = "",
 ) -> str:
     review_protocol = state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
     if review_protocol not in REVIEW_PROTOCOLS:
@@ -5053,6 +5295,7 @@ Review profile:
 - Review lanes: {", ".join(lanes)}
 - Review mode: {mode}
 - Agent backend: {agent_display(agent_config)}
+{report_contract_text(review_id, attempt_id or f"{review_id}-A001", state, report_token=report_token, task_contract_digest=task_contract_digest)}
 
 {protocol}
 
@@ -5082,6 +5325,9 @@ def render_gap_prompt(
     state: dict[str, Any] | None = None,
     agent_config: dict[str, str] | None = None,
     head_sha: str = "",
+    report_token: str = "",
+    task_contract_digest: str = "",
+    attempt_id: str = "",
 ) -> str:
     agent_config = agent_config or role_agent_config(state or {}, "gap")
     if spec_sources:
@@ -5113,6 +5359,7 @@ Read:
 
 Spec sources:
 {source_lines}
+{report_contract_text(gap_id, attempt_id or f"{gap_id}-A001", state or {}, report_token=report_token, task_contract_digest=task_contract_digest)}
 
 Rules:
 - Do not edit code.
@@ -8097,26 +8344,6 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     )
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree(repo, task_id, state)
     task_contract_digest = hashlib.sha256(task_file(repo, task_id).read_bytes()).hexdigest()
-    report_token = secrets.token_hex(32)
-    store = _open_broker_store(repo)
-    with store.transaction() as txn:
-        store.register_active_role(
-            txn,
-            run_id=str(state.get("run_id") or "local"),
-            role_id=task_id,
-            attempt_id=attempt_id,
-            task_contract_digest=task_contract_digest,
-            token=report_token,
-        )
-    prompt = render_worker_prompt(
-        task_id,
-        task_meta,
-        worktree,
-        branch,
-        state,
-        report_token=report_token,
-        task_contract_digest=task_contract_digest,
-    )
     runner = args.runner or state.get("worker_runner", "tui")
     agent_config = role_agent_config(
         state,
@@ -8150,6 +8377,22 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
         prepare_role_worktree(repo, worktree, state, role="worker", agent_id=task_id)
         ensure_task_visible_in_worktree(worktree, task_id)
         ensure_worktree_parent_dirs(worktree, prompt_rel, LOOP_DIR / "results" / task_id / "result.md")
+        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=task_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_worker_prompt(
+            task_id,
+            task_meta,
+            worktree,
+            branch,
+            state,
+            report_token=report_token,
+            task_contract_digest=task_contract_digest,
+        )
         write_text(worktree / prompt_rel, prompt)
         if args.launcher == "agent":
             pane_id = start_agent_launcher(
@@ -8166,14 +8409,22 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
-    except (HLoopError, subprocess.CalledProcessError):
-        rollback_failed_role_start(
-            repo,
-            worktree,
-            created_worktree=not worktree_preexisting,
-            branch=branch,
-            created_branch=not branch_preexisting,
-        )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ):
+        try:
+            rollback_failed_role_start(
+                repo,
+                worktree,
+                created_worktree=not worktree_preexisting,
+                branch=branch,
+                created_branch=not branch_preexisting,
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, task_id)
         raise
     task_state.update(
         {
@@ -8195,6 +8446,12 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "provider_invocation": provider_invocation.as_record(),
         }
     )
+    arm_initial_semantic_ack_barrier(
+        task_state,
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=initial_ack_floor,
+    )
     state["phase"] = "running"
     save_state(repo, state)
     journal(repo, f"Started Worker `{task_id}` in pane `{pane_id}` and worktree `{worktree}`.")
@@ -8213,6 +8470,9 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     task_state = state.get("tasks", {}).get(task_id)
     if not task_state:
         raise HLoopError(f"unknown task: {task_id}")
+    block_reason = semantic_ack_barrier_blocking(task_state)
+    if block_reason:
+        raise HLoopError(f"cannot harvest {task_id}: {block_reason}")
     worktree = Path(task_state.get("worktree") or default_worktree(repo, task_id, state)).resolve()
     result = result_file(worktree, task_id)
     if not result.exists():
@@ -8301,7 +8561,14 @@ def send_manager_message_and_record(
         state, agent_id, agent_state, message, contract_changing=contract_changing
     )
     if contract_changing:
-        arm_semantic_ack_barrier(agent_state, message_id=message_id, digest=message_digest(message))
+        arm_semantic_ack_barrier(
+            agent_state,
+            message_id=message_id,
+            digest=message_digest(message),
+            required_reack_after_sequence=latest_semantic_ack_sequence(
+                repo, state, role_id=agent_id, agent_state=agent_state
+            ),
+        )
     try:
         send_agent_tui_message(
             str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER),
@@ -8410,6 +8677,40 @@ def cmd_message_drain(args: argparse.Namespace) -> int:
         f"Drained pending Manager messages: {total_drained} resent, {total_remaining} still pending.",
     )
     print(f"drained {total_drained} pending message(s); {total_remaining} still pending")
+    return 0
+
+
+def cmd_message_resolve(args: argparse.Namespace) -> int:
+    """Durably record transport ACK, applied result, or explicit resolution."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    role, agent_state = resolve_agent_state(state, args.agent_id)
+    entry = manager_message_by_id(agent_state, args.message_id)
+    if entry is None:
+        raise HLoopError(
+            f"unknown Manager message for {args.agent_id}: {args.message_id}"
+        )
+    transition_manager_message(
+        agent_state,
+        entry,
+        delivery_status=args.status,
+        result=getattr(args, "result", None),
+        error=getattr(args, "error", None),
+    )
+    if args.status in {"acknowledged", "applied", "superseded"}:
+        agent_state["unknown_manager_messages"] = [
+            item
+            for item in agent_state.get("unknown_manager_messages") or []
+            if item.get("message_id") != args.message_id
+        ]
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Resolved Manager message `{args.message_id}` for {role} `{args.agent_id}` "
+        f"as `{args.status}`.",
+    )
+    print(f"{args.agent_id}/{args.message_id}: {args.status}")
     return 0
 
 
@@ -9213,7 +9514,8 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         if mode != "single"
         else review_file(repo, review_id)
     )
-    prompt = render_reviewer_prompt(
+    attempt_id = f"{review_id}-A001"
+    prompt_without_identity = render_reviewer_prompt(
         review_id,
         base,
         head,
@@ -9222,6 +9524,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         head_sha=head_sha,
         review_plan=review_plan,
     )
+    task_contract_digest = prompt_contract_digest(prompt_without_identity)
     agent_command, provider_invocation = role_agent_command(
         repo,
         agent_config,
@@ -9239,6 +9542,25 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         prepare_role_worktree(repo, worktree, state, role="reviewer", agent_id=review_id)
         ensure_review_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, review_rel)
+        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=review_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_reviewer_prompt(
+            review_id,
+            base,
+            head,
+            state,
+            agent_config=agent_config,
+            head_sha=head_sha,
+            review_plan=review_plan,
+            report_token=report_token,
+            task_contract_digest=task_contract_digest,
+            attempt_id=attempt_id,
+        )
         write_text(prompt_path, prompt)
         baseline_dirty = porcelain_paths(worktree)
         if args.launcher == "agent":
@@ -9256,10 +9578,18 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
-    except (HLoopError, subprocess.CalledProcessError):
-        rollback_failed_role_start(
-            repo, worktree, created_worktree=not worktree_preexisting
-        )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ):
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, review_id)
         raise
     state["reviews"][review_id] = {
         "status": "running",
@@ -9278,7 +9608,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
         "claude_permission_mode": agent_config["claude_permission_mode"],
-        "attempt_id": f"{review_id}-A001",
+        "attempt_id": attempt_id,
         "fallback_provider": agent_config["fallback_provider"],
         "skill_version": SKILL_VERSION,
         "sandbox": "workspace-write",
@@ -9290,6 +9620,12 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "started_at": now_iso(),
         "provider_invocation": provider_invocation.as_record(),
     }
+    arm_initial_semantic_ack_barrier(
+        state["reviews"][review_id],
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=initial_ack_floor,
+    )
     state["phase"] = "reviewing"
     save_state(repo, state)
     journal(repo, f"Started Reviewer `{review_id}` in pane `{pane_id}` and worktree `{worktree}`.")
@@ -9308,6 +9644,9 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     review_state = state.get("reviews", {}).get(review_id)
     if not review_state:
         raise HLoopError(f"unknown review: {review_id}")
+    block_reason = semantic_ack_barrier_blocking(review_state)
+    if block_reason:
+        raise HLoopError(f"cannot harvest {review_id}: {block_reason}")
     path = review_artifact_path(repo, review_id, review_state)
     if not path.exists() or not read_text(path).strip():
         raise HLoopError(f"review artifact not found or empty: {path}")
@@ -9417,6 +9756,7 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
         keep_pane=getattr(args, "keep_pane", False),
         session_cleanup=session_cleanup_mode(args, state),
     )
+    revoke_active_role_report_identity(repo, state, review_id)
     state["last_review_id"] = review_id
     state["needs_review"] = True
     if violations:
@@ -9645,7 +9985,8 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    prompt = render_gap_prompt(
+    attempt_id = f"{gap_id}-A001"
+    prompt_without_identity = render_gap_prompt(
         gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
     )
     agent_command, _preview_invocation = role_agent_command(
@@ -9691,9 +10032,10 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    prompt = render_gap_prompt(
+    prompt_without_identity = render_gap_prompt(
         gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
     )
+    task_contract_digest = prompt_contract_digest(prompt_without_identity)
     agent_command, provider_invocation = role_agent_command(
         repo,
         agent_config,
@@ -9711,6 +10053,25 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         prepare_role_worktree(repo, worktree, state, role="gap", agent_id=gap_id)
         ensure_gap_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, gap_rel)
+        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=gap_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_gap_prompt(
+            gap_id,
+            base,
+            head,
+            spec_sources,
+            state,
+            agent_config=agent_config,
+            head_sha=head_sha,
+            report_token=report_token,
+            task_contract_digest=task_contract_digest,
+            attempt_id=attempt_id,
+        )
         write_text(prompt_path, prompt)
         baseline_dirty = porcelain_paths(worktree)
         if args.launcher == "agent":
@@ -9728,10 +10089,18 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
-    except (HLoopError, subprocess.CalledProcessError):
-        rollback_failed_role_start(
-            repo, worktree, created_worktree=not worktree_preexisting
-        )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ):
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, gap_id)
         raise
     state["gaps"][gap_id] = {
         "status": "running",
@@ -9747,7 +10116,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
         "claude_permission_mode": agent_config["claude_permission_mode"],
-        "attempt_id": f"{gap_id}-A001",
+        "attempt_id": attempt_id,
         "fallback_provider": agent_config["fallback_provider"],
         "skill_version": SKILL_VERSION,
         "sandbox": "workspace-write",
@@ -9759,6 +10128,12 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "started_at": now_iso(),
         "provider_invocation": provider_invocation.as_record(),
     }
+    arm_initial_semantic_ack_barrier(
+        state["gaps"][gap_id],
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=initial_ack_floor,
+    )
     state["phase"] = "gap_checking"
     save_state(repo, state)
     journal(repo, f"Started Gap Auditor `{gap_id}` in pane `{pane_id}` and worktree `{worktree}`.")
@@ -9777,6 +10152,9 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
     gap_state = state.get("gaps", {}).get(gap_id)
     if not gap_state:
         raise HLoopError(f"unknown gap audit: {gap_id}")
+    block_reason = semantic_ack_barrier_blocking(gap_state)
+    if block_reason:
+        raise HLoopError(f"cannot harvest {gap_id}: {block_reason}")
     path = gap_artifact_path(repo, gap_id, gap_state)
     if not path.exists() or not read_text(path).strip():
         raise HLoopError(f"gap artifact not found or empty: {path}")
@@ -9815,6 +10193,7 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
         keep_pane=getattr(args, "keep_pane", False),
         session_cleanup=session_cleanup_mode(args, state),
     )
+    revoke_active_role_report_identity(repo, state, gap_id)
     state["last_gap_id"] = gap_id
     state["needs_gap_check"] = True
     if violations:
@@ -10187,6 +10566,26 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     participant["model"] = agent_config["model"]
     prepare_advisor_dialogue_start(state, advice_state, participant)
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
+    role_id = f"{advice_id}/{participant_id}"
+    attempt_id = f"{advice_id}-{participant_id}-A001"
+    prompt_without_identity = render_advisor_prompt(
+        advice_id,
+        participant,
+        advice_state,
+        state,
+        advice_rel,
+        head_sha=head_sha,
+    )
+    task_contract_digest = prompt_contract_digest(prompt_without_identity)
+    agent_command, provider_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=advice_rel if runner == "exec" else None,
+    )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     worktree_preexisting = worktree.exists()
     if not worktree_preexisting:
         git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
@@ -10196,6 +10595,24 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
         )
         ensure_advisor_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, advice_rel)
+        report_token, initial_ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=role_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_advisor_prompt(
+            advice_id,
+            participant,
+            advice_state,
+            state,
+            advice_rel,
+            head_sha=head_sha,
+            report_token=report_token,
+            task_contract_digest=task_contract_digest,
+            attempt_id=attempt_id,
+        )
         write_text(prompt_path, prompt)
         baseline_dirty = porcelain_paths(worktree)
         if args.launcher == "agent":
@@ -10213,10 +10630,18 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
-    except (HLoopError, subprocess.CalledProcessError):
-        rollback_failed_role_start(
-            repo, worktree, created_worktree=not worktree_preexisting
-        )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ):
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, role_id)
         raise
     participant.update(
         {
@@ -10231,7 +10656,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
             "claude_permission_mode": agent_config["claude_permission_mode"],
-            "attempt_id": f"{advice_id}-{participant_id}-A001",
+            "attempt_id": attempt_id,
             "fallback_provider": agent_config["fallback_provider"],
             "skill_version": SKILL_VERSION,
             "sandbox": "workspace-write",
@@ -10243,6 +10668,12 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             "started_at": now_iso(),
             "provider_invocation": provider_invocation.as_record(),
         }
+    )
+    arm_initial_semantic_ack_barrier(
+        participant,
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=initial_ack_floor,
     )
     advice_state["status"] = "running"
     advice_state["gate_status"] = "running"
@@ -10260,6 +10691,11 @@ def cmd_advisor_harvest(args: argparse.Namespace) -> int:
     participant_id = args.participant_id
     advice_state = require_advice_state(state, advice_id)
     participant = find_advisor_participant(advice_state, participant_id)
+    block_reason = semantic_ack_barrier_blocking(participant)
+    if block_reason:
+        raise HLoopError(
+            f"cannot harvest {advice_id}/{participant_id}: {block_reason}"
+        )
     path = advice_artifact_path(repo, advice_id, participant)
     if not path.exists() or not read_text(path).strip():
         raise HLoopError(f"advisor artifact not found or empty: {path}")
@@ -10293,6 +10729,9 @@ def cmd_advisor_harvest(args: argparse.Namespace) -> int:
         label=f"Advisor {advice_id}/{participant_id}",
         keep_pane=getattr(args, "keep_pane", False),
         session_cleanup=session_cleanup_mode(args, state),
+    )
+    revoke_active_role_report_identity(
+        repo, state, f"{advice_id}/{participant_id}"
     )
     if violations:
         participant["status"] = "blocked_write_scope"
@@ -10430,7 +10869,18 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
         contract_changing=contract_changing,
     )
     if contract_changing:
-        arm_semantic_ack_barrier(participant, message_id=message_id, digest=message_digest(message))
+        advisor_role_id = f"{args.advice_id}/{args.participant_id}"
+        arm_semantic_ack_barrier(
+            participant,
+            message_id=message_id,
+            digest=message_digest(message),
+            required_reack_after_sequence=latest_semantic_ack_sequence(
+                repo,
+                state,
+                role_id=advisor_role_id,
+                agent_state=participant,
+            ),
+        )
     followups_before, max_rounds = enforce_advisor_message_round_limit(
         state, advice_state, participant
     )
@@ -11215,6 +11665,7 @@ def cmd_agent_abort(args: argparse.Namespace) -> int:
     )
     if not args.keep_worktree:
         cleanup_agent_worktree_for_lifecycle(repo, agent, force=args.force_cleanup)
+    revoke_active_role_report_identity(repo, state, args.agent_id)
     supersede_pending_manager_messages(repo, agent)
     agent["status"] = "aborted"
     if role != "worker":
@@ -11232,7 +11683,24 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     role, agent = resolve_agent_state(state, args.agent_id)
-    barrier = resolve_semantic_ack_barrier(agent, decision=args.decision, reason=args.reason)
+    attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
+    if not attempt_id:
+        raise HLoopError(f"active attempt identity is missing for {args.agent_id}")
+    store = _open_broker_store(repo)
+    with store.transaction() as transaction:
+        latest_ack = store.latest_role_event(
+            transaction,
+            run_id=str(state.get("run_id") or "local"),
+            role_id=args.agent_id,
+            attempt_id=attempt_id,
+            report_type="ack",
+        )
+    barrier = resolve_semantic_ack_barrier(
+        agent,
+        decision=args.decision,
+        reason=args.reason,
+        latest_ack=latest_ack,
+    )
     save_state(repo, state)
     journal(
         repo,
@@ -11240,6 +11708,36 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
         f"(message `{barrier.get('message_id')}`) as `{barrier['status']}`: {args.reason}",
     )
     print(f"{args.agent_id}: semantic ACK barrier {barrier['status']}")
+    pane_id = str(agent.get("pane_id") or "")
+    if pane_id:
+        if barrier["status"] == "approved":
+            notice = (
+                f"Semantic ACK {barrier.get('ack_event_id')} is approved. "
+                "Resume the contracted material work."
+            )
+        else:
+            notice = (
+                f"Semantic ACK barrier is {barrier['status']}: {args.reason}. "
+                "Remain stopped and submit a corrected new ACK event."
+            )
+        delivery_args = argparse.Namespace(
+            contract_changing=False,
+            timeout_ms=30_000,
+            input_settle_ms=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+            submit_verify_ms=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+            submit_attempts=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
+        )
+        return send_manager_message_and_record(
+            repo,
+            state,
+            agent,
+            role=role.title(),
+            agent_id=args.agent_id,
+            pane_id=pane_id,
+            message=notice,
+            source="semantic-ack-resolution",
+            args=delivery_args,
+        )
     return 0
 
 
@@ -11550,7 +12048,7 @@ def cmd_hooks_guard(args: argparse.Namespace) -> int:
 
 
 def revoke_active_role_report_identity(repo: Path, state: dict[str, Any], role_id: str) -> None:
-    """Best-effort revoke so a finished or requeued attempt cannot keep reporting."""
+    """Revoke a role before completing a lifecycle transition, or fail closed."""
 
     try:
         store = _open_broker_store(repo)
@@ -11558,8 +12056,10 @@ def revoke_active_role_report_identity(repo: Path, state: dict[str, Any], role_i
             store.revoke_active_role(
                 txn, run_id=str(state.get("run_id") or "local"), role_id=role_id
             )
-    except (hloop_broker.BrokerStorageError, OSError):
-        pass
+    except (hloop_broker.BrokerStorageError, OSError) as exc:
+        raise HLoopError(
+            f"could not revoke report identity for {role_id}; lifecycle transition is blocked: {exc}"
+        ) from exc
 
 
 def cmd_agent_report(args: argparse.Namespace) -> int:
@@ -11621,24 +12121,22 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
     try:
         store = _open_broker_store(repo)
         with store.transaction() as txn:
-            if store.has_active_role_registration(
-                txn, run_id=client_event["run_id"], role_id=client_event["role_id"]
+            if not getattr(args, "report_token", None) or not store.authenticate_role_report(
+                txn,
+                run_id=client_event["run_id"],
+                role_id=client_event["role_id"],
+                attempt_id=client_event["attempt_id"],
+                task_contract_digest=client_event["task_contract_digest"],
+                token=str(args.report_token or ""),
             ):
-                if not getattr(args, "report_token", None) or not store.authenticate_role_report(
-                    txn,
-                    run_id=client_event["run_id"],
-                    role_id=client_event["role_id"],
-                    attempt_id=client_event["attempt_id"],
-                    task_contract_digest=client_event["task_contract_digest"],
-                    token=str(args.report_token or ""),
-                ):
-                    raise _Unauthenticated(
-                        "report does not match the registered run/role/attempt/digest/token "
-                        f"for role {client_event['role_id']}"
-                    )
+                raise _Unauthenticated(
+                    "report does not match a registered active "
+                    "run/role/attempt/digest/token identity "
+                    f"for role {client_event['role_id']}"
+                )
             stored = store.accept_report(txn, client_event)
             lease = store.current_lease(txn, run_id=stored.event["run_id"])
-            if lease is not None:
+            if lease is not None and stored.event["type"] in REPORT_WAKE_TYPES:
                 try:
                     store.enqueue_wake(
                         txn,
@@ -11649,26 +12147,50 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
                     )
                 except hloop_broker.LeaseGenerationMismatch:
                     pass
+            owner = store.current_owner(
+                txn, namespace=LOOP_NAMESPACE, run_id=stored.event["run_id"]
+            )
     except _Unauthenticated as exc:
         raise HLoopError(str(exc)) from exc
     except (hloop_broker.BrokerStorageError, OSError) as exc:
-        spool_path = hloop_broker.spool_client_event(broker_spool_dir(repo), client_event)
-        journal(
-            repo,
-            f"Broker unavailable ({exc}); spooled report {client_event['event_id']} to {spool_path.name}",
+        spool_path = hloop_broker.spool_client_event(
+            broker_spool_dir(repo),
+            client_event,
+            authentication={
+                "run_id": client_event["run_id"],
+                "role_id": client_event["role_id"],
+                "attempt_id": client_event["attempt_id"],
+                "task_contract_digest": client_event["task_contract_digest"],
+                "token": str(args.report_token or ""),
+            },
         )
+        try:
+            hloop_supervisor.signal_supervisor(
+                hloop_broker.derive_runtime_socket_path(
+                    LOOP_NAMESPACE, client_event["run_id"]
+                )
+            )
+        except (OSError, hloop_supervisor.SupervisorError):
+            pass
         print(f"spooled {client_event['event_id']} (broker unavailable: {exc})")
         return 0
-    journal(repo, f"Agent report accepted by broker: {stored.event['event_id']} ({report_type})")
+    if owner is not None and stored.event["type"] in REPORT_WAKE_TYPES:
+        try:
+            hloop_supervisor.signal_supervisor(Path(owner["socket_path"]))
+        except (OSError, hloop_supervisor.SupervisorError):
+            pass
     print(f"accepted {stored.event['event_id']} (broker)")
     return 0
 
 
 def cmd_inbox_list(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
     store = _open_broker_store(repo)
     with store.transaction() as txn:
-        rows = store.inbox(txn)
+        rows = store.unconsumed_inbox(
+            txn, run_id=str(state.get("run_id") or "local")
+        )
     if not rows:
         print("inbox empty")
         return 0
@@ -11691,13 +12213,12 @@ def cmd_inbox_show(args: argparse.Namespace) -> int:
 def cmd_inbox_ack(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
-    lease = state.get("broker_lease")
-    if not lease:
-        raise HLoopError("no active manager wake lease; run `hloop manager sleep` first")
     store = _open_broker_store(repo)
     with store.transaction() as txn:
-        result = store.consume_wake(
-            txn, event_id=args.event_id, lease_generation=int(lease["generation"])
+        result = store.acknowledge_inbox(
+            txn,
+            event_id=args.event_id,
+            run_id=str(state.get("run_id") or "local"),
         )
     if not result.accepted:
         raise HLoopError(f"could not ack {args.event_id}: {result.reason}")
@@ -11710,51 +12231,93 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     run_id = str(state.get("run_id") or "local")
+    if isinstance(args.ttl_seconds, bool) or args.ttl_seconds <= 0:
+        raise HLoopError("--ttl-seconds must be positive")
     store = _open_broker_store(repo)
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=args.ttl_seconds)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     manager_session_id = (
         args.manager_session_id or os.environ.get("HERDR_SESSION_ID") or "manager"
     )
     pane_id = args.pane_id or os.environ.get("HERDR_PANE_ID") or "manager"
-    with store.transaction() as txn:
-        lease = store.register_wake_lease(
-            txn,
-            run_id=run_id,
-            manager_session_id=manager_session_id,
-            pane_id=pane_id,
-            expires_at=expires_at,
+    fallback_watches: list[hloop_supervisor.FallbackWatch] = []
+    role_states = [
+        *state.get("tasks", {}).values(),
+        *state.get("reviews", {}).values(),
+        *state.get("gaps", {}).values(),
+        *(
+            participant
+            for advice in state.get("advice", {}).values()
+            for participant in advice.get("participants", [])
+        ),
+    ]
+    for role_state in role_states:
+        if (
+            role_state.get("status") != "running"
+            and role_state.get("gate_status") != "running"
+        ):
+            continue
+        role_pane = str(role_state.get("pane_id") or "")
+        if not role_pane:
+            continue
+        fallback_watches.extend(
+            hloop_supervisor.FallbackWatch(role_pane, status)
+            for status in sorted(hloop_supervisor.FALLBACK_STATUSES)
         )
-        # Registering the lease and inspecting the inbox in the same broker
-        # transaction closes the lost-wake window: a report accepted after the
-        # last `inbox list`/`manager next` but before this lease existed is
-        # still found here, instead of silently waiting for a wake that was
-        # never enqueued against a matching lease generation.
-        unread = store.unconsumed_inbox(txn, run_id=run_id)
-    state["broker_lease"] = lease
+    result = hloop_supervisor.ManagerSleepSupervisor(
+        store,
+        namespace=LOOP_NAMESPACE,
+        run_id=run_id,
+        runtime_version=SKILL_VERSION,
+        manager_session_id=manager_session_id,
+        pane_id=pane_id,
+        spool_directory=broker_spool_dir(repo),
+    ).sleep(
+        timeout_seconds=float(args.ttl_seconds),
+        fallback_watches=fallback_watches,
+    )
+    state["broker_lease"] = {
+        "run_id": run_id,
+        "generation": result.lease_generation,
+        "manager_session_id": manager_session_id,
+        "pane_id": pane_id,
+        "status": "returned",
+        "reason": result.reason,
+        "returned_at": now_iso(),
+    }
+    state["last_manager_sleep"] = {
+        "reason": result.reason,
+        "event_ids": list(result.event_ids),
+        "drained_reports": result.drained_reports,
+        "fallback": (
+            {
+                "pane_id": result.fallback.pane_id,
+                "status": result.fallback.status,
+                "returncode": result.fallback.returncode,
+            }
+            if result.fallback is not None
+            else None
+        ),
+    }
     save_state(repo, state)
-    if unread:
-        journal(
-            repo,
-            f"Manager sleep found {len(unread)} unread report(s) already in the inbox; "
-            "not sleeping.",
-        )
-        print(f"lease generation {lease['generation']} expires {expires_at}")
-        print(f"unread reports already pending: {len(unread)}")
-        for row in unread:
-            print(json.dumps(row, sort_keys=True))
-        return 0
     journal(
         repo,
-        f"Manager sleeping; wake lease generation {lease['generation']} expires {expires_at}.",
+        f"Manager sleep returned `{result.reason}` at lease generation "
+        f"{result.lease_generation}; events={','.join(result.event_ids) or 'none'}.",
     )
-    print(f"lease generation {lease['generation']} expires {expires_at}")
+    print(f"manager sleep returned: {result.reason}")
+    print(f"lease generation: {result.lease_generation}")
+    for event_id in result.event_ids:
+        print(f"event_id: {event_id}")
+    if result.fallback is not None:
+        print(
+            f"fallback: {result.fallback.pane_id} "
+            f"status={result.fallback.status}"
+        )
     return 0
 
 
 def cmd_manager_next(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
     store = _open_broker_store(repo)
     spool_dir = broker_spool_dir(repo)
     spooled = list(hloop_broker.iter_spooled_events(spool_dir))
@@ -11765,12 +12328,14 @@ def cmd_manager_next(args: argparse.Namespace) -> int:
         print(f"replayed {len(replayed)} spooled report(s); re-run to see pending wakes")
         return 0
     with store.transaction() as txn:
-        wakes = store.pending_wakes(txn)
-    if not wakes:
+        unread = store.unconsumed_inbox(
+            txn, run_id=str(state.get("run_id") or "local")
+        )
+    if not unread:
         print("no pending wakes")
         return 0
-    for wake in wakes:
-        print(json.dumps(wake, sort_keys=True))
+    for row in unread:
+        print(json.dumps(row, sort_keys=True))
     return 0
 
 
@@ -13452,7 +14017,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument("--task-contract-digest")
     agent_report.add_argument(
         "--report-token",
-        help="short-lived token issued at role start; required once the role registered one",
+        help="private token issued at role start; required for every role report",
     )
     agent_report.add_argument(
         "--type", choices=["ack", "milestone", "attention", "completion"], required=True
@@ -13478,14 +14043,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument("--handoff")
     agent_report.set_defaults(func=cmd_agent_report)
     agent_ack = agent_sub.add_parser(
-        "ack", help="resolve a role's semantic ACK barrier for a contract-changing message"
+        "ack", help="resolve a role's initial or contract-changing semantic ACK barrier"
     )
     agent_ack_sub = agent_ack.add_subparsers(dest="agent_ack_command", required=True)
     agent_ack_resolve = agent_ack_sub.add_parser(
-        "resolve", help="approve or reject the pending semantic ACK barrier"
+        "resolve", help="approve, reject, or time out the pending semantic ACK barrier"
     )
     agent_ack_resolve.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
-    agent_ack_resolve.add_argument("--decision", choices=["approve", "reject"], required=True)
+    agent_ack_resolve.add_argument(
+        "--decision", choices=["approve", "reject", "timeout"], required=True
+    )
     agent_ack_resolve.add_argument("--reason", required=True)
     agent_ack_resolve.set_defaults(func=cmd_agent_ack_resolve)
 
@@ -13851,6 +14418,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--submit-attempts", type=int, default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS
     )
     message_drain.set_defaults(func=cmd_message_drain)
+    message_resolve = message_sub.add_parser(
+        "resolve", help="durably resolve one delivered or unknown Manager message"
+    )
+    message_resolve.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    message_resolve.add_argument("message_id")
+    message_resolve.add_argument(
+        "--status",
+        choices=["acknowledged", "applied", "unknown", "superseded"],
+        required=True,
+    )
+    message_resolve.add_argument("--result")
+    message_resolve.add_argument("--error")
+    message_resolve.set_defaults(func=cmd_message_resolve)
 
     merge = sub.add_parser("merge", help="merge a Worker task")
     merge.add_argument("task_id")

@@ -27,6 +27,7 @@ from . import broker
 
 
 WAKE_SIGNAL = b"HLOOP_WAKE\n"
+WAKE_REPORT_TYPES = frozenset({"ack", "attention", "completion"})
 FALLBACK_STATUSES = frozenset({"idle", "blocked", "done", "unknown"})
 
 
@@ -328,8 +329,21 @@ class ManagerSleepSupervisor:
                     expires_at=expires_at,
                     created_at=created_at,
                 )
-                unread = _unseen_inbox(self.store.inbox(transaction), seen, self.run_id)
+                unread = _unseen_inbox(
+                    self.store.unconsumed_inbox(transaction, run_id=self.run_id),
+                    seen,
+                    self.run_id,
+                )
                 if unread:
+                    self.store.enqueue_unacknowledged_for_lease(
+                        transaction,
+                        run_id=self.run_id,
+                        lease_generation=lease["generation"],
+                        manager_session_id=self.manager_session_id,
+                        pane_id=self.pane_id,
+                        report_types=WAKE_REPORT_TYPES,
+                        created_at=created_at,
+                    )
                     self._cancel_lease_in_transaction(transaction, created_at)
                     lease_cancelled = True
             if unread:
@@ -398,7 +412,11 @@ class ManagerSleepSupervisor:
     ) -> tuple[list[dict[str, Any]], int]:
         with self.store.transaction() as transaction:
             drained = self.store.replay_spool(transaction, self.spool_directory)
-            unread = _unseen_inbox(self.store.inbox(transaction), seen, self.run_id)
+            unread = _unseen_inbox(
+                self.store.unconsumed_inbox(transaction, run_id=self.run_id),
+                seen,
+                self.run_id,
+            )
             return unread, len(drained)
 
     def _cancel_lease_in_transaction(
@@ -529,7 +547,9 @@ def _unseen_inbox(
     return [
         item
         for item in inbox
-        if item.get("run_id") == run_id and item.get("event_id") not in seen
+        if item.get("run_id") == run_id
+        and item.get("event_id") not in seen
+        and item.get("report_type") in WAKE_REPORT_TYPES
     ]
 
 

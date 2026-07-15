@@ -530,22 +530,31 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
     path = state_path(repo, namespace)
     state = json.loads(path.read_text(encoding="utf-8"))
 
-    run(
-        hloop_command(
-            repo,
-            namespace,
-            "manager",
-            "sleep",
-            "--ttl-seconds",
-            "300",
-            "--manager-session-id",
-            "synthetic-manager",
-            "--pane-id",
-            "synthetic-pane",
-        ),
-        cwd=root,
-        env=env,
-    )
+    t001_digest = hashlib.sha256(b"T001").hexdigest()
+    t002_digest = hashlib.sha256(b"T002").hexdigest()
+    previous_namespace = hloop.LOOP_NAMESPACE
+    hloop.configure_loop_namespace(namespace)
+    try:
+        store = hloop._open_broker_store(repo)
+        with store.transaction() as transaction:
+            store.register_active_role(
+                transaction,
+                run_id=state["run_id"],
+                role_id="T001",
+                attempt_id="T001-A001",
+                task_contract_digest=t001_digest,
+                token="synthetic-t001-token",
+            )
+            store.register_active_role(
+                transaction,
+                run_id=state["run_id"],
+                role_id="T002",
+                attempt_id="T002-A001",
+                task_contract_digest=t002_digest,
+                token="synthetic-t002-token",
+            )
+    finally:
+        hloop.configure_loop_namespace(previous_namespace)
     event_id = str(uuid.uuid4())
     run(
         hloop_command(
@@ -557,6 +566,12 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
             "T001",
             "--attempt-id",
             "T001-A001",
+            "--run-id",
+            state["run_id"],
+            "--task-contract-digest",
+            t001_digest,
+            "--report-token",
+            "synthetic-t001-token",
             "--event-id",
             event_id,
             "--type",
@@ -579,6 +594,23 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
         cwd=root,
         env=env,
     )
+    sleep_result = run(
+        hloop_command(
+            repo,
+            namespace,
+            "manager",
+            "sleep",
+            "--ttl-seconds",
+            "1",
+            "--manager-session-id",
+            "synthetic-manager",
+            "--pane-id",
+            "synthetic-pane",
+        ),
+        cwd=root,
+        env=env,
+    )
+    require("manager sleep returned: report" in sleep_result.stdout, "Manager sleep did not surface the pending ACK")
     pending = run(
         hloop_command(repo, namespace, "manager", "next"),
         cwd=root,
@@ -603,7 +635,7 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
             "run_id": state["run_id"],
             "role_id": "T002",
             "attempt_id": "T002-A001",
-            "task_contract_digest": hashlib.sha256(b"T002").hexdigest(),
+            "task_contract_digest": t002_digest,
             "type": "milestone",
             "stage": "testing",
             "summary": "broker recovery fixture",
@@ -621,7 +653,17 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
         spool_dir = hloop.broker_spool_dir(repo)
     finally:
         hloop.configure_loop_namespace(previous_namespace)
-    spool_client_event(spool_dir, milestone)
+    spool_client_event(
+        spool_dir,
+        milestone,
+        authentication={
+            "run_id": state["run_id"],
+            "role_id": "T002",
+            "attempt_id": "T002-A001",
+            "task_contract_digest": t002_digest,
+            "token": "synthetic-t002-token",
+        },
+    )
     recovered = run(
         hloop_command(repo, namespace, "broker", "recover"),
         cwd=root,
