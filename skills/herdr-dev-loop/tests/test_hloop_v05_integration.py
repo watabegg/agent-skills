@@ -5,12 +5,14 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1010,6 +1012,97 @@ effort = "medium"
         finally:
             hloop.configure_loop_namespace(previous)
 
+    def test_worker_seal_persists_exact_tree_before_validation_and_commits_it(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-tree-before-validation", status="done"
+                )
+                observed = {}
+                real_build = hloop.build_validation_snapshot
+
+                def inspect_transaction(snapshot_source, staged_tree, expected_parent):
+                    transaction = state["tasks"]["T001"]["seal_transaction"]
+                    self.assertEqual(transaction["staged_tree"], staged_tree)
+                    self.assertEqual(transaction["expected_parent"], expected_parent)
+                    self.assertFalse(transaction["validation_passed"])
+                    self.assertEqual(
+                        subprocess.run(
+                            ["git", "write-tree"],
+                            cwd=worktree,
+                            check=True,
+                            text=True,
+                            capture_output=True,
+                        ).stdout.strip(),
+                        staged_tree,
+                    )
+                    staged_result = hloop.read_frontmatter(worktree / result_rel)
+                    self.assertEqual(staged_result["validation_results"], ["passed"])
+                    observed["tree"] = staged_tree
+                    return real_build(snapshot_source, staged_tree, expected_parent)
+
+                with mock.patch.object(
+                    hloop, "build_validation_snapshot", side_effect=inspect_transaction
+                ):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            code = hloop.cmd_worker_seal(
+                                self.seal_args(repo, validation_command=["exit 0"])
+                            )
+
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "show", "-s", "--format=%T", "HEAD"],
+                        cwd=worktree,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                    observed["tree"],
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_rejects_noncanonical_source_index_flags_before_scope_scan(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            for option, expected in (
+                ("--assume-unchanged", "assume-unchanged"),
+                ("--skip-worktree", "skip-worktree"),
+            ):
+                with self.subTest(option=option):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        repo, worktree, state, _ = self.make_worker_seal_fixture(
+                            root,
+                            namespace=f"worker-seal-index-{expected}",
+                            status="partial",
+                        )
+                        subprocess.run(
+                            ["git", "update-index", option, "--", "src/tracked.txt"],
+                            cwd=worktree,
+                            check=True,
+                        )
+                        with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                            with self.assertRaisesRegex(
+                                hloop.HLoopError, rf"{expected}.*src/tracked.txt|src/tracked.txt.*{expected}"
+                            ):
+                                hloop.cmd_worker_seal(self.seal_args(repo))
+                        self.assertNotIn("seal_transaction", state["tasks"]["T001"])
+                        self.assertEqual(
+                            subprocess.run(
+                                ["git", "diff", "--cached", "--quiet"],
+                                cwd=worktree,
+                                check=False,
+                            ).returncode,
+                            0,
+                        )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
     def test_worker_seal_fails_closed_on_out_of_scope_dirty_path(self):
         previous = hloop.LOOP_NAMESPACE
         try:
@@ -1480,6 +1573,75 @@ effort = "medium"
         finally:
             hloop.configure_loop_namespace(previous)
 
+    def test_worker_seal_absolute_original_path_change_survives_only_unstaged(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, _ = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-absolute-original", status="done"
+                )
+                absolute_keep = shlex.quote(str(worktree / "keep.txt"))
+                validation = f"printf 'changed outside snapshot\\n' > {absolute_keep}"
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=[validation])
+                        )
+
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "show", "HEAD:keep.txt"],
+                        cwd=worktree,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout,
+                    "changed\n",
+                )
+                self.assertEqual(
+                    (worktree / "keep.txt").read_text(encoding="utf-8"),
+                    "changed outside snapshot\n",
+                )
+                self.assertIn("keep.txt", hloop.porcelain_paths_no_renames(worktree))
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_validation_commands_share_one_recorded_tree_snapshot(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, _ = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-sequential-validation", status="done"
+                )
+                commands = ["printf ready > sequence.marker", "test -f sequence.marker"]
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=commands)
+                        )
+                self.assertEqual(code, 0)
+                self.assertFalse((worktree / "sequence.marker").exists())
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["git", "cat-file", "-e", "HEAD:sequence.marker"],
+                        cwd=worktree,
+                        check=False,
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
     def test_worker_seal_aborts_and_resets_when_worktree_changes_while_staging(self):
         """Simulate the TOCTOU window between the pre-stage scan and `git add`."""
 
@@ -1591,6 +1753,9 @@ effort = "medium"
                 # The crash left the index staged and a resumable transaction recorded --
                 # not lost work requiring manual `git reset`/`git add` repair.
                 self.assertIn("seal_transaction", state["tasks"]["T001"])
+                self.assertTrue(
+                    state["tasks"]["T001"]["seal_transaction"]["validation_passed"]
+                )
                 self.assertEqual(
                     subprocess.run(
                         ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
@@ -1641,6 +1806,59 @@ effort = "medium"
                             )
                         )
                 self.assertEqual(harvest_code, 0)
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_crash_before_validation_marker_reconciles_and_reruns(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, _ = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-prevalidation-marker-crash", status="done"
+                )
+
+                class SimulatedProcessDeath(BaseException):
+                    pass
+
+                with mock.patch.object(
+                    hloop,
+                    "run_seal_validation_command",
+                    side_effect=SimulatedProcessDeath("died before pass marker"),
+                ):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with self.assertRaises(SimulatedProcessDeath):
+                            hloop.cmd_worker_seal(
+                                self.seal_args(repo, validation_command=["exit 0"])
+                            )
+
+                transaction = state["tasks"]["T001"]["seal_transaction"]
+                self.assertIn("staged_tree", transaction)
+                self.assertFalse(transaction["validation_passed"])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    1,
+                )
+
+                measured = []
+
+                def passing_validation(snapshot, command):
+                    measured.append((snapshot, command))
+                    return True, ""
+
+                with mock.patch.object(
+                    hloop, "run_seal_validation_command", side_effect=passing_validation
+                ):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            code = hloop.cmd_worker_seal(
+                                self.seal_args(repo, validation_command=["exit 0"])
+                            )
+                self.assertEqual(code, 0)
+                self.assertEqual(len(measured), 1)
+                self.assertNotIn("seal_transaction", state["tasks"]["T001"])
         finally:
             hloop.configure_loop_namespace(previous)
 
@@ -1697,6 +1915,66 @@ effort = "medium"
                 ).stdout
                 self.assertEqual(committed_keep, "changed\n")
                 self.assertEqual((worktree / "keep.txt").read_text(encoding="utf-8"), "tampered\n")
+                self.assertIn("keep.txt", hloop.porcelain_paths_no_renames(worktree))
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_resume_preserves_post_validation_worktree_change_unstaged(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, _ = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-resume-dirty-worktree", status="done"
+                )
+                real_run_cmd = hloop.run_cmd
+
+                class SimulatedCrash(Exception):
+                    pass
+
+                def crash_before_commit(cmd, *cmd_args, **cmd_kwargs):
+                    if isinstance(cmd, list) and "commit-tree" in cmd:
+                        raise SimulatedCrash("died after validation marker")
+                    return real_run_cmd(cmd, *cmd_args, **cmd_kwargs)
+
+                with mock.patch.object(hloop, "run_cmd", side_effect=crash_before_commit):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with self.assertRaises(SimulatedCrash):
+                            hloop.cmd_worker_seal(
+                                self.seal_args(repo, validation_command=["exit 0"])
+                            )
+                self.assertTrue(
+                    state["tasks"]["T001"]["seal_transaction"]["validation_passed"]
+                )
+                (worktree / "keep.txt").write_text(
+                    "changed after validation\n", encoding="utf-8"
+                )
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(self.seal_args(repo))
+
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "show", "HEAD:keep.txt"],
+                        cwd=worktree,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout,
+                    "changed\n",
+                )
+                self.assertEqual(
+                    (worktree / "keep.txt").read_text(encoding="utf-8"),
+                    "changed after validation\n",
+                )
                 self.assertIn("keep.txt", hloop.porcelain_paths_no_renames(worktree))
                 self.assertEqual(
                     subprocess.run(
@@ -1961,8 +2239,8 @@ effort = "medium"
         finally:
             hloop.configure_loop_namespace(previous)
 
-    def test_worker_seal_resume_fails_closed_when_tree_identity_not_yet_durable(self):
-        """A crash before the tree-identity checkpoint lands must not resume-commit."""
+    def test_worker_seal_reconciles_and_revalidates_when_tree_identity_not_yet_durable(self):
+        """A pre-tree crash safely unstages and requires validation again."""
 
         previous = hloop.LOOP_NAMESPACE
         try:
@@ -2008,13 +2286,20 @@ effort = "medium"
                 ).stdout.strip()
 
                 with mock.patch.object(hloop, "preflight_loop", return_value=state):
-                    with self.assertRaisesRegex(hloop.HLoopError, "already has staged changes"):
+                    with self.assertRaisesRegex(hloop.HLoopError, "without at least one Manager"):
                         hloop.cmd_worker_seal(self.seal_args(repo))
 
-                # Must not silently resume-commit an unverified tree -- the
-                # transaction record must survive for inspection, and nothing
-                # may have been committed without validation running again.
-                self.assertIn("seal_transaction", state["tasks"]["T001"])
+                # Must not silently resume-commit an unverified tree. The
+                # index-only reconciliation preserves every working byte,
+                # clears the stale transaction, and reaches the ordinary
+                # missing-validation gate for a fresh attempt.
+                self.assertNotIn("seal_transaction", state["tasks"]["T001"])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
                 head_after = subprocess.run(
                     ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
                 ).stdout.strip()
@@ -2500,6 +2785,13 @@ effort = "medium"
             subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True)
             (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
             (repo / "untracked.txt").write_text("new\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            expected_parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            staged_tree = subprocess.run(
+                ["git", "write-tree"], cwd=repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
 
             expected_status = subprocess.run(
                 ["git", "status", "--porcelain"], cwd=repo, check=True, text=True, capture_output=True
@@ -2508,7 +2800,7 @@ effort = "medium"
                 ["git", "diff"], cwd=repo, check=True, text=True, capture_output=True
             ).stdout
 
-            snapshot = hloop.build_validation_snapshot(repo)
+            snapshot = hloop.build_validation_snapshot(repo, staged_tree, expected_parent)
             try:
                 observed_status = subprocess.run(
                     ["git", "status", "--porcelain"],
@@ -2523,7 +2815,7 @@ effort = "medium"
                 self.assertEqual(observed_status, expected_status)
                 self.assertEqual(observed_diff, expected_diff)
             finally:
-                shutil.rmtree(snapshot, ignore_errors=True)
+                hloop.remove_validation_snapshot(snapshot)
 
     def test_build_validation_snapshot_fails_closed_on_symlink_escaping_worktree(self):
         """A symlink whose target resolves outside the worktree could let a
@@ -2538,13 +2830,20 @@ effort = "medium"
             secret = root / "secret.txt"
             secret.write_text("classified\n", encoding="utf-8")
             (repo / "escape.txt").symlink_to(secret)
+            subprocess.run(["git", "add", "escape.txt"], cwd=repo, check=True)
+            expected_parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            staged_tree = subprocess.run(
+                ["git", "write-tree"], cwd=repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
             before_repo = self.snapshot_worktree_state(repo)
             before_secret = secret.read_bytes()
 
             with self.assertRaisesRegex(
                 hloop.HLoopError, "resolves outside the worktree and cannot be safely isolated"
             ):
-                hloop.build_validation_snapshot(repo)
+                hloop.build_validation_snapshot(repo, staged_tree, expected_parent)
 
             self.assertEqual(self.snapshot_worktree_state(repo), before_repo)
             self.assertEqual(secret.read_bytes(), before_secret)
@@ -2579,21 +2878,36 @@ effort = "medium"
             subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True)
 
             aliased_repo = alias_root / "repo"
-            snapshot = hloop.build_validation_snapshot(aliased_repo)
+            expected_parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=aliased_repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            staged_tree = subprocess.run(
+                ["git", "write-tree"], cwd=aliased_repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            snapshot = hloop.build_validation_snapshot(
+                aliased_repo, staged_tree, expected_parent
+            )
             try:
                 rewritten = os.readlink(snapshot / "link.txt")
                 self.assertTrue(rewritten.startswith(str(snapshot) + os.sep))
                 self.assertEqual(Path(rewritten).read_text(encoding="utf-8"), "hi\n")
             finally:
-                shutil.rmtree(snapshot, ignore_errors=True)
+                hloop.remove_validation_snapshot(snapshot)
 
     def test_build_validation_snapshot_preserves_directory_mode_and_mtime(self):
-        """Directory metadata (mode, mtime) must be reproduced too, not just
-        directory existence and file content."""
+        """Ignored dependency directory metadata is reproduced too."""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = self.make_repo(root)
+            (repo / ".gitignore").write_text("restricted/\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "ignore dependency"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
             restricted = repo / "restricted"
             restricted.mkdir()
             (restricted / "inside.txt").write_text("hi\n", encoding="utf-8")
@@ -2601,14 +2915,387 @@ effort = "medium"
             os.utime(restricted, (1_600_000_000, 1_600_000_000))
             expected_stat = os.stat(restricted)
 
-            snapshot = hloop.build_validation_snapshot(repo)
+            expected_parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            staged_tree = subprocess.run(
+                ["git", "write-tree"], cwd=repo, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            snapshot = hloop.build_validation_snapshot(repo, staged_tree, expected_parent)
             try:
                 observed_stat = os.stat(snapshot / "restricted")
                 self.assertEqual(stat.S_IMODE(observed_stat.st_mode), stat.S_IMODE(expected_stat.st_mode))
                 self.assertEqual(int(observed_stat.st_mtime), int(expected_stat.st_mtime))
             finally:
                 os.chmod(restricted, 0o755)
-                shutil.rmtree(snapshot, ignore_errors=True)
+                hloop.remove_validation_snapshot(snapshot)
+
+    def test_build_validation_snapshot_isolates_nested_repo_and_linked_submodule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def make_origin(name):
+                origin = root / name
+                origin.mkdir()
+                subprocess.run(
+                    ["git", "init", "-q", "-b", "master"], cwd=origin, check=True
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "nested@example.com"],
+                    cwd=origin,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Nested"], cwd=origin, check=True
+                )
+                (origin / "tracked.txt").write_text(f"{name}\n", encoding="utf-8")
+                subprocess.run(["git", "add", "tracked.txt"], cwd=origin, check=True)
+                subprocess.run(
+                    ["git", "commit", "-qm", "seed"], cwd=origin, check=True
+                )
+                return origin
+
+            sub_origin = make_origin("sub-origin")
+            nested_origin = make_origin("nested-origin")
+            repo = self.make_repo(root)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    str(sub_origin),
+                    "deps/sub",
+                ],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "tools").mkdir()
+            subprocess.run(
+                ["git", "clone", "-q", str(nested_origin), str(repo / "tools/nested")],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "add", ".gitmodules", "deps/sub", "tools/nested"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-qm", "add nested repositories"], cwd=repo, check=True
+            )
+
+            worktree = root / "linked-super"
+            subprocess.run(
+                ["git", "worktree", "add", "-q", "-b", "linked-super", str(worktree), "master"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "-q",
+                    "deps/sub",
+                ],
+                cwd=worktree,
+                check=True,
+            )
+            nested_worktree = worktree / "tools/nested"
+            nested_worktree.rmdir()
+            subprocess.run(
+                ["git", "clone", "-q", str(nested_origin), str(nested_worktree)],
+                cwd=worktree,
+                check=True,
+            )
+            sub_worktree = worktree / "deps/sub"
+            self.assertTrue((sub_worktree / ".git").is_file())
+            self.assertTrue((nested_worktree / ".git").is_dir())
+
+            (sub_worktree / "tracked.txt").write_text("sub modified\n", encoding="utf-8")
+            (sub_worktree / "staged.txt").write_text("sub staged\n", encoding="utf-8")
+            subprocess.run(["git", "add", "staged.txt"], cwd=sub_worktree, check=True)
+            (nested_worktree / "tracked.txt").write_text(
+                "nested modified\n", encoding="utf-8"
+            )
+            (nested_worktree / "untracked.txt").write_text(
+                "nested untracked\n", encoding="utf-8"
+            )
+
+            def git_observation(path):
+                return tuple(
+                    subprocess.run(
+                        command,
+                        cwd=path,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout
+                    for command in (
+                        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                        ["git", "diff"],
+                        ["git", "diff", "--cached"],
+                    )
+                )
+
+            expected = {
+                ".": git_observation(worktree),
+                "deps/sub": git_observation(sub_worktree),
+                "tools/nested": git_observation(nested_worktree),
+            }
+            expected_parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            staged_tree = subprocess.run(
+                ["git", "write-tree"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+
+            snapshot = hloop.build_validation_snapshot(
+                worktree, staged_tree, expected_parent
+            )
+            try:
+                for relative, observation in expected.items():
+                    self.assertEqual(git_observation(snapshot / relative), observation)
+                    self.assertEqual(
+                        subprocess.run(
+                            ["git", "remote"],
+                            cwd=snapshot / relative,
+                            check=True,
+                            text=True,
+                            capture_output=True,
+                        ).stdout,
+                        "",
+                    )
+                self.assertTrue((snapshot / "deps/sub/.git").is_dir())
+                self.assertTrue((snapshot / "tools/nested/.git").is_dir())
+
+                snapshot_sub = snapshot / "deps/sub"
+                source_before = git_observation(sub_worktree)
+                unique = f"snapshot-only-{os.getpid()}-{time.time_ns()}\n"
+                object_id = subprocess.run(
+                    ["git", "hash-object", "-w", "--stdin"],
+                    cwd=snapshot_sub,
+                    input=unique,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                (snapshot_sub / "snapshot-only.txt").write_text(unique, encoding="utf-8")
+                subprocess.run(["git", "add", "snapshot-only.txt"], cwd=snapshot_sub, check=True)
+                subprocess.run(
+                    ["git", "update-ref", "refs/heads/snapshot-only", "HEAD"],
+                    cwd=snapshot_sub,
+                    check=True,
+                )
+
+                self.assertEqual(git_observation(sub_worktree), source_before)
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["git", "show-ref", "--verify", "refs/heads/snapshot-only"],
+                        cwd=sub_worktree,
+                        check=False,
+                        capture_output=True,
+                    ).returncode,
+                    0,
+                )
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["git", "cat-file", "-e", object_id],
+                        cwd=sub_worktree,
+                        check=False,
+                        capture_output=True,
+                    ).returncode,
+                    0,
+                )
+            finally:
+                hloop.remove_validation_snapshot(snapshot)
+
+    def test_build_validation_snapshot_dissociates_borrowed_object_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            origin = self.make_repo(root)
+            source = root / "shared-source"
+            subprocess.run(
+                ["git", "clone", "-q", "--shared", str(origin), str(source)],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "shared@example.com"],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Shared"], cwd=source, check=True
+            )
+            (source / "README.md").write_text("staged candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+            expected_parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            staged_tree = subprocess.run(
+                ["git", "write-tree"],
+                cwd=source,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+
+            snapshot = hloop.build_validation_snapshot(
+                source, staged_tree, expected_parent
+            )
+            try:
+                alternates = Path(
+                    subprocess.run(
+                        [
+                            "git",
+                            "rev-parse",
+                            "--path-format=absolute",
+                            "--git-path",
+                            "objects/info/alternates",
+                        ],
+                        cwd=snapshot,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip()
+                )
+                self.assertFalse(alternates.exists())
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "write-tree"],
+                        cwd=snapshot,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                    staged_tree,
+                )
+                unique = f"snapshot-borrowed-{time.time_ns()}\n"
+                object_id = subprocess.run(
+                    ["git", "hash-object", "-w", "--stdin"],
+                    cwd=snapshot,
+                    input=unique,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                self.assertNotEqual(
+                    subprocess.run(
+                        ["git", "cat-file", "-e", object_id],
+                        cwd=source,
+                        check=False,
+                        capture_output=True,
+                    ).returncode,
+                    0,
+                )
+            finally:
+                hloop.remove_validation_snapshot(snapshot)
+
+    def test_remove_validation_snapshot_repairs_read_only_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            locked = snapshot / "locked"
+            locked.mkdir(parents=True)
+            artifact = locked / "artifact.bin"
+            artifact.write_bytes(b"immutable")
+            os.chmod(artifact, 0o400)
+            os.chmod(locked, 0o500)
+            os.chmod(snapshot, 0o500)
+
+            hloop.remove_validation_snapshot(snapshot)
+
+            self.assertFalse(snapshot.exists())
+
+    def test_remove_validation_snapshot_surfaces_retained_path_on_retry_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "artifact").write_text("x", encoding="utf-8")
+            with mock.patch.object(
+                hloop.shutil, "rmtree", side_effect=PermissionError("still locked")
+            ):
+                with self.assertRaisesRegex(
+                    hloop.HLoopError, rf"retained path: {re.escape(str(snapshot))}"
+                ):
+                    hloop.remove_validation_snapshot(snapshot)
+            self.assertTrue(snapshot.exists())
+            shutil.rmtree(snapshot)
+
+    def test_worker_seal_snapshot_cleanup_failure_prevents_success_and_reruns(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, _ = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-cleanup-failure", status="done"
+                )
+                head_before = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                real_remove = hloop.remove_validation_snapshot
+
+                def remove_then_report_failure(snapshot):
+                    real_remove(snapshot)
+                    raise hloop.HLoopError(
+                        f"failed to remove validation snapshot; retained path: {snapshot}"
+                    )
+
+                with mock.patch.object(
+                    hloop, "remove_validation_snapshot", side_effect=remove_then_report_failure
+                ):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with self.assertRaisesRegex(hloop.HLoopError, "retained path"):
+                            hloop.cmd_worker_seal(
+                                self.seal_args(repo, validation_command=["exit 0"])
+                            )
+
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=worktree,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                    head_before,
+                )
+                transaction = state["tasks"]["T001"]["seal_transaction"]
+                self.assertFalse(transaction["validation_passed"])
+
+                # The next invocation safely reconciles that unvalidated
+                # index and runs Manager validation again.
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=["exit 0"])
+                        )
+                self.assertEqual(code, 0)
+        finally:
+            hloop.configure_loop_namespace(previous)
 
     def test_worker_seal_force_stages_result_artifact_when_ai_is_gitignored(self):
         """The namespaced result artifact must land in the seal commit even in

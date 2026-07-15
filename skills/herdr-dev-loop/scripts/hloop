@@ -9321,6 +9321,126 @@ def resolve_symlink_target(link_path: Path, target: str) -> str:
     return os.path.realpath(candidate)
 
 
+def repair_tree_permissions(path: Path) -> None:
+    """Give the current user enough permission to delete a disposable tree."""
+
+    if not path.exists() and not path.is_symlink():
+        return
+    for root, dirnames, filenames in os.walk(path, topdown=False, followlinks=False):
+        root_path = Path(root)
+        for name in filenames:
+            item = root_path / name
+            if item.is_symlink():
+                continue
+            try:
+                os.chmod(item, item.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
+            except FileNotFoundError:
+                pass
+        for name in dirnames:
+            item = root_path / name
+            if item.is_symlink():
+                continue
+            try:
+                os.chmod(item, item.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            except FileNotFoundError:
+                pass
+        if not root_path.is_symlink():
+            try:
+                os.chmod(
+                    root_path,
+                    root_path.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+                )
+            except FileNotFoundError:
+                pass
+
+
+def remove_validation_snapshot(snapshot: Path) -> None:
+    """Remove a snapshot, repairing read-only content and failing visibly.
+
+    Validation is not successful while its supposedly disposable filesystem
+    remains live.  In particular, formatter/build commands commonly create
+    read-only artifacts, so retry once after repairing owner permissions and
+    retain the path in the final error when deletion still fails.
+    """
+
+    if not snapshot.exists() and not snapshot.is_symlink():
+        return
+    first_error: Exception | None = None
+    try:
+        shutil.rmtree(snapshot)
+        return
+    except Exception as exc:  # permission repair is the deliberate fallback
+        first_error = exc
+    try:
+        repair_tree_permissions(snapshot)
+        shutil.rmtree(snapshot)
+    except Exception as exc:
+        raise HLoopError(
+            f"failed to remove validation snapshot; retained path: {snapshot}; "
+            f"initial error: {first_error}; retry error: {exc}"
+        ) from exc
+
+
+def git_metadata_path(worktree: Path, name: str) -> Path:
+    raw = git(worktree, ["rev-parse", "--path-format=absolute", "--git-path", name])
+    return Path(raw).resolve()
+
+
+def noncanonical_index_flags(worktree: Path) -> dict[str, list[str]]:
+    """Return assume-unchanged/skip-worktree entries in one Git index."""
+
+    result: dict[str, list[str]] = {}
+    for option, flag in (("-v", "assume-unchanged"), ("-t", "skip-worktree")):
+        proc = run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(worktree), "ls-files", option, "-z"],
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise HLoopError(
+                f"cannot inspect Git index flags for {worktree}: "
+                + (proc.stderr or proc.stdout or "git ls-files failed").strip()
+            )
+        for record in (proc.stdout or "").split("\0"):
+            if len(record) < 3 or record[1] != " ":
+                continue
+            tag, path = record[0], record[2:]
+            active = tag.islower() if flag == "assume-unchanged" else tag.upper() == "S"
+            if active:
+                result.setdefault(path, []).append(flag)
+    return result
+
+
+def assert_canonical_git_index(worktree: Path, *, label: str = "source") -> None:
+    flagged = noncanonical_index_flags(worktree)
+    if not flagged:
+        return
+    details = "; ".join(
+        f"{path} ({', '.join(sorted(set(flags)))})" for path, flags in sorted(flagged.items())
+    )
+    paths = " ".join(shlex.quote(path) for path in sorted(flagged))
+    raise HLoopError(
+        f"cannot build an immutable seal from non-canonical {label} index flags: {details}. "
+        "Clear them before retrying with "
+        f"`git -C {shlex.quote(str(worktree))} update-index --no-assume-unchanged "
+        f"--no-skip-worktree -- {paths}`"
+    )
+
+
+def discover_nested_git_worktrees(worktree: Path) -> list[Path]:
+    """Find initialized Git worktrees below (but not including) `worktree`."""
+
+    nested: list[Path] = []
+    for root, dirnames, filenames in os.walk(worktree, topdown=True, followlinks=False):
+        root_path = Path(root)
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+            if root_path != worktree:
+                nested.append(root_path)
+        elif ".git" in filenames and root_path != worktree:
+            nested.append(root_path)
+    return sorted(set(nested), key=lambda path: (len(path.parts), path.as_posix()))
+
+
 def snapshot_symlink_target(worktree: Path, snapshot: Path, link_path: Path, target: str) -> str:
     """Return the target a symlink must carry inside the isolated snapshot.
 
@@ -9353,54 +9473,225 @@ def copy_worktree_tree_entry(worktree: Path, snapshot: Path, source: Path, desti
     """Reproduce `source` at `destination` inside `snapshot`, recursing into directories."""
 
     if source.is_symlink():
+        if destination.exists() or destination.is_symlink():
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
         target = os.readlink(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(snapshot_symlink_target(worktree, snapshot, source, target), destination)
     elif source.is_dir():
+        if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+            destination.unlink()
         destination.mkdir(parents=True, exist_ok=True)
         for entry in source.iterdir():
+            if entry.name == ".git":
+                continue
             copy_worktree_tree_entry(worktree, snapshot, entry, destination / entry.name)
         # Preserve directory mode/mtime too, once its content has finished
         # copying -- otherwise a later write into it above would bump mtime
         # again after copystat ran.
         shutil.copystat(source, destination, follow_symlinks=False)
     else:
+        if destination.is_symlink() or (destination.exists() and destination.is_dir()):
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
 
 
-def build_validation_snapshot(worktree: Path) -> Path:
-    """Build a disposable, git-aware copy of `worktree` for isolated validation.
+def ignored_worktree_paths(worktree: Path) -> list[Path]:
+    proc = run_cmd(
+        [
+            TRUSTED_GIT_PATH,
+            "-C",
+            str(worktree),
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError(
+            "cannot enumerate ignored validation dependencies: "
+            + (proc.stderr or proc.stdout or "git ls-files failed").strip()
+        )
+    return [worktree / path for path in (proc.stdout or "").split("\0") if path]
 
-    A Manager validation command (formatter, linter, build) may mutate
-    whatever it touches, but the only content seal may ever commit is the
-    exact tree recorded before validation ran. Running validation against a
-    full copy instead of `worktree` itself means those mutations can never
-    reach the original worktree at all -- there is nothing to roll back, and
-    a retried seal can never get stuck on a validation side effect.
 
-    The copy is byte-for-byte: every path under `worktree` except its own
-    `.git` (a link file, not a real repository, for a linked Worker
-    worktree) is reproduced exactly, including untracked and ignored files,
-    executable bits, deletions (nothing is copied for a path that is not
-    there), and empty directories. Symlinks are handled by
-    `copy_worktree_tree_entry`/`snapshot_symlink_target`: an internal
-    absolute symlink is rewritten to the snapshot's equivalent path so
-    following it never reaches the original worktree, an internal relative
-    symlink is copied unchanged (the reproduced layout keeps it resolving
-    correctly), and a symlink that escapes the worktree entirely fails
-    closed before any validation command runs. `git clone --local
-    --no-hardlinks --no-checkout` gives the copy its own real `.git`
-    (cloned from `worktree`'s current HEAD, with its own object files
-    rather than ones hardlinked back to the original repository) so
-    ordinary git-aware validation commands (`git status`, `git diff`, ...)
-    work inside it exactly as they would in `worktree`; an explicit `git
-    read-tree HEAD` guarantees the index reflects that HEAD tree rather
-    than relying on `--no-checkout`'s implicit behavior. Local clone with
-    `--no-hardlinks` still never requires a reflink-capable filesystem, so
-    this is portable across Linux and macOS. Content is copied with
-    `shutil`, not `cp --reflink`, for the same reason.
-    """
+def overlay_empty_directories(worktree: Path, snapshot: Path) -> None:
+    for root, dirnames, filenames in os.walk(worktree, topdown=True, followlinks=False):
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        root_path = Path(root)
+        if root_path == worktree or dirnames or filenames:
+            continue
+        destination = snapshot / root_path.relative_to(worktree)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copystat(root_path, destination, follow_symlinks=False)
 
-    snapshot = Path(tempfile.mkdtemp(prefix="hloop-seal-validate-"))
+
+def isolate_materialized_tree_symlinks(worktree: Path, snapshot: Path) -> None:
+    """Reject escaping tree symlinks and rewrite absolute internal targets."""
+
+    snapshot_real = os.path.realpath(str(snapshot))
+    for root, dirnames, filenames in os.walk(snapshot, topdown=True, followlinks=False):
+        root_path = Path(root)
+        if root_path == snapshot and ".git" in dirnames:
+            dirnames.remove(".git")
+        candidates: list[Path] = []
+        for name in list(dirnames):
+            item = root_path / name
+            if item.is_symlink():
+                dirnames.remove(name)
+                candidates.append(item)
+        candidates.extend(
+            root_path / name for name in filenames if (root_path / name).is_symlink()
+        )
+        for link in candidates:
+            target = os.readlink(link)
+            relative = link.relative_to(snapshot)
+            if os.path.isabs(target):
+                isolated = snapshot_symlink_target(
+                    worktree, snapshot, worktree / relative, target
+                )
+                if isolated != target:
+                    link.unlink()
+                    os.symlink(isolated, link)
+                continue
+            resolved = os.path.realpath(str(link.parent / target))
+            if resolved != snapshot_real and not resolved.startswith(snapshot_real + os.sep):
+                raise HLoopError(
+                    "cannot build isolated validation snapshot: symlink "
+                    f"{relative.as_posix()} targets {target!r}, which resolves outside "
+                    "the worktree and cannot be safely isolated"
+                )
+
+
+def copy_status_relevant_git_config(source: Path, destination: Path) -> None:
+    """Copy effective config that can affect status/diff interpretation."""
+
+    keys = (
+        "core.filemode",
+        "core.ignorecase",
+        "core.symlinks",
+        "core.precomposeunicode",
+        "core.excludesfile",
+        "diff.ignoresubmodules",
+    )
+    for key in keys:
+        value = git(source, ["config", "--get", key], check=False)
+        if value:
+            run_cmd(
+                [TRUSTED_GIT_PATH, "-C", str(destination), "config", "--local", key, value],
+                check=True,
+            )
+    submodule_config = run_cmd(
+        [
+            TRUSTED_GIT_PATH,
+            "-C",
+            str(source),
+            "config",
+            "--get-regexp",
+            r"^submodule\..*\.ignore$",
+        ],
+        check=False,
+    )
+    for line in (submodule_config.stdout or "").splitlines():
+        if not line.strip() or " " not in line:
+            continue
+        key, value = line.split(None, 1)
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(destination), "config", "--local", key, value],
+            check=True,
+        )
+
+
+def remove_snapshot_remotes(snapshot_repo: Path) -> None:
+    """Prevent an ordinary snapshot `git push` from targeting the source repo."""
+
+    remotes = git(snapshot_repo, ["remote"], check=False).splitlines()
+    for remote in remotes:
+        if remote.strip():
+            run_cmd(
+                [TRUSTED_GIT_PATH, "-C", str(snapshot_repo), "remote", "remove", remote],
+                check=True,
+            )
+
+
+def index_object_ids(worktree: Path) -> list[str]:
+    output = git(worktree, ["ls-files", "--stage", "-z"], check=False)
+    object_ids: list[str] = []
+    for record in output.split("\0"):
+        match = re.match(r"^([0-7]{6}) ([0-9a-f]{40,64}) [0-3]\t", record)
+        if match and match.group(1) != "160000":
+            # A gitlink records a commit owned by the nested repository, not
+            # necessarily by this superproject's object store.
+            object_ids.append(match.group(2))
+    return list(dict.fromkeys(object_ids))
+
+
+def dissociate_snapshot_object_store(snapshot_repo: Path, protected_objects: list[str]) -> None:
+    """Remove any copied alternates after packing every required object locally."""
+
+    alternates = git_metadata_path(snapshot_repo, "objects/info/alternates")
+    if not alternates.is_file():
+        return
+    temporary_refs: list[str] = []
+    for index, object_id in enumerate(dict.fromkeys(protected_objects), start=1):
+        if not object_id:
+            continue
+        reference = f"refs/hloop-snapshot/protected-{index}"
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(snapshot_repo), "update-ref", reference, object_id],
+            check=True,
+        )
+        temporary_refs.append(reference)
+    run_cmd([TRUSTED_GIT_PATH, "-C", str(snapshot_repo), "repack", "-a", "-d"], check=True)
+    for reference in temporary_refs:
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(snapshot_repo), "update-ref", "-d", reference],
+            check=True,
+        )
+    alternates.unlink()
+    for object_id in protected_objects:
+        if object_id:
+            run_cmd(
+                [TRUSTED_GIT_PATH, "-C", str(snapshot_repo), "cat-file", "-e", object_id],
+                check=True,
+            )
+
+
+def git_status_diff_observation(worktree: Path) -> tuple[str, str, str]:
+    commands = (
+        ["status", "--porcelain=v1", "--untracked-files=all", "--no-renames"],
+        ["diff", "--no-renames"],
+        ["diff", "--cached", "--no-renames"],
+    )
+    return tuple(git(worktree, command, check=True) for command in commands)  # type: ignore[return-value]
+
+
+def recreate_nested_git_worktree(source: Path, worktree: Path, snapshot: Path) -> None:
+    """Overlay one nested worktree with an independent Git dir/index/store."""
+
+    relative = source.relative_to(worktree)
+    destination = snapshot / relative
+    destination.mkdir(parents=True, exist_ok=True)
+    for entry in source.iterdir():
+        if entry.name == ".git":
+            continue
+        copy_worktree_tree_entry(worktree, snapshot, entry, destination / entry.name)
+
+    source_head = git(source, ["rev-parse", "HEAD"])
+    protected_objects = [source_head, *index_object_ids(source)]
+    clone_target = Path(tempfile.mkdtemp(prefix="hloop-nested-", dir=str(snapshot / ".git")))
     clone = run_cmd(
         [
             TRUSTED_GIT_PATH,
@@ -9409,33 +9700,155 @@ def build_validation_snapshot(worktree: Path) -> Path:
             "--no-hardlinks",
             "--no-checkout",
             "--quiet",
-            str(worktree),
-            str(snapshot),
+            str(source),
+            str(clone_target),
         ],
         check=False,
     )
     if clone.returncode != 0:
-        shutil.rmtree(snapshot, ignore_errors=True)
         raise HLoopError(
-            "failed to build isolated validation snapshot: "
+            f"failed to recreate nested Git worktree {relative.as_posix()}: "
             + (clone.stderr or clone.stdout or "git clone failed").strip()
         )
-    read_tree = run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(snapshot), "read-tree", "HEAD"], check=False
-    )
-    if read_tree.returncode != 0:
-        shutil.rmtree(snapshot, ignore_errors=True)
+    dissociate_snapshot_object_store(clone_target, protected_objects)
+    nested_git = destination / ".git"
+    if nested_git.exists() or nested_git.is_symlink():
         raise HLoopError(
-            "failed to build isolated validation snapshot: "
-            + (read_tree.stderr or read_tree.stdout or "git read-tree HEAD failed").strip()
+            f"validation snapshot unexpectedly materialized nested .git at {relative.as_posix()}"
         )
+    shutil.move(str(clone_target / ".git"), str(nested_git))
+    clone_target.rmdir()
+
+    source_symbolic_head = git(source, ["symbolic-ref", "-q", "HEAD"], check=False)
+    if source_symbolic_head:
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(destination), "update-ref", source_symbolic_head, source_head],
+            check=True,
+        )
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(destination), "symbolic-ref", "HEAD", source_symbolic_head],
+            check=True,
+        )
+    else:
+        run_cmd(
+            [
+                TRUSTED_GIT_PATH,
+                "-C",
+                str(destination),
+                "update-ref",
+                "--no-deref",
+                "HEAD",
+                source_head,
+            ],
+            check=True,
+        )
+    source_index = git_metadata_path(source, "index")
+    if source_index.is_file():
+        shutil.copy2(source_index, nested_git / "index")
+        for shared_index in source_index.parent.glob("sharedindex.*"):
+            if shared_index.is_file():
+                shutil.copy2(shared_index, nested_git / shared_index.name)
+    else:
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(destination), "read-tree", "HEAD"], check=True)
+    remove_snapshot_remotes(destination)
+    copy_status_relevant_git_config(source, destination)
+    source_observation = git_status_diff_observation(source)
+    snapshot_observation = git_status_diff_observation(destination)
+    if snapshot_observation != source_observation:
+        raise HLoopError(
+            f"nested Git snapshot parity mismatch at {relative.as_posix()}: "
+            f"source={source_observation!r} snapshot={snapshot_observation!r}"
+        )
+
+
+def build_validation_snapshot(worktree: Path, staged_tree: str, expected_parent: str) -> Path:
+    """Build an immutable, Git-aware snapshot of one recorded seal tree.
+
+    The root index and filesystem come from `staged_tree`, never from the
+    mutable source worktree.  Only ignored files and empty directories are
+    overlaid as validation dependencies.  Initialized repositories below the
+    root (including linked-worktree submodules whose `.git` is a file) get a
+    no-hardlink local clone, the exact source index and HEAD, and an exact
+    working-filesystem overlay.  Thus status/diff remain useful at every
+    repository boundary while validation-side index/ref/object mutations are
+    confined to the snapshot.
+    """
+
+    nested = discover_nested_git_worktrees(worktree)
+    assert_canonical_git_index(worktree)
+    for nested_worktree in nested:
+        assert_canonical_git_index(
+            nested_worktree,
+            label=f"nested {nested_worktree.relative_to(worktree).as_posix()}",
+        )
+
+    snapshot = Path(tempfile.mkdtemp(prefix="hloop-seal-validate-"))
     try:
-        for entry in worktree.iterdir():
-            if entry.name == ".git":
-                continue
-            copy_worktree_tree_entry(worktree, snapshot, entry, snapshot / entry.name)
+        clone = run_cmd(
+            [
+                TRUSTED_GIT_PATH,
+                "clone",
+                "--local",
+                "--no-hardlinks",
+                "--no-checkout",
+                "--quiet",
+                str(worktree),
+                str(snapshot),
+            ],
+            check=False,
+        )
+        if clone.returncode != 0:
+            raise HLoopError(
+                "failed to build isolated validation snapshot: "
+                + (clone.stderr or clone.stdout or "git clone failed").strip()
+            )
+        dissociate_snapshot_object_store(snapshot, [expected_parent, staged_tree])
+        tree_exists = run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(snapshot), "cat-file", "-e", f"{staged_tree}^{{tree}}"],
+            check=False,
+        )
+        if tree_exists.returncode != 0:
+            raise HLoopError(
+                f"recorded staged tree {staged_tree} is unavailable in the independent snapshot"
+            )
+        run_cmd(
+            [
+                TRUSTED_GIT_PATH,
+                "-C",
+                str(snapshot),
+                "update-ref",
+                "--no-deref",
+                "HEAD",
+                expected_parent,
+            ],
+            check=True,
+        )
+        remove_snapshot_remotes(snapshot)
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(snapshot), "read-tree", staged_tree], check=True)
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(snapshot), "checkout-index", "--all", "--force"],
+            check=True,
+        )
+        isolate_materialized_tree_symlinks(worktree, snapshot)
+        copy_status_relevant_git_config(worktree, snapshot)
+        for source in ignored_worktree_paths(worktree):
+            if source.exists() or source.is_symlink():
+                copy_worktree_tree_entry(
+                    worktree,
+                    snapshot,
+                    source,
+                    snapshot / source.relative_to(worktree),
+                )
+        overlay_empty_directories(worktree, snapshot)
+        for nested_worktree in nested:
+            recreate_nested_git_worktree(nested_worktree, worktree, snapshot)
+        if git(snapshot, ["write-tree"]) != staged_tree:
+            raise HLoopError(
+                "validation snapshot index does not match the recorded staged tree: "
+                f"expected {staged_tree}, got {git(snapshot, ['write-tree'])}"
+            )
     except Exception:
-        shutil.rmtree(snapshot, ignore_errors=True)
+        remove_validation_snapshot(snapshot)
         raise
     return snapshot
 
@@ -9670,6 +10083,34 @@ def reconcile_seal_index(
         )
 
 
+def discard_unvalidated_seal_transaction(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    worktree: Path,
+    *,
+    restore_result_path: Path | None = None,
+    restore_result_text: str | None = None,
+) -> None:
+    """Unstage an unvalidated transaction without moving its branch ref."""
+
+    transaction = task_state.get("seal_transaction")
+    if not isinstance(transaction, dict):
+        return
+    expected_parent = str(transaction.get("expected_parent") or "")
+    branch_ref = str(transaction.get("branch_ref") or "")
+    if not expected_parent or not branch_ref:
+        raise HLoopError(
+            f"cannot reconcile incomplete unvalidated seal transaction for {task_id}"
+        )
+    reconcile_seal_index(worktree, task_id, branch_ref, expected_parent)
+    if restore_result_path is not None and restore_result_text is not None:
+        write_text(restore_result_path, restore_result_text)
+    task_state.pop("seal_transaction", None)
+    save_state(repo, state)
+
+
 def commit_recorded_seal_tree(
     repo: Path,
     state: dict[str, Any],
@@ -9808,34 +10249,47 @@ def resume_staged_seal_transaction(
         return None
     if str(transaction.get("result_rel") or "") != result_rel.as_posix():
         return None
-    expected_scope = normalize_list(transaction.get("staged_paths"))
-    commit_message = str(transaction.get("commit_message") or "")
-    expected_tree = str(transaction.get("staged_tree") or "")
     expected_parent = str(transaction.get("expected_parent") or "")
     branch_ref = str(transaction.get("branch_ref") or "")
     expected_branch = str(task_state.get("branch") or "")
     if (
-        not expected_scope
-        or not commit_message
-        or not expected_tree
-        or not expected_parent
+        not expected_parent
         or not expected_branch
         or branch_ref != f"refs/heads/{expected_branch}"
     ):
         return None
-    # `staged_tree` is only written *after* `git add -A` finished and the
-    # staged scope was re-verified (see `cmd_worker_seal` below) -- it is the
-    # durable marker that the exact tree identity for this transaction was
-    # persisted before any crash. A transaction recorded without it means the
-    # process died during or before that verification: the staged paths may
-    # match by name alone (e.g. a partial `git add -A`, or a crash right as
-    # it started) without the content actually being what was validated.
-    # Refuse to resume-commit such a transaction -- fail closed so the caller
-    # raises "already has staged changes" and a human/Manager must inspect
-    # and re-run the full seal (including validation) rather than trusting an
-    # unverified tree.
     current_head = git(worktree, ["rev-parse", "HEAD"])
     recorded_commit = str(transaction.get("commit_sha") or "")
+    validation_passed = transaction.get("validation_passed") is True
+    if not validation_passed:
+        if recorded_commit:
+            raise HLoopError(
+                f"unvalidated seal transaction for {task_id} unexpectedly records commit "
+                f"{recorded_commit}; refusing to move refs"
+            )
+        if current_head != expected_parent:
+            raise HLoopError(
+                f"seal resume aborted for {task_id}: Worker branch moved from recorded parent "
+                f"{expected_parent} to {current_head}; preserving the unvalidated transaction"
+            )
+        # A crash before validation (or before the durable pass marker) may
+        # leave a complete or partial index update.  The branch still points
+        # at the recorded parent, so read-tree safely restores only the index;
+        # every working-file byte survives and the normal path below reruns
+        # validation from a newly recorded tree.
+        discard_unvalidated_seal_transaction(
+            repo, state, task_id, task_state, worktree
+        )
+        pre_staged.clear()
+        return None
+
+    expected_scope = normalize_list(transaction.get("staged_paths"))
+    commit_message = str(transaction.get("commit_message") or "")
+    expected_tree = str(transaction.get("staged_tree") or "")
+    if not expected_scope or not commit_message or not expected_tree:
+        raise HLoopError(
+            f"validated seal transaction is incomplete for {task_id}; refusing resume-commit"
+        )
     if recorded_commit and current_head == recorded_commit:
         # update-ref won before a crash, but index reconciliation and state
         # cleanup did not. Validate the object and finish those idempotently.
@@ -9863,19 +10317,18 @@ def resume_staged_seal_transaction(
         return None
 
     # `pre_staged` already matches the recorded scope exactly, so the prior
-    # `git add -A` ran to completion before the crash -- restaging is
-    # unnecessary and, for a path whose only change was a deletion, would
-    # fail outright (a fully staged deletion no longer matches any pathspec
-    # in the index or worktree). Only the TOCTOU recheck below is needed
-    # before completing the commit.
+    # `git add -A` ran to completion before the crash. Working-file changes
+    # after the durable validation marker are allowed: the recorded index
+    # tree remains the sole commit source and reconciliation will preserve
+    # those bytes as unstaged content.
     remaining_dirty = porcelain_paths_no_renames(worktree)
     cached_files = cached_diff_paths_no_renames(worktree)
     observed_tree = git(worktree, ["write-tree"])
-    if remaining_dirty or set(cached_files) != set(expected_scope) or observed_tree != expected_tree:
-        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "reset"], check=False)
+    if set(cached_files) != set(expected_scope) or observed_tree != expected_tree:
+        reconcile_seal_index(worktree, task_id, branch_ref, expected_parent)
         task_state.pop("seal_transaction", None)
         save_state(repo, state)
-        if not remaining_dirty and set(cached_files) == set(expected_scope) and observed_tree != expected_tree:
+        if set(cached_files) == set(expected_scope) and observed_tree != expected_tree:
             # Same paths, different content: the index was re-staged (or
             # tampered with) after the crash to match the recorded path
             # names exactly, but the durable tree identity captured before
@@ -9888,8 +10341,8 @@ def resume_staged_seal_transaction(
                 f"{sorted(expected_scope)}; refusing to trust re-staged or tampered content"
             )
         raise HLoopError(
-            f"seal resume aborted for {task_id}: worktree changed since the crashed seal "
-            f"attempt staged this transaction (remaining dirty: {remaining_dirty}; staged "
+            f"seal resume aborted for {task_id}: staged scope changed since the crashed seal "
+            f"attempt (working changes preserved: {remaining_dirty}; staged "
             f"{sorted(cached_files)} != expected {sorted(expected_scope)}); inspect the "
             "worktree before retrying"
         )
@@ -9950,6 +10403,16 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     branch = current_branch(worktree)
     if expected_branch and branch != expected_branch:
         raise HLoopError(f"Worker branch mismatch: expected {expected_branch}, got {branch}")
+
+    # Status/scope scans are trustworthy only for a canonical index.  Git's
+    # assume-unchanged and skip-worktree flags can hide real source changes,
+    # so reject them before looking for staged or dirty paths.
+    assert_canonical_git_index(worktree)
+    for nested_worktree in discover_nested_git_worktrees(worktree):
+        assert_canonical_git_index(
+            nested_worktree,
+            label=f"nested {nested_worktree.relative_to(worktree).as_posix()}",
+        )
 
     result_rel = LOOP_DIR / "results" / task_id / "result.md"
     result_path = worktree / result_rel
@@ -10057,37 +10520,12 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 f"cannot seal {task_id} as status done without at least one Manager "
                 "--validation-command"
             )
-        # Run every Manager validation command inside a disposable, isolated
-        # copy of this worktree rather than in place: a validation command
-        # (formatter, linter, build) may mutate whatever it touches, and the
-        # only thing seal may ever commit is the exact content recorded
-        # before validation ran. Building and discarding the snapshot around
-        # the whole command sequence guarantees this worktree is never
-        # mutated by validation, so there is nothing to roll back and no
-        # post-validation rescan is needed -- `full_scope`/`dirty`, both
-        # already measured above, remain exactly what gets sealed.
-        snapshot = build_validation_snapshot(worktree)
-        try:
-            for command in manager_validation_commands:
-                passed, output = run_seal_validation_command(snapshot, command)
-                manager_validation_results.append("passed" if passed else "failed")
-                if not passed:
-                    raise HLoopError(
-                        f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
-                        + output
-                    )
-        finally:
-            shutil.rmtree(snapshot, ignore_errors=True)
-
-        observed_parent = git(worktree, ["rev-parse", "HEAD"])
-        if observed_parent != expected_parent:
-            raise HLoopError(
-                f"Worker branch moved during Manager validation for {task_id}: "
-                f"expected {expected_parent}, got {observed_parent}"
-            )
         validation_recorded = bool(manager_validation_commands)
         validation_commands = manager_validation_commands
-        validation_results = manager_validation_results
+        # The result artifact is part of the immutable tree validated below.
+        # Record the only result that is eligible to commit up front, then
+        # commit that tree only if every real command earns the prediction.
+        validation_results = ["passed" for _ in manager_validation_commands]
         validation_summary = args.validation_summary or handoff_meta.get("validation_summary") or ""
     else:
         # Manager does not re-run validation for a `partial`/`blocked`/
@@ -10108,8 +10546,9 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         validation_summary = args.validation_summary or handoff_meta.get("validation_summary") or ""
 
     merge_ready = status == "done" and bool(manager_validation_commands) and not blocking_questions and all(
-        result == "passed" for result in manager_validation_results
+        result == "passed" for result in validation_results
     )
+    original_result_text = read_text(result_path)
     replace_frontmatter(
         result_path,
         {
@@ -10138,10 +10577,11 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
             f"seal aborted for {task_id}: Worker HEAD is not attached to {expected_branch_ref}"
         )
 
-    # Record this transaction before staging so a crash between `git add -A`,
-    # exact-tree commit creation, ref CAS, and index reconciliation leaves a
-    # recoverable trail. The next `hloop worker seal` invocation resumes only
-    # a transaction whose durable identities still match.
+    # Record identity before staging.  `validation_passed` is deliberately
+    # false until the exact staged tree has been materialized, all commands
+    # have passed in that tree's snapshot, cleanup has succeeded, and the
+    # marker itself is durable.  A crash at any earlier point reconciles only
+    # the index to `expected_parent` and reruns validation; it never commits.
     task_state["seal_transaction"] = {
         "attempt_id": expected_attempt,
         "result_rel": result_rel.as_posix(),
@@ -10149,6 +10589,8 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         "commit_message": commit_message,
         "expected_parent": expected_parent,
         "branch_ref": branch_ref,
+        "validation_required": status == "done",
+        "validation_passed": False,
     }
     save_state(repo, state)
 
@@ -10158,12 +10600,28 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     # `git add -A` semantics (respecting .gitignore, honoring deletions) so
     # product paths are never force-staged past a repository's own ignore
     # rules.
-    other_paths = [path for path in dirty if path != result_rel.as_posix()]
-    if other_paths:
-        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-A", "--", *other_paths], check=True)
-    run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-f", "--", result_rel.as_posix()], check=True
-    )
+    try:
+        other_paths = [path for path in dirty if path != result_rel.as_posix()]
+        if other_paths:
+            run_cmd(
+                [TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-A", "--", *other_paths],
+                check=True,
+            )
+        run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-f", "--", result_rel.as_posix()],
+            check=True,
+        )
+    except Exception:
+        discard_unvalidated_seal_transaction(
+            repo,
+            state,
+            task_id,
+            task_state,
+            worktree,
+            restore_result_path=result_path,
+            restore_result_text=original_result_text,
+        )
+        raise
 
     # Re-verify nothing changed underneath staging (a genuine TOCTOU window,
     # however small) before committing: no unstaged/untracked path may
@@ -10171,9 +10629,15 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     remaining_dirty = porcelain_paths_no_renames(worktree)
     cached_files = cached_diff_paths_no_renames(worktree)
     if remaining_dirty or set(cached_files) != set(dirty):
-        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "reset"], check=False)
-        task_state.pop("seal_transaction", None)
-        save_state(repo, state)
+        discard_unvalidated_seal_transaction(
+            repo,
+            state,
+            task_id,
+            task_state,
+            worktree,
+            restore_result_path=result_path,
+            restore_result_text=original_result_text,
+        )
         raise HLoopError(
             f"seal aborted for {task_id}: worktree changed while staging (remaining dirty: "
             f"{remaining_dirty}; staged {sorted(cached_files)} != expected {sorted(dirty)})"
@@ -10187,6 +10651,52 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     # closed instead of resume-committing an unverified tree.
     staged_tree = git(worktree, ["write-tree"])
     task_state["seal_transaction"]["staged_tree"] = staged_tree
+    save_state(repo, state)
+
+    if status == "done":
+        snapshot: Path | None = None
+        try:
+            snapshot = build_validation_snapshot(worktree, staged_tree, expected_parent)
+            for command in manager_validation_commands:
+                passed, output = run_seal_validation_command(snapshot, command)
+                manager_validation_results.append("passed" if passed else "failed")
+                if not passed:
+                    raise HLoopError(
+                        f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
+                        + output
+                    )
+        except Exception:
+            discard_unvalidated_seal_transaction(
+                repo,
+                state,
+                task_id,
+                task_state,
+                worktree,
+                restore_result_path=result_path,
+                restore_result_text=original_result_text,
+            )
+            raise
+        finally:
+            if snapshot is not None:
+                remove_validation_snapshot(snapshot)
+
+        observed_parent = git(worktree, ["rev-parse", "HEAD"])
+        if observed_parent != expected_parent:
+            raise HLoopError(
+                f"Worker branch moved during Manager validation for {task_id}: "
+                f"expected {expected_parent}, got {observed_parent}; preserving the staged "
+                "transaction without marking validation passed"
+            )
+        if manager_validation_results != validation_results:
+            raise HLoopError(
+                f"Manager validation result mismatch for {task_id}: "
+                f"measured={manager_validation_results} recorded={validation_results}"
+            )
+
+    # Non-done handoffs have no Manager validation gate; for done handoffs
+    # this assignment happens only after every command and snapshot cleanup
+    # completed.  Saving the marker is the resume-commit boundary.
+    task_state["seal_transaction"]["validation_passed"] = True
     save_state(repo, state)
 
     head_sha = commit_recorded_seal_tree(
