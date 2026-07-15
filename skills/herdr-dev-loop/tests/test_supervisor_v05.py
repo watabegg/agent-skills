@@ -413,6 +413,27 @@ class SupervisorPrimitiveTests(unittest.TestCase):
                 )
             )
 
+    def test_sleep_quarantines_poison_spool_entries_and_still_returns_the_valid_report(self):
+        event = client_event()
+        broker.spool_client_event(
+            self.spool, event, authentication=report_authentication(event)
+        )
+        poison = self.spool / "ffffffff-ffff-4fff-8fff-ffffffffffff.json"
+        poison.write_text('{"not": "an event"}', encoding="utf-8")
+
+        result = self.make_supervisor().sleep(timeout_seconds=1)
+
+        self.assertEqual(result.reason, "report")
+        self.assertEqual(result.event_ids, (event["event_id"],))
+        self.assertEqual(result.drained_reports, 1)
+        self.assertEqual(list(self.spool.glob("*.json")), [])
+        quarantined = [
+            path
+            for path in (self.spool / "quarantine").glob("*.json")
+            if not path.name.endswith(".audit.json")
+        ]
+        self.assertEqual([path.name for path in quarantined], [poison.name])
+
     def test_milestone_remains_inbox_only_and_does_not_wake_manager(self):
         event = milestone_event()
         with self.store.transaction() as transaction:

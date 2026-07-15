@@ -468,6 +468,54 @@ class BrokerReportLifecycleTests(unittest.TestCase):
                 hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
             self.assertIn(event_id, buffer.getvalue())
 
+    def test_manager_next_and_broker_recover_quarantine_poison_entries_and_replay_valid_ones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            spool_dir = hloop.broker_spool_dir(repo)
+
+            with mock.patch.object(
+                hloop,
+                "_open_broker_store",
+                side_effect=hloop_broker.BrokerStorageError("simulated broker outage"),
+            ):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    hloop.cmd_agent_report(self.report_args(repo, event_id=str(uuid.uuid4())))
+                self.assertIn("spooled", buffer.getvalue())
+
+            poison = spool_dir / "ffffffff-ffff-4fff-8fff-ffffffffffff.json"
+            poison.write_text(json.dumps({"not": "an event"}), encoding="utf-8")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_manager_next(SimpleNamespace(repo=str(repo)))
+            self.assertIn("replayed 1 spooled report", buffer.getvalue())
+            self.assertEqual(list(spool_dir.glob("*.json")), [])
+            quarantine_dir = spool_dir / "quarantine"
+            self.assertEqual(
+                [
+                    path.name
+                    for path in quarantine_dir.glob("*.json")
+                    if not path.name.endswith(".audit.json")
+                ],
+                ["ffffffff-ffff-4fff-8fff-ffffffffffff.json"],
+            )
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_broker_status(SimpleNamespace(repo=str(repo)))
+            status = json.loads(buffer.getvalue())
+            self.assertEqual(status["spool_quarantined"], 1)
+
+            # A second recovery pass over an already-drained, already-quarantined
+            # spool must not fail or duplicate the quarantine entry.
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_broker_recover(SimpleNamespace(repo=str(repo)))
+            self.assertIn("replayed 0 spooled report", buffer.getvalue())
+            self.assertIn("quarantined 1 poison entrie", buffer.getvalue())
+
 
 class BrokerTransportAndAuthenticationTests(unittest.TestCase):
     """Exercises detached-worktree broker sharing, inbox show, report auth, hooks, drain."""
@@ -2119,6 +2167,111 @@ class RequirementProgressOutcomeTests(unittest.TestCase):
             self.assertIn("U0001", context)
             self.assertNotIn("context-secret-12345678", context)
             self.assertIn("[REDACTED]", context)
+
+    def test_progress_record_clears_or_replaces_blockers_then_advances_to_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+
+            hloop.cmd_input_record(
+                SimpleNamespace(
+                    repo=str(repo),
+                    source="manager-chat",
+                    text="add blocker recovery support",
+                )
+            )
+            hloop.cmd_requirement_new(
+                SimpleNamespace(
+                    repo=str(repo),
+                    id=None,
+                    source_input=["U0001"],
+                    acceptance=["blocked progress is recoverable"],
+                    priority="P1",
+                    depends_on=None,
+                )
+            )
+
+            def record(**overrides):
+                base = dict(
+                    repo=str(repo),
+                    requirement_id="REQ-001",
+                    task_id=None,
+                    evidence_kind=None,
+                    evidence_ref=None,
+                    verified_by=None,
+                    head_sha=None,
+                    result=None,
+                    remaining_work=None,
+                    blocker=None,
+                    clear_blockers=False,
+                )
+                base.update(overrides)
+                return hloop.cmd_progress_record(SimpleNamespace(**base))
+
+            record(status="in_progress", remaining_work="waiting on upstream fix")
+            record(status="blocked", blocker=["upstream dependency is broken"])
+            state = hloop.load_state(repo)
+            self.assertEqual(
+                state["requirements"]["REQ-001"]["progress"]["blockers"],
+                ["upstream dependency is broken"],
+            )
+
+            # --clear-blockers and --blocker together is ambiguous and rejected.
+            with self.assertRaises(hloop.HLoopError):
+                record(
+                    status="in_progress",
+                    blocker=["still blocked"],
+                    clear_blockers=True,
+                )
+
+            # A stale blocker from an old obstacle must not silently persist once
+            # a different one replaces it.
+            record(status="in_progress", blocker=["a different, newer blocker"])
+            state = hloop.load_state(repo)
+            self.assertEqual(
+                state["requirements"]["REQ-001"]["progress"]["blockers"],
+                ["a different, newer blocker"],
+            )
+
+            # Explicitly clearing blockers (rather than merely omitting --blocker)
+            # is required to advance cleanly; omission alone must retain them.
+            record(status="in_progress")
+            state = hloop.load_state(repo)
+            self.assertEqual(
+                state["requirements"]["REQ-001"]["progress"]["blockers"],
+                ["a different, newer blocker"],
+            )
+            record(status="in_progress", clear_blockers=True, remaining_work="")
+            state = hloop.load_state(repo)
+            self.assertEqual(state["requirements"]["REQ-001"]["progress"]["blockers"], [])
+            self.assertEqual(state["requirements"]["REQ-001"]["progress"]["remaining_work"], "")
+
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            record(
+                status="implemented_unverified",
+                evidence_kind="artifact",
+                evidence_ref="results/REQ-001/result.md",
+                verified_by="manager",
+                head_sha=head_sha,
+            )
+            record(
+                status="verified",
+                evidence_kind="test",
+                evidence_ref="targeted suite",
+                verified_by="manager",
+                head_sha=head_sha,
+                result="passed",
+            )
+            state = hloop.load_state(repo)
+            progress = state["requirements"]["REQ-001"]["progress"]
+            self.assertEqual(progress["status"], "verified")
+            self.assertEqual(progress["blockers"], [])
 
     def test_input_file_extract_and_accept_preserve_confirmation_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
