@@ -18,7 +18,8 @@
     "validation_commands": {"type": "array", "items": {"type": "string"}},
     "validation_results": {"type": "array", "items": {"enum": ["passed", "failed", "blocked"]}},
     "validation_summary": {"type": "string"},
-    "blocking_questions": {"type": "array", "items": {"type": "string"}}
+    "blocking_questions": {"type": "array", "items": {"type": "string"}},
+    "handoff": {"type": "boolean"}
   },
   "allOf": [
     {
