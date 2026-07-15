@@ -281,6 +281,189 @@ class ProviderPreflightIntegrationTests(unittest.TestCase):
             self.assertEqual(unchanged, state)
 
 
+class MergeCrashRecoveryRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-merge-crash-recovery")
+
+    def tearDown(self):
+        hloop.configure_loop_namespace(self.previous_namespace)
+
+    def init_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=master"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return repo
+
+    def test_save_state_fsyncs_file_before_replace_and_parent_after_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            events = []
+            real_fsync = os.fsync
+            real_replace = os.replace
+
+            def record_fsync(descriptor):
+                events.append("fsync")
+                return real_fsync(descriptor)
+
+            def record_replace(source, destination):
+                events.append("replace")
+                return real_replace(source, destination)
+
+            state = {
+                "state_format_version": hloop.STATE_FORMAT_VERSION,
+                "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                "namespace": hloop.LOOP_NAMESPACE,
+                "phase": "dispatching",
+                "integration_branch": "master",
+            }
+            with mock.patch.object(hloop.os, "fsync", side_effect=record_fsync), mock.patch.object(
+                hloop.os, "replace", side_effect=record_replace
+            ):
+                hloop.save_state(repo, state)
+
+            self.assertEqual(events, ["fsync", "replace", "fsync"])
+            self.assertEqual(hloop.load_state(repo)["phase"], "dispatching")
+            self.assertEqual(list(hloop.state_path(repo).parent.glob(".STATE.json.*.tmp")), [])
+
+    def test_merge_reconciles_squash_commit_landed_before_final_state_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            pre_merge_head = hloop.git(repo, ["rev-parse", "HEAD"])
+            subprocess.run(
+                ["git", "switch", "-c", "worker"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            (repo / "feature.txt").write_text("landed once\n", encoding="utf-8")
+            subprocess.run(["git", "add", "feature.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "worker change"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            worker_head = hloop.git(repo, ["rev-parse", "HEAD"])
+            subprocess.run(
+                ["git", "switch", "master"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            transaction = hloop.build_merge_transaction(
+                task_id="T001",
+                attempt_id="T001-A001",
+                branch="worker",
+                pre_merge_head=pre_merge_head,
+                worker_head=worker_head,
+                index_state=hloop.merge_transaction_index_state(repo, "HEAD"),
+                changed_paths=("feature.txt",),
+            )
+            state = {
+                "state_format_version": hloop.STATE_FORMAT_VERSION,
+                "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                "namespace": hloop.LOOP_NAMESPACE,
+                "phase": "dispatching",
+                "integration_branch": "master",
+                "merge_mode": "squash",
+                "manager_qa_profile": "none",
+                "tasks": {
+                    "T001": {
+                        "status": "result_reported",
+                        "branch": "worker",
+                    }
+                },
+                "active_merge": transaction.to_record(),
+            }
+            hloop.save_state(repo, state)
+            subprocess.run(
+                ["git", "merge", "--squash", "worker"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            transaction = hloop.record_squash_tree(repo, state, transaction)
+            subprocess.run(
+                ["git", "commit", "-m", "ai-loop(T001): squash worker"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "commit", "--amend", "-m", "manual commit"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            args = SimpleNamespace(
+                repo=str(repo),
+                task_id="T001",
+                abort=False,
+                continue_merge=False,
+                retry=False,
+                mode=None,
+                dry_run=False,
+            )
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=hloop.load_state(repo)
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "commit subject"):
+                    hloop.cmd_merge(args)
+            self.assertIn("active_merge", hloop.load_state(repo))
+
+            subprocess.run(
+                ["git", "commit", "--amend", "-m", "ai-loop(T001): squash worker"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            landed_head = hloop.git(repo, ["rev-parse", "HEAD"])
+            commit_count = hloop.git(repo, ["rev-list", "--count", "HEAD"])
+            self.assertEqual(
+                hloop.load_state(repo)["active_merge"]["squash_tree"],
+                hloop.merge_transaction_index_state(repo, landed_head),
+            )
+
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=hloop.load_state(repo)
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(hloop.cmd_merge(args), 0)
+
+            reconciled = hloop.load_state(repo)
+            self.assertIn("reconciled merge T001", output.getvalue())
+            self.assertNotIn("active_merge", reconciled)
+            self.assertEqual(reconciled["tasks"]["T001"]["status"], "merged")
+            self.assertEqual(reconciled["last_merged_task"], "T001")
+            self.assertEqual(reconciled["unreviewed_merge_count"], 1)
+            self.assertEqual(reconciled["ungapped_merge_count"], 1)
+            self.assertEqual(hloop.git(repo, ["rev-parse", "HEAD"]), landed_head)
+            self.assertEqual(hloop.git(repo, ["rev-list", "--count", "HEAD"]), commit_count)
+
+            with mock.patch.object(hloop, "preflight_loop", return_value=reconciled):
+                with self.assertRaisesRegex(hloop.HLoopError, "task is not merge ready"):
+                    hloop.cmd_merge(args)
+            self.assertEqual(hloop.git(repo, ["rev-parse", "HEAD"]), landed_head)
+
+
 class BrokerReportLifecycleTests(unittest.TestCase):
     """Exercises agent report / inbox / manager sleep-next / broker status-recover."""
 

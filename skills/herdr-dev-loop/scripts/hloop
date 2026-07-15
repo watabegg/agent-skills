@@ -1349,11 +1349,33 @@ def read_text(path: Path) -> str:
         raise HLoopError(f"missing file: {path}") from exc
 
 
-def write_text(path: Path, text: str) -> None:
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_text(path: Path, text: str, *, durable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        with tmp.open("w", encoding="utf-8") as stream:
+            stream.write(text)
+            if durable:
+                stream.flush()
+                os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        if durable:
+            fsync_directory(path.parent)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def ensure_worktree_parent_dirs(worktree: Path, *relative_paths: Path) -> None:
@@ -1520,7 +1542,11 @@ def assert_mutating_state_schema_compatible(repo: Path) -> None:
 
 def save_state(repo: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = now_iso()
-    write_text(state_path(repo), json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    write_text(
+        state_path(repo),
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        durable=True,
+    )
 
 
 def journal(repo: Path, message: str) -> None:
@@ -10222,6 +10248,92 @@ def transition_merge_transaction(
     return candidate
 
 
+def record_squash_tree(
+    repo: Path,
+    state: dict[str, Any],
+    transaction: MergeTransaction,
+) -> MergeTransaction:
+    observed = dataclass_replace(transaction, squash_tree=git(repo, ["write-tree"]))
+    recorded = transition_merge_transaction(
+        repo,
+        state,
+        transaction,
+        transaction.status,
+        observed=observed,
+    )
+    save_state(repo, state)
+    return recorded
+
+
+def reconcile_completed_squash_merge(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+) -> bool:
+    """Finish STATE bookkeeping after a squash commit won the crash race."""
+
+    active = state.get("active_merge") or {}
+    if str(active.get("task_id") or "") != task_id:
+        return False
+    try:
+        transaction = MergeTransaction.from_record(active)
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
+    if transaction.mode != "squash" or transaction.status not in {
+        MERGE_ACTIVE,
+        MERGE_CONTENT_CONFLICT,
+    }:
+        return False
+
+    current_head = git(repo, ["rev-parse", "HEAD"])
+    if current_head == transaction.pre_merge_head:
+        return False
+
+    expected_message = f"ai-loop({task_id}): squash {transaction.branch}"
+    parents = git(repo, ["rev-list", "--parents", "-n", "1", current_head]).split()
+    commit_tree = merge_transaction_index_state(repo, current_head)
+    index_diff = run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--quiet", current_head, "--"],
+        check=False,
+    )
+    if index_diff.returncode not in {0, 1}:
+        raise HLoopError(
+            (index_diff.stderr or index_diff.stdout or "failed to compare the merge index").strip()
+        )
+    integration_head = git(repo, ["rev-parse", str(state["integration_branch"])])
+    commit_subject = git(repo, ["show", "-s", "--format=%s", current_head])
+    worker_head = (
+        git(repo, ["rev-parse", transaction.branch])
+        if branch_exists(repo, transaction.branch)
+        else ""
+    )
+    mismatches: list[str] = []
+    if not transaction.squash_tree:
+        mismatches.append("transaction has no recorded squash tree")
+    elif commit_tree != transaction.squash_tree:
+        mismatches.append("commit tree differs from the recorded squash tree")
+    if parents != [current_head, transaction.pre_merge_head]:
+        mismatches.append("commit is not the single child of the pre-merge HEAD")
+    if index_diff.returncode != 0:
+        mismatches.append("index differs from the landed commit tree")
+    if integration_head != current_head:
+        mismatches.append("integration branch does not point at the landed commit")
+    if commit_subject != expected_message:
+        mismatches.append("commit subject does not identify the active squash transaction")
+    if worker_head != transaction.worker_head:
+        mismatches.append("Worker branch head differs from the active transaction")
+    if mismatches:
+        raise HLoopError(
+            "active squash merge HEAD advanced without matching the recorded transaction: "
+            + "; ".join(mismatches)
+        )
+
+    transition_merge_transaction(repo, state, transaction, MERGE_COMPLETED)
+    complete_merge_state(repo, state, task_id, "squash")
+    journal(repo, f"Reconciled landed squash commit `{current_head}` for Worker `{task_id}`.")
+    return True
+
+
 def cmd_merge_abort(repo: Path, state: dict[str, Any], task_id: str) -> int:
     active = state.get("active_merge") or {}
     if str(active.get("task_id") or "") != task_id:
@@ -10286,6 +10398,7 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
             repo, state, prior, MERGE_COMPLETED, observed=observed
         )
     else:
+        prior = record_squash_tree(repo, state, prior)
         git(repo, ["commit", "-m", f"ai-loop({task_id}): {mode} {state['tasks'][task_id]['branch']}"])
         transition_merge_transaction(repo, state, prior, MERGE_COMPLETED)
     complete_merge_state(repo, state, task_id, mode)
@@ -10311,6 +10424,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
         require_integration_branch=True,
         skip_dirty_check=recovering_active_transaction,
     )
+    if reconcile_completed_squash_merge(repo, state, task_id):
+        print(f"reconciled merge {task_id}")
+        return 0
     if getattr(args, "abort", False):
         return cmd_merge_abort(repo, state, task_id)
     if getattr(args, "continue_merge", False):
@@ -10436,6 +10552,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
                     raise HLoopError(
                         (reset_loop.stderr or reset_loop.stdout or "failed to unstage local-only loop artifacts").strip()
                     )
+            transaction = record_squash_tree(repo, state, transaction)
             git(repo, ["commit", "-m", f"ai-loop({task_id}): squash {branch}"])
         else:
             git(repo, ["cherry-pick", *commits])

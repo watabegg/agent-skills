@@ -230,7 +230,7 @@ _MERGE_OPERATIONS = {
 
 @dataclass(frozen=True, slots=True)
 class MergeTransaction:
-    """Merge identity plus append-only cherry-pick progress observations."""
+    """Merge identity plus append-only cherry-pick or squash observations."""
 
     transaction_id: str
     task_id: str
@@ -246,6 +246,7 @@ class MergeTransaction:
     source_commits: tuple[str, ...] = ()
     applied_commits: tuple[str, ...] = ()
     applied_head: str = ""
+    squash_tree: str = ""
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -278,6 +279,8 @@ class MergeTransaction:
             raise ValueError("applied_commits must not contain empty commits")
         if self.mode == "squash" and (self.source_commits or self.applied_commits):
             raise ValueError("squash transactions cannot record cherry-pick commits")
+        if self.mode != "squash" and self.squash_tree:
+            raise ValueError("only squash transactions can record a squash tree")
         if self.mode == "cherry-pick" and not self.source_commits:
             raise ValueError("cherry-pick transactions require source_commits")
         if self.applied_commits != self.source_commits[: len(self.applied_commits)]:
@@ -318,6 +321,7 @@ class MergeTransaction:
             applied_head=str(
                 record.get("applied_head") or record.get("pre_merge_head") or ""
             ),
+            squash_tree=str(record.get("squash_tree") or ""),
         )
 
     def immutable_identity(self) -> tuple[Any, ...]:
@@ -351,6 +355,7 @@ class MergeTransaction:
             "source_commits": list(self.source_commits),
             "applied_commits": list(self.applied_commits),
             "applied_head": self.applied_head,
+            "squash_tree": self.squash_tree,
         }
 
 
@@ -407,6 +412,22 @@ def validate_merge_transaction(
                 severity="P0",
             )
         )
+    if candidate.squash_tree != prior.squash_tree:
+        if (
+            prior.squash_tree
+            or not candidate.squash_tree
+            or prior.mode != "squash"
+            or prior.status not in {MERGE_ACTIVE, MERGE_CONTENT_CONFLICT}
+            or candidate.status != prior.status
+        ):
+            issues.append(
+                LifecycleIssue(
+                    "manual-integration-trace",
+                    "merge transaction squash tree was rewritten or removed",
+                    prior.transaction_id,
+                    severity="P0",
+                )
+            )
     if candidate.applied_commits[: len(prior.applied_commits)] != prior.applied_commits:
         issues.append(
             LifecycleIssue(
