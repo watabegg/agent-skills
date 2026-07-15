@@ -16,7 +16,7 @@
     "changed_files": {"type": "array", "items": {"type": "string"}},
     "validation_recorded": {"type": "boolean"},
     "validation_commands": {"type": "array", "items": {"type": "string"}},
-    "validation_results": {"type": "array", "items": {"type": "string"}},
+    "validation_results": {"type": "array", "items": {"enum": ["passed", "failed", "blocked"]}},
     "validation_summary": {"type": "string"},
     "blocking_questions": {"type": "array", "items": {"type": "string"}}
   },
@@ -34,7 +34,7 @@
           "status": {"const": "done"},
           "validation_recorded": {"const": true},
           "validation_commands": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-          "validation_results": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+          "validation_results": {"type": "array", "minItems": 1, "items": {"const": "passed"}}
         }
       }
     }

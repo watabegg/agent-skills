@@ -31,6 +31,8 @@ $HLOOP agent report \
 
 After sending the initial ACK, the role enters the semantic ACK barrier and must not begin material work. The Manager approves or rejects the newest authenticated ACK with `hloop agent ack resolve <role-id> --decision approve|reject|timeout --reason <text>`. Reject and timeout remain blocking; approval then requires a newer corrected ACK event. The same rule applies when a later Manager message changes goal, scope, acceptance, or public behavior.
 
+`hloop task update` applies a stronger form of the same rule to a running Worker. It hashes the updated task artifact, rebinds the active broker identity to that digest without rotating the attempt token, and replaces the prior barrier with a `task-contract` barrier. Only an authenticated ACK carrying the new digest and a sequence newer than the prior ACK can be approved. The canonical Manager state is authoritative for finalize, harvest, and merge, even when the Worker's local-only startup snapshot is older.
+
 If the broker store is unavailable, the client atomically writes the event to the run-specific fallback spool. `hloop broker recover` replays valid events idempotently. Invalid, stale-run, or digest-conflicting events fail closed.
 
 ## Event-driven Manager

@@ -609,6 +609,217 @@ effort = "medium"
         finally:
             hloop.configure_loop_namespace(previous)
 
+    def test_migrated_worker_results_use_canonical_manager_copy_without_warning(self):
+        previous = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("canonical-migrated-workers")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                tasks = {
+                    f"T{index:03d}": {
+                        "status": "merged",
+                        "result_path": f"/tmp/removed-T{index:03d}/result.md",
+                        "worktree": f"/tmp/removed-T{index:03d}",
+                    }
+                    for index in range(1, 25)
+                }
+                migrated = hloop.migrate_format_two_to_three(
+                    {
+                        "state_format_version": 2,
+                        "skill_version": "0.4.0",
+                        "tasks": tasks,
+                    }
+                )
+                for task_id, task in migrated["tasks"].items():
+                    self.assertEqual(
+                        task["result_path"],
+                        f"{hloop.LOOP_DIR.as_posix()}/results/{task_id}/result.md",
+                    )
+                    issue_codes = {
+                        issue["code"]
+                        for issue in hloop.agent_contract_issues(
+                            repo,
+                            role="worker",
+                            agent_id=task_id,
+                            agent=task,
+                        )
+                    }
+                    self.assertNotIn("manager-owned-worker-result", issue_codes)
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_failed_worker_validation_blocks_finalize_harvest_and_merge(self):
+        previous = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("worker-validation-gates")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = self.make_repo(root)
+                base_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                worktree = root / "worker"
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", "worker-validation", str(worktree), "master"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                task_meta = {
+                    "id": "T001",
+                    "run_id": "run-validation",
+                    "kind": "fix",
+                    "status": "running",
+                    "branch": "worker-validation",
+                    "base_ref": "master",
+                    "base_sha": base_sha,
+                    "write_allow": ["README.md"],
+                    "write_deny": [],
+                    "acceptance": ["validation passes"],
+                }
+                task_text = hloop.frontmatter(task_meta) + "\n\n# Task T001\n"
+                hloop.write_text(hloop.task_file(repo, "T001"), task_text)
+                hloop.write_text(hloop.task_file(worktree, "T001"), task_text)
+                result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+                result_meta = {
+                    "task_id": "T001",
+                    "run_id": "run-validation",
+                    "skill_version": hloop.SKILL_VERSION,
+                    "attempt_id": "T001-A001",
+                    "status": "done",
+                    "merge_ready": True,
+                    "branch": "worker-validation",
+                    "head_sha": "HEAD",
+                    "base_sha": base_sha,
+                    "changed_files": [result_rel.as_posix()],
+                    "validation_recorded": True,
+                    "validation_commands": ["false"],
+                    "validation_results": ["failed"],
+                    "validation_summary": "expected fixture failure",
+                    "blocking_questions": [],
+                }
+                hloop.write_text(
+                    worktree / result_rel,
+                    hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n",
+                )
+                subprocess.run(
+                    ["git", "add", "-f", result_rel.as_posix()],
+                    cwd=worktree,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", "fixture result"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                )
+                task_state = {
+                    **task_meta,
+                    "status": "running",
+                    "worktree": str(worktree),
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "worker_base_sha": base_sha,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "semantic_ack_barrier": {"status": "approved"},
+                }
+                state = {
+                    "state_format_version": hloop.STATE_FORMAT_VERSION,
+                    "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                    "namespace": hloop.LOOP_NAMESPACE,
+                    "run_id": "run-validation",
+                    "skill_version": hloop.SKILL_VERSION,
+                    "phase": "running",
+                    "integration_branch": "master",
+                    "merge_mode": "squash",
+                    "persistence": "local-only",
+                    "tasks": {"T001": task_state},
+                }
+                worker_state = json.loads(json.dumps(state))
+                state["tasks"]["T001"]["semantic_ack_barrier"] = {
+                    "status": "awaiting_ack",
+                    "message_id": "task-contract:" + "a" * 64,
+                }
+                hloop.save_state(repo, state)
+                hloop.save_state(worktree, worker_state)
+
+                with mock.patch.object(hloop, "porcelain_paths", return_value=[]):
+                    with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                        hloop.cmd_worker_finalize(
+                            argparse.Namespace(
+                                repo=str(worktree),
+                                task_id="T001",
+                                status="done",
+                                validation_command=["true"],
+                                validation_result=["passed"],
+                                validation_summary="passed",
+                                blocking_question=[],
+                                no_commit=True,
+                            )
+                        )
+
+                state["tasks"]["T001"]["semantic_ack_barrier"] = {"status": "approved"}
+                hloop.save_state(repo, state)
+
+                with mock.patch.object(hloop, "porcelain_paths", return_value=[]):
+                    with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
+                        hloop.cmd_worker_finalize(
+                            argparse.Namespace(
+                                repo=str(worktree),
+                                task_id="T001",
+                                status="done",
+                                validation_command=["false"],
+                                validation_result=["failed"],
+                                validation_summary="failed",
+                                blocking_question=[],
+                                no_commit=True,
+                            )
+                        )
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
+                        hloop.cmd_worker_harvest(
+                            argparse.Namespace(
+                                repo=str(repo),
+                                task_id="T001",
+                                keep_pane=False,
+                                session_cleanup=None,
+                            )
+                        )
+                self.assertFalse(hloop.result_file(repo, "T001").exists())
+
+                merge_state = json.loads(json.dumps(state))
+                merge_state["tasks"]["T001"].update(
+                    {
+                        "status": "result_reported",
+                        "result_status": "done",
+                        "merge_ready": True,
+                        "validation_recorded": True,
+                        "validation_commands": ["false"],
+                        "validation_results": ["failed"],
+                        "blocking_questions": [],
+                    }
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=merge_state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
+                        hloop.cmd_merge(
+                            argparse.Namespace(
+                                repo=str(repo),
+                                task_id="T001",
+                                abort=False,
+                                continue_merge=False,
+                                retry=False,
+                                mode=None,
+                                dry_run=False,
+                            )
+                        )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
     def test_message_envelopes_are_bound_to_each_role_without_undefined_names(self):
         state = {
             "run_id": "run-1",
