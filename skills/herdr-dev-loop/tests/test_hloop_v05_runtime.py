@@ -1560,6 +1560,20 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
         base.update(overrides)
         return SimpleNamespace(**base)
 
+    def manager_role_context(
+        self,
+        repo: Path,
+        *,
+        role_id: str = "T001",
+        attempt_id: str = "T001-A001",
+    ) -> dict[str, str]:
+        return {
+            hloop.ROLE_CONTEXT_ENV: "1",
+            hloop.ROLE_ID_ENV: role_id,
+            hloop.ROLE_ATTEMPT_ID_ENV: attempt_id,
+            hloop.MANAGER_REPO_ENV: str(repo),
+        }
+
     def test_broker_transport_is_shared_across_worktrees_without_copying_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1608,6 +1622,107 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
 
             with self.assertRaises(hloop.HLoopError):
                 hloop.cmd_inbox_show(SimpleNamespace(repo=str(repo), event_id=str(uuid.uuid4())))
+
+    def test_role_launch_command_propagates_best_effort_manager_guard_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            command, _ = hloop.role_agent_command(
+                repo,
+                {
+                    "provider": "codex",
+                    "model": "auto",
+                    "effort": "auto",
+                    "claude_permission_mode": "auto",
+                },
+                runner="tui",
+                prompt_rel=hloop.LOOP_DIR / "prompts" / "T001.worker.md",
+                cwd=repo,
+                role_id="T001",
+                attempt_id="T001-A001",
+            )
+
+            self.assertIn("HLOOP_ROLE_CONTEXT=1", command)
+            self.assertIn("HLOOP_ROLE_ID=T001", command)
+            self.assertIn("HLOOP_ROLE_ATTEMPT_ID=T001-A001", command)
+            self.assertIn(f"HLOOP_MANAGER_REPO={repo}", command)
+
+    def test_manager_consumers_reject_subordinate_wrong_role_and_stale_attempt_contexts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            state["tasks"] = {
+                "T001": {
+                    "status": "running",
+                    "active_attempt_id": "T001-A001",
+                }
+            }
+            hloop.save_state(repo, state)
+            hloop.write_text(hloop.loop_path(repo) / "JOURNAL.md", "# Journal\n")
+
+            consumers = [
+                ("inbox list", hloop.cmd_inbox_list, SimpleNamespace(repo=str(repo))),
+                (
+                    "inbox show",
+                    hloop.cmd_inbox_show,
+                    SimpleNamespace(repo=str(repo), event_id=str(uuid.uuid4())),
+                ),
+                (
+                    "inbox ack",
+                    hloop.cmd_inbox_ack,
+                    SimpleNamespace(repo=str(repo), event_id=str(uuid.uuid4())),
+                ),
+                ("manager next", hloop.cmd_manager_next, SimpleNamespace(repo=str(repo))),
+                ("manager sleep", hloop.cmd_manager_sleep, SimpleNamespace(repo=str(repo))),
+            ]
+            for command_name, consumer, args in consumers:
+                with self.subTest(command=command_name), mock.patch.dict(
+                    os.environ, self.manager_role_context(repo), clear=False
+                ):
+                    with self.assertRaisesRegex(hloop.HLoopError, "subordinate-context"):
+                        consumer(args)
+
+            with mock.patch.dict(
+                os.environ,
+                self.manager_role_context(repo, role_id="T999"),
+                clear=False,
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "wrong-role"):
+                    hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
+
+            with mock.patch.dict(
+                os.environ,
+                self.manager_role_context(repo, attempt_id="T001-A000"),
+                clear=False,
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "stale-attempt"):
+                    hloop.cmd_manager_next(SimpleNamespace(repo=str(repo)))
+
+            journal = hloop.read_text(hloop.loop_path(repo) / "JOURNAL.md")
+            for command_name, _, _ in consumers:
+                self.assertIn(f'"command": "{command_name}"', journal)
+            self.assertIn('"reason": "wrong-role"', journal)
+            self.assertIn('"reason": "stale-attempt"', journal)
+
+    def test_manager_consumer_rejection_survives_audit_write_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            state["tasks"] = {
+                "T001": {
+                    "status": "running",
+                    "active_attempt_id": "T001-A001",
+                }
+            }
+            hloop.save_state(repo, state)
+            hloop.write_text(hloop.loop_path(repo) / "JOURNAL.md", "# Journal\n")
+
+            with mock.patch.dict(
+                os.environ, self.manager_role_context(repo), clear=False
+            ), mock.patch.object(
+                hloop, "journal", side_effect=PermissionError("read-only journal")
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "subordinate-context"):
+                    hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
 
     def test_report_token_authentication_accepts_matching_and_rejects_mismatched(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2141,6 +2256,23 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 )
             self.assertIn("accepted", output.getvalue())
             self.assertNotIn(secret, output.getvalue())
+
+            for role_id, attempt_id in (
+                ("R010", "T010-A001"),
+                ("T010", "T010-A002"),
+            ):
+                with self.subTest(role_id=role_id, attempt_id=attempt_id):
+                    with self.assertRaisesRegex(
+                        hloop.HLoopError, "credential identity does not match"
+                    ):
+                        hloop.read_role_report_credential(
+                            repo,
+                            str(credential_file),
+                            run_id="run-001",
+                            role_id=role_id,
+                            attempt_id=attempt_id,
+                        )
+
             credential_file.chmod(0o644)
 
             with self.assertRaises(hloop.HLoopError) as raised:
