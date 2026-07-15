@@ -27,7 +27,7 @@ Set `--worktree-root ../wt/<goal>` at init when the repository requires a partic
 
 With `branch-history`, checkpoint newly created or updated task contracts before starting a role. With `local-only`, hloop copies the selected namespace into each role worktree, so task and gate inputs do not need branch-history commits.
 
-Mutating `hloop` commands are serialized with the repo-local Git lock from `git rev-parse --git-path hloop.lock`, but Manager should still treat them as transactions. Do not run `hloop task new`, `tick`, `pump`, `worker harvest`, `merge`, `validate`, `triage`, `gap`, or `reviewer` mutating commands in parallel. Parallelize reads and inspections only.
+Mutating `hloop` commands are serialized with `/tmp/herdr-dev-loop-<uid>/locks/<sha256>.lock`. The digest identifies the canonical Git common directory and namespace, while the fixed UID-private runtime root remains the same across `HLOOP_RUNTIME_DIR`, `XDG_RUNTIME_DIR`, and `TMPDIR` differences and stays outside Git metadata. Manager should still treat commands as transactions. Do not run `hloop task new`, `tick`, `pump`, `worker harvest`, `merge`, `validate`, `triage`, `gap`, or `reviewer` mutating commands in parallel. Parallelize reads and inspections only.
 
 `dashboard`, `status`, `conductor`, and `doctor --sessions` are read-only inspection commands. Prefer them over manually reading panes one by one when deciding the next Manager action.
 

@@ -21,7 +21,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Sequence
@@ -129,6 +128,7 @@ DEFAULT_ADVISOR_MODE = "single"
 DEFAULT_ADVISOR_MAX_ROUNDS = 2
 DEFAULT_SPECIFICATION_SCOUT = "auto"
 SPECIFICATION_SCOUT_MODES = {"auto", "always", "off"}
+REPOSITORY_LOCK_RUNTIME_BASE = Path("/tmp")
 DEFAULT_REVIEW_LANES = [
     "integration-contract",
     "correctness",
@@ -1355,12 +1355,10 @@ def _private_runtime_directory(path: Path) -> Path:
 def repo_lock_path(repo: Path) -> Path:
     """Return one private cross-worktree lock path for this repo/namespace."""
 
-    configured = os.environ.get("HLOOP_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR")
-    runtime_base = Path(configured).expanduser() if configured else Path(tempfile.gettempdir())
-    if not runtime_base.is_absolute():
-        raise HLoopError("HLoop runtime directory must be absolute")
-    uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
-    runtime_root = _private_runtime_directory(runtime_base / f"herdr-dev-loop-{uid}")
+    uid = os.geteuid()
+    runtime_root = _private_runtime_directory(
+        REPOSITORY_LOCK_RUNTIME_BASE / f"herdr-dev-loop-{uid}"
+    )
     lock_directory = _private_runtime_directory(runtime_root / "locks")
     identity = f"{git_common_dir(repo)}\0{LOOP_NAMESPACE}".encode("utf-8")
     digest = hashlib.sha256(identity).hexdigest()
