@@ -70,6 +70,50 @@ class RepositoryLockRuntimeTests(unittest.TestCase):
         )
         return repo, linked
 
+    def wait_for_path(self, path: Path, *, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return True
+            time.sleep(0.01)
+        return path.exists()
+
+    def subprocess_lock_helper(self) -> str:
+        return """
+import importlib.machinery
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+script, repo, namespace, runtime_base, role, ready, acquired, release, path_output = sys.argv[1:]
+sys.path.insert(0, str(Path(script).parent))
+loader = importlib.machinery.SourceFileLoader("hloop_lock_subprocess", script)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+hloop = importlib.util.module_from_spec(spec)
+loader.exec_module(hloop)
+hloop.configure_loop_namespace(namespace)
+hloop.REPOSITORY_LOCK_RUNTIME_BASE = Path(runtime_base)
+Path(path_output).write_text(str(hloop.repo_lock_path(Path(repo))), encoding="utf-8")
+real_flock = hloop.fcntl.flock
+def observed_flock(descriptor, operation):
+    if operation & hloop.fcntl.LOCK_EX:
+        Path(ready).write_text("ready", encoding="utf-8")
+    return real_flock(descriptor, operation)
+hloop.fcntl.flock = observed_flock
+with hloop.loop_lock(Path(repo)):
+    Path(acquired).write_text("acquired", encoding="utf-8")
+    if role == "holder":
+        deadline = time.monotonic() + 15.0
+        while not Path(release).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not Path(release).exists():
+            raise TimeoutError("release marker was not created")
+"""
+
+    def test_default_lock_runtime_base_is_fixed_posix_tmp(self):
+        self.assertEqual(hloop.REPOSITORY_LOCK_RUNTIME_BASE, Path("/tmp"))
+
     def test_lock_path_is_private_shared_and_outside_protected_git_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -80,7 +124,16 @@ class RepositoryLockRuntimeTests(unittest.TestCase):
             )
             protected_mode = stat.S_IMODE(linked_git_dir.stat().st_mode)
 
-            with mock.patch.dict(os.environ, {"HLOOP_RUNTIME_DIR": str(runtime_base)}):
+            with mock.patch.object(
+                hloop, "REPOSITORY_LOCK_RUNTIME_BASE", runtime_base
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "HLOOP_RUNTIME_DIR": str(root / "ignored-hloop-runtime"),
+                    "XDG_RUNTIME_DIR": str(root / "ignored-xdg-runtime"),
+                    "TMPDIR": str(root / "ignored-tmpdir"),
+                },
+            ):
                 repo_path = hloop.repo_lock_path(repo)
                 linked_path = hloop.repo_lock_path(linked)
                 self.assertEqual(repo_path, linked_path)
@@ -99,6 +152,9 @@ class RepositoryLockRuntimeTests(unittest.TestCase):
                     linked_git_dir.chmod(protected_mode)
 
                 self.assertEqual(stat.S_IMODE(repo_path.parent.stat().st_mode), 0o700)
+                self.assertEqual(
+                    stat.S_IMODE(repo_path.parent.parent.stat().st_mode), 0o700
+                )
                 self.assertEqual(stat.S_IMODE(repo_path.stat().st_mode), 0o600)
                 self.assertEqual(repo_path.stat().st_uid, os.geteuid())
                 old_lock = linked_git_dir / "hloop.lock"
@@ -109,6 +165,119 @@ class RepositoryLockRuntimeTests(unittest.TestCase):
                     self.assertNotEqual(hloop.repo_lock_path(repo), repo_path)
                 finally:
                     hloop.configure_loop_namespace("test-repository-lock")
+
+    def test_uid_private_runtime_root_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, _linked = self.init_worktrees(root)
+            runtime_base = root / "runtime"
+            runtime_base.mkdir()
+            symlink_target = root / "attacker-controlled"
+            symlink_target.mkdir()
+            uid = os.geteuid()
+            (runtime_base / f"herdr-dev-loop-{uid}").symlink_to(
+                symlink_target, target_is_directory=True
+            )
+
+            with mock.patch.object(
+                hloop, "REPOSITORY_LOCK_RUNTIME_BASE", runtime_base
+            ), self.assertRaisesRegex(hloop.HLoopError, "must be a real directory"):
+                hloop.repo_lock_path(repo)
+
+    def test_divergent_process_environments_contend_on_the_same_flock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, _linked = self.init_worktrees(root)
+            runtime_base = root / "canonical-runtime"
+            markers = root / "markers"
+            markers.mkdir()
+            release = markers / "release"
+            first_ready = markers / "first-ready"
+            first_acquired = markers / "first-acquired"
+            first_path = markers / "first-path"
+            second_ready = markers / "second-ready"
+            second_acquired = markers / "second-acquired"
+            second_path = markers / "second-path"
+            helper = self.subprocess_lock_helper()
+            base_args = [
+                sys.executable,
+                "-c",
+                helper,
+                str(SCRIPT),
+                str(repo),
+                hloop.LOOP_NAMESPACE,
+                str(runtime_base),
+            ]
+            first_env = os.environ.copy()
+            first_env.update(
+                {
+                    "HLOOP_RUNTIME_DIR": str(root / "process-a-hloop"),
+                    "XDG_RUNTIME_DIR": str(root / "process-a-xdg"),
+                    "TMPDIR": str(root / "process-a-tmp"),
+                }
+            )
+            second_env = os.environ.copy()
+            second_env.update(
+                {
+                    "HLOOP_RUNTIME_DIR": str(root / "process-b-hloop"),
+                    "XDG_RUNTIME_DIR": str(root / "process-b-xdg"),
+                    "TMPDIR": str(root / "process-b-tmp"),
+                }
+            )
+
+            first = subprocess.Popen(
+                base_args
+                + [
+                    "holder",
+                    str(first_ready),
+                    str(first_acquired),
+                    str(release),
+                    str(first_path),
+                ],
+                env=first_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            second = None
+            try:
+                self.assertTrue(self.wait_for_path(first_ready))
+                self.assertTrue(self.wait_for_path(first_acquired))
+                second = subprocess.Popen(
+                    base_args
+                    + [
+                        "contender",
+                        str(second_ready),
+                        str(second_acquired),
+                        str(release),
+                        str(second_path),
+                    ],
+                    env=second_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertTrue(self.wait_for_path(second_ready))
+                self.assertFalse(self.wait_for_path(second_acquired, timeout=0.2))
+                self.assertEqual(
+                    first_path.read_text(encoding="utf-8"),
+                    second_path.read_text(encoding="utf-8"),
+                )
+                release.write_text("release\n", encoding="utf-8")
+                self.assertTrue(self.wait_for_path(second_acquired))
+                first_stdout, first_stderr = first.communicate(timeout=5)
+                second_stdout, second_stderr = second.communicate(timeout=5)
+                self.assertEqual((first.returncode, first_stdout, first_stderr), (0, "", ""))
+                self.assertEqual(
+                    (second.returncode, second_stdout, second_stderr), (0, "", "")
+                )
+            finally:
+                release.touch(exist_ok=True)
+                for process in (first, second):
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                    if process is not None:
+                        process.communicate(timeout=5)
 
     def test_linked_worktrees_contend_on_the_same_flock(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -146,8 +315,8 @@ class RepositoryLockRuntimeTests(unittest.TestCase):
                 except BaseException as exc:
                     errors.append(exc)
 
-            with mock.patch.dict(
-                os.environ, {"HLOOP_RUNTIME_DIR": str(runtime_base)}
+            with mock.patch.object(
+                hloop, "REPOSITORY_LOCK_RUNTIME_BASE", runtime_base
             ), mock.patch.object(hloop.fcntl, "flock", side_effect=observed_flock):
                 first = threading.Thread(target=hold_first, name="first-lock")
                 second = threading.Thread(target=acquire_second, name="second-lock")
