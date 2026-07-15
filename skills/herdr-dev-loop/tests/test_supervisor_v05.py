@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -10,6 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
@@ -355,6 +358,39 @@ class SupervisorPrimitiveTests(unittest.TestCase):
         with self.assertRaises(supervisor.UnsafeSocketError):
             self.make_supervisor().acquire()
         self.assertEqual(self.socket_path.read_text(encoding="utf-8"), "user data")
+
+    def test_socket_parent_symlink_is_rejected_without_chmod_or_socket_placement(self):
+        victim = self.root / "victim"
+        victim.mkdir(mode=0o755)
+        victim.chmod(0o755)
+        self.socket_path.parent.symlink_to(victim, target_is_directory=True)
+
+        with self.assertRaises(supervisor.UnsafeSocketError):
+            self.make_supervisor()._prepare_socket_path()
+
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o755)
+        self.assertFalse((victim / self.socket_path.name).exists())
+
+    def test_socket_parent_owned_by_another_user_is_rejected(self):
+        self.socket_path.parent.mkdir(mode=0o700)
+        with mock.patch.object(
+            supervisor.os, "geteuid", return_value=os.geteuid() + 1
+        ):
+            with self.assertRaises(supervisor.UnsafeSocketError):
+                self.make_supervisor()._prepare_socket_path()
+
+    def test_socket_parent_chmod_failure_is_not_suppressed(self):
+        self.socket_path.parent.mkdir(mode=0o755)
+        self.socket_path.parent.chmod(0o755)
+        with mock.patch.object(
+            supervisor.os,
+            "fchmod",
+            side_effect=PermissionError("simulated chmod failure"),
+        ):
+            with self.assertRaisesRegex(
+                supervisor.UnsafeSocketError, "cannot secure private directory"
+            ):
+                self.make_supervisor()._prepare_socket_path()
 
     def test_report_signal_drains_spool_and_wakes_manager(self):
         event = client_event()
