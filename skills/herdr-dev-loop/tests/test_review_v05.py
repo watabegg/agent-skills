@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 try:
     import jsonschema
@@ -19,6 +27,14 @@ SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
 RUNTIME_SCHEMAS = Path(__file__).parents[1] / "schemas"
 sys.path.insert(0, str(SCRIPTS))
+
+HLOOP_SCRIPT = SCRIPTS / "hloop"
+loader = importlib.machinery.SourceFileLoader(
+    "hloop_review_schema_runtime", str(HLOOP_SCRIPT)
+)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+runtime_hloop = importlib.util.module_from_spec(spec)
+loader.exec_module(runtime_hloop)
 
 from hloop_lib.review import (  # noqa: E402
     FindingCandidate,
@@ -37,6 +53,16 @@ HEAD = "abc123"
 def review_schema_validator(schema_path: Path):
     """Load a review schema with repository-relative references available."""
 
+    if (
+        jsonschema is None
+        or Registry is None
+        or Resource is None
+        or not hasattr(jsonschema, "Draft202012Validator")
+    ):
+        raise AssertionError(
+            "review schema tests require jsonschema.Draft202012Validator "
+            "and the referencing registry"
+        )
     registry = Registry()
     for path in (
         SCHEMAS / "review-manifest.schema.json",
@@ -57,6 +83,187 @@ def review_schema_validator(schema_path: Path):
         },
         registry=registry,
     )
+
+
+def harvested_review_group_state() -> dict:
+    """Return the review state written by the real start and harvest paths."""
+
+    previous_namespace = runtime_hloop.LOOP_NAMESPACE
+    runtime_hloop.configure_loop_namespace("test-review-schema-runtime")
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "--initial-branch=main"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=repo, check=True
+            )
+            (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "init"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+
+            state = {
+                "state_format_version": runtime_hloop.STATE_FORMAT_VERSION,
+                "schema_revision": runtime_hloop.STATE_SCHEMA_REVISION,
+                "namespace": runtime_hloop.LOOP_NAMESPACE,
+                "goal_id": "review-schema-runtime",
+                "run_id": "review-schema-runtime-run",
+                "skill_version": runtime_hloop.SKILL_VERSION,
+                "persistence": "local-only",
+                "phase": "dispatching",
+                "base_branch": "main",
+                "integration_branch": "main",
+                "reviews": {},
+                "reviewer_runner": "tui",
+                "reviewer_agent_provider": "codex",
+                "reviewer_agent_model": "auto",
+            }
+            runtime_hloop.save_state(repo, state)
+
+            review_id = "R001"
+            worktree = root / "review-worktree"
+            worktree.mkdir()
+            credential = root / "review-credential.json"
+            credential.write_text("{}\n", encoding="utf-8")
+            start_args = SimpleNamespace(
+                repo=str(repo),
+                review_id=review_id,
+                base=None,
+                head=None,
+                worktree=str(worktree),
+                manager_pane=None,
+                direction="down",
+                launcher="pane",
+                runner="tui",
+                agent_provider="codex",
+                agent_model="auto",
+                mode="dual-swarm",
+                dry_run=False,
+            )
+            with mock.patch.object(
+                runtime_hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                runtime_hloop, "require_role_snapshot"
+            ), mock.patch.object(
+                runtime_hloop, "prepare_role_worktree"
+            ), mock.patch.object(
+                runtime_hloop, "ensure_review_visible_in_worktree"
+            ), mock.patch.object(
+                runtime_hloop, "porcelain_paths", return_value=[]
+            ), mock.patch.object(
+                runtime_hloop.hloop_providers,
+                "check_review_capacity",
+                return_value=(),
+            ), mock.patch.object(
+                runtime_hloop,
+                "register_role_report_identity_and_ack_floor",
+                return_value=(credential, 0),
+            ), mock.patch.object(
+                runtime_hloop, "start_pane_launcher", return_value="test-pane"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                if runtime_hloop.cmd_reviewer_start(start_args) != 0:
+                    raise AssertionError("runtime reviewer start fixture failed")
+
+            review_state = state["reviews"][review_id]
+            runtime_hloop.resolve_semantic_ack_barrier(
+                review_state,
+                decision="approve",
+                reason="runtime schema fixture",
+                latest_ack={"event_id": "fixture-ack", "sequence": 1},
+            )
+            runtime_hloop.save_state(repo, state)
+
+            plan = runtime_hloop.hloop_review.ReviewGroupPlan.from_record(
+                review_state["review_plan"]
+            )
+            manifest = runtime_hloop.hloop_review.ReviewManifest(
+                review_id=review_id,
+                plan=plan,
+                lane_results=tuple(lane.result() for lane in plan.expected_lanes),
+                findings=(),
+                verification_plan=runtime_hloop.hloop_review.plan_verification(
+                    plan, ()
+                ),
+                verifications=(),
+            )
+            runtime_hloop.write_text(
+                runtime_hloop.review_manifest_file(worktree, review_id),
+                json.dumps(manifest.to_record(), indent=2, sort_keys=True) + "\n",
+            )
+            for provider in plan.providers:
+                runtime_hloop.write_text(
+                    runtime_hloop.review_provider_file(
+                        worktree, review_id, provider
+                    ),
+                    runtime_hloop.frontmatter(
+                        {
+                            "review_id": review_id,
+                            "run_id": state["run_id"],
+                            "skill_version": runtime_hloop.SKILL_VERSION,
+                            "head_sha": review_state["head_sha"],
+                            "provider": provider,
+                            "status": "reported",
+                        }
+                    )
+                    + f"\n# {provider} provider report\n",
+                )
+            runtime_hloop.write_text(
+                Path(review_state["worktree_review_path"]),
+                runtime_hloop.frontmatter(
+                    {
+                        "review_id": review_id,
+                        "run_id": state["run_id"],
+                        "skill_version": runtime_hloop.SKILL_VERSION,
+                        "base": "main",
+                        "head": "main",
+                        "head_sha": review_state["head_sha"],
+                        "status": "reported",
+                    }
+                )
+                + "\n## Fix Task Candidates\n\nNo fix task candidates.\n",
+            )
+
+            with mock.patch.object(
+                runtime_hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                runtime_hloop, "validate_reviewer_worktree_scope", return_value=[]
+            ), mock.patch.object(
+                runtime_hloop, "cleanup_completed_agent_pane"
+            ), mock.patch.object(
+                runtime_hloop, "cleanup_review_worktree"
+            ), mock.patch.object(
+                runtime_hloop, "revoke_active_role_report_identity"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                if runtime_hloop.cmd_reviewer_harvest(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        review_id=review_id,
+                        keep_pane=False,
+                        session_cleanup="none",
+                    )
+                ) != 0:
+                    raise AssertionError("runtime reviewer harvest fixture failed")
+
+            return json.loads(json.dumps(review_state))
+    finally:
+        runtime_hloop.configure_loop_namespace(previous_namespace)
 
 
 def candidate(
@@ -453,7 +660,13 @@ class ManifestGateTests(unittest.TestCase):
 
 
 class ReviewSchemaTests(unittest.TestCase):
-    @unittest.skipUnless(jsonschema is not None, "jsonschema is not installed")
+    def test_validator_unavailability_fails_explicitly(self):
+        with mock.patch.object(sys.modules[__name__], "jsonschema", None):
+            with self.assertRaisesRegex(
+                AssertionError, "jsonschema.Draft202012Validator"
+            ):
+                review_schema_validator(SCHEMAS / "review-manifest.schema.json")
+
     def test_runtime_records_validate_against_review_family_schemas(self):
         group = plan_review_group(
             "dual-swarm", head_sha=HEAD, probes_per_provider=4
@@ -471,31 +684,7 @@ class ReviewSchemaTests(unittest.TestCase):
             verifications=confirmed_records(verification),
         )
         manifest_record = manifest.to_record()
-        group_state_record = {
-            "status": "reported",
-            "gate_status": "reported",
-            "mode": group.mode,
-            "review_plan": group.to_record(),
-            "review_providers": list(group.providers),
-            "head_sha": group.head_sha,
-            "review_path": ".ai/herdr-dev-loop/loops/example/reviews/R001/FINAL.md",
-            "manifest_path": ".ai/herdr-dev-loop/loops/example/reviews/R001/MANIFEST.json",
-            "provider_report_paths": {
-                provider: (
-                    ".ai/herdr-dev-loop/loops/example/reviews/"
-                    f"R001/providers/{provider}.md"
-                )
-                for provider in group.providers
-            },
-            "provider_artifact_statuses": {
-                provider: "reported" for provider in group.providers
-            },
-            "manifest_complete": manifest.completeness.complete,
-            "manifest_issues": list(manifest.completeness.issues),
-            "confirmed_finding_fingerprints": list(
-                manifest.confirmed_fingerprints
-            ),
-        }
+        group_state_record = harvested_review_group_state()
 
         records = (
             (
