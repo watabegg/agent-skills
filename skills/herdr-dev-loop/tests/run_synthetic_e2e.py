@@ -365,6 +365,8 @@ def scenario_merge_conflict_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
             "result_status": "done",
             "merge_ready": True,
             "validation_recorded": True,
+            "validation_commands": ["synthetic worker validation"],
+            "validation_results": ["passed"],
             "write_allow": ["README.md"],
             "write_deny": [],
             "active_attempt_id": f"{task_id}-A001",

@@ -1108,6 +1108,182 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertEqual(reloaded_task_state["semantic_ack_barrier"]["status"], "approved")
             self.assertEqual(hloop.semantic_ack_barrier_blocking(reloaded_task_state), "")
 
+    def test_running_task_update_rebinds_digest_and_requires_matching_reack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            task_meta = {
+                "id": "T001",
+                "run_id": "run-001",
+                "kind": "fix",
+                "status": "running",
+                "branch": "main",
+                "base_ref": "main",
+                "base_sha": head,
+                "write_allow": ["tracked.txt"],
+                "write_deny": [],
+                "acceptance": ["original contract"],
+            }
+            hloop.write_text(
+                hloop.task_file(repo, "T001"),
+                hloop.frontmatter(task_meta) + "\n\n# Task T001\n",
+            )
+            original_digest = hashlib.sha256(hloop.task_file(repo, "T001").read_bytes()).hexdigest()
+            state = hloop.load_state(repo)
+            state["persistence"] = "local-only"
+            state["tasks"] = {
+                "T001": {
+                    **task_meta,
+                    "worktree": str(repo),
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "worker_base_sha": head,
+                    "task_contract_digest": original_digest,
+                }
+            }
+            hloop.save_state(repo, state)
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                store.register_active_role(
+                    transaction,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest=original_digest,
+                    token="test-report-token",
+                )
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    type="ack",
+                    stage="planning",
+                    summary="original contract understood",
+                    next="wait",
+                    task_contract_digest=original_digest,
+                    understood_goal="complete T001",
+                    scope=["tracked.txt"],
+                    acceptance=["original contract"],
+                    approach="bounded change",
+                )
+            )
+            update_args = SimpleNamespace(
+                repo=str(repo),
+                task_id="T001",
+                add_write_allow=None,
+                remove_write_allow=None,
+                add_write_deny=None,
+                remove_write_deny=None,
+                add_acceptance=["updated contract"],
+                set_acceptance=None,
+                priority=None,
+                validation_minimum=None,
+                worker_protocol=None,
+                worker_qa_profile=None,
+                worker_agent_provider=None,
+                worker_agent_model=None,
+            )
+            with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                hloop.cmd_task_update(update_args)
+
+            updated_digest = hashlib.sha256(hloop.task_file(repo, "T001").read_bytes()).hexdigest()
+            self.assertNotEqual(updated_digest, original_digest)
+            reloaded = hloop.load_state(repo)["tasks"]["T001"]
+            barrier = reloaded["semantic_ack_barrier"]
+            self.assertEqual(barrier["kind"], "task-contract")
+            self.assertEqual(barrier["digest"], updated_digest)
+            self.assertEqual(barrier["status"], "awaiting_ack")
+            self.assertGreaterEqual(barrier["required_reack_after_sequence"], 1)
+            with store.transaction() as transaction:
+                self.assertFalse(
+                    store.authenticate_role_report(
+                        transaction,
+                        run_id="run-001",
+                        role_id="T001",
+                        attempt_id="T001-A001",
+                        task_contract_digest=original_digest,
+                        token="test-report-token",
+                    )
+                )
+                self.assertTrue(
+                    store.authenticate_role_report(
+                        transaction,
+                        run_id="run-001",
+                        role_id="T001",
+                        attempt_id="T001-A001",
+                        task_contract_digest=updated_digest,
+                        token="test-report-token",
+                    )
+                )
+
+            with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                hloop.cmd_worker_finalize(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        task_id="T001",
+                        status="done",
+                        validation_command=["true"],
+                        validation_result=["passed"],
+                        validation_summary="pass",
+                        blocking_question=[],
+                        no_commit=True,
+                    )
+                )
+            with self.assertRaisesRegex(hloop.HLoopError, "corrected semantic ACK"):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="T001",
+                        decision="approve",
+                        reason="stale ACK must not pass",
+                    )
+                )
+
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    type="ack",
+                    stage="planning",
+                    summary="updated contract understood",
+                    next="wait",
+                    task_contract_digest=updated_digest,
+                    understood_goal="complete updated T001",
+                    scope=["tracked.txt"],
+                    acceptance=["updated contract"],
+                    approach="bounded updated change",
+                )
+            )
+            hloop.cmd_agent_ack_resolve(
+                SimpleNamespace(
+                    repo=str(repo),
+                    agent_id="T001",
+                    decision="approve",
+                    reason="updated digest reviewed",
+                )
+            )
+            approved = hloop.load_state(repo)["tasks"]["T001"]["semantic_ack_barrier"]
+            self.assertEqual(approved["status"], "approved")
+
+            with mock.patch.object(hloop, "porcelain_paths", return_value=[]):
+                with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
+                    hloop.cmd_worker_finalize(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            task_id="T001",
+                            status="done",
+                            validation_command=["false"],
+                            validation_result=["failed"],
+                            validation_summary="failed",
+                            blocking_question=[],
+                            no_commit=True,
+                        )
+                    )
+
     def test_contract_changing_message_rearms_an_already_resolved_barrier(self):
         agent_state = {}
         hloop.arm_semantic_ack_barrier(agent_state, message_id="msg-1", digest="aaa")
@@ -1134,6 +1310,48 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 reason="old ACK must not approve a new contract",
                 latest_ack={"event_id": "ack-1", "sequence": 1},
             )
+
+    def test_contract_message_preserves_pending_task_digest_barrier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "attempt_id": "T001-A001",
+                "agent_provider": "codex",
+            }
+            hloop.arm_semantic_ack_barrier(
+                task_state,
+                message_id="task-contract:" + "a" * 64,
+                digest="a" * 64,
+                kind="task-contract",
+                required_reack_after_sequence=3,
+            )
+            state["tasks"] = {"T001": task_state}
+            hloop.save_state(repo, state)
+            args = SimpleNamespace(
+                contract_changing=True,
+                timeout_ms=1,
+                input_settle_ms=1,
+                submit_verify_ms=1,
+                submit_attempts=1,
+            )
+            with mock.patch.object(hloop, "send_agent_tui_message"):
+                hloop.send_manager_message_and_record(
+                    repo,
+                    state,
+                    task_state,
+                    role="Worker",
+                    agent_id="T001",
+                    pane_id="w:p1",
+                    message="apply the updated task contract",
+                    source="test",
+                    args=args,
+                )
+            barrier = hloop.load_state(repo)["tasks"]["T001"]["semantic_ack_barrier"]
+            self.assertEqual(barrier["kind"], "task-contract")
+            self.assertEqual(barrier["digest"], "a" * 64)
+            self.assertEqual(barrier["required_reack_after_sequence"], 3)
 
     def test_reject_and_timeout_require_a_fresh_corrected_ack(self):
         state = {}

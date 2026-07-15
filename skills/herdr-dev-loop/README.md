@@ -314,6 +314,8 @@ $HLOOP --repo <repo> task update T001 \
   --add-acceptance '共有処理の回帰テストが通る'
 ```
 
+実行中Workerの契約を変更すると、新しいtask digestへreport identityが再束縛され、semantic ACK barrierが自動で再設定されます。続けて`hloop worker message`で変更内容を伝え、Workerが新digestのcorrected ACKを送り、Managerが承認するまでfinalize、harvest、mergeは進みません。
+
 ### 4. bounded tickから始める
 
 ```bash
@@ -353,6 +355,8 @@ $HLOOP worker finalize T001 \
   --validation-result passed \
   --validation-summary 'targeted test passed'
 ```
+
+`--validation-result`は`passed`、`failed`、`blocked`のいずれかです。`--status done`では全件`passed`でなければならず、失敗またはblockedを含む成果物はharvest時にmerge-readyと認められず、mergeでも再検査されます。harvest済みartifactの正本はManager側のnamespaced result pathです。
 
 `wait --harvest`、`tick`、`pump`は、Worker成果物がHEADへcommitされるまでreadyと扱いません。Reviewer、Gap Auditor、Advisorは`run_id`と監査対象`head_sha`が一致する場合だけ回収されます。
 
