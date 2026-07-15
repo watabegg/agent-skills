@@ -1009,6 +1009,36 @@ def scenario_scout_liaison_reports(ctx: dict[str, Any]) -> dict[str, Any]:
             env=env,
         )
 
+        # Regression for the live failure: selecting the recommendation in an
+        # artifact immediately after presentation has no subsequent-user
+        # provenance and must fail closed. Free text from a later direct user
+        # turn remains valid without defaulting selected_option.
+        premature_recommendation = {
+            "responded_by": "liaison",
+            "responded_at": "2026-07-15T12:00:00+00:00",
+            "selected_option": "opt_1",
+        }
+        require(
+            "response_source" in hloop.decision_liaison_response_provenance_error(
+                premature_recommendation
+            ),
+            "recommendation-only Liaison response did not fail closed",
+        )
+        explicit_free_text = {
+            **premature_recommendation,
+            "responded_at": "2026-07-15T12:00:01+00:00",
+            "response_source": "explicit-user-input",
+            "response_channel": "same-pane",
+            "response_turn": "after-question",
+            "user_input_received_at": "2026-07-15T12:00:00+00:00",
+            "user_input_kind": "free-text",
+        }
+        explicit_free_text.pop("selected_option")
+        require(
+            hloop.decision_liaison_response_provenance_error(explicit_free_text) == "",
+            "explicit later free-text Liaison response was rejected",
+        )
+
         attention_ids = {
             role_id: send_report(role_id, "attention", f"{role_id} needs attention")
             for role_id in identities
@@ -1086,6 +1116,8 @@ def scenario_scout_liaison_reports(ctx: dict[str, Any]) -> dict[str, Any]:
             "scout_ack_approved": True,
             "liaison_reject_reack": True,
             "liaison_timeout_reack": True,
+            "liaison_recommendation_is_not_consent": True,
+            "liaison_explicit_free_text_without_default_option": True,
             "contract_changing_message": True,
             "attention_events": attention_ids,
             "completion_events": completion_ids,

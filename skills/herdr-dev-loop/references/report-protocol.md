@@ -15,6 +15,8 @@ Every report is bound to `run_id`, role and attempt identity, task contract dige
 
 Every long-running Worker, Reviewer, Gap Auditor, Advisor participant, Specification Scout, and Decision Liaison receives an attempt-scoped credential file path in its rendered prompt. Scout uses role ID `S001`; a Liaison for `DNNN` uses `L-DNNN`. The token itself is stored under the repository Git common directory in a local-only file owned by the current user with mode `0600`; it never appears in a repository prompt, checkpoint, state diagnostic, or provider command. Reports from an unknown role, revoked role, stale attempt, mismatched contract digest, unreadable or over-permissive credential file, or wrong token fail closed. The fallback spool is local-only and carries the same private authentication envelope; replay reauthenticates it before accepting the event.
 
+A Decision Liaison's approved semantic ACK authorizes it to present the question; it is not user consent. The presentation turn must not send a `completion` report. The Liaison waits in the same pane for a later explicit user option selection or free-text answer and may report completion only after writing the provenance-valid response artifact. Recommendation text, silence, system or Manager messages, and ACK approval do not satisfy this report boundary. A premature completion report remains only a wake signal and cannot make harvest accept a response without explicit subsequent-user provenance.
+
 ## Sending a semantic report
 
 The role submits reports through the repository-local helper. The following ACK is the minimum material-edit barrier for a Worker:

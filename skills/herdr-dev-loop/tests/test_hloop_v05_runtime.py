@@ -3251,7 +3251,157 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
             self.assertIn(str(credential), prompt)
             self.assertIn("agent report", prompt)
             self.assertIn("stop before material work", prompt)
+            self.assertIn("推奨案は利用者の同意では", prompt)
+            self.assertIn("`Manager message id:`", prompt)
+            self.assertIn("completion report も完了 sentinel も送らない", prompt)
+            self.assertIn("response_source: explicit-user-input", prompt)
             self.assertEqual(stat.S_IMODE(credential.stat().st_mode), 0o600)
+
+    def test_liaison_harvest_requires_explicit_subsequent_user_input_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, state = self.init_repo(root)
+            worktree = root / "liaison-artifact"
+            source = (
+                worktree
+                / hloop.LOOP_DIR
+                / "decisions"
+                / "D001"
+                / "RESPONSE.md"
+            )
+            source.parent.mkdir(parents=True)
+            head_sha = "b" * 40
+            liaison = {
+                "role_id": "L-D001",
+                "decision_id": "D001",
+                "status": "running",
+                "gate_status": "running",
+                "worktree": str(worktree),
+                "attempt_id": "L-D001-A001",
+                "skill_version": hloop.SKILL_VERSION,
+                "head_sha": head_sha,
+                "semantic_ack_barrier": {"status": "approved"},
+            }
+            state["decision_liaisons"]["D001"] = liaison
+            args = SimpleNamespace(
+                repo=str(repo), id="D001", session_cleanup="none"
+            )
+            identity = {
+                "decision_id": "D001",
+                "responded_by": "liaison",
+                "responded_at": "2026-07-15T12:00:01+00:00",
+                "attempt_id": "L-D001-A001",
+                "run_id": "run-spec",
+                "skill_version": hloop.SKILL_VERSION,
+                "head_sha": head_sha,
+            }
+
+            # The live failure shape selected the recommendation immediately
+            # after presenting it, without any later user message provenance.
+            source.write_text(
+                hloop.frontmatter({**identity, "selected_option": "opt_1"})
+                + "\n# 回答\n\n推奨案を選びます。\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "validate_decision_role_scope", return_value=[]
+            ):
+                with self.assertRaisesRegex(
+                    hloop.HLoopError,
+                    "lacks explicit subsequent user input provenance",
+                ):
+                    hloop.cmd_decision_liaison_harvest(args)
+            self.assertEqual(state["decisions"]["D001"]["status"], hloop.DECISION_PENDING)
+
+            explicit_response = {
+                **identity,
+                "response_source": "explicit-user-input",
+                "response_channel": "same-pane",
+                "response_turn": "after-question",
+                "user_input_received_at": "2026-07-15T12:00:00+00:00",
+                "user_input_kind": "free-text",
+            }
+            source.write_text(
+                hloop.frontmatter(explicit_response)
+                + "\n# 回答\n\n段階的な互換期間を設けてください。\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "validate_decision_role_scope", return_value=[]
+            ), mock.patch.object(
+                hloop, "cleanup_completed_agent_pane"
+            ), mock.patch.object(
+                hloop, "cleanup_decision_role_worktree"
+            ), mock.patch.object(
+                hloop, "revoke_active_role_report_identity"
+            ), mock.patch.object(
+                hloop, "write_decision_artifacts"
+            ), mock.patch.object(
+                hloop, "save_state"
+            ), mock.patch.object(
+                hloop, "journal"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(hloop.cmd_decision_liaison_harvest(args), 0)
+            response = hloop.DecisionRecord.from_record(
+                state["decisions"]["D001"]
+            ).response
+            self.assertIsNotNone(response)
+            self.assertEqual(response.selected_option, "")
+            self.assertEqual(response.free_text, "段階的な互換期間を設けてください。")
+            self.assertEqual(
+                liaison["response_provenance"]["response_source"],
+                "explicit-user-input",
+            )
+            with mock.patch.object(hloop, "decision_attention_notice"):
+                hloop.write_decision_artifacts(repo, state)
+            canonical_meta = hloop.read_frontmatter(
+                hloop.decision_liaison_file(repo, "D001")
+            )
+            self.assertEqual(canonical_meta["response_channel"], "same-pane")
+            self.assertEqual(canonical_meta["response_turn"], "after-question")
+            self.assertEqual(canonical_meta["user_input_kind"], "free-text")
+            self.assertNotIn("selected_option", canonical_meta)
+
+    def test_liaison_provenance_accepts_free_text_without_recommendation_fallback(self):
+        meta = {
+            "responded_by": "liaison",
+            "responded_at": "2026-07-15T12:00:01+00:00",
+            "response_source": "explicit-user-input",
+            "response_channel": "same-pane",
+            "response_turn": "after-question",
+            "user_input_received_at": "2026-07-15T12:00:00+00:00",
+            "user_input_kind": "free-text",
+        }
+        self.assertEqual(hloop.decision_liaison_response_provenance_error(meta), "")
+        self.assertNotIn("selected_option", meta)
+        self.assertEqual(
+            hloop.decision_liaison_response_provenance_error(
+                {**meta, "user_input_kind": "option", "selected_option": "opt_1"}
+            ),
+            "",
+        )
+        self.assertIn(
+            "response_source",
+            hloop.decision_liaison_response_provenance_error(
+                {**meta, "response_source": "manager-message"}
+            ),
+        )
+        self.assertIn(
+            "selected_option",
+            hloop.decision_liaison_response_provenance_error(
+                {**meta, "user_input_kind": "option"}
+            ),
+        )
+        self.assertIn(
+            "selected_option",
+            hloop.decision_liaison_response_provenance_error(
+                {**meta, "selected_option": "opt_1"}
+            ),
+        )
 
     def test_successful_scout_start_registers_identity_before_pane(self):
         with tempfile.TemporaryDirectory() as directory:
