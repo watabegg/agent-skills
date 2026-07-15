@@ -722,13 +722,27 @@ class BrokerStore:
         run_id: str,
         acknowledged_at: str | None = None,
     ) -> InboxAcknowledgement:
-        """Explicitly acknowledge one inbox event exactly once."""
+        """Explicitly acknowledge one displayed inbox event exactly once.
+
+        A displayed milestone can represent several earlier unread milestones
+        collapsed by :meth:`unconsumed_inbox`.  Acknowledging that displayed
+        event also acknowledges the matching milestones up to its sequence so
+        the hidden duplicates do not resurface one by one.  Later reports and
+        every non-milestone remain independent inbox events.
+        """
 
         transaction.require_active(self)
         event_id = _nonempty_line(event_id, "event_id")
         run_id = _nonempty_line(run_id, "run_id")
         row = transaction.connection.execute(
-            "SELECT run_id FROM inbox WHERE event_id = ?", (event_id,)
+            """
+            SELECT inbox.run_id, inbox.sequence, inbox.role_id,
+                   inbox.report_type, events.attempt_id, events.event_json
+            FROM inbox
+            JOIN events ON events.event_id = inbox.event_id
+            WHERE inbox.event_id = ?
+            """,
+            (event_id,),
         ).fetchone()
         if row is None or row["run_id"] != run_id:
             return InboxAcknowledgement(False, "missing")
@@ -739,12 +753,40 @@ class BrokerStore:
             return InboxAcknowledgement(False, "duplicate")
         timestamp = acknowledged_at or utc_now()
         parse_rfc3339(timestamp, field="acknowledged_at")
-        transaction.connection.execute(
+        acknowledged_event_ids = [event_id]
+        if row["report_type"] == "milestone":
+            displayed_key = _milestone_coalescing_key(row)
+            candidates = transaction.connection.execute(
+                """
+                SELECT inbox.event_id, inbox.role_id, events.event_json
+                FROM inbox
+                JOIN events ON events.event_id = inbox.event_id
+                LEFT JOIN inbox_acknowledgements AS acknowledgements
+                  ON acknowledgements.event_id = inbox.event_id
+                WHERE inbox.run_id = ?
+                  AND inbox.role_id = ?
+                  AND inbox.report_type = 'milestone'
+                  AND inbox.sequence <= ?
+                  AND events.attempt_id = ?
+                  AND acknowledgements.acknowledgement_id IS NULL
+                ORDER BY inbox.sequence
+                """,
+                (run_id, row["role_id"], row["sequence"], row["attempt_id"]),
+            ).fetchall()
+            acknowledged_event_ids = [
+                candidate["event_id"]
+                for candidate in candidates
+                if _milestone_coalescing_key(candidate) == displayed_key
+            ]
+        transaction.connection.executemany(
             """
             INSERT INTO inbox_acknowledgements(event_id, run_id, acknowledged_at)
             VALUES (?, ?, ?)
             """,
-            (event_id, run_id, timestamp),
+            [
+                (acknowledged_event_id, run_id, timestamp)
+                for acknowledged_event_id in acknowledged_event_ids
+            ],
         )
         return InboxAcknowledgement(True, "acknowledged")
 
@@ -1142,9 +1184,7 @@ def _coalesce_unread_milestones(rows: list[dict[str, Any]]) -> list[dict[str, An
     for index, row in enumerate(rows):
         if row["report_type"] != "milestone":
             continue
-        event = json.loads(row["event_json"])
-        key = (row["role_id"], event["attempt_id"], event["stage"], event["summary"])
-        keep_index[key] = index
+        keep_index[_milestone_coalescing_key(row)] = index
     kept = set(keep_index.values())
     result: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
@@ -1152,6 +1192,15 @@ def _coalesce_unread_milestones(rows: list[dict[str, Any]]) -> list[dict[str, An
             continue
         result.append({key: value for key, value in row.items() if key != "event_json"})
     return result
+
+
+def _milestone_coalescing_key(
+    row: Mapping[str, Any],
+) -> tuple[str, str, str, str]:
+    """Return the identity shared by milestone projection and acknowledgement."""
+
+    event = json.loads(row["event_json"])
+    return (row["role_id"], event["attempt_id"], event["stage"], event["summary"])
 
 
 def role_outbox_event_id(
