@@ -109,12 +109,24 @@ def report_authentication(event: dict[str, object], token: str = "report-token")
 
 
 class ReportValidationTests(unittest.TestCase):
-    def test_invocation_id_accepts_visible_ascii_and_rejects_unsafe_keys(self):
+    def test_invocation_id_accepts_shell_safe_ascii_and_rejects_unsafe_keys(self):
         self.assertEqual(
             events.normalize_invocation_id("T003-A001:report/0001"),
             "T003-A001:report/0001",
         )
-        for invalid in ("", "two words", "line\nbreak", "tab\tkey", "非ASCII"):
+        for invalid in (
+            "",
+            "two words",
+            "line\nbreak",
+            "tab\tkey",
+            "非ASCII",
+            "-leading-option",
+            "ack&retry",
+            "$(date)",
+            "`date`",
+            "report*",
+            "report;next",
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(events.ReportValidationError):
                     events.normalize_invocation_id(invalid)
@@ -973,36 +985,28 @@ class RoleOutboxTests(unittest.TestCase):
         )
         self.assertNotEqual(recreated, first_event_id)
 
-    def test_invocation_entries_obey_max_entries_retention(self):
+    def test_invocation_entries_obey_default_64_entry_retention(self):
         first = broker.role_outbox_client_event(
             self.outbox_path,
             report=report(summary="first"),
             invocation_id="report-1",
-            max_entries=2,
         )
-        broker.role_outbox_client_event(
-            self.outbox_path,
-            report=report(summary="second"),
-            invocation_id="report-2",
-            max_entries=2,
-        )
-        broker.role_outbox_client_event(
-            self.outbox_path,
-            report=report(summary="third"),
-            invocation_id="report-3",
-            max_entries=2,
-        )
+        for index in range(2, 66):
+            broker.role_outbox_client_event(
+                self.outbox_path,
+                report=report(summary=f"report {index}"),
+                invocation_id=f"report-{index}",
+            )
 
         stored = json.loads(self.outbox_path.read_text(encoding="utf-8"))
         self.assertEqual(
             [entry["invocation_id"] for entry in stored["entries"]],
-            ["report-2", "report-3"],
+            [f"report-{index}" for index in range(2, 66)],
         )
         recreated = broker.role_outbox_client_event(
             self.outbox_path,
             report=report(summary="first"),
             invocation_id="report-1",
-            max_entries=2,
         )
         self.assertNotEqual(recreated["event_id"], first["event_id"])
 

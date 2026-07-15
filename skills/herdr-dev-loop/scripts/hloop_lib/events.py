@@ -450,7 +450,29 @@ def normalize_event_id(value: Any) -> str:
 
 
 def normalize_invocation_id(value: Any) -> str:
-    """Validate a caller-stable opaque invocation key."""
+    """Validate a caller-stable shell-safe invocation key."""
+
+    text = _text(
+        value,
+        field="invocation_id",
+        maximum=MAX_IDENTIFIER_LENGTH,
+        allow_newlines=False,
+    )
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", text) is None:
+        raise ReportValidationError(
+            "invocation_id must start with an ASCII alphanumeric character and "
+            "contain only ASCII alphanumerics or . _ : / -"
+        )
+    return text
+
+
+def normalize_legacy_invocation_id(value: Any) -> str:
+    """Read a retained pre-0.5.1 invocation key without admitting new ones.
+
+    0.5.0 accepted any non-whitespace visible ASCII key.  Callers must use
+    :func:`normalize_invocation_id` before creating a new retained entry; this
+    compatibility validator exists only to find and preserve an old one.
+    """
 
     text = _text(
         value,
@@ -460,7 +482,7 @@ def normalize_invocation_id(value: Any) -> str:
     )
     if any(ord(char) < 0x21 or ord(char) > 0x7E for char in text):
         raise ReportValidationError(
-            "invocation_id must contain only visible ASCII without whitespace"
+            "retained invocation_id must contain only visible ASCII without whitespace"
         )
     return text
 

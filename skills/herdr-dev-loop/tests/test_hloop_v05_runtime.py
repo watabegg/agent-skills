@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -1404,6 +1405,94 @@ class BrokerReportLifecycleTests(unittest.TestCase):
                     )
                 )
 
+    def test_legacy_invocation_keys_remain_retryable_but_cannot_be_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            self.arm_wake_lease(repo)
+            first_output = io.StringIO()
+            with contextlib.redirect_stdout(first_output):
+                hloop.cmd_agent_report(
+                    self.attention_args(repo, invocation_id="legacy-confirmed")
+                )
+            first_event_id = first_output.getvalue().split()[1]
+            outbox_path = hloop.role_report_outbox_path(
+                repo,
+                run_id="run-001",
+                role_id="T001",
+                attempt_id="T001-A001",
+            )
+            outbox = json.loads(outbox_path.read_text(encoding="utf-8"))
+            outbox["entries"][0]["invocation_id"] = "legacy+confirmed"
+            outbox_path.write_text(json.dumps(outbox), encoding="utf-8")
+
+            retry_output = io.StringIO()
+            with contextlib.redirect_stdout(retry_output):
+                hloop.cmd_agent_report(
+                    self.attention_args(repo, invocation_id="legacy+confirmed")
+                )
+            self.assertIn(first_event_id, retry_output.getvalue())
+            self.assert_delivery_count(repo, 1)
+
+            outbox = json.loads(outbox_path.read_text(encoding="utf-8"))
+            first_event = outbox["entries"][0]["event"]
+            pending_report = {
+                key: value
+                for key, value in first_event.items()
+                if key not in {"event_id", "payload_digest"}
+            }
+            pending_report["summary"] = "pending legacy report"
+            pending_report["created_at"] = "2026-07-16T00:01:00+00:00"
+            pending_event = hloop_broker.role_outbox_client_event(
+                outbox_path,
+                report=pending_report,
+                invocation_id="legacy-pending",
+            )
+            outbox = json.loads(outbox_path.read_text(encoding="utf-8"))
+            outbox["entries"][-1]["invocation_id"] = "legacy+pending"
+            outbox_path.write_text(json.dumps(outbox), encoding="utf-8")
+
+            retried_pending = hloop_broker.role_outbox_client_event(
+                outbox_path,
+                report=pending_report,
+                invocation_id="legacy+pending",
+            )
+            self.assertEqual(retried_pending, pending_event)
+            self.assertTrue(
+                hloop_broker.confirm_role_outbox_delivery(
+                    outbox_path,
+                    event_id=pending_event["event_id"],
+                    payload_digest_value=pending_event["payload_digest"],
+                )
+            )
+
+            safe_new_report = dict(pending_report)
+            safe_new_report["summary"] = "new safe report"
+            safe_new_event = hloop_broker.role_outbox_client_event(
+                outbox_path,
+                report=safe_new_report,
+                invocation_id="safe-new-key",
+            )
+            self.assertNotEqual(safe_new_event["event_id"], pending_event["event_id"])
+
+            unsafe_new_report = dict(pending_report)
+            unsafe_new_report["summary"] = "new unsafe report"
+            with self.assertRaises(hloop.hloop_events.ReportValidationError):
+                hloop_broker.role_outbox_client_event(
+                    outbox_path,
+                    report=unsafe_new_report,
+                    invocation_id="unsafe+new-key",
+                )
+
+            retained = json.loads(outbox_path.read_text(encoding="utf-8"))["entries"]
+            self.assertEqual(
+                [entry.get("invocation_id") for entry in retained],
+                ["legacy+confirmed", "legacy+pending", "safe-new-key"],
+            )
+            self.assertEqual(
+                [entry.get("status") for entry in retained],
+                ["confirmed", "confirmed", "pending"],
+            )
+
     def test_explicit_event_id_retry_reuses_confirmed_full_envelope(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1894,7 +1983,9 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertIn("HLOOP_ROLE_CONTEXT=1", command)
             self.assertIn("HLOOP_ROLE_ID=T001", command)
             self.assertIn("HLOOP_ROLE_ATTEMPT_ID=T001-A001", command)
-            self.assertIn(f"HLOOP_MANAGER_REPO={repo}", command)
+            self.assertIn(
+                f"HLOOP_MANAGER_REPO={shlex.quote(str(repo.resolve()))}", command
+            )
 
     def test_manager_consumers_reject_subordinate_wrong_role_and_stale_attempt_contexts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1953,6 +2044,134 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertIn('"reason": "wrong-role"', journal)
             self.assertIn('"reason": "stale-attempt"', journal)
 
+    def test_malformed_or_partial_role_context_fails_closed(self):
+        cases = [
+            {hloop.ROLE_CONTEXT_ENV: "true"},
+            {hloop.ROLE_ID_ENV: "T001"},
+            {
+                hloop.ROLE_CONTEXT_ENV: "1",
+                hloop.ROLE_ID_ENV: "T001",
+                hloop.ROLE_ATTEMPT_ID_ENV: "T001-A001",
+            },
+        ]
+        for environment in cases:
+            with self.subTest(environment=environment), mock.patch.dict(
+                os.environ, environment, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    hloop.HLoopError, "malformed-role-context"
+                ):
+                    hloop.manager_consumer_preflight(
+                        SimpleNamespace(repo="."), "inbox list"
+                    )
+
+    def test_manager_consumer_audit_does_not_follow_journal_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            state["tasks"] = {
+                "T001": {
+                    "status": "running",
+                    "active_attempt_id": "T001-A001",
+                }
+            }
+            hloop.save_state(repo, state)
+            target = Path(directory) / "audit-target.txt"
+            target.write_text("unchanged\n", encoding="utf-8")
+            journal_path = hloop.loop_path(repo) / "JOURNAL.md"
+            journal_path.symlink_to(target)
+
+            with mock.patch.dict(
+                os.environ, self.manager_role_context(repo), clear=False
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "subordinate-context"):
+                    hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "unchanged\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO support is required")
+    def test_manager_consumer_rejection_does_not_block_on_journal_fifo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            state["tasks"] = {
+                "T001": {
+                    "status": "running",
+                    "active_attempt_id": "T001-A001",
+                }
+            }
+            hloop.save_state(repo, state)
+            journal_path = hloop.loop_path(repo) / "JOURNAL.md"
+            journal_path.unlink(missing_ok=True)
+            os.mkfifo(journal_path, mode=0o600)
+            environment = os.environ.copy()
+            environment.update(self.manager_role_context(repo))
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo),
+                    "--namespace",
+                    hloop.LOOP_NAMESPACE,
+                    "inbox",
+                    "list",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                timeout=2,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("subordinate-context", result.stderr)
+
+    def test_cli_manager_consumer_preflight_runs_before_schema_guard_and_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            state["tasks"] = {
+                "T001": {
+                    "status": "running",
+                    "active_attempt_id": "T001-A001",
+                }
+            }
+            hloop.save_state(repo, state)
+            hloop.write_text(hloop.loop_path(repo) / "JOURNAL.md", "# Journal\n")
+            commands = [
+                ["inbox", "ack", str(uuid.uuid4())],
+                ["manager", "next"],
+            ]
+
+            for command in commands:
+                with self.subTest(command=command), mock.patch.dict(
+                    os.environ, self.manager_role_context(repo), clear=False
+                ), mock.patch.object(
+                    hloop,
+                    "assert_mutating_state_schema_compatible",
+                    side_effect=AssertionError("schema guard must not run"),
+                ) as schema_guard, mock.patch.object(
+                    hloop,
+                    "loop_lock",
+                    side_effect=AssertionError("loop lock must not run"),
+                ) as loop_lock, contextlib.redirect_stderr(io.StringIO()):
+                    result = hloop.main(
+                        [
+                            "--repo",
+                            str(repo),
+                            "--namespace",
+                            hloop.LOOP_NAMESPACE,
+                            *command,
+                        ]
+                    )
+
+                self.assertEqual(result, 2)
+                schema_guard.assert_not_called()
+                loop_lock.assert_not_called()
+
     def test_manager_consumer_rejection_survives_audit_write_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = self.init_repo(Path(directory))
@@ -1969,7 +2188,9 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ, self.manager_role_context(repo), clear=False
             ), mock.patch.object(
-                hloop, "journal", side_effect=PermissionError("read-only journal")
+                hloop,
+                "append_manager_consumer_audit",
+                side_effect=PermissionError("read-only journal"),
             ):
                 with self.assertRaisesRegex(hloop.HLoopError, "subordinate-context"):
                     hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))

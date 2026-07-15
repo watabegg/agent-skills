@@ -1,4 +1,4 @@
-"""Unit tests for structured provider E2E timeout evidence."""
+"""Unit tests for structured provider marker-probe evidence."""
 
 from __future__ import annotations
 
@@ -84,6 +84,14 @@ class StructuredTimeoutResultTests(unittest.TestCase):
                     returncode, result = self.run_timeout(provider, stdout, stderr)
                     self.assertEqual(returncode, 1)
                     self.assertEqual(result["provider"], provider)
+                    self.assertEqual(
+                        result["runner"], "herdr-dev-loop-provider-marker-probe"
+                    )
+                    self.assertEqual(
+                        result["probe_kind"],
+                        "live-provider-availability-read-only-marker",
+                    )
+                    self.assertIn("hloop-role-launch", result["excluded_coverage"])
                     self.assertEqual(result["status"], "failed")
                     self.assertTrue(result["live_execution"])
                     self.assertEqual(result["diagnostic"]["returncode"], 124)

@@ -89,6 +89,51 @@ class BrokerStorageBoundaryTests(unittest.TestCase):
             [],
         )
 
+    def test_connect_preserves_base_exception_when_real_connection_close_also_fails(self):
+        created_connections = []
+        real_connect = sqlite3.connect
+        initialization_failure = KeyboardInterrupt("simulated initialization abort")
+
+        class FailingCleanupConnection(sqlite3.Connection):
+            close_called = False
+
+            def execute(self, sql, parameters=(), /):
+                if sql == "PRAGMA journal_mode = DELETE":
+                    raise initialization_failure
+                return super().execute(sql, parameters)
+
+            def close(self):
+                self.close_called = True
+                super().close()
+                raise SystemExit("simulated cleanup abort")
+
+        def connect_with_faults(*args, **kwargs):
+            connection = real_connect(
+                *args, **kwargs, factory=FailingCleanupConnection
+            )
+            created_connections.append(connection)
+            return connection
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            with mock.patch.object(
+                broker.sqlite3, "connect", side_effect=connect_with_faults
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    broker.BrokerStore(self.root / "base-exception-broker")
+
+            self.assertIs(raised.exception, initialization_failure)
+            self.assertEqual(len(created_connections), 1)
+            close_called = created_connections[0].close_called
+            created_connections.clear()
+            gc.collect()
+
+        self.assertTrue(close_called)
+        self.assertEqual(
+            [warning for warning in caught if warning.category is ResourceWarning],
+            [],
+        )
+
     def test_integrity_error_is_permanent_storage_semantics(self):
         connection = mock.Mock()
         connection.execute.side_effect = sqlite3.IntegrityError(
