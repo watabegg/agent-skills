@@ -6,6 +6,14 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
+try:
+    import jsonschema
+    from referencing import Registry, Resource
+except ImportError:  # pragma: no cover - exercised by minimal installations
+    jsonschema = None
+    Registry = None
+    Resource = None
+
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
@@ -24,6 +32,31 @@ from hloop_lib.review import (  # noqa: E402
 
 
 HEAD = "abc123"
+
+
+def review_schema_validator(schema_path: Path):
+    """Load a review schema with repository-relative references available."""
+
+    registry = Registry()
+    for path in (
+        SCHEMAS / "review-manifest.schema.json",
+        SCHEMAS / "review-finding.schema.json",
+        SCHEMAS / "review-group-state.schema.json",
+        RUNTIME_SCHEMAS / "review-group-state.schema.json",
+    ):
+        registry = registry.with_resource(
+            path.resolve().as_uri(),
+            Resource.from_contents(json.loads(path.read_text(encoding="utf-8"))),
+        )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    return jsonschema.Draft202012Validator(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": schema_path.resolve().as_uri(),
+        },
+        registry=registry,
+    )
 
 
 def candidate(
@@ -420,6 +453,76 @@ class ManifestGateTests(unittest.TestCase):
 
 
 class ReviewSchemaTests(unittest.TestCase):
+    @unittest.skipUnless(jsonschema is not None, "jsonschema is not installed")
+    def test_runtime_records_validate_against_review_family_schemas(self):
+        group = plan_review_group(
+            "dual-swarm", head_sha=HEAD, probes_per_provider=4
+        )
+        findings = normalize_findings(
+            (candidate(), candidate("A-F001", provider="claude"))
+        )
+        verification = plan_verification(group, findings)
+        manifest = ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=completed_lanes(group, findings),
+            findings=findings,
+            verification_plan=verification,
+            verifications=confirmed_records(verification),
+        )
+        manifest_record = manifest.to_record()
+        group_state_record = {
+            "status": "reported",
+            "gate_status": "reported",
+            "mode": group.mode,
+            "review_plan": group.to_record(),
+            "review_providers": list(group.providers),
+            "head_sha": group.head_sha,
+            "review_path": ".ai/herdr-dev-loop/loops/example/reviews/R001/FINAL.md",
+            "manifest_path": ".ai/herdr-dev-loop/loops/example/reviews/R001/MANIFEST.json",
+            "provider_report_paths": {
+                provider: (
+                    ".ai/herdr-dev-loop/loops/example/reviews/"
+                    f"R001/providers/{provider}.md"
+                )
+                for provider in group.providers
+            },
+            "provider_artifact_statuses": {
+                provider: "reported" for provider in group.providers
+            },
+            "manifest_complete": manifest.completeness.complete,
+            "manifest_issues": list(manifest.completeness.issues),
+            "confirmed_finding_fingerprints": list(
+                manifest.confirmed_fingerprints
+            ),
+        }
+
+        records = (
+            (
+                SCHEMAS / "review-manifest.schema.json",
+                manifest_record,
+            ),
+            (
+                SCHEMAS / "review-finding.schema.json",
+                findings[0].to_record(),
+            ),
+            (
+                SCHEMAS / "review-group-state.schema.json",
+                group_state_record,
+            ),
+        )
+        for schema_path, record in records:
+            with self.subTest(schema=schema_path.name):
+                errors = sorted(
+                    review_schema_validator(schema_path).iter_errors(record),
+                    key=lambda error: list(error.absolute_path),
+                )
+                self.assertEqual(
+                    errors,
+                    [],
+                    "\n".join(error.message for error in errors),
+                )
+
     def test_review_schemas_capture_manifest_finding_and_verification_contracts(self):
         finding_schema = json.loads(
             (SCHEMAS / "review-finding.schema.json").read_text(encoding="utf-8")
