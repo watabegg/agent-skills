@@ -11,6 +11,8 @@ herdr-dev-loop 0.5.0 treats role progress as structured input to the Manager. Re
 
 Every report is bound to `run_id`, role and attempt identity, task contract digest, stage, summary, next action, evidence references, timestamp, and a client event UUID. The broker assigns the monotonic sequence. Reusing the same event ID with different content is rejected.
 
+`hloop agent report` accepts the report body as a schema-validated JSON object via `--file <path>` or `--stdin`, or as the individual `--type`/`--stage`/`--summary`/`...` flags kept as compatibility input; the two input styles are mutually exclusive per call. Before ever reaching the broker or the fallback spool, the client resolves and atomically persists the event ID for the normalized payload digest in a `0600` role-local outbox keyed by run/role/attempt. A retry that resubmits identical content after a broker commit the client never observed, or after the client itself was interrupted, resolves to the same event ID recorded there instead of minting a new one, so the broker's per-event idempotency prevents a duplicate event, inbox projection, or wake.
+
 Every long-running Worker, Reviewer, Gap Auditor, and Advisor participant receives an attempt-scoped credential file path in its rendered prompt. The token itself is stored under the repository Git common directory in a local-only file owned by the current user with mode `0600`; it never appears in a repository prompt, checkpoint, state diagnostic, or provider command. Reports from an unknown role, revoked role, stale attempt, mismatched contract digest, unreadable or over-permissive credential file, or wrong token fail closed. The fallback spool is local-only and carries the same private authentication envelope; replay reauthenticates it before accepting the event.
 
 ## Sending a semantic report
@@ -52,6 +54,8 @@ $HLOOP manager sleep --ttl-seconds 3600
 ```
 
 The lease is bound to the run, Manager session, pane, generation, and expiry. Registration and actionable-event inspection share the broker transaction, closing the lost-wake window between checking the inbox and sleeping. `manager sleep` is a foreground blocking operation and returns only for an ACK, attention or completion report, a Herdr fallback signal, or timeout. Those actionable reports signal the supervisor socket after the durable broker transaction commits; milestones remain inbox-only.
+
+Unread `milestone` reports that share the same run, role, attempt, stage, and summary as a later unread `milestone` are coalesced to that later report in the inbox projection Managers read (`inbox list`, `manager next`, and the pre-sleep unread check); the underlying append-only event log and inbox table are never mutated or pruned, and every `attention` report is always delivered individually, even when its content repeats an earlier one. Once any wake-eligible report (`ack`, `attention`, `completion`) is seen, `manager sleep` holds the return open for a short bounded window so a cross-role burst landing moments later is delivered as one batch instead of forcing a separate wake per event; every event that arrives is preserved either way, including across a Manager crash and restart of `manager sleep` itself.
 
 Wake delivery and inbox acknowledgement are separate. A stale-generation wake remains unprocessed, and an unacknowledged event is projected again when a fresh lease is registered. The Manager explicitly acknowledges the stable event ID exactly once:
 

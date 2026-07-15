@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import queue
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -293,6 +294,48 @@ class BrokerStorageTests(unittest.TestCase):
             with self.assertRaises(broker.IdempotencyConflict):
                 self.store.accept_report(transaction, conflicting)
             self.assertEqual([item["sequence"] for item in self.store.events(transaction)], [1, 2])
+
+    def test_unread_milestone_projection_coalesces_duplicates_but_keeps_attention_and_append_only_events(self):
+        milestone_a_first = events.prepare_client_event(
+            report(summary="進捗1", report_type="milestone"), event_id=str(uuid.uuid4())
+        )
+        milestone_a_second = events.prepare_client_event(
+            report(summary="進捗1", report_type="milestone"), event_id=str(uuid.uuid4())
+        )
+        milestone_b = events.prepare_client_event(
+            report(summary="進捗2", report_type="milestone"), event_id=str(uuid.uuid4())
+        )
+        attention_first = events.prepare_client_event(
+            report(summary="進捗1", report_type="attention"), event_id=str(uuid.uuid4())
+        )
+        attention_second = events.prepare_client_event(
+            report(summary="進捗1", report_type="attention"), event_id=str(uuid.uuid4())
+        )
+
+        with self.store.transaction() as transaction:
+            for candidate in (
+                milestone_a_first,
+                milestone_a_second,
+                milestone_b,
+                attention_first,
+                attention_second,
+            ):
+                self.store.accept_report(transaction, candidate)
+
+            self.assertEqual(len(self.store.events(transaction)), 5)
+            self.assertEqual(len(self.store.inbox(transaction)), 5)
+
+            unread = self.store.unconsumed_inbox(transaction, run_id="run-001")
+
+        self.assertEqual(
+            [item["event_id"] for item in unread],
+            [
+                milestone_a_second["event_id"],
+                milestone_b["event_id"],
+                attention_first["event_id"],
+                attention_second["event_id"],
+            ],
+        )
 
     def test_exception_rolls_back_event_and_inbox_together(self):
         with self.assertRaisesRegex(RuntimeError, "rollback"):
@@ -704,6 +747,69 @@ class BrokerStorageTests(unittest.TestCase):
         )
         self.assertEqual(audit["reason"], "invalid")
         self.assertIn("invalid spool entry", audit["detail"])
+
+
+class RoleOutboxTests(unittest.TestCase):
+    """Exercises the pre-broker-send role-local outbox primitive."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.outbox_path = Path(self.temporary.name) / "outbox" / "role.json"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_outbox_persists_atomically_with_private_permissions_before_any_broker_call(self):
+        event_id = broker.role_outbox_event_id(
+            self.outbox_path, payload_digest="a" * 64
+        )
+        self.assertTrue(uuid.UUID(event_id))
+        self.assertTrue(self.outbox_path.exists())
+        self.assertEqual(stat.S_IMODE(self.outbox_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            stat.S_IMODE(self.outbox_path.parent.stat().st_mode), 0o700
+        )
+        stored = json.loads(self.outbox_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored, {"entries": [["a" * 64, event_id]]})
+
+    def test_retry_with_identical_digest_reuses_the_persisted_event_id(self):
+        first = broker.role_outbox_event_id(self.outbox_path, payload_digest="b" * 64)
+        second = broker.role_outbox_event_id(self.outbox_path, payload_digest="b" * 64)
+        self.assertEqual(first, second)
+
+        different = broker.role_outbox_event_id(self.outbox_path, payload_digest="c" * 64)
+        self.assertNotEqual(first, different)
+
+    def test_requested_event_id_takes_precedence_and_is_recorded_for_later_reuse(self):
+        requested = "28b79cf0-8e32-4b89-88af-e332ee5a5dbe"
+        resolved = broker.role_outbox_event_id(
+            self.outbox_path, payload_digest="d" * 64, requested_event_id=requested
+        )
+        self.assertEqual(resolved, requested)
+
+        reused = broker.role_outbox_event_id(self.outbox_path, payload_digest="d" * 64)
+        self.assertEqual(reused, requested)
+
+    def test_outbox_trims_the_oldest_digests_while_keeping_recent_ones(self):
+        first_event_id = broker.role_outbox_event_id(
+            self.outbox_path, payload_digest="0" * 64
+        )
+        for index in range(1, 70):
+            broker.role_outbox_event_id(
+                self.outbox_path, payload_digest=f"{index:064x}"
+            )
+        stored = json.loads(self.outbox_path.read_text(encoding="utf-8"))
+        digests = [pair[0] for pair in stored["entries"]]
+        self.assertLessEqual(len(digests), 64)
+        self.assertIn(f"{69:064x}", digests)
+        self.assertNotIn("0" * 64, digests)
+
+        # The trimmed digest is durably gone: a "retry" for it mints a fresh
+        # event ID rather than resurrecting the evicted one.
+        recreated = broker.role_outbox_event_id(
+            self.outbox_path, payload_digest="0" * 64
+        )
+        self.assertNotEqual(recreated, first_event_id)
 
 
 if __name__ == "__main__":

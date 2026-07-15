@@ -56,6 +56,19 @@ _REPORT_FIELDS = frozenset(
 )
 _CLIENT_EVENT_FIELDS = _REPORT_FIELDS | {"event_id", "payload_digest"}
 
+# Identity and envelope fields the CLI derives from role registration rather
+# than from a submitted report body: a JSON --file/--stdin payload carries
+# only these remaining "content" fields, matching the individual CLI flags it
+# replaces.
+REPORT_CONTENT_FIELDS = _REPORT_FIELDS - {
+    "run_id",
+    "role_id",
+    "attempt_id",
+    "task_contract_digest",
+    "needs_manager",
+    "created_at",
+}
+
 
 class ReportValidationError(ValueError):
     """Raised when an agent report does not satisfy the transport schema."""

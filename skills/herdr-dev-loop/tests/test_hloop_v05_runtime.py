@@ -341,6 +341,8 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
             report_token="test-report-token",
             report_credential_file=None,
+            file=None,
+            stdin=False,
             type="milestone",
             stage="implementing",
             summary="made progress",
@@ -364,6 +366,40 @@ class BrokerReportLifecycleTests(unittest.TestCase):
         )
         base.update(overrides)
         return SimpleNamespace(**base)
+
+    def body_args(self, repo: Path, **overrides) -> SimpleNamespace:
+        """`report_args` with every individual content flag cleared to None.
+
+        Used for --file/--stdin tests, since the CLI rejects using both an
+        input source and the individual compatibility flags at once.
+        """
+
+        base = self.report_args(
+            repo,
+            type=None,
+            stage=None,
+            summary=None,
+            next=None,
+            evidence_ref=None,
+            understood_goal=None,
+            scope=None,
+            acceptance=None,
+            approach=None,
+            risk=None,
+            impact=None,
+            attempted=None,
+            option_text=None,
+            recommendation=None,
+            blocked_scope=None,
+            artifact=None,
+            head_sha=None,
+            validation_result_ref=None,
+            residual_risk=None,
+            handoff=None,
+        )
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        return base
 
     def test_report_inbox_manager_sleep_next_and_ack_round_trip(self):
         event_id = str(uuid.uuid4())
@@ -468,6 +504,169 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 hloop.cmd_inbox_list(SimpleNamespace(repo=str(repo)))
             self.assertIn(event_id, buffer.getvalue())
+
+    def test_agent_report_accepts_a_schema_validated_json_body_via_file_or_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            body = {
+                "type": "ack",
+                "stage": "planning",
+                "summary": "契約を確認した",
+                "next": "material editを開始する",
+                "evidence_refs": ["skills/herdr-dev-loop/scripts/hloop:1"],
+                "understood_goal": "対象機能を契約どおり実装する",
+                "scope": ["skills/herdr-dev-loop/scripts/hloop"],
+                "acceptance": ["対象テストが通る"],
+                "approach": "既存の境界を保った最小変更",
+            }
+            body_path = root / "report.json"
+            body_path.write_text(json.dumps(body), encoding="utf-8")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(self.body_args(repo, file=str(body_path)))
+            first_event_id = buffer.getvalue().split()[1]
+
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                stored = store.get_event(transaction, event_id=first_event_id)
+            self.assertEqual(stored["type"], "ack")
+            self.assertEqual(stored["summary"], body["summary"])
+
+            stdin_body = dict(body, summary="stdinから受理した契約確認")
+            with mock.patch.object(
+                hloop.sys, "stdin", io.StringIO(json.dumps(stdin_body))
+            ):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    hloop.cmd_agent_report(self.body_args(repo, stdin=True))
+            second_event_id = buffer.getvalue().split()[1]
+            self.assertNotEqual(first_event_id, second_event_id)
+
+    def test_agent_report_rejects_combining_json_body_with_individual_flags_or_unknown_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            body_path = root / "report.json"
+            body_path.write_text(
+                json.dumps(
+                    {
+                        "type": "milestone",
+                        "stage": "implementing",
+                        "summary": "progress",
+                        "next": "continue",
+                        "evidence_refs": ["hloop:1"],
+                        "risks": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(hloop.HLoopError, "use only one of"):
+                hloop.cmd_agent_report(
+                    self.body_args(repo, file=str(body_path), stage="implementing")
+                )
+
+            unknown_field_path = root / "unknown.json"
+            unknown_field_path.write_text(
+                json.dumps({"type": "milestone", "not_a_field": True}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(hloop.HLoopError, "unknown fields"):
+                hloop.cmd_agent_report(self.body_args(repo, file=str(unknown_field_path)))
+
+    def test_agent_report_retry_reuses_the_outbox_event_id_without_duplicating_the_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(self.report_args(repo))
+            first_event_id = buffer.getvalue().split()[1]
+
+            outbox_dir = hloop.broker_transport_root(repo) / "outbox"
+            outbox_files = [
+                path for path in outbox_dir.glob("*.json") if not path.name.startswith(".")
+            ]
+            self.assertEqual(len(outbox_files), 1)
+            self.assertEqual(stat.S_IMODE(outbox_files[0].stat().st_mode), 0o600)
+
+            # A retry of the identical report content (no explicit --event-id,
+            # as a caller that never observed the first call's outcome would
+            # send) must resolve to the same event ID the outbox already
+            # recorded, not a fresh one.
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(self.report_args(repo))
+            second_event_id = buffer.getvalue().split()[1]
+            self.assertEqual(first_event_id, second_event_id)
+
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                events = store.events(transaction)
+                inbox_rows = store.inbox(transaction)
+            self.assertEqual([event["event_id"] for event in events], [first_event_id])
+            self.assertEqual(len(inbox_rows), 1)
+
+    def test_agent_report_reuses_a_pre_persisted_outbox_event_id_after_a_simulated_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            report_ns = self.report_args(repo, type="attention")
+
+            # Simulate a client that persisted the outbox entry (the mandatory
+            # pre-broker-send step) and then crashed before ever reaching the
+            # broker.
+            outbox_path = hloop.role_report_outbox_path(
+                repo, run_id="run-001", role_id="T001", attempt_id="T001-A001"
+            )
+            content = {
+                "stage": report_ns.stage,
+                "summary": report_ns.summary,
+                "next": report_ns.next,
+                "evidence_refs": report_ns.evidence_ref,
+                "impact": report_ns.summary,
+                "attempted": ["investigated"],
+                "options": ["proceed"],
+                "recommendation": "proceed",
+                "blocked_scope": ["material edits"],
+            }
+            raw_report = dict(
+                run_id="run-001",
+                role_id="T001",
+                attempt_id="T001-A001",
+                task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+                type="attention",
+                needs_manager=True,
+                created_at=hloop.now_iso(),
+                **content,
+            )
+            normalized = hloop.hloop_events.validate_report(raw_report)
+            digest = hloop.hloop_events.payload_digest(normalized)
+            pre_persisted_event_id = hloop_broker.role_outbox_event_id(
+                outbox_path, payload_digest=digest
+            )
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        type="attention",
+                        impact=report_ns.summary,
+                        attempted=["investigated"],
+                        option_text=["proceed"],
+                        recommendation="proceed",
+                        blocked_scope=["material edits"],
+                    )
+                )
+            self.assertIn(f"accepted {pre_persisted_event_id}", buffer.getvalue())
+
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                events = store.events(transaction)
+            self.assertEqual(len(events), 1)
 
     def test_manager_next_and_broker_recover_quarantine_poison_entries_and_replay_valid_ones(self):
         with tempfile.TemporaryDirectory() as directory:

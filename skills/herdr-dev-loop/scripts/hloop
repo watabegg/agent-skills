@@ -13406,6 +13406,21 @@ def role_report_credential_path(
     return report_credential_root(repo) / name
 
 
+def role_report_outbox_path(
+    repo: Path, *, run_id: str, role_id: str, attempt_id: str
+) -> Path:
+    """Return the private, worktree-shared path for one attempt's outbox.
+
+    Anchored beside the report credential directory (`broker_transport_root`)
+    so every worktree of the repository resolves the same path, and stored
+    outside `LOOP_DIR` like the credential and spool directories.
+    """
+
+    identity = "\0".join((LOOP_NAMESPACE, run_id, role_id, attempt_id))
+    name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
+    return broker_transport_root(repo) / "outbox" / name
+
+
 def write_role_report_credential(
     repo: Path,
     state: dict[str, Any],
@@ -13703,6 +13718,61 @@ def revoke_active_role_report_identity(repo: Path, state: dict[str, Any], role_i
             ) from exc
 
 
+_AGENT_REPORT_CONTENT_ARGS = (
+    "type",
+    "stage",
+    "summary",
+    "next",
+    "evidence_ref",
+    "understood_goal",
+    "scope",
+    "acceptance",
+    "approach",
+    "risk",
+    "impact",
+    "attempted",
+    "option_text",
+    "recommendation",
+    "blocked_scope",
+    "artifact",
+    "head_sha",
+    "validation_result_ref",
+    "residual_risk",
+    "handoff",
+)
+
+
+def _read_agent_report_body(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Read a schema-validated JSON report body from --file or stdin.
+
+    Returns ``None`` when neither is used, so the caller falls back to the
+    individual report content flags kept as compatibility input.
+    """
+
+    file_path = getattr(args, "file", None)
+    use_stdin = bool(getattr(args, "stdin", False))
+    if not file_path and not use_stdin:
+        return None
+    if file_path:
+        raw = read_text(Path(file_path).resolve())
+        source = "file"
+    else:
+        raw = sys.stdin.read()
+        source = "stdin"
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HLoopError(f"invalid report JSON ({source}): {exc}") from exc
+    if not isinstance(body, dict):
+        raise HLoopError(f"report JSON ({source}) must be a JSON object")
+    unknown = set(body) - hloop_events.REPORT_CONTENT_FIELDS
+    if unknown:
+        raise HLoopError(
+            "report JSON contains unknown fields: " + ", ".join(sorted(unknown))
+        )
+    return body
+
+
 def cmd_agent_report(args: argparse.Namespace) -> int:
     """Submit an agent report; spools to disk when the broker is unavailable."""
 
@@ -13724,7 +13794,61 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             role_id=str(args.role_id or ""),
             attempt_id=str(args.attempt_id or ""),
         )
-    report_type = args.type
+
+    body = _read_agent_report_body(args)
+    if body is not None:
+        used_flags = sorted(
+            name for name in _AGENT_REPORT_CONTENT_ARGS if getattr(args, name, None)
+        )
+        if used_flags:
+            raise HLoopError(
+                "use only one of --file/--stdin or individual report content "
+                "flags (found: " + ", ".join(used_flags) + ")"
+            )
+        report_type = body.get("type")
+        content = dict(body)
+    else:
+        report_type = args.type
+        if not report_type:
+            raise HLoopError("--type is required unless --file or --stdin is used")
+        if args.stage is None:
+            raise HLoopError("--stage is required unless --file or --stdin is used")
+        if args.summary is None:
+            raise HLoopError("--summary is required unless --file or --stdin is used")
+        if args.next is None:
+            raise HLoopError("--next is required unless --file or --stdin is used")
+        content = {
+            "stage": args.stage,
+            "summary": args.summary,
+            "next": args.next,
+            "evidence_refs": args.evidence_ref or [],
+        }
+        if report_type == "ack":
+            content.update(
+                understood_goal=args.understood_goal or args.summary,
+                scope=args.scope or [],
+                acceptance=args.acceptance or [],
+                approach=args.approach or args.summary,
+            )
+        elif report_type == "milestone":
+            content["risks"] = args.risk or []
+        elif report_type == "attention":
+            content.update(
+                impact=args.impact or args.summary,
+                attempted=args.attempted or [],
+                options=args.option_text or [],
+                recommendation=args.recommendation or "",
+                blocked_scope=args.blocked_scope or [],
+            )
+        elif report_type == "completion":
+            content.update(
+                artifact=args.artifact or "",
+                head_sha=args.head_sha or "",
+                validation_results=args.validation_result_ref or [],
+                residual_risks=args.residual_risk or [],
+                handoff=args.handoff or "",
+            )
+
     report: dict[str, Any] = {
         "run_id": run_id,
         "role_id": args.role_id,
@@ -13732,40 +13856,36 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
         "task_contract_digest": args.task_contract_digest
         or hashlib.sha256(args.role_id.encode("utf-8")).hexdigest(),
         "type": report_type,
-        "stage": args.stage,
-        "summary": args.summary,
-        "next": args.next,
         "needs_manager": report_type in {"ack", "attention"},
-        "evidence_refs": args.evidence_ref or [],
         "created_at": now_iso(),
     }
-    if report_type == "ack":
-        report.update(
-            understood_goal=args.understood_goal or args.summary,
-            scope=args.scope or [],
-            acceptance=args.acceptance or [],
-            approach=args.approach or args.summary,
-        )
-    elif report_type == "milestone":
-        report["risks"] = args.risk or []
-    elif report_type == "attention":
-        report.update(
-            impact=args.impact or args.summary,
-            attempted=args.attempted or [],
-            options=args.option_text or [],
-            recommendation=args.recommendation or "",
-            blocked_scope=args.blocked_scope or [],
-        )
-    elif report_type == "completion":
-        report.update(
-            artifact=args.artifact or "",
-            head_sha=args.head_sha or "",
-            validation_results=args.validation_result_ref or [],
-            residual_risks=args.residual_risk or [],
-            handoff=args.handoff or "",
-        )
+    report.update(content)
+
     try:
-        client_event = hloop_events.prepare_client_event(report, event_id=args.event_id)
+        normalized = hloop_events.validate_report(report)
+    except hloop_events.ReportValidationError as exc:
+        raise HLoopError(f"invalid report: {exc}") from exc
+    digest = hloop_events.payload_digest(normalized)
+    requested_event_id = None
+    raw_event_id = getattr(args, "event_id", None)
+    if raw_event_id:
+        try:
+            requested_event_id = hloop_events.normalize_event_id(raw_event_id)
+        except hloop_events.ReportValidationError as exc:
+            raise HLoopError(f"invalid report: {exc}") from exc
+    outbox_path = role_report_outbox_path(
+        repo,
+        run_id=str(report["run_id"]),
+        role_id=str(report["role_id"]),
+        attempt_id=str(report["attempt_id"]),
+    )
+    resolved_event_id = hloop_broker.role_outbox_event_id(
+        outbox_path,
+        payload_digest=digest,
+        requested_event_id=requested_event_id,
+    )
+    try:
+        client_event = hloop_events.prepare_client_event(report, event_id=resolved_event_id)
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid report: {exc}") from exc
 
@@ -15902,12 +16022,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-credential-file",
         help="0600 attempt credential issued in local-only storage at role start",
     )
-    agent_report.add_argument(
-        "--type", choices=["ack", "milestone", "attention", "completion"], required=True
+    report_body = agent_report.add_mutually_exclusive_group()
+    report_body.add_argument(
+        "--file", help="read a schema-validated JSON report body from a file"
     )
-    agent_report.add_argument("--stage", required=True)
-    agent_report.add_argument("--summary", required=True)
-    agent_report.add_argument("--next", required=True)
+    report_body.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read a schema-validated JSON report body from stdin",
+    )
+    agent_report.add_argument(
+        "--type",
+        choices=["ack", "milestone", "attention", "completion"],
+        help="required unless --file or --stdin supplies the report body",
+    )
+    agent_report.add_argument(
+        "--stage", help="required unless --file or --stdin supplies the report body"
+    )
+    agent_report.add_argument(
+        "--summary", help="required unless --file or --stdin supplies the report body"
+    )
+    agent_report.add_argument(
+        "--next", help="required unless --file or --stdin supplies the report body"
+    )
     agent_report.add_argument("--evidence-ref", action="append")
     agent_report.add_argument("--understood-goal")
     agent_report.add_argument("--scope", action="append")
