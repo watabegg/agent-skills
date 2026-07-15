@@ -296,6 +296,7 @@ def run_cmd(
     cwd: Path | None = None,
     check: bool = True,
     capture: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -304,6 +305,7 @@ def run_cmd(
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         check=check,
+        env=env,
     )
 
 
@@ -312,6 +314,8 @@ def run_cmd_bytes(
     cwd: Path | None = None,
     check: bool = True,
     capture: bool = True,
+    input_data: bytes | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run a command without decoding output that may contain Git path bytes."""
 
@@ -321,6 +325,8 @@ def run_cmd_bytes(
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         check=check,
+        input=input_data,
+        env=env,
     )
 
 
@@ -334,8 +340,18 @@ def run_cmd_bytes(
 TRUSTED_GIT_PATH = "git"
 
 
-def git(repo: Path, args: list[str], check: bool = True) -> str:
-    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), *args], check=check)
+def git(
+    repo: Path,
+    args: list[str],
+    check: bool = True,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    proc = run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(repo), *args],
+        check=check,
+        env=env,
+    )
     if proc.returncode != 0 and check:
         raise HLoopError(proc.stderr.strip())
     return (proc.stdout or "").strip()
@@ -3579,7 +3595,13 @@ def validate_change_scope(task_id: str, task_meta: dict[str, Any], files: list[s
 def porcelain_paths(repo: Path) -> list[str]:
     out = git_bytes(
         repo,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
         check=True,
     )
     return [paths[0] for _, paths in parse_porcelain_v1_z_records(out)]
@@ -3655,6 +3677,17 @@ def porcelain_paths_all_no_renames(repo: Path) -> list[str]:
         check=True,
     )
     return [paths[0] for _, paths in parse_porcelain_v1_z_records(out)]
+
+
+def role_scope_paths(repo: Path) -> list[str]:
+    """Return one canonical path representation for role baselines and gates.
+
+    Role worktrees permit only their prompt and artifact paths.  Rename
+    detection must stay disabled at both baseline capture and harvest so an
+    out-of-scope source cannot disappear behind an allowed destination.
+    """
+
+    return porcelain_paths(repo)
 
 
 def cached_diff_paths_no_renames(repo: Path) -> list[str]:
@@ -4990,7 +5023,7 @@ def validate_reviewer_worktree_scope(
         allowed.add(str((LOOP_DIR / "reviews" / f"{review_id}.md").as_posix()))
     baseline = set(normalize_list(review_state.get("baseline_dirty_files")))
     violations = []
-    for path in porcelain_paths(worktree):
+    for path in role_scope_paths(worktree):
         if path in baseline:
             continue
         if path not in allowed:
@@ -5009,7 +5042,7 @@ def validate_gap_worktree_scope(
     }
     baseline = set(normalize_list(gap_state.get("baseline_dirty_files")))
     violations = []
-    for path in porcelain_paths(worktree):
+    for path in role_scope_paths(worktree):
         if path in baseline:
             continue
         if path not in allowed:
@@ -5029,7 +5062,7 @@ def validate_advisor_worktree_scope(
     }
     baseline = set(normalize_list(participant.get("baseline_dirty_files")))
     violations = []
-    for path in porcelain_paths(worktree):
+    for path in role_scope_paths(worktree):
         if path in baseline:
             continue
         if path not in allowed:
@@ -8528,7 +8561,7 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
             attempt_id=attempt_id,
         )
         write_text(worktree / prompt_rel, prompt)
-        baseline = porcelain_paths(worktree)
+        baseline = role_scope_paths(worktree)
         if getattr(args, "launcher", "pane") == "agent":
             pane_id = start_agent_launcher(
                 name=f"hloop-{state['goal_id']}-specification-scout",
@@ -8611,7 +8644,7 @@ def validate_decision_role_scope(
     baseline = set(normalize_list(role_state.get("baseline_dirty_files")))
     return [
         path
-        for path in porcelain_paths(worktree)
+        for path in role_scope_paths(worktree)
         if path not in baseline and path not in allowed
     ]
 
@@ -8805,7 +8838,7 @@ def start_decision_liaison(
             attempt_id=attempt_id,
         )
         write_text(worktree / prompt_rel, prompt)
-        baseline = porcelain_paths(worktree)
+        baseline = role_scope_paths(worktree)
         if getattr(args, "launcher", "pane") == "agent":
             pane_id = start_agent_launcher(
                 name=f"hloop-{state['goal_id']}-{role_id}-liaison",
@@ -12131,6 +12164,8 @@ def expected_cherry_pick_tree(
     landed_parent: str,
     source_parent: str,
     source_commit: str,
+    *,
+    allow_conflict: bool = False,
 ) -> str:
     """Compute the exact clean cherry-pick result without touching index/worktree."""
 
@@ -12149,6 +12184,13 @@ def expected_cherry_pick_tree(
         check=False,
     )
     if proc.returncode != 0:
+        conflict_tree = (proc.stdout or "").splitlines()[0] if (proc.stdout or "").splitlines() else ""
+        if (
+            allow_conflict
+            and proc.returncode == 1
+            and re.fullmatch(r"[0-9a-f]{40,64}", conflict_tree)
+        ):
+            return ""
         raise HLoopError(
             "completed cherry-pick recovery rejected: recorded source does not replay cleanly "
             f"from landed parent {landed_parent}"
@@ -12159,6 +12201,302 @@ def expected_cherry_pick_tree(
             "completed cherry-pick recovery rejected: git merge-tree returned no exact tree identity"
         )
     return tree_sha
+
+
+def cherry_pick_evidence_digest(record: dict[str, Any]) -> str:
+    material = {key: value for key, value in record.items() if key != "evidence_digest"}
+    payload = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def fixed_cherry_pick_committer(
+    repo: Path,
+    record: dict[str, Any] | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return a reproducible committer environment and its durable identity."""
+
+    if record is None:
+        committer_date = f"{int(time.time())} +0000"
+        probe_env = dict(os.environ)
+        probe_env["GIT_COMMITTER_DATE"] = committer_date
+        ident = git(repo, ["var", "GIT_COMMITTER_IDENT"], env=probe_env)
+        match = re.fullmatch(r"(.*) <([^<>]*)> (\d+ [+-]\d{4})", ident)
+        if match is None:
+            raise HLoopError("git returned an invalid fixed committer identity")
+        identity = {
+            "committer_name": match.group(1),
+            "committer_email": match.group(2),
+            "committer_date": match.group(3),
+            "committer_ident": ident,
+        }
+    else:
+        identity = {
+            key: str(record.get(key) or "")
+            for key in (
+                "committer_name",
+                "committer_email",
+                "committer_date",
+                "committer_ident",
+            )
+        }
+        if any(not value for value in identity.values()):
+            raise HLoopError("cherry-pick transaction evidence has incomplete committer identity")
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_COMMITTER_NAME": identity["committer_name"],
+            "GIT_COMMITTER_EMAIL": identity["committer_email"],
+            "GIT_COMMITTER_DATE": identity["committer_date"],
+        }
+    )
+    observed_ident = git(repo, ["var", "GIT_COMMITTER_IDENT"], env=env)
+    if observed_ident != identity["committer_ident"]:
+        raise HLoopError("cherry-pick committer identity no longer matches transaction evidence")
+    return env, identity
+
+
+def predicted_cherry_pick_commit(
+    repo: Path,
+    *,
+    source_commit: str,
+    landed_parent: str,
+    landed_tree: str,
+    committer_ident: str,
+) -> str:
+    """Write and return the exact commit object HLoop expects Git to land."""
+
+    author, message = commit_author_message(repo, source_commit)
+    payload = b"\n".join(
+        (
+            f"tree {landed_tree}".encode("ascii"),
+            f"parent {landed_parent}".encode("ascii"),
+            b"author " + author,
+            b"committer " + committer_ident.encode("utf-8"),
+        )
+    ) + b"\n\n" + message
+    proc = run_cmd_bytes(
+        [
+            TRUSTED_GIT_PATH,
+            "-C",
+            str(repo),
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+        ],
+        input_data=payload,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError(
+            os.fsdecode(proc.stderr or b"failed to write predicted cherry-pick commit").strip()
+        )
+    commit_sha = os.fsdecode(proc.stdout or b"").strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
+        raise HLoopError("git hash-object returned no predicted cherry-pick commit identity")
+    return commit_sha
+
+
+def build_cherry_pick_evidence(
+    repo: Path,
+    transaction: MergeTransaction,
+    *,
+    resolved_tree: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, str]]:
+    """Predict the exact clean suffix starting at the transaction's live prefix."""
+
+    start = len(transaction.applied_commits)
+    parent = transaction.applied_head
+    env, identity = fixed_cherry_pick_committer(repo)
+    sources: list[str] = []
+    trees: list[str] = []
+    landed: list[str] = []
+    kind = "resolution" if resolved_tree is not None else "clean"
+    for sequence, source_commit in enumerate(transaction.source_commits[start:]):
+        source_parents = commit_parent_shas(repo, source_commit)
+        if len(source_parents) != 1:
+            raise HLoopError(
+                f"cherry-pick transaction source commit is not single-parent: {source_commit}"
+            )
+        if sequence == 0 and resolved_tree is not None:
+            tree_sha = resolved_tree
+        else:
+            tree_sha = expected_cherry_pick_tree(
+                repo,
+                parent,
+                source_parents[0],
+                source_commit,
+                allow_conflict=True,
+            )
+            if not tree_sha:
+                # Git will stop at this source for a new explicit resolution.
+                break
+        expected_commit = predicted_cherry_pick_commit(
+            repo,
+            source_commit=source_commit,
+            landed_parent=parent,
+            landed_tree=tree_sha,
+            committer_ident=identity["committer_ident"],
+        )
+        sources.append(source_commit)
+        trees.append(tree_sha)
+        landed.append(expected_commit)
+        parent = expected_commit
+
+    if not sources:
+        return None, env
+    record: dict[str, Any] = {
+        "version": 1,
+        "kind": kind,
+        "sequence_start": start,
+        "source_commits": sources,
+        "expected_parent": transaction.applied_head,
+        "resolved_tree": resolved_tree or "",
+        "expected_trees": trees,
+        "expected_landed_commits": landed,
+        **identity,
+    }
+    record["evidence_digest"] = cherry_pick_evidence_digest(record)
+    return record, env
+
+
+def cherry_pick_evidence_records(active: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = active.get("cherry_pick_evidence") or []
+    if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+        raise HLoopError("cherry-pick transaction evidence is malformed")
+    return [dict(item) for item in raw]
+
+
+def validate_cherry_pick_evidence(
+    repo: Path,
+    active: dict[str, Any],
+    transaction: MergeTransaction,
+    *,
+    applied_head: str,
+    applied_count: int,
+) -> dict[int, tuple[str, str]]:
+    """Validate durable evidence and bind every landed evidence slot to a SHA/tree."""
+
+    records = cherry_pick_evidence_records(active)
+    evidence_version = active.get("cherry_pick_evidence_version")
+    if evidence_version is None and not records:
+        return {}
+    if evidence_version != 1:
+        raise HLoopError("cherry-pick transaction evidence marker is invalid")
+    try:
+        legacy_prefix_count = int(active.get("cherry_pick_evidence_legacy_prefix_count"))
+    except (TypeError, ValueError) as exc:
+        raise HLoopError("cherry-pick transaction evidence legacy prefix is invalid") from exc
+    if not 0 <= legacy_prefix_count <= applied_count:
+        raise HLoopError("cherry-pick transaction evidence legacy prefix is out of range")
+    landed_commits = tuple(
+        git(
+            repo,
+            [
+                "rev-list",
+                "--reverse",
+                "--first-parent",
+                f"{transaction.pre_merge_head}..{applied_head}",
+            ],
+        ).splitlines()
+    )
+    if len(landed_commits) != applied_count:
+        raise HLoopError(
+            "cherry-pick transaction evidence does not match first-parent applied progress"
+        )
+
+    expected_by_sequence: dict[int, tuple[str, str]] = {}
+    previous_end: int | None = legacy_prefix_count
+    for record in records:
+        if record.get("evidence_digest") != cherry_pick_evidence_digest(record):
+            raise HLoopError("cherry-pick transaction evidence digest mismatch")
+        if record.get("version") != 1 or record.get("kind") not in {"clean", "resolution"}:
+            raise HLoopError("cherry-pick transaction evidence version or kind is invalid")
+        try:
+            start = int(record.get("sequence_start"))
+        except (TypeError, ValueError) as exc:
+            raise HLoopError("cherry-pick transaction evidence sequence is invalid") from exc
+        sources = record.get("source_commits")
+        trees = record.get("expected_trees")
+        landed = record.get("expected_landed_commits")
+        if not all(isinstance(value, list) for value in (sources, trees, landed)):
+            raise HLoopError("cherry-pick transaction evidence arrays are malformed")
+        if not sources or not (len(sources) == len(trees) == len(landed)):
+            raise HLoopError("cherry-pick transaction evidence arrays have inconsistent lengths")
+        end = start + len(sources)
+        if start < 0 or end > len(transaction.source_commits):
+            raise HLoopError("cherry-pick transaction evidence sequence is out of range")
+        if start != previous_end:
+            raise HLoopError("cherry-pick transaction evidence sequence is not contiguous")
+        if tuple(str(item) for item in sources) != transaction.source_commits[start:end]:
+            raise HLoopError("cherry-pick transaction evidence source sequence mismatch")
+        if start > applied_count:
+            raise HLoopError("cherry-pick transaction evidence starts after observed progress")
+        expected_parent = (
+            transaction.pre_merge_head if start == 0 else landed_commits[start - 1]
+        )
+        if str(record.get("expected_parent") or "") != expected_parent:
+            raise HLoopError("cherry-pick transaction evidence parent mismatch")
+        if record["kind"] == "resolution":
+            if not record.get("resolved_tree") or record.get("resolved_tree") != trees[0]:
+                raise HLoopError("cherry-pick conflict-resolution tree evidence mismatch")
+        elif record.get("resolved_tree"):
+            raise HLoopError("clean cherry-pick evidence unexpectedly records a resolution tree")
+
+        _, identity = fixed_cherry_pick_committer(repo, record)
+        parent = expected_parent
+        for offset, (source_commit, tree_sha, expected_commit) in enumerate(
+            zip(sources, trees, landed)
+        ):
+            sequence = start + offset
+            source_commit = str(source_commit)
+            tree_sha = str(tree_sha)
+            expected_commit = str(expected_commit)
+            source_parents = commit_parent_shas(repo, source_commit)
+            if len(source_parents) != 1:
+                raise HLoopError(
+                    f"cherry-pick transaction evidence source is not single-parent: {source_commit}"
+                )
+            if record["kind"] != "resolution" or offset != 0:
+                clean_tree = expected_cherry_pick_tree(
+                    repo,
+                    parent,
+                    source_parents[0],
+                    source_commit,
+                )
+                if clean_tree != tree_sha:
+                    raise HLoopError("cherry-pick transaction evidence clean tree mismatch")
+            recomputed = predicted_cherry_pick_commit(
+                repo,
+                source_commit=source_commit,
+                landed_parent=parent,
+                landed_tree=tree_sha,
+                committer_ident=identity["committer_ident"],
+            )
+            if recomputed != expected_commit:
+                raise HLoopError("cherry-pick transaction evidence landed identity mismatch")
+            if sequence < applied_count and landed_commits[sequence] != expected_commit:
+                raise HLoopError(
+                    "completed cherry-pick recovery rejected: landed commit identity does not match durable evidence"
+                )
+            expected_by_sequence[sequence] = (expected_commit, tree_sha)
+            parent = expected_commit
+        previous_end = end
+    missing_applied = [
+        sequence
+        for sequence in range(legacy_prefix_count, applied_count)
+        if sequence not in expected_by_sequence
+    ]
+    if missing_applied:
+        raise HLoopError("cherry-pick transaction evidence is missing an applied sequence")
+    return expected_by_sequence
 
 
 def cherry_pick_todo_commits(repo: Path, todo_path: Path) -> tuple[str, ...]:
@@ -12212,9 +12550,20 @@ def observe_cherry_pick_progress(
             raise HLoopError("conflicted cherry-pick is missing CHERRY_PICK_HEAD")
         applied = source_commits[:applied_count]
     else:
-        if transaction.status == MERGE_CONTENT_CONFLICT and not allow_completed:
+        cherry_pick_head = git_dir / "CHERRY_PICK_HEAD"
+        applied_count_without_sequencer = int(
+            git(repo, ["rev-list", "--first-parent", "--count", f"{start_head}..{current_head}"])
+        )
+        if cherry_pick_head.exists():
+            if applied_count_without_sequencer >= len(source_commits):
+                raise HLoopError("single cherry-pick conflict is outside the recorded source sequence")
+            current_source = read_text(cherry_pick_head).strip()
+            if current_source != source_commits[applied_count_without_sequencer]:
+                raise HLoopError("CHERRY_PICK_HEAD does not match the recorded source sequence")
+            applied = source_commits[:applied_count_without_sequencer]
+        elif transaction.status == MERGE_CONTENT_CONFLICT and not allow_completed:
             raise HLoopError("conflicted cherry-pick sequencer is missing")
-        if current_head == start_head:
+        elif current_head == start_head:
             applied = ()
         elif allow_completed:
             applied = source_commits
@@ -12306,6 +12655,14 @@ def preflight_merge_transaction(repo: Path, active: dict[str, Any], op: str) -> 
             "merge transaction drifted from recorded Git observations: "
             + "; ".join(issue.message for issue in drift.issues)
         )
+    if prior.mode == "cherry-pick":
+        validate_cherry_pick_evidence(
+            repo,
+            active,
+            prior,
+            applied_head=observed.applied_head,
+            applied_count=len(observed.applied_commits),
+        )
     return prior
 
 
@@ -12327,6 +12684,69 @@ def transition_merge_transaction(
         extra = {key: value for key, value in existing.items() if key not in candidate.to_record()}
         state["active_merge"] = {**extra, **candidate.to_record()}
     return candidate
+
+
+def prepare_cherry_pick_evidence(
+    repo: Path,
+    state: dict[str, Any],
+    transaction: MergeTransaction,
+    *,
+    resolved_tree: str | None,
+) -> tuple[MergeTransaction, dict[str, str]]:
+    """Persist exact landed-commit evidence before invoking cherry-pick."""
+
+    current = observed_merge_transaction(repo, transaction)
+    transition_merge_transaction(
+        repo,
+        state,
+        transaction,
+        transaction.status,
+        observed=current,
+    )
+    active = state.get("active_merge") or {}
+    validate_cherry_pick_evidence(
+        repo,
+        active,
+        current,
+        applied_head=current.applied_head,
+        applied_count=len(current.applied_commits),
+    )
+    start = len(current.applied_commits)
+    if "cherry_pick_evidence_version" not in active:
+        active["cherry_pick_evidence_version"] = 1
+        active["cherry_pick_evidence_legacy_prefix_count"] = start
+        state["active_merge"] = active
+    existing = next(
+        (
+            record
+            for record in cherry_pick_evidence_records(active)
+            if int(record.get("sequence_start", -1)) == start
+        ),
+        None,
+    )
+    if existing is not None:
+        expected_kind = "resolution" if resolved_tree is not None else "clean"
+        if existing.get("kind") != expected_kind:
+            raise HLoopError("cherry-pick transaction evidence kind changed before retry")
+        if resolved_tree is not None and existing.get("resolved_tree") != resolved_tree:
+            raise HLoopError("cherry-pick conflict resolution changed after durable recording")
+        env, _ = fixed_cherry_pick_committer(repo, existing)
+        return current, env
+
+    record, env = build_cherry_pick_evidence(
+        repo,
+        current,
+        resolved_tree=resolved_tree,
+    )
+    if resolved_tree is not None and record is None:
+        raise HLoopError("resolved cherry-pick produced no durable transaction evidence")
+    if record is not None:
+        evidence = cherry_pick_evidence_records(active)
+        evidence.append(record)
+        active["cherry_pick_evidence"] = evidence
+        state["active_merge"] = active
+    save_state(repo, state)
+    return current, env
 
 
 def record_squash_tree(
@@ -12503,8 +12923,18 @@ def reconcile_completed_cherry_pick(
             "completed cherry-pick recovery rejected: first-parent suffix length does not match the recorded source sequence"
         )
 
+    expected_by_sequence = validate_cherry_pick_evidence(
+        repo,
+        active,
+        transaction,
+        applied_head=current_head,
+        applied_count=len(landed_commits),
+    )
+
     expected_parent = transaction.pre_merge_head
-    for source_commit, landed_commit in zip(transaction.source_commits, landed_commits):
+    for sequence, (source_commit, landed_commit) in enumerate(
+        zip(transaction.source_commits, landed_commits)
+    ):
         source_parents = commit_parent_shas(repo, source_commit)
         landed_parents = commit_parent_shas(repo, landed_commit)
         if len(source_parents) != 1:
@@ -12515,16 +12945,28 @@ def reconcile_completed_cherry_pick(
             raise HLoopError(
                 "completed cherry-pick recovery rejected: landed commits are not the exact first-parent suffix"
             )
-        expected_tree = expected_cherry_pick_tree(
-            repo,
-            expected_parent,
-            source_parents[0],
-            source_commit,
-        )
+        evidence = expected_by_sequence.get(sequence)
+        if evidence is not None:
+            expected_commit, expected_tree = evidence
+            if landed_commit != expected_commit:
+                raise HLoopError(
+                    "completed cherry-pick recovery rejected: landed commit identity does not match durable evidence"
+                )
+        else:
+            expected_tree = expected_cherry_pick_tree(
+                repo,
+                expected_parent,
+                source_parents[0],
+                source_commit,
+            )
+            if merge_transaction_index_state(repo, landed_commit) != expected_tree:
+                raise HLoopError(
+                    "completed cherry-pick recovery rejected: landed tree does not exactly replay recorded source "
+                    f"{source_commit}"
+                )
         if merge_transaction_index_state(repo, landed_commit) != expected_tree:
             raise HLoopError(
-                "completed cherry-pick recovery rejected: landed tree does not exactly replay recorded source "
-                f"{source_commit}"
+                "completed cherry-pick recovery rejected: landed tree differs from durable evidence"
             )
         if commit_author_message(repo, source_commit) != commit_author_message(repo, landed_commit):
             raise HLoopError(
@@ -12600,10 +13042,27 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
         raise HLoopError("merge continue has no staged changes")
     mode = str(active.get("mode") or state.get("merge_mode") or "squash")
     if mode == "cherry-pick":
+        prior, cherry_pick_env = prepare_cherry_pick_evidence(
+            repo,
+            state,
+            prior,
+            resolved_tree=git(repo, ["write-tree"]),
+        )
         try:
-            git(repo, ["cherry-pick", "--continue"])
+            git(
+                repo,
+                ["-c", "commit.gpgSign=false", "cherry-pick", "--continue"],
+                env=cherry_pick_env,
+            )
         except subprocess.CalledProcessError as exc:
             observed = observed_merge_transaction(repo, prior)
+            validate_cherry_pick_evidence(
+                repo,
+                state.get("active_merge") or {},
+                prior,
+                applied_head=observed.applied_head,
+                applied_count=len(observed.applied_commits),
+            )
             transition_merge_transaction(
                 repo,
                 state,
@@ -12622,6 +13081,13 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
             )
             raise
         observed = observed_merge_transaction(repo, prior, allow_completed=True)
+        validate_cherry_pick_evidence(
+            repo,
+            state.get("active_merge") or {},
+            prior,
+            applied_head=observed.applied_head,
+            applied_count=len(observed.applied_commits),
+        )
         transition_merge_transaction(
             repo, state, prior, MERGE_COMPLETED, observed=observed
         )
@@ -12786,10 +13252,28 @@ def cmd_merge(args: argparse.Namespace) -> int:
             transaction = record_squash_tree(repo, state, transaction)
             git(repo, ["commit", "-m", f"ai-loop({task_id}): squash {branch}"])
         else:
-            git(repo, ["cherry-pick", *commits])
+            transaction, cherry_pick_env = prepare_cherry_pick_evidence(
+                repo,
+                state,
+                transaction,
+                resolved_tree=None,
+            )
+            git(
+                repo,
+                ["-c", "commit.gpgSign=false", "cherry-pick", *commits],
+                env=cherry_pick_env,
+            )
     except subprocess.CalledProcessError as exc:
         detail = command_error_detail(exc)
         observed = observed_merge_transaction(repo, transaction)
+        if mode == "cherry-pick":
+            validate_cherry_pick_evidence(
+                repo,
+                state.get("active_merge") or {},
+                transaction,
+                applied_head=observed.applied_head,
+                applied_count=len(observed.applied_commits),
+            )
         if is_environment_git_error(detail):
             transition_merge_transaction(
                 repo,
@@ -12829,6 +13313,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
         raise exc
     if mode == "cherry-pick":
         observed = observed_merge_transaction(repo, transaction, allow_completed=True)
+        validate_cherry_pick_evidence(
+            repo,
+            state.get("active_merge") or {},
+            transaction,
+            applied_head=observed.applied_head,
+            applied_count=len(observed.applied_commits),
+        )
         transition_merge_transaction(
             repo, state, transaction, MERGE_COMPLETED, observed=observed
         )
@@ -13348,7 +13839,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             attempt_id=attempt_id,
         )
         write_text(prompt_path, prompt)
-        baseline_dirty = porcelain_paths(worktree)
+        baseline_dirty = role_scope_paths(worktree)
         if args.launcher == "agent":
             pane_id = start_agent_launcher(
                 name=f"hloop-{state['goal_id']}-{review_id}-reviewer",
@@ -13859,7 +14350,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             attempt_id=attempt_id,
         )
         write_text(prompt_path, prompt)
-        baseline_dirty = porcelain_paths(worktree)
+        baseline_dirty = role_scope_paths(worktree)
         if args.launcher == "agent":
             pane_id = start_agent_launcher(
                 name=f"hloop-{state['goal_id']}-{gap_id}-gap",
@@ -14400,7 +14891,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             attempt_id=attempt_id,
         )
         write_text(prompt_path, prompt)
-        baseline_dirty = porcelain_paths(worktree)
+        baseline_dirty = role_scope_paths(worktree)
         if args.launcher == "agent":
             pane_id = start_agent_launcher(
                 name=f"hloop-{state['goal_id']}-{advice_id}-{participant_id}-advisor",
