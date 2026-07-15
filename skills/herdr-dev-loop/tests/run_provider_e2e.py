@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run or explicitly skip one read-only live-provider release probe."""
+"""Run or explicitly skip one read-only live-provider marker probe.
+
+The legacy filename is retained for compatibility.  This runner proves only
+provider CLI availability, an exact marker response, and fixture Git
+immutability; it does not exercise an HLoop role, Herdr, prompts, or reports.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from typing import Any
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-SUCCESS_MARKER = "HLOOP_PROVIDER_E2E_OK"
+SUCCESS_MARKER = "HLOOP_PROVIDER_MARKER_PROBE_OK"
 UNAVAILABLE_PATTERNS = {
     "credentials-unavailable": (
         "not logged in",
@@ -107,15 +112,15 @@ def make_repo(root: Path) -> Path:
     repo.mkdir()
     commands = (
         ["git", "init", "--initial-branch=master"],
-        ["git", "config", "user.email", "hloop-provider-e2e@example.invalid"],
-        ["git", "config", "user.name", "HLoop Provider E2E"],
+        ["git", "config", "user.email", "hloop-provider-probe@example.invalid"],
+        ["git", "config", "user.name", "HLoop Provider Probe"],
     )
     for command in commands:
         subprocess.run(command, cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    (repo / "README.md").write_text("provider e2e fixture\n", encoding="utf-8")
+    (repo / "README.md").write_text("provider marker probe fixture\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
     subprocess.run(
-        ["git", "commit", "-m", "provider e2e fixture"],
+        ["git", "commit", "-m", "provider marker probe fixture"],
         cwd=repo,
         check=True,
         stdout=subprocess.PIPE,
@@ -198,7 +203,7 @@ def emit(result: dict[str, Any], args: argparse.Namespace) -> int:
         sys.stdout.write(payload)
     else:
         print(
-            f"provider E2E ({result['provider']}): {result['status']}"
+            f"provider marker probe ({result['provider']}): {result['status']}"
             + (f" - {result['skip_reason']}" if result["skip_reason"] else "")
         )
     return 0 if result["status"] in {"passed", "skipped"} else 1
@@ -217,7 +222,19 @@ def main() -> int:
     version = command_version(executable) if executable else {"returncode": 127, "value": ""}
     base: dict[str, Any] = {
         "schema_version": 1,
-        "runner": "herdr-dev-loop-provider-e2e",
+        "runner": "herdr-dev-loop-provider-marker-probe",
+        "probe_kind": "live-provider-availability-read-only-marker",
+        "coverage": [
+            "provider-cli-availability",
+            "exact-marker-response",
+            "fixture-git-immutability",
+        ],
+        "excluded_coverage": [
+            "hloop-role-launch",
+            "herdr-integration",
+            "rendered-role-prompt",
+            "agent-report-path",
+        ],
         "runtime_version": runtime_version,
         "provider": args.provider,
         "model": args.model or "provider-default",
@@ -259,7 +276,7 @@ def main() -> int:
         base.update(status="failed", skip_reason=f"{args.provider} executable is unavailable")
         return emit(base, args)
 
-    root = Path(tempfile.mkdtemp(prefix=f"hloop-provider-e2e-{args.provider}-"))
+    root = Path(tempfile.mkdtemp(prefix=f"hloop-provider-probe-{args.provider}-"))
     repo = make_repo(root)
     output_path = root / "provider-last-message.txt"
     before = subprocess.run(

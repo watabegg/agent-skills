@@ -27,6 +27,7 @@ from .events import (
     canonical_json,
     new_event_id,
     normalize_invocation_id,
+    normalize_legacy_invocation_id,
     parse_rfc3339,
     payload_digest,
     prepare_client_event,
@@ -1342,11 +1343,12 @@ def role_outbox_client_event(
         raise ReportValidationError(
             "event_id and invocation_id are mutually exclusive"
         )
-    normalized_invocation_id = (
-        normalize_invocation_id(invocation_id)
+    retained_invocation_id = (
+        normalize_legacy_invocation_id(invocation_id)
         if invocation_id is not None
         else None
     )
+    normalized_invocation_id: str | None = None
     normalized = validate_report(report)
     semantic_payload = dict(normalized)
     semantic_payload.pop("created_at", None)
@@ -1407,7 +1409,7 @@ def role_outbox_client_event(
                     recorded_semantic_digest = str(entry["semantic_digest"])
                     status = str(entry.get("status", "pending"))
                     recorded_invocation_id = (
-                        normalize_invocation_id(entry["invocation_id"])
+                        normalize_legacy_invocation_id(entry["invocation_id"])
                         if "invocation_id" in entry
                         else None
                     )
@@ -1443,12 +1445,12 @@ def role_outbox_client_event(
                     if event["event_id"] == requested_event_id:
                         requested_event = (recorded_semantic_digest, event)
                     if (
-                        normalized_invocation_id is not None
-                        and recorded_invocation_id == normalized_invocation_id
+                        retained_invocation_id is not None
+                        and recorded_invocation_id == retained_invocation_id
                     ):
                         if recorded_semantic_digest != semantic_digest:
                             raise IdempotencyConflict(
-                                f"invocation id {normalized_invocation_id} is retained "
+                                f"invocation id {retained_invocation_id} is retained "
                                 "for different semantic content"
                             )
                         if invocation_event is None:
@@ -1486,10 +1488,18 @@ def role_outbox_client_event(
 
             if (
                 requested_event_id is None
-                and normalized_invocation_id is None
+                and retained_invocation_id is None
                 and existing_event is not None
             ):
                 return existing_event
+
+            if retained_invocation_id is not None:
+                # Existing 0.5.0 keys were allowed to contain any visible ASCII.
+                # A matching retained key returned above remains retryable, but
+                # only the 0.5.1 shell-safe grammar may allocate a new entry.
+                normalized_invocation_id = normalize_invocation_id(
+                    retained_invocation_id
+                )
 
             event_id = requested_event_id or legacy_event_id or new_event_id()
             client_event = prepare_client_event(normalized, event_id=event_id)
@@ -1572,7 +1582,7 @@ def confirm_role_outbox_delivery(
                     event = validate_client_event(entry["event"])
                     status = str(entry.get("status", "pending"))
                     recorded_invocation_id = (
-                        normalize_invocation_id(entry["invocation_id"])
+                        normalize_legacy_invocation_id(entry["invocation_id"])
                         if "invocation_id" in entry
                         else None
                     )

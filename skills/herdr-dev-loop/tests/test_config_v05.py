@@ -1,8 +1,12 @@
 """Unit tests for hloop_lib.config (herdr-dev-loop 0.5.0 config primitives)."""
 
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -22,7 +26,9 @@ _AUTHOR_HOME_PATH = re.compile(r"/home/[^/\s\"'()]+/")
 _PORTABLE_DOC_PATHS = (
     "README.md",
     "docs/RELEASE-0.5.0.md",
+    "docs/RELEASE-0.5.1.md",
     "docs/2026-07-14-v0.5.0-plan.md",
+    "docs/2026-07-16-v0.5.1-release-hardening-plan.md",
     "references/migration-install.md",
 )
 
@@ -38,6 +44,565 @@ class RequiredCommandPortabilityTests(unittest.TestCase):
                     [],
                     f"{relative_path} hard-codes an author-machine home path: {matches}",
                 )
+
+    def test_v051_repository_validation_contract_is_fail_closed_and_clean(self):
+        for relative_path in (
+            "docs/RELEASE-0.5.1.md",
+            "docs/2026-07-16-v0.5.1-release-hardening-plan.md",
+        ):
+            with self.subTest(doc=relative_path):
+                text = (SKILL_ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn("set -euo pipefail", text)
+                self.assertIn('trap cleanup EXIT', text)
+                self.assertIn('PYTHONPYCACHEPREFIX="$PYCACHE_DIR"', text)
+                self.assertIn("if rg -n 'ResourceWarning", text)
+                self.assertIn("warning_scan_status=$?", text)
+                self.assertIn('*) exit "$warning_scan_status" ;;', text)
+                self.assertIn("require_clean_worktree()", text)
+                self.assertIn(
+                    ': "${EXPECTED_CANDIDATE_SHA:?set the externally reviewed full candidate SHA}"',
+                    text,
+                )
+                self.assertIn(
+                    'ACTUAL_CANDIDATE_SHA="$(git rev-parse HEAD)"', text
+                )
+                self.assertIn(
+                    'git merge-base "$EXPECTED_BASE_SHA" "$ACTUAL_CANDIDATE_SHA"',
+                    text,
+                )
+                self.assertIn(
+                    'EVIDENCE_ROOT="$EVIDENCE_PARENT/$EXPECTED_CANDIDATE_SHA"',
+                    text,
+                )
+                self.assertIn('test ! -L "$EVIDENCE_ROOT"', text)
+                self.assertIn('test ! -e "$EVIDENCE_ROOT"', text)
+                self.assertIn('mkdir -m 700 "$EVIDENCE_ROOT"', text)
+                self.assertIn("set -o noclobber", text)
+                for evidence_name in (
+                    "compile.status",
+                    "version.json",
+                    "selftest.log",
+                    "quick-validate.log",
+                    "synthetic.json",
+                    "synthetic.stdout.log",
+                    "synthetic.stderr.log",
+                    "diff-check.log",
+                    "repository-gates.status",
+                ):
+                    self.assertIn(evidence_name, text)
+                self.assertIn(
+                    'git diff --check "$EXPECTED_BASE_SHA...$EXPECTED_CANDIDATE_SHA"',
+                    text,
+                )
+                self.assertGreaterEqual(text.count("require_candidate_identity"), 3)
+                self.assertIn(
+                    'worktree_status="$(git status --porcelain --untracked-files=all)"',
+                    text,
+                )
+                self.assertEqual(
+                    text.count("git status --porcelain --untracked-files=all"), 1
+                )
+                self.assertGreaterEqual(text.count("require_clean_worktree"), 3)
+                self.assertIn(
+                    "$(git rev-parse --git-common-dir)/herdr-dev-loop-release-evidence/0.5.1/<candidate-sha>/",
+                    text,
+                )
+
+    def test_v051_release_contract_atomically_finalizes_complete_manifest(self):
+        release_text = (SKILL_ROOT / "docs/RELEASE-0.5.1.md").read_text(
+            encoding="utf-8"
+        )
+        marker = (
+            'python3 - "$EVIDENCE_ROOT" "$EXPECTED_BASE_SHA" '
+            '"$EXPECTED_CANDIDATE_SHA" <<\'PY\'\n'
+        )
+        self.assertIn(marker, release_text)
+        self.assertIn(
+            'test "$(git rev-parse master)" = "$EXPECTED_CANDIDATE_SHA"',
+            release_text,
+        )
+        self.assertIn(
+            'test "$(git rev-parse origin/master)" = "$EXPECTED_CANDIDATE_SHA"',
+            release_text,
+        )
+        self.assertIn(
+            'test "$(git rev-parse --verify "${EXPECTED_BASE_SHA}^{commit}")" = "$EXPECTED_BASE_SHA"',
+            release_text,
+        )
+        self.assertIn(
+            'test "$(git merge-base "$EXPECTED_BASE_SHA" "$EXPECTED_CANDIDATE_SHA")" = "$EXPECTED_BASE_SHA"',
+            release_text,
+        )
+        self.assertGreaterEqual(
+            release_text.count(
+                'test "$(git merge-base "$EXPECTED_BASE_SHA" "$EXPECTED_CANDIDATE_SHA")" = "$EXPECTED_BASE_SHA"'
+            ),
+            5,
+        )
+        finalizer = release_text.split(marker, 1)[1].split("\nPY\n", 1)[0]
+        for expected_fragment in (
+            '"codex-marker-probe.json"',
+            '"provider-gates.status"',
+            '"codex-install-diff.log"',
+            '"claude-install-diff.log"',
+            '"installed-source.json"',
+            '"install-gates.status"',
+            '"codex-discovery.json"',
+            '"gap-audit.txt"',
+            '"review-correctness.txt"',
+            '"review-security.txt"',
+            '"review-cli-docs.txt"',
+            '"review-tests.txt"',
+            '"claude_live_provider_e2e": "not_run"',
+            '"fresh_claude_discovery": "not_run"',
+            "os.O_EXCL",
+            "os.replace(temporary_path, manifest_path)",
+        ):
+            self.assertIn(expected_fragment, finalizer)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "evidence"
+            root.mkdir(mode=0o700)
+            nonempty_text = {
+                "compile.status": "passed\n",
+                "unit.log": "test_example ... ok\n\nRan 1 tests in 0.001s\n\nOK\n",
+                "selftest.log": "selftest ok\n",
+                "quick-validate.log": "Skill is valid!\n",
+                "synthetic.stdout.log": "synthetic E2E: passed\n",
+                "repository-gates.status": "passed\n",
+                "codex-marker-probe.stdout.log": "provider marker probe: passed\n",
+                "provider-gates.status": "passed\n",
+                "codex-installed-selftest.log": "selftest ok\n",
+                "claude-installed-selftest.log": "selftest ok\n",
+                "install-gates.status": "passed\n",
+                "gap-audit.txt": (
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'2' * 40}\n"
+                    "GAP AUDIT: PASS\n"
+                ),
+                "review-correctness.txt": (
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'2' * 40}\n"
+                    "REVIEW RESULT: CLEAN\n"
+                ),
+                "review-security.txt": (
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'2' * 40}\n"
+                    "REVIEW RESULT: CLEAN\n"
+                ),
+                "review-cli-docs.txt": (
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'2' * 40}\n"
+                    "REVIEW RESULT: CLEAN\n"
+                ),
+                "review-tests.txt": (
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'2' * 40}\n"
+                    "REVIEW RESULT: CLEAN\n"
+                ),
+            }
+            empty_files = {
+                "synthetic.stderr.log",
+                "diff-check.log",
+                "diff-check.stderr.log",
+                "compile.stdout.log",
+                "compile.stderr.log",
+                "version.stderr.log",
+                "selftest.stderr.log",
+                "quick-validate.stderr.log",
+                "codex-marker-probe.stderr.log",
+                "codex-install-diff.log",
+                "codex-install-diff.stderr.log",
+                "claude-install-diff.log",
+                "claude-install-diff.stderr.log",
+                "codex-installed-version.stderr.log",
+                "claude-installed-version.stderr.log",
+                "codex-installed-selftest.stderr.log",
+                "claude-installed-selftest.stderr.log",
+                "installed-source.stderr.log",
+            }
+            json_evidence = {
+                "version.json": {"runtime_skill_version": "0.5.1"},
+                "synthetic.json": {
+                    "status": "passed",
+                    "scenario_count": 9,
+                },
+                "codex-marker-probe.json": {
+                    "status": "passed",
+                    "runner": "herdr-dev-loop-provider-marker-probe",
+                },
+                "codex-installed-version.json": {
+                    "runtime_skill_version": "0.5.1"
+                },
+                "claude-installed-version.json": {
+                    "runtime_skill_version": "0.5.1"
+                },
+                "install-backups.json": {
+                    "status": "passed",
+                    "codex_backup": "/tmp/codex-backup",
+                    "claude_backup": "/tmp/claude-backup",
+                },
+                "installed-source.json": {
+                    "status": "passed",
+                    "source_sha": "2" * 40,
+                },
+                "codex-discovery.json": {
+                    "status": "passed",
+                    "source_sha": "2" * 40,
+                },
+            }
+            for name, value in nonempty_text.items():
+                (root / name).write_text(value, encoding="utf-8")
+            for name in empty_files:
+                (root / name).write_text("", encoding="utf-8")
+            for name, value in json_evidence.items():
+                (root / name).write_text(
+                    json.dumps(value) + "\n", encoding="utf-8"
+                )
+
+            base_sha = "1" * 40
+            candidate_sha = "2" * 40
+            result = subprocess.run(
+                [sys.executable, "-c", finalizer, str(root), base_sha, candidate_sha],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stderr.decode("utf-8", errors="replace"),
+            )
+            manifest = json.loads(
+                (root / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["candidate_sha"], candidate_sha)
+            self.assertEqual(manifest["installed_source_sha"], candidate_sha)
+            self.assertEqual(manifest["gates"]["repository_unit"]["count"], 1)
+            self.assertEqual(manifest["gates"]["manual_review"]["findings"], 0)
+
+            second = subprocess.run(
+                [sys.executable, "-c", finalizer, str(root), base_sha, candidate_sha],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(second.returncode, 0)
+
+            scenario_mutations = {
+                "missing-required": lambda path: (path / "quick-validate.log").unlink(),
+                "invalid-json": lambda path: (path / "synthetic.json").write_text(
+                    "{\n", encoding="utf-8"
+                ),
+                "resource-warning": lambda path: (path / "unit.log").write_text(
+                    (path / "unit.log").read_text(encoding="utf-8")
+                    + "ResourceWarning: leaked connection\n",
+                    encoding="utf-8",
+                ),
+                "review-not-clean": lambda path: (
+                    path / "review-security.txt"
+                ).write_text("REVIEW RESULT: FINDINGS\n", encoding="utf-8"),
+                "review-substring-false-positive": lambda path: (
+                    path / "review-security.txt"
+                ).write_text(
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'2' * 40}\n"
+                    "Expected REVIEW RESULT: CLEAN, actual REVIEW RESULT: FINDINGS\n",
+                    encoding="utf-8",
+                ),
+                "review-wrong-candidate": lambda path: (
+                    path / "review-security.txt"
+                ).write_text(
+                    f"base_sha: {'1' * 40}\n"
+                    f"candidate_sha: {'3' * 40}\n"
+                    "REVIEW RESULT: CLEAN\n",
+                    encoding="utf-8",
+                ),
+                "install-diff": lambda path: (
+                    path / "codex-install-diff.log"
+                ).write_text("Files differ\n", encoding="utf-8"),
+                "wrong-installed-source": lambda path: (
+                    path / "installed-source.json"
+                ).write_text(
+                    json.dumps({"status": "passed", "source_sha": "3" * 40})
+                    + "\n",
+                    encoding="utf-8",
+                ),
+                "failed-status": lambda path: (
+                    path / "install-gates.status"
+                ).write_text("failed\n", encoding="utf-8"),
+            }
+            source_files = [
+                path for path in root.iterdir() if path.name != "manifest.json"
+            ]
+            for label, mutate in scenario_mutations.items():
+                with self.subTest(invalid_manifest_scenario=label):
+                    scenario_root = Path(directory) / label
+                    scenario_root.mkdir(mode=0o700)
+                    for source in source_files:
+                        shutil.copy2(source, scenario_root / source.name)
+                    mutate(scenario_root)
+                    invalid = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            finalizer,
+                            str(scenario_root),
+                            base_sha,
+                            candidate_sha,
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertNotEqual(invalid.returncode, 0)
+                    self.assertFalse((scenario_root / "manifest.json").exists())
+
+    def test_v051_warning_scan_distinguishes_match_no_match_and_scan_failure(self):
+        script = r"""
+set -euo pipefail
+rg() { return "${RG_STATUS:?}"; }
+if rg warning-pattern warning.log; then
+  warning_scan_status=0
+else
+  warning_scan_status=$?
+fi
+case "$warning_scan_status" in
+  0) exit 1 ;;
+  1) ;;
+  *) exit "$warning_scan_status" ;;
+esac
+"""
+        for rg_status, expected_status in ((0, 1), (1, 0), (2, 2), (127, 127)):
+            with self.subTest(rg_status=rg_status):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    env={**os.environ, "RG_STATUS": str(rg_status)},
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected_status)
+
+    def test_v051_candidate_identity_gate_rejects_wrong_or_implicit_sha(self):
+        script = r"""
+set -euo pipefail
+: "${EXPECTED_BASE_SHA:?set the externally reviewed full baseline SHA}"
+: "${EXPECTED_CANDIDATE_SHA:?set the externally reviewed full candidate SHA}"
+case "$EXPECTED_BASE_SHA" in
+  *[!0-9a-f]*|'') exit 2 ;;
+esac
+case "$EXPECTED_CANDIDATE_SHA" in
+  *[!0-9a-f]*|'') exit 2 ;;
+esac
+test "${#EXPECTED_BASE_SHA}" -eq 40
+test "${#EXPECTED_CANDIDATE_SHA}" -eq 40
+require_candidate_identity() {
+  ACTUAL_CANDIDATE_SHA="$(git rev-parse HEAD)"
+  test "$(git rev-parse --verify "${EXPECTED_BASE_SHA}^{commit}")" = "$EXPECTED_BASE_SHA"
+  test "$(git rev-parse --verify "${EXPECTED_CANDIDATE_SHA}^{commit}")" = "$EXPECTED_CANDIDATE_SHA"
+  test "$ACTUAL_CANDIDATE_SHA" = "$EXPECTED_CANDIDATE_SHA"
+  test "$(git merge-base "$EXPECTED_BASE_SHA" "$ACTUAL_CANDIDATE_SHA")" = "$EXPECTED_BASE_SHA"
+}
+require_candidate_identity
+EVIDENCE_PARENT="$(git rev-parse --git-common-dir)/herdr-dev-loop-release-evidence/0.5.1"
+EVIDENCE_ROOT="$EVIDENCE_PARENT/$EXPECTED_CANDIDATE_SHA"
+test "$(basename "$EVIDENCE_ROOT")" = "$ACTUAL_CANDIDATE_SHA"
+mkdir -p "$EVIDENCE_PARENT"
+test ! -L "$EVIDENCE_ROOT"
+test ! -e "$EVIDENCE_ROOT"
+mkdir -m 700 "$EVIDENCE_ROOT"
+if test -n "${MOVE_HEAD_TO:-}"; then
+  git checkout --detach "$MOVE_HEAD_TO" >/dev/null 2>&1
+fi
+git diff --check "$EXPECTED_BASE_SHA...$EXPECTED_CANDIDATE_SHA"
+require_candidate_identity
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "--initial-branch=master"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=repo, check=True
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                text=True,
+                check=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            tracked.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            candidate_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                text=True,
+                check=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+
+            scenarios = (
+                ({"EXPECTED_BASE_SHA": base_sha, "EXPECTED_CANDIDATE_SHA": candidate_sha}, True),
+                ({"EXPECTED_BASE_SHA": base_sha, "EXPECTED_CANDIDATE_SHA": base_sha}, False),
+                ({"EXPECTED_BASE_SHA": "0" * 40, "EXPECTED_CANDIDATE_SHA": candidate_sha}, False),
+                ({"EXPECTED_BASE_SHA": base_sha, "EXPECTED_CANDIDATE_SHA": candidate_sha[:12]}, False),
+                ({"EXPECTED_BASE_SHA": base_sha, "EXPECTED_CANDIDATE_SHA": candidate_sha.upper()}, False),
+                ({"EXPECTED_BASE_SHA": base_sha, "EXPECTED_CANDIDATE_SHA": candidate_sha[:-1] + ":"}, False),
+                ({"EXPECTED_BASE_SHA": base_sha}, False),
+                (
+                    {
+                        "EXPECTED_BASE_SHA": base_sha,
+                        "EXPECTED_CANDIDATE_SHA": candidate_sha,
+                        "MOVE_HEAD_TO": base_sha,
+                    },
+                    False,
+                ),
+            )
+            for identity_environment, should_pass in scenarios:
+                with self.subTest(identity_environment=identity_environment):
+                    subprocess.run(
+                        ["git", "checkout", "--detach", candidate_sha],
+                        cwd=repo,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    shutil.rmtree(
+                        repo / ".git" / "herdr-dev-loop-release-evidence",
+                        ignore_errors=True,
+                    )
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=repo,
+                        env={**os.environ, **identity_environment},
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    if should_pass:
+                        self.assertEqual(
+                            result.returncode,
+                            0,
+                            result.stderr.decode("utf-8", errors="replace"),
+                        )
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+
+    def test_v051_evidence_creation_rejects_existing_paths_and_symlinks(self):
+        script = r"""
+set -euo pipefail
+EVIDENCE_PARENT="${TEST_ROOT:?}/evidence/0.5.1"
+EVIDENCE_ROOT="$EVIDENCE_PARENT/0123456789012345678901234567890123456789"
+mkdir -p "$EVIDENCE_PARENT"
+test ! -L "$EVIDENCE_ROOT"
+test ! -e "$EVIDENCE_ROOT"
+mkdir -m 700 "$EVIDENCE_ROOT"
+WARNING_LOG="$EVIDENCE_ROOT/unit.log"
+umask 077
+set -o noclobber
+if test -n "${INJECT_LOG_SYMLINK:-}"; then
+  ln -s "$INJECT_LOG_SYMLINK" "$WARNING_LOG"
+fi
+: >"$WARNING_LOG"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_root = (
+                root
+                / "evidence"
+                / "0.5.1"
+                / "0123456789012345678901234567890123456789"
+            )
+            target = root / "target"
+            target.mkdir()
+
+            def run(**environment):
+                return subprocess.run(
+                    ["bash", "-c", script],
+                    env={**os.environ, "TEST_ROOT": str(root), **environment},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+            self.assertEqual(run().returncode, 0)
+            shutil.rmtree(evidence_root)
+
+            evidence_root.mkdir(parents=True)
+            self.assertNotEqual(run().returncode, 0)
+            shutil.rmtree(evidence_root)
+
+            evidence_root.parent.mkdir(parents=True, exist_ok=True)
+            evidence_root.symlink_to(target, target_is_directory=True)
+            self.assertNotEqual(run().returncode, 0)
+            evidence_root.unlink()
+
+            protected_target = root / "protected.log"
+            protected_target.write_text("unchanged\n", encoding="utf-8")
+            result = run(INJECT_LOG_SYMLINK=str(protected_target))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                protected_target.read_text(encoding="utf-8"), "unchanged\n"
+            )
+
+    def test_v051_clean_worktree_check_propagates_git_failure(self):
+        script = r"""
+set -euo pipefail
+git() {
+  printf '%s' "${GIT_OUTPUT:-}"
+  return "${GIT_STATUS:?}"
+}
+require_clean_worktree() {
+  local worktree_status
+  worktree_status="$(git status --porcelain --untracked-files=all)"
+  test -z "$worktree_status"
+}
+require_clean_worktree
+"""
+        scenarios = (
+            (0, "", 0),
+            (0, " M tracked-file", 1),
+            (2, "", 2),
+        )
+        for git_status, git_output, expected_status in scenarios:
+            with self.subTest(git_status=git_status, git_output=git_output):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    env={
+                        **os.environ,
+                        "GIT_STATUS": str(git_status),
+                        "GIT_OUTPUT": git_output,
+                    },
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected_status)
 
 
 def _extract_hloop_function_snippets(text):
