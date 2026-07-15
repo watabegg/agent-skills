@@ -20,6 +20,205 @@
         "required": {"type": "boolean"}
       },
       "additionalProperties": false
+    },
+    "count_map": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "manager_invocation": {
+      "type": "object",
+      "required": [
+        "provider",
+        "model",
+        "reasoning_effort",
+        "recorded_at",
+        "unavailable_reason"
+      ],
+      "properties": {
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "reasoning_effort": {"type": "string"},
+        "recorded_at": {
+          "anyOf": [
+            {"const": ""},
+            {"type": "string", "format": "date-time"}
+          ]
+        },
+        "unavailable_reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "execution_metrics": {
+      "type": "object",
+      "required": [
+        "planned_task_count",
+        "remediation_task_count",
+        "task_origin_counts",
+        "scope_revision_counts",
+        "review_fix_rounds",
+        "candidate_count",
+        "confirmed_count",
+        "finding_origin_counts",
+        "finding_contract_relation_counts",
+        "finding_decision_requirement_counts",
+        "finding_disposition_counts",
+        "review_completed_count",
+        "stale_review_count",
+        "aborted_review_count",
+        "timeout_review_count",
+        "gap_completed_count",
+        "stale_gap_count",
+        "aborted_gap_count",
+        "timeout_gap_count",
+        "worker_count",
+        "planned_task_completed",
+        "scope_expansion_started_at",
+        "scope_expansion_user_input_id",
+        "effective_parallelism",
+        "phase_wall_time_seconds",
+        "validation_time_seconds",
+        "review_wait_time_seconds",
+        "longest_worker_seconds"
+      ],
+      "properties": {
+        "planned_task_count": {"type": "integer", "minimum": 0},
+        "remediation_task_count": {"type": "integer", "minimum": 0},
+        "task_origin_counts": {"$ref": "#/$defs/count_map"},
+        "scope_revision_counts": {"$ref": "#/$defs/count_map"},
+        "review_fix_rounds": {"type": "integer", "minimum": 0},
+        "candidate_count": {"type": "integer", "minimum": 0},
+        "confirmed_count": {"type": "integer", "minimum": 0},
+        "finding_origin_counts": {"$ref": "#/$defs/count_map"},
+        "finding_contract_relation_counts": {"$ref": "#/$defs/count_map"},
+        "finding_decision_requirement_counts": {"$ref": "#/$defs/count_map"},
+        "finding_disposition_counts": {"$ref": "#/$defs/count_map"},
+        "review_completed_count": {"type": "integer", "minimum": 0},
+        "stale_review_count": {"type": "integer", "minimum": 0},
+        "aborted_review_count": {"type": "integer", "minimum": 0},
+        "timeout_review_count": {"type": "integer", "minimum": 0},
+        "gap_completed_count": {"type": "integer", "minimum": 0},
+        "stale_gap_count": {"type": "integer", "minimum": 0},
+        "aborted_gap_count": {"type": "integer", "minimum": 0},
+        "timeout_gap_count": {"type": "integer", "minimum": 0},
+        "worker_count": {"type": "integer", "minimum": 0},
+        "planned_task_completed": {"type": "boolean"},
+        "scope_expansion_started_at": {
+          "anyOf": [
+            {"const": ""},
+            {"type": "string", "format": "date-time"}
+          ]
+        },
+        "scope_expansion_user_input_id": {"type": "string"},
+        "effective_parallelism": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "number", "minimum": 0}
+          ]
+        },
+        "phase_wall_time_seconds": {"type": "number", "minimum": 0},
+        "validation_time_seconds": {"type": "number", "minimum": 0},
+        "review_wait_time_seconds": {"type": "number", "minimum": 0},
+        "longest_worker_seconds": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "follow_ups": {
+      "type": "object",
+      "required": ["count", "references", "issue_keys", "issue_key_aliases"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "references": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "issue_keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "issue_key_aliases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
+    "review_convergence": {
+      "type": "object",
+      "required": [
+        "status",
+        "target_sha",
+        "fix_round",
+        "max_fix_rounds",
+        "authorized_extra_rounds",
+        "verified_actionable_findings",
+        "artifact_refs"
+      ],
+      "properties": {
+        "status": {"type": "string", "minLength": 1},
+        "target_sha": {"type": "string"},
+        "fix_round": {"type": "integer", "minimum": 0},
+        "max_fix_rounds": {"type": "integer", "minimum": 1},
+        "authorized_extra_rounds": {"type": "integer", "minimum": 0},
+        "verified_actionable_findings": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 0}
+          ]
+        },
+        "artifact_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
+    "manual_final_review": {
+      "type": "object",
+      "required": [
+        "status",
+        "certification_id",
+        "target_sha",
+        "prepared_plan",
+        "prepared_plan_digest",
+        "manifest",
+        "report",
+        "manifest_complete",
+        "shortfall_count",
+        "verified_actionable_findings",
+        "lane_completed_count",
+        "lane_count",
+        "incomplete_attempt_count"
+      ],
+      "properties": {
+        "status": {"type": "string", "minLength": 1},
+        "certification_id": {"type": "string"},
+        "target_sha": {"type": "string"},
+        "prepared_plan": {"type": "string"},
+        "prepared_plan_digest": {"type": "string"},
+        "manifest": {"type": "string"},
+        "report": {"type": "string"},
+        "manifest_complete": {"type": ["boolean", "null"]},
+        "shortfall_count": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 0}
+          ]
+        },
+        "verified_actionable_findings": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 0}
+          ]
+        },
+        "lane_completed_count": {"type": "integer", "minimum": 0},
+        "lane_count": {"type": "integer", "minimum": 0},
+        "incomplete_attempt_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
     }
   },
   "type": "object",
@@ -79,7 +278,17 @@
     "next_user_actions": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "blocking_reason": {"type": "string"},
     "external_goal_blocked": {"type": "boolean"},
-    "finalized": {"type": "boolean"}
+    "finalized": {"type": "boolean"},
+    "manager_invocation": {"$ref": "#/$defs/manager_invocation"},
+    "execution_metrics": {"$ref": "#/$defs/execution_metrics"},
+    "follow_ups": {"$ref": "#/$defs/follow_ups"},
+    "review_convergence": {"$ref": "#/$defs/review_convergence"},
+    "manual_final_review": {"$ref": "#/$defs/manual_final_review"},
+    "postmortem_warnings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
   },
   "allOf": [
     {
