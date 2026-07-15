@@ -5740,12 +5740,13 @@ Reporting: send ack, milestone, attention, and completion reports as your unders
 python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent report \\
   --role-id {role_id} --attempt-id {attempt_id} --run-id {run_id} \\
   --task-contract-digest {task_contract_digest} --report-credential-file {credential_ref} \\
-  --invocation-id <new-stable-key-for-this-logical-report> \\
+  --invocation-id {attempt_id}:report/0001 \\
   --type ack --stage <stage> --summary '<summary>' --next '<next action>' ...
 ```
-Generate a new visible-ASCII, whitespace-free invocation ID for each logical
-report. Reuse that exact ID for every retry of the same report, and finish its
-retry before sending a newer logical report.
+Generate a new shell-safe invocation ID for each logical report. It must start
+with an ASCII alphanumeric character and then use only ASCII alphanumerics or
+`.`, `_`, `:`, `/`, `-`. Reuse that exact ID for every retry of the same report,
+and finish its retry before sending a newer logical report.
 After the initial read-only investigation, send the semantic `ack` and stop before material work. Resume only after the Manager explicitly approves that ACK and sends the approval notice. A reject or timeout requires a corrected, new ACK event.
 """
 
@@ -6894,8 +6895,8 @@ validation_commands: ["npm test -- --grep foo,bar"]
         task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
     )
     check(
-        "--invocation-id <new-stable-key-for-this-logical-report>"
-        in report_contract,
+        "--invocation-id T001-A001:report/0001" in report_contract
+        and "ASCII alphanumeric character" in report_contract,
         "report contract omitted caller-stable invocation ID",
     )
     review_override_prompt = render_reviewer_prompt(
@@ -17109,10 +17110,9 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             raise HLoopError(f"invalid report: {exc}") from exc
     invocation_id = None
     if raw_invocation_id is not None:
-        try:
-            invocation_id = hloop_events.normalize_invocation_id(raw_invocation_id)
-        except hloop_events.ReportValidationError as exc:
-            raise HLoopError(f"invalid report: {exc}") from exc
+        # The outbox decides whether this is a retry of a retained 0.5.0 key
+        # or a new 0.5.1 key.  New keys still require the shell-safe grammar.
+        invocation_id = raw_invocation_id
     outbox_path = role_report_outbox_path(
         repo,
         run_id=str(report["run_id"]),
@@ -17236,6 +17236,49 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def manager_consumer_command_name(args: argparse.Namespace) -> str | None:
+    """Return the protected Manager-consumer command name, if any."""
+
+    command = str(getattr(args, "command", "") or "")
+    if command == "inbox":
+        inbox_command = str(getattr(args, "inbox_command", "") or "")
+        if inbox_command in {"list", "show", "ack"}:
+            return f"inbox {inbox_command}"
+    if command == "manager":
+        manager_command = str(getattr(args, "manager_command", "") or "")
+        if manager_command in {"next", "sleep"}:
+            return f"manager {manager_command}"
+    return None
+
+
+def append_manager_consumer_audit(repo: Path, audit: dict[str, str]) -> None:
+    """Append one best-effort audit record without following JOURNAL symlinks."""
+
+    journal_path = loop_path(repo) / "JOURNAL.md"
+    flags = os.O_WRONLY | os.O_APPEND
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    else:
+        metadata = os.lstat(journal_path)
+        if stat.S_ISLNK(metadata.st_mode):
+            return
+    descriptor = os.open(journal_path, flags)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            return
+        stream.write(
+            f"\n## {now_iso()}\n\n"
+            "Rejected Manager consumer command from subordinate role context: "
+            + json.dumps(audit, sort_keys=True)
+            + "\n"
+        )
+
+
 def manager_consumer_preflight(args: argparse.Namespace, command: str) -> None:
     """Reject accidental Manager-consumer use inherited from a subordinate role.
 
@@ -17243,20 +17286,24 @@ def manager_consumer_preflight(args: argparse.Namespace, command: str) -> None:
     authentication boundary.  A same-UID process can remove or replace it.
     """
 
-    if os.environ.get(ROLE_CONTEXT_ENV) != "1":
+    marker_raw = os.environ.get(ROLE_CONTEXT_ENV)
+    role_raw = os.environ.get(ROLE_ID_ENV)
+    attempt_raw = os.environ.get(ROLE_ATTEMPT_ID_ENV)
+    manager_repo_value = os.environ.get(MANAGER_REPO_ENV)
+    if all(
+        value is None
+        for value in (marker_raw, role_raw, attempt_raw, manager_repo_value)
+    ):
         return
 
-    role_id = str(os.environ.get(ROLE_ID_ENV) or "")
-    attempt_id = str(os.environ.get(ROLE_ATTEMPT_ID_ENV) or "")
-    manager_repo_raw = str(os.environ.get(MANAGER_REPO_ENV) or "")
+    role_id = str(role_raw or "")
+    attempt_id = str(attempt_raw or "")
+    manager_repo_raw = str(manager_repo_value or "")
     manager_repo: Path | None = None
-    reason = "subordinate-context"
+    reason = "malformed-role-context"
 
-    if not role_id or not attempt_id:
-        reason = "malformed-role-context"
-    elif not manager_repo_raw:
-        reason = "manager-context-unavailable"
-    else:
+    if marker_raw == "1" and role_id and attempt_id and manager_repo_raw:
+        reason = "subordinate-context"
         try:
             manager_repo = Path(manager_repo_raw).expanduser().resolve()
             manager_state = load_state(manager_repo)
@@ -17284,13 +17331,7 @@ def manager_consumer_preflight(args: argparse.Namespace, command: str) -> None:
     }
     if manager_repo is not None:
         try:
-            journal_path = loop_path(manager_repo) / "JOURNAL.md"
-            if journal_path.is_file():
-                journal(
-                    manager_repo,
-                    "Rejected Manager consumer command from subordinate role context: "
-                    + json.dumps(audit, sort_keys=True),
-                )
+            append_manager_consumer_audit(manager_repo, audit)
         except Exception:  # best-effort audit must never weaken the rejection
             pass
     raise HLoopError(
@@ -19428,7 +19469,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report_idempotency.add_argument(
         "--invocation-id",
-        help="caller-stable visible-ASCII key reused for one logical report retry",
+        help="caller-stable shell-safe key reused for one logical report retry",
     )
     agent_report.add_argument("--task-contract-digest")
     report_credential = agent_report.add_mutually_exclusive_group()
@@ -20449,6 +20490,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         configure_loop_namespace(getattr(args, "namespace", None))
+        protected_manager_command = manager_consumer_command_name(args)
+        if protected_manager_command is not None:
+            # Reject inherited subordinate contexts before schema guards or the
+            # cross-worktree lock can block on a Manager that is waiting for
+            # this role. Command-local guards remain for direct Python callers.
+            manager_consumer_preflight(args, protected_manager_command)
         # Resolve/verify the trusted git executable before any code path below
         # can execute a PATH `git` -- `find_repo_root` and STATE.json reads are
         # plain filesystem operations, so no git subprocess runs before this
