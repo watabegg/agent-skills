@@ -9,5 +9,7 @@ __all__ = [
     "migration",
     "providers",
     "requirements",
+    "release_scope",
     "review",
+    "review_policy",
 ]

@@ -43,8 +43,10 @@ from hloop_lib import events as hloop_events
 from hloop_lib import hooks as hloop_hooks
 from hloop_lib import providers as hloop_providers
 from hloop_lib import requirements as hloop_requirements
+from hloop_lib import release_scope as hloop_release_scope
 from hloop_lib import reports as hloop_reports
 from hloop_lib import review as hloop_review
+from hloop_lib import review_policy as hloop_review_policy
 from hloop_lib import supervisor as hloop_supervisor
 from hloop_lib.decisions import (
     DECISION_ACCEPTED,
@@ -184,6 +186,10 @@ STRICT_MULTILINE_LIST_FIELDS = {
     "evidence",
     "participants",
     "review_lanes",
+    "plan_item_refs",
+    "requirement_refs",
+    "scope_refs",
+    "source_review_fingerprints",
     "source_refs",
     "spec_sources",
     "task_ids",
@@ -1542,6 +1548,12 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
         return True
     if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish", "final-gates", "cleanup"}:
         return True
+    if command == "release-scope":
+        return getattr(args, "release_scope_command", "") in {"lock", "amend"}
+    if command == "dispatch":
+        return getattr(args, "dispatch_command", "") in {"freeze", "unfreeze"}
+    if command == "follow-up":
+        return getattr(args, "follow_up_command", "") in {"add", "export"}
     if command == "batch":
         return getattr(args, "batch_command", "") in {"start", "assign", "close"}
     if command == "harvest":
@@ -1883,6 +1895,19 @@ def extract_fix_task_candidates(text: str, source_id: str) -> tuple[list[dict[st
             "acceptance": normalize_list(data.get("acceptance")),
             "depends_on": normalize_list(data.get("depends_on")),
             "rationale": str(data.get("rationale") or data.get("reason") or ""),
+            "task_origin": str(data.get("task_origin") or ""),
+            "release_scope_revision": data.get("release_scope_revision"),
+            "plan_item_refs": normalize_list(data.get("plan_item_refs") or data.get("plan_item_ref")),
+            "requirement_refs": normalize_list(data.get("requirement_refs") or data.get("requirement_ref")),
+            "scope_refs": normalize_list(data.get("scope_refs") or data.get("scope_ref")),
+            "authorization_input_id": str(data.get("authorization_input_id") or data.get("user_input_id") or ""),
+            "why_fix_now": str(data.get("why_fix_now") or ""),
+            "origin": str(data.get("origin") or ""),
+            "contract_relation": str(data.get("contract_relation") or ""),
+            "release_effect": str(data.get("release_effect") or ""),
+            "remediation_round": data.get("remediation_round", 0),
+            "fact_status": str(data.get("fact_status") or ""),
+            "disposition": str(data.get("disposition") or ""),
         }
         reasons = validate_fix_task_candidate(candidate, {**data, "action": action})
         if reasons:
@@ -1932,8 +1957,339 @@ def ensure_loop_dirs(repo: Path) -> None:
         "inbox/manager",
         "inbox/pending",
         "inbox/user",
+        "release-scope/amendments",
+        "follow-ups",
     ]:
         (loop_path(repo) / rel).mkdir(parents=True, exist_ok=True)
+
+
+def dispatch_freeze_record(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the normalized dispatch-freeze record without creating policy state."""
+
+    value = state.get("dispatch_freeze")
+    if not isinstance(value, dict):
+        return {
+            "status": "inactive",
+            "reason": "",
+            "frozen_at": "",
+            "source_input_id": "",
+            "allowed_running_role_ids": [],
+        }
+    return value
+
+
+def dispatch_is_frozen(state: dict[str, Any]) -> bool:
+    return str(dispatch_freeze_record(state).get("status") or "inactive") == "active"
+
+
+def release_scope_from_state(state: dict[str, Any]) -> hloop_release_scope.ReleaseScope:
+    """Load scope policy, treating pre-0.5.2 state as explicitly legacy."""
+
+    value = state.get("release_scope")
+    if value is None:
+        return hloop_release_scope.ReleaseScope(status="legacy-unlocked")
+    if not isinstance(value, dict):
+        raise HLoopError("STATE.json release_scope must be an object")
+    try:
+        return hloop_release_scope.ReleaseScope.from_record(value)
+    except hloop_release_scope.ReleaseScopeError as exc:
+        raise HLoopError(f"invalid release_scope state: {exc}") from exc
+
+
+def release_scope_enabled(state: dict[str, Any]) -> bool:
+    return "release_scope" in state
+
+
+def safe_repo_path(repo: Path, raw: str, *, default_loop_path: bool = False) -> Path:
+    value = str(raw or "").strip()
+    if not value:
+        raise HLoopError("source reference must be non-empty")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = loop_path(repo) / candidate if default_loop_path else repo / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(repo.resolve())
+    except ValueError as exc:
+        raise HLoopError(f"path escapes repository: {raw}") from exc
+    return resolved
+
+
+def scope_source_path(repo: Path, reference: str) -> Path:
+    """Resolve a scope reference against the loop first, then the repository."""
+
+    value = str(reference or "").strip()
+    if value.startswith(str(LOOP_DIR) + "/"):
+        return safe_repo_path(repo, value)
+    loop_candidate = safe_repo_path(repo, value, default_loop_path=True)
+    if loop_candidate.exists():
+        return loop_candidate
+    return safe_repo_path(repo, value)
+
+
+def read_scope_sources(repo: Path, references: Sequence[str]) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for reference in references:
+        path = scope_source_path(repo, reference)
+        if not path.is_file():
+            raise HLoopError(f"release-scope source does not exist: {reference}")
+        try:
+            sources[str(reference)] = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HLoopError(f"cannot read release-scope source {reference}: {exc}") from exc
+    return sources
+
+
+def assert_release_scope_snapshot(
+    repo: Path, state: dict[str, Any]
+) -> hloop_release_scope.ReleaseScope:
+    scope = release_scope_from_state(state)
+    if scope.status == "locked":
+        try:
+            scope.assert_source_snapshot(read_scope_sources(repo, scope.source_refs))
+        except hloop_release_scope.ReleaseScopeError as exc:
+            raise HLoopError(str(exc)) from exc
+    return scope
+
+
+def _arg_list(args: argparse.Namespace, *names: str) -> list[str]:
+    for name in names:
+        value = getattr(args, name, None)
+        if value:
+            return [str(item) for item in normalize_list(value)]
+    return []
+
+
+def provenance_record_from_args(
+    args: argparse.Namespace | None,
+    state: dict[str, Any],
+    *,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one flat provenance record for every task-creation entry point."""
+
+    candidate = candidate or {}
+    get = lambda name, default=None: getattr(args, name, None) if args is not None else default
+
+    source_finding = str(get("source_finding") or candidate.get("source_finding") or "")
+    scope = release_scope_from_state(state)
+    requested_origin = get("task_origin") or candidate.get("task_origin")
+    if requested_origin:
+        task_origin = str(requested_origin)
+    elif source_finding:
+        task_origin = "finding"
+    elif scope.status == "locked":
+        task_origin = "planned"
+    else:
+        task_origin = "legacy-unclassified"
+    scope_refs = _arg_list(args, "scope_ref", "release_scope_ref") or normalize_list(
+        candidate.get("scope_refs") or candidate.get("release_scope_refs")
+    )
+    revision_value = get("release_scope_revision")
+    if revision_value is None:
+        revision_value = candidate.get("release_scope_revision")
+    if revision_value is None:
+        revision_value = scope.scope_revision if release_scope_enabled(state) else 0
+    if isinstance(revision_value, str) and re.fullmatch(r"[0-9]+", revision_value):
+        revision_value = int(revision_value)
+    remediation_value = get("remediation_round")
+    if remediation_value is None:
+        remediation_value = candidate.get("remediation_round", 0)
+    if isinstance(remediation_value, str) and re.fullmatch(r"[0-9]+", remediation_value):
+        remediation_value = int(remediation_value)
+    record: dict[str, Any] = {
+        "task_origin": task_origin,
+        "release_scope_revision": revision_value,
+        "plan_item_refs": _arg_list(args, "plan_item_ref") or normalize_list(
+            candidate.get("plan_item_refs")
+        ),
+        "requirement_refs": _arg_list(args, "requirement_ref") or normalize_list(
+            candidate.get("requirement_refs")
+        ),
+        "scope_refs": scope_refs,
+        "source_finding": source_finding,
+        "authorization_input_id": str(
+            get("authorization_input_id")
+            or get("user_input_id")
+            or candidate.get("authorization_input_id")
+            or ""
+        ),
+        "why_fix_now": str(get("why_fix_now") or candidate.get("why_fix_now") or ""),
+        "operational_reason": str(
+            get("operational_reason") or candidate.get("operational_reason") or ""
+        ),
+        "origin": str(get("origin") or candidate.get("origin") or ""),
+        "contract_relation": str(
+            get("contract_relation") or candidate.get("contract_relation") or ""
+        ),
+        "release_effect": str(
+            get("release_effect") or candidate.get("release_effect") or ""
+        ),
+        "remediation_round": remediation_value,
+        "fact_status": str(get("fact_status") or candidate.get("fact_status") or ""),
+        "disposition": str(get("disposition") or candidate.get("disposition") or ""),
+    }
+    scope_expanding = bool(get("scope_expanding") or candidate.get("scope_expanding", False))
+    if scope_expanding:
+        record["scope_expanding"] = True
+    return record
+
+
+def authorize_task_record(
+    repo: Path,
+    state: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    existing_task: dict[str, Any] | None = None,
+) -> hloop_release_scope.TaskProvenance:
+    scope = assert_release_scope_snapshot(repo, state)
+    try:
+        return hloop_release_scope.authorize_task_creation(
+            record,
+            scope,
+            existing_task=existing_task,
+            locked_plan_item_refs=scope.plan_item_refs,
+            locked_requirement_refs=scope.requirement_refs,
+            locked_finding_ids=normalize_list(
+                state.get("locked_finding_ids") or state.get("finding_ids")
+            ),
+            legacy_mode=scope.status == "legacy-unlocked",
+            allow_legacy_unclassified=scope.status == "legacy-unlocked",
+        )
+    except hloop_release_scope.ReleaseScopeError as exc:
+        raise HLoopError(f"task authorization failed: {exc}") from exc
+
+
+def task_provenance_record(meta: dict[str, Any]) -> dict[str, Any] | None:
+    if not meta.get("task_origin"):
+        return None
+    record = {
+        key: meta.get(key, [] if key.endswith("_refs") else "")
+        for key in (
+            "task_origin",
+            "release_scope_revision",
+            "plan_item_refs",
+            "requirement_refs",
+            "scope_refs",
+            "source_finding",
+            "authorization_input_id",
+            "why_fix_now",
+            "operational_reason",
+            "origin",
+            "contract_relation",
+            "release_effect",
+            "remediation_round",
+            "fact_status",
+            "disposition",
+        )
+        if key in meta
+    }
+    for key in ("release_scope_revision", "remediation_round"):
+        value = record.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            record[key] = int(value)
+    return record | ({"scope_expanding": True} if meta.get("scope_expanding") else {})
+
+
+def validate_task_update_provenance(
+    repo: Path,
+    state: dict[str, Any],
+    current_meta: dict[str, Any],
+    updates: dict[str, Any],
+) -> None:
+    old_record = task_provenance_record(current_meta)
+    if old_record is None and not release_scope_enabled(state):
+        return
+    if old_record is None:
+        raise HLoopError("new-policy task is missing immutable provenance")
+    next_meta = dict(current_meta)
+    next_meta.update(updates)
+    if bool(current_meta.get("scope_expanding")) != bool(next_meta.get("scope_expanding")):
+        raise HLoopError("task provenance update rejected: scope_expanding is immutable")
+    scope = assert_release_scope_snapshot(repo, state)
+    try:
+        hloop_release_scope.validate_provenance_update(
+            old_record,
+            task_provenance_record(next_meta) or {},
+            scope,
+            locked_plan_item_refs=scope.plan_item_refs,
+            locked_requirement_refs=scope.requirement_refs,
+            locked_finding_ids=normalize_list(
+                state.get("locked_finding_ids") or state.get("finding_ids")
+            ),
+            legacy_mode=scope.status == "legacy-unlocked",
+            allow_legacy_unclassified=scope.status == "legacy-unlocked",
+        )
+    except hloop_release_scope.ReleaseScopeError as exc:
+        raise HLoopError(f"task provenance update rejected: {exc}") from exc
+
+
+def dispatch_start_preflight(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    role_kind: str,
+    task_meta: dict[str, Any] | None = None,
+) -> None:
+    if dispatch_is_frozen(state):
+        freeze = dispatch_freeze_record(state)
+        reason = str(freeze.get("reason") or "Manager dispatch freeze")
+        raise HLoopError(
+            f"dispatch is frozen; cannot start {role_kind} {role_id}: {reason}"
+        )
+    scope = assert_release_scope_snapshot(repo, state)
+    if release_scope_enabled(state) and scope.status not in {"locked", "legacy-unlocked"}:
+        raise HLoopError(
+            f"{role_kind} dispatch requires a locked release scope; current status={scope.status}"
+        )
+    if role_kind == "worker":
+        if task_meta is None:
+            raise HLoopError(f"worker task metadata is unavailable: {role_id}")
+        record = task_provenance_record(task_meta)
+        if record is None:
+            if scope.status != "legacy-unlocked":
+                raise HLoopError(f"task {role_id} is missing immutable provenance")
+        else:
+            authorize_task_record(repo, state, record)
+
+
+def assert_task_creation_dispatchable(state: dict[str, Any]) -> None:
+    if dispatch_is_frozen(state):
+        freeze = dispatch_freeze_record(state)
+        raise HLoopError(
+            "dispatch is frozen; cannot create a task: "
+            + str(freeze.get("reason") or "Manager dispatch freeze")
+        )
+
+
+def role_ids_running(state: dict[str, Any]) -> list[str]:
+    running: list[str] = []
+    for group_name in ("tasks", "reviews", "gaps", "advice", "decision_liaisons"):
+        group = state.get(group_name)
+        if not isinstance(group, dict):
+            continue
+        for role_id, value in group.items():
+            if not isinstance(value, dict):
+                continue
+            status = str(value.get("status") or value.get("gate_status") or "")
+            if status in {"running", "starting", "awaiting_result"}:
+                running.append(str(role_id))
+            if group_name == "advice":
+                for participant in value.get("participants", []):
+                    if not isinstance(participant, dict):
+                        continue
+                    participant_status = str(
+                        participant.get("status") or participant.get("gate_status") or ""
+                    )
+                    if participant_status in {"running", "starting", "awaiting_result"}:
+                        running.append(
+                            f"{role_id}/{participant.get('participant_id') or 'P1'}"
+                        )
+    scout = state.get("specification_scout_run")
+    if isinstance(scout, dict) and str(scout.get("status") or "") in {"running", "starting"}:
+        running.append("S001")
+    return sorted(dict.fromkeys(running))
 
 
 def archive_existing_loop(repo: Path) -> Path | None:
@@ -4916,22 +5272,37 @@ def collect_loop_inventory(
             issues.extend(item.get("issues", []))
     issues = sorted(issues, key=issue_sort_key)
     next_actions = []
+    dispatch_frozen = dispatch_is_frozen(state)
+    release_scope = release_scope_from_state(state)
 
     def add_next_action(action: str) -> None:
+        if dispatch_frozen and any(
+            token in action
+            for token in (
+                "hloop worker start",
+                "hloop reviewer start",
+                "hloop gap start",
+                "hloop advisor start",
+                "hloop specification-scout start",
+                "Decision Liaison",
+            )
+        ):
+            return
         if action and action not in next_actions:
             next_actions.append(action)
 
     if phase not in RUN_TERMINAL_PHASES:
         for item in issues:
             add_next_action(item.get("action", ""))
-        if state.get("needs_gap_check") and not pending_gap_exists(state):
-            add_next_action("hloop gap start")
-        if state.get("needs_review") and not pending_review_exists(state):
-            add_next_action("hloop reviewer start")
-        if last_validation_passed(state) and should_open_gap_gate(state):
-            add_next_action("hloop tick --once # open gap gate")
-        if last_validation_passed(state) and should_open_review_gate(state):
-            add_next_action("hloop tick --once # open review gate")
+        if not dispatch_frozen:
+            if state.get("needs_gap_check") and not pending_gap_exists(state):
+                add_next_action("hloop gap start")
+            if state.get("needs_review") and not pending_review_exists(state):
+                add_next_action("hloop reviewer start")
+            if last_validation_passed(state) and should_open_gap_gate(state):
+                add_next_action("hloop tick --once # open gap gate")
+            if last_validation_passed(state) and should_open_review_gate(state):
+                add_next_action("hloop tick --once # open review gate")
     running_workers = [item["id"] for item in workers if item.get("status") == "running"]
     running_reviewers = [item["id"] for item in reviewers if item.get("gate_status") == "running"]
     running_gaps = [item["id"] for item in gaps if item.get("gate_status") == "running"]
@@ -4962,6 +5333,10 @@ def collect_loop_inventory(
             "needs_validation": normalize_bool(state.get("needs_validation")),
             "needs_review": normalize_bool(state.get("needs_review")),
             "needs_gap_check": normalize_bool(state.get("needs_gap_check")),
+            "dispatch_frozen": dispatch_frozen,
+            "dispatch_freeze": dispatch_freeze_record(state),
+            "release_scope": release_scope.to_record(),
+            "follow_ups": _follow_up_state(state),
             "review_queue": {
                 "count": normalize_int(state.get("unreviewed_merge_count"), 0),
                 "threshold": review_after_merges(state),
@@ -7511,6 +7886,24 @@ None.
         "max_gap_auditors": args.max_gap_auditors,
         "spec_sources": args.spec_source or [],
         "validation_commands": args.validation or [],
+        # ``release-scope lock`` adds the policy record.  Until a Manager
+        # explicitly locks the source snapshot, this state remains
+        # legacy-unlocked so existing v0.5.1 loops retain their task flow.
+        "dispatch_freeze": {
+            "status": "inactive",
+            "reason": "",
+            "frozen_at": "",
+            "source_input_id": "",
+            "allowed_running_role_ids": [],
+        },
+        "follow_ups": {
+            "next_id": 1,
+            "open_count": 0,
+            "artifact_refs": [],
+            "issue_keys": {},
+            "issue_key_aliases": {},
+            "export_paths": [],
+        },
         "tasks": {},
         "batches": {},
         "reviews": {},
@@ -7540,6 +7933,27 @@ None.
     if state_path(repo).exists() and not args.force:
         old = load_state(repo)
         old.setdefault("validation_commands", args.validation or [])
+        old.setdefault(
+            "dispatch_freeze",
+            {
+                "status": "inactive",
+                "reason": "",
+                "frozen_at": "",
+                "source_input_id": "",
+                "allowed_running_role_ids": [],
+            },
+        )
+        old.setdefault(
+            "follow_ups",
+            {
+                "next_id": 1,
+                "open_count": 0,
+                "artifact_refs": [],
+                "issue_keys": {},
+                "issue_key_aliases": {},
+                "export_paths": [],
+            },
+        )
         old.setdefault("run_id", new_run_id(str(old.get("goal_id") or goal_id)))
         old.setdefault("skill_version", "unversioned")
         old.setdefault("namespace", LOOP_NAMESPACE)
@@ -7611,6 +8025,446 @@ None.
     return 0
 
 
+def print_policy_payload(payload: dict[str, Any], *, as_json: bool, label: str) -> None:
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    print(label)
+    for key, value in payload.items():
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            rendered = str(value)
+        print(f"{key}: {rendered}")
+
+
+def cmd_release_scope_lock(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    current = release_scope_from_state(state)
+    if current.status == "locked":
+        raise HLoopError("release scope is already locked; use release-scope amend")
+    source_refs = _arg_list(args, "source_ref") or [
+        "MISSION.md",
+        "PLAN.md",
+    ]
+    sources = read_scope_sources(repo, source_refs)
+    try:
+        scope = hloop_release_scope.ReleaseScope.lock(
+            source_refs=source_refs,
+            source_contents=sources,
+            scope_revision=1,
+            source_snapshot_revision=1,
+            locked_at=now_iso(),
+            plan_item_refs=_arg_list(args, "plan_item_ref"),
+            requirement_refs=_arg_list(args, "requirement_ref"),
+            release_scope_refs=_arg_list(args, "scope_ref", "release_scope_ref")
+            or source_refs,
+        )
+    except hloop_release_scope.ReleaseScopeError as exc:
+        raise HLoopError(f"cannot lock release scope: {exc}") from exc
+    state["release_scope"] = scope.to_record()
+    state.setdefault("dispatch_freeze", dispatch_freeze_record(state))
+    state.setdefault(
+        "follow_ups",
+        {"next_id": 1, "open_count": 0, "artifact_refs": [], "issue_keys": {}, "issue_key_aliases": {}},
+    )
+    save_state(repo, state)
+    journal(repo, f"Locked release scope revision {scope.scope_revision} from {', '.join(source_refs)}.")
+    payload = {"status": "locked", "scope": scope.to_record()}
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label="release scope locked")
+    return 0
+
+
+def cmd_release_scope_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    scope = release_scope_from_state(state)
+    drift: list[str] = []
+    if scope.status == "locked":
+        try:
+            drift = list(scope.source_drift(read_scope_sources(repo, scope.source_refs)))
+        except HLoopError as exc:
+            drift = [str(exc)]
+    payload = {
+        "status": scope.status,
+        "enabled": release_scope_enabled(state),
+        "scope": scope.to_record(),
+        "source_drift": drift,
+        "source_snapshot_ok": not drift,
+    }
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label="release scope status")
+    return 0
+
+
+def cmd_release_scope_amend(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    # An amendment is the explicit escape hatch for a changed source
+    # snapshot, so do not reject the very drift this command is meant to
+    # record.  The immutable previous digest is carried by the core module.
+    scope = release_scope_from_state(state)
+    if scope.status != "locked":
+        raise HLoopError("release-scope amend requires a locked release scope")
+    source_refs = _arg_list(args, "source_ref") or list(scope.source_refs)
+    sources = read_scope_sources(repo, source_refs)
+    amendment_refs = {ref: True for ref in scope.amendment_refs}
+    amendment_id = next_id("A", amendment_refs)
+    try:
+        amendment = hloop_release_scope.create_amendment(
+            scope,
+            amendment_id=amendment_id,
+            kind=args.kind,
+            reason=args.reason,
+            new_source_contents=sources,
+            basis_refs=_arg_list(args, "basis_ref"),
+            user_input_id=str(
+                getattr(args, "user_input_id", None)
+                or getattr(args, "authorization_input_id", None)
+                or ""
+            ),
+            affected_task_ids=_arg_list(args, "affected_task_id"),
+            created_at=now_iso(),
+        )
+        updated_scope = scope.apply_amendment(amendment)
+    except hloop_release_scope.ReleaseScopeError as exc:
+        raise HLoopError(f"cannot amend release scope: {exc}") from exc
+    amendment_path = loop_path(repo) / "release-scope" / "amendments" / f"{amendment_id}.json"
+    write_text(amendment_path, json.dumps(amendment.to_record(), ensure_ascii=False, indent=2) + "\n")
+    state["release_scope"] = updated_scope.to_record()
+    save_state(repo, state)
+    journal(repo, f"Applied release-scope amendment `{amendment_id}` ({amendment.kind}).")
+    payload = {
+        "status": "amended",
+        "amendment": amendment.to_record(),
+        "scope": updated_scope.to_record(),
+        "artifact": str(amendment_path),
+    }
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label=f"release scope amended: {amendment_id}")
+    return 0
+
+
+def cmd_dispatch_freeze(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    freeze = dispatch_freeze_record(state)
+    if str(freeze.get("status") or "inactive") == "active":
+        raise HLoopError("dispatch is already frozen")
+    source_input_id = str(
+        getattr(args, "source_input_id", None)
+        or getattr(args, "user_input_id", None)
+        or ""
+    )
+    if source_input_id and not re.fullmatch(r"U[0-9]{4}", source_input_id):
+        raise HLoopError("source_input_id must match U0001-style input ids")
+    allowed = _arg_list(args, "allowed_running_role_id") or role_ids_running(state)
+    state["dispatch_freeze"] = {
+        "status": "active",
+        "reason": str(args.reason).strip(),
+        "frozen_at": now_iso(),
+        "source_input_id": source_input_id,
+        "allowed_running_role_ids": allowed,
+    }
+    save_state(repo, state)
+    journal(repo, f"Froze new dispatch: {args.reason}")
+    payload = {"status": "active", "dispatch_freeze": state["dispatch_freeze"]}
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label="dispatch frozen")
+    return 0
+
+
+def cmd_dispatch_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    freeze = dispatch_freeze_record(state)
+    payload = {
+        "status": freeze.get("status", "inactive"),
+        "active": dispatch_is_frozen(state),
+        "dispatch_freeze": freeze,
+    }
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label="dispatch status")
+    return 0
+
+
+def cmd_dispatch_unfreeze(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    reason = str(getattr(args, "reason", None) or "").strip()
+    source_input_id = str(
+        getattr(args, "source_input_id", None)
+        or getattr(args, "user_input_id", None)
+        or ""
+    )
+    if not reason and not source_input_id:
+        raise HLoopError("dispatch unfreeze requires --reason or --user-input-id")
+    if source_input_id and not re.fullmatch(r"U[0-9]{4}", source_input_id):
+        raise HLoopError("source_input_id must match U0001-style input ids")
+    current = dispatch_freeze_record(state)
+    state["dispatch_freeze"] = {
+        **current,
+        "status": "inactive",
+        "reason": "",
+        "frozen_at": "",
+        "source_input_id": "",
+        "allowed_running_role_ids": [],
+        "unfrozen_at": now_iso(),
+        "unfreeze_reason": reason,
+        "unfreeze_input_id": source_input_id,
+    }
+    save_state(repo, state)
+    journal(repo, f"Unfroze dispatch: {reason or source_input_id}")
+    payload = {"status": "inactive", "dispatch_freeze": state["dispatch_freeze"]}
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label="dispatch unfrozen")
+    return 0
+
+
+def _follow_up_state(state: dict[str, Any]) -> dict[str, Any]:
+    value = state.setdefault("follow_ups", {})
+    if not isinstance(value, dict):
+        raise HLoopError("STATE.json follow_ups must be an object")
+    value.setdefault("next_id", 1)
+    value.setdefault("open_count", 0)
+    value.setdefault("artifact_refs", [])
+    value.setdefault("issue_keys", {})
+    value.setdefault("issue_key_aliases", {})
+    value.setdefault("export_paths", [])
+    return value
+
+
+def _follow_up_artifact(repo: Path, follow_up_id: str) -> Path:
+    if not re.fullmatch(r"F[0-9]{3}", follow_up_id):
+        raise HLoopError(f"invalid follow-up id: {follow_up_id}")
+    return loop_path(repo) / "follow-ups" / f"{follow_up_id}.md"
+
+
+def _follow_up_records(repo: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for raw_ref in normalize_list(_follow_up_state(state).get("artifact_refs")):
+        path = repo / raw_ref if not Path(raw_ref).is_absolute() else Path(raw_ref)
+        if path.is_file():
+            record = read_frontmatter(path)
+            if record:
+                record["artifact"] = str(path)
+                records.append(record)
+    return records
+
+
+def _refresh_follow_up_count(state: dict[str, Any]) -> None:
+    follow_ups = _follow_up_state(state)
+    follow_ups["open_count"] = sum(
+        1 for record in state.get("_follow_up_records_cache", [])
+        if str(record.get("status") or "") in {"open", "active", "deferred"}
+    )
+    state.pop("_follow_up_records_cache", None)
+
+
+def cmd_follow_up_add(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    follow_ups = _follow_up_state(state)
+    try:
+        key = hloop_review_policy.build_follow_up_issue_key(
+            component=args.component,
+            trigger_class=args.trigger_class,
+            product_impact=args.product_impact,
+            root_cause=args.root_cause,
+        )
+        disposition = hloop_review_policy.FindingDisposition(
+            fact_status=args.fact_status,
+            origin=args.origin,
+            contract_relation=args.contract_relation,
+            decision_requirement=args.decision_requirement,
+            severity=args.severity,
+            disposition=args.disposition,
+            release_effect=args.release_effect,
+            requirement_refs=tuple(_arg_list(args, "requirement_ref")),
+            why_fix_now=args.why_fix_now or "",
+            remediation_round=args.remediation_round,
+        )
+        hloop_review_policy.validate_disposition(
+            disposition,
+            acceptance_can_be_met_without_decision=bool(args.acceptance_can_be_met_without_decision),
+            safety_critical=bool(args.safety_critical),
+            scope_change_authorized=bool(args.scope_change_authorized),
+            accepted_risk_authorized=bool(args.accepted_risk_authorized),
+        )
+    except hloop_review_policy.ReviewPolicyError as exc:
+        raise HLoopError(f"follow-up policy rejected: {exc}") from exc
+    if args.recommended_action != "defer_follow_up":
+        raise HLoopError("follow-up add requires recommended_action=defer_follow_up")
+    if args.disposition != "defer_follow_up":
+        raise HLoopError("follow-up add accepts only the defer_follow_up disposition")
+    if not args.source_review_fingerprint:
+        raise HLoopError("follow-up requires at least one --source-review-fingerprint")
+    if not args.evidence:
+        raise HLoopError("follow-up requires at least one --evidence")
+    if not args.affected_path and not args.symbol:
+        raise HLoopError("follow-up requires --affected-path or --symbol")
+    fingerprints = []
+    for raw in args.source_review_fingerprint:
+        value = str(raw).strip().lower()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise HLoopError("source review fingerprints must use sha256:<64 hex chars>")
+        if value not in fingerprints:
+            fingerprints.append(value)
+    issue_key = key.key
+    issue_keys = follow_ups["issue_keys"]
+    if not isinstance(issue_keys, dict):
+        raise HLoopError("STATE.json follow_ups.issue_keys must be an object")
+    existing_id = str(issue_keys.get(issue_key) or "")
+    duplicate = bool(existing_id)
+    follow_up_id = existing_id or next_id("F", {
+        ref: True for ref in normalize_list(follow_ups.get("artifact_refs"))
+    })
+    path = _follow_up_artifact(repo, follow_up_id)
+    previous = read_frontmatter(path) if path.exists() else {}
+    created_at = str(previous.get("created_at") or now_iso())
+    previous_fingerprints = normalize_list(previous.get("source_review_fingerprints"))
+    previous_evidence = normalize_list(previous.get("evidence"))
+    key_record = key.to_record()
+    if key_record.get("root_cause") is None:
+        key_record["root_cause"] = ""
+    record: dict[str, Any] = {
+        "id": follow_up_id,
+        "title": args.title,
+        "status": str(previous.get("status") or args.status),
+        **key_record,
+        "source_review_fingerprints": list(dict.fromkeys([*previous_fingerprints, *fingerprints])),
+        "discovered_head": args.discovered_head or git(repo, ["rev-parse", state["integration_branch"]]),
+        "evidence": list(dict.fromkeys([*previous_evidence, *args.evidence])),
+        "impact": args.impact,
+        "fact_status": args.fact_status,
+        "severity": args.severity,
+        "origin": args.origin,
+        "contract_relation": args.contract_relation,
+        "decision_requirement": args.decision_requirement,
+        "release_effect": args.release_effect,
+        "requirement_refs": _arg_list(args, "requirement_ref"),
+        "recommended_action": args.recommended_action,
+        "deferred_reason": args.deferred_reason,
+        "reconsider_condition": args.reconsider_condition,
+        "created_at": created_at,
+        "updated_at": now_iso(),
+    }
+    for name in (
+        "source_review",
+        "source_gap",
+        "source_task",
+        "source_finding",
+        "affected_path",
+        "symbol",
+        "target_version",
+        "milestone",
+    ):
+        value = getattr(args, name, None)
+        if value:
+            record[name] = value
+    write_text(path, frontmatter(record) + f"\n# {args.title}\n\n{args.impact}\n")
+    artifact_ref = str(path.relative_to(repo))
+    refs = normalize_list(follow_ups.get("artifact_refs"))
+    if artifact_ref not in refs:
+        refs.append(artifact_ref)
+    follow_ups["artifact_refs"] = refs
+    if not duplicate:
+        follow_ups["next_id"] = max(
+            normalize_int(follow_ups.get("next_id"), 1),
+            int(follow_up_id[1:]) + 1,
+        )
+    issue_keys[issue_key] = follow_up_id
+    state["_follow_up_records_cache"] = _follow_up_records(repo, state)
+    _refresh_follow_up_count(state)
+    save_state(repo, state)
+    journal(repo, f"{'Updated' if duplicate else 'Recorded'} follow-up `{follow_up_id}` ({issue_key}).")
+    payload = {"status": "deduplicated" if duplicate else "created", "follow_up": record, "artifact": str(path)}
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label=f"follow-up {'updated' if duplicate else 'created'}: {follow_up_id}")
+    return 0
+
+
+def resolve_follow_up_id(state: dict[str, Any], raw_id: str) -> str:
+    value = str(raw_id or "").strip()
+    if re.fullmatch(r"F[0-9]{3}", value):
+        return value
+    issue_keys = _follow_up_state(state).get("issue_keys", {})
+    if isinstance(issue_keys, dict) and value in issue_keys:
+        return str(issue_keys[value])
+    raise HLoopError(f"unknown follow-up: {value}")
+
+
+def cmd_follow_up_list(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    records = _follow_up_records(repo, state)
+    if getattr(args, "status", None):
+        records = [record for record in records if record.get("status") == args.status]
+    if getattr(args, "json", False):
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+    else:
+        for record in records:
+            print(f"{record.get('id')}: {record.get('status')} {record.get('title')} [{record.get('issue_key')}]")
+        if not records:
+            print("no follow-ups")
+    return 0
+
+
+def cmd_follow_up_show(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    follow_up_id = resolve_follow_up_id(state, args.follow_up_id)
+    path = _follow_up_artifact(repo, follow_up_id)
+    if not path.is_file():
+        raise HLoopError(f"follow-up artifact does not exist: {follow_up_id}")
+    if getattr(args, "json", False):
+        print(json.dumps(read_frontmatter(path), ensure_ascii=False, indent=2))
+    else:
+        print(read_text(path), end="")
+    return 0
+
+
+def cmd_follow_up_export(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    records = _follow_up_records(repo, state)
+    output = Path(args.output) if args.output else repo / "docs" / f"{datetime.now(timezone.utc).date().isoformat()}-{slugify(str(state.get('goal_id') or 'release'), 40)}-follow-ups.md"
+    if not output.is_absolute():
+        output = repo / output
+    try:
+        output.resolve().relative_to(repo.resolve())
+    except ValueError as exc:
+        raise HLoopError("follow-up export path must remain inside the repository") from exc
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# Follow-ups for {state.get('goal_id') or 'release'}", "", f"Generated: {now_iso()}", ""]
+    if not records:
+        lines.append("No follow-ups recorded.")
+    for record in records:
+        lines.extend(
+            [
+                f"## {record.get('id')}: {record.get('title')}",
+                "",
+                f"- Status: {record.get('status')}",
+                f"- Issue key: `{record.get('issue_key')}`",
+                f"- Component: {record.get('component')}",
+                f"- Impact: {record.get('impact')}",
+                f"- Reconsider: {record.get('reconsider_condition')}",
+                "",
+            ]
+        )
+    write_text(output, "\n".join(lines) + "\n")
+    follow_ups = _follow_up_state(state)
+    exports = normalize_list(follow_ups.get("export_paths"))
+    ref = str(output.relative_to(repo))
+    if ref not in exports:
+        exports.append(ref)
+    follow_ups["export_paths"] = exports
+    save_state(repo, state)
+    journal(repo, f"Exported {len(records)} follow-up(s) to `{ref}`.")
+    payload = {"status": "exported", "artifact": str(output), "count": len(records)}
+    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label=f"follow-ups exported: {output}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     if getattr(args, "raw_state", False):
@@ -7639,6 +8493,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"worker_qa_profile: {loop.get('worker_qa_profile')}")
     print(f"manager_qa_profile: {loop.get('manager_qa_profile')}")
     print(f"manager_qa_status: {loop.get('manager_qa_status')}")
+    print(f"release_scope_status: {loop.get('release_scope', {}).get('status')}")
+    print(f"dispatch_freeze_status: {loop.get('dispatch_freeze', {}).get('status')}")
     print(f"current_batch_id: {loop.get('current_batch_id') or '-'}")
     print(
         "review_queue: "
@@ -8559,6 +9415,7 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
         return 0
     if not reasons:
         reasons = ["Manager forced the Scout"]
+    dispatch_start_preflight(repo, state, role_id="S001", role_kind="specification-scout")
     head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
     worktree_arg = getattr(args, "worktree", None)
     worktree = (
@@ -8840,6 +9697,12 @@ def start_decision_liaison(
     if str(liaison.get("status") or "") in {"running", "responded", "completed"}:
         print(f"Decision Liaison already {liaison.get('status')}: {record.decision_id}")
         return 0
+    dispatch_start_preflight(
+        repo,
+        state,
+        role_id=f"L-{record.decision_id}",
+        role_kind="decision-liaison",
+    )
     head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
     prompt = render_decision_liaison_prompt(record, state, head_sha=head_sha)
     if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
@@ -9364,7 +10227,9 @@ def create_loop_task(
     worker_agent_provider: str | None = None,
     worker_agent_model: str | None = None,
     allow_no_write: bool = False,
+    provenance: dict[str, Any] | None = None,
 ) -> str:
+    assert_task_creation_dispatchable(state)
     if kind == "implementation" and not write_allow and not allow_no_write:
         raise HLoopError("implementation tasks require at least one write_allow")
     if kind == "fix" and not write_allow and not allow_no_write:
@@ -9379,6 +10244,8 @@ def create_loop_task(
     resolved_batch_id = validate_batch_id(batch_id) if batch_id else current_batch_id(state)
     if resolved_batch_id:
         require_batch(state, resolved_batch_id)
+    provenance_input = provenance or provenance_record_from_args(None, state)
+    normalized_provenance = authorize_task_record(repo, state, provenance_input)
     fields = {
         "id": task_id,
         "run_id": str(state.get("run_id") or ""),
@@ -9403,6 +10270,7 @@ def create_loop_task(
         "worker_agent_model": normalize_agent_model(
             worker_agent_model or state.get("worker_agent_model") or DEFAULT_AGENT_MODEL
         ),
+        **normalized_provenance.to_record(),
     }
     if resolved_batch_id:
         fields["batch_id"] = resolved_batch_id
@@ -9448,6 +10316,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         "worker_qa_profile": fields["worker_qa_profile"],
         "agent_provider": fields["worker_agent_provider"],
         "agent_model": fields["worker_agent_model"],
+        **normalized_provenance.to_record(),
         "created_at": now_iso(),
     }
     if resolved_batch_id:
@@ -9469,6 +10338,7 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         require_integration_branch=True,
         mark_blocked=False,
     )
+    assert_task_creation_dispatchable(state)
     if args.kind in {"implementation", "fix"} and not args.write_allow and not args.allow_no_write:
         raise HLoopError(f"{args.kind} tasks require at least one --write-allow")
     task_id = args.id or next_id("T", state.setdefault("tasks", {}))
@@ -9495,6 +10365,11 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         validation_minimum = validation_minimums[0]
     else:
         validation_minimum = validation_minimums
+    normalized_provenance = authorize_task_record(
+        repo,
+        state,
+        provenance_record_from_args(args, state),
+    )
     fields = {
         "id": task_id,
         "run_id": str(state.get("run_id") or ""),
@@ -9525,6 +10400,7 @@ def cmd_task_new(args: argparse.Namespace) -> int:
             or state.get("worker_agent_model")
             or DEFAULT_AGENT_MODEL
         ),
+        **normalized_provenance.to_record(),
     }
     if resolved_batch_id:
         fields["batch_id"] = resolved_batch_id
@@ -9565,6 +10441,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         "worker_qa_profile": fields["worker_qa_profile"],
         "agent_provider": fields["worker_agent_provider"],
         "agent_model": fields["worker_agent_model"],
+        **normalized_provenance.to_record(),
         "created_at": now_iso(),
     }
     if resolved_batch_id:
@@ -9628,6 +10505,7 @@ def cmd_task_update(args: argparse.Namespace) -> int:
     updates.update({key: value for key, value in scalar_updates.items() if value is not None})
     if not updates:
         raise HLoopError("task update has no changes")
+    validate_task_update_provenance(repo, state, meta, updates)
     kind = str(meta.get("kind") or "implementation")
     next_allow = normalize_list(updates.get("write_allow", meta.get("write_allow")))
     if kind in {"implementation", "fix"} and not next_allow:
@@ -11747,6 +12625,9 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     if task_state.get("status") not in {"queued", "failed_validation"}:
         raise HLoopError(f"task is not startable: {task_id} status={task_state.get('status')}")
     task_meta = read_frontmatter(task_file(repo, task_id))
+    dispatch_start_preflight(
+        repo, state, role_id=task_id, role_kind="worker", task_meta=task_meta
+    )
     if getattr(args, "agent_provider", None):
         task_meta["agent_provider"] = args.agent_provider
     if getattr(args, "agent_model", None):
@@ -11799,6 +12680,9 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     if task_state.get("status") not in {"queued", "failed_validation"}:
         raise HLoopError(f"task is not startable: {task_id} status={task_state.get('status')}")
     task_meta = read_frontmatter(task_file(repo, task_id))
+    dispatch_start_preflight(
+        repo, state, role_id=task_id, role_kind="worker", task_meta=task_meta
+    )
     if getattr(args, "agent_provider", None):
         task_meta["agent_provider"] = args.agent_provider
     if getattr(args, "agent_model", None):
@@ -13986,6 +14870,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     )
     mode = topology["mode"]
     review_id = args.review_id or next_id("R", state.setdefault("reviews", {}))
+    dispatch_start_preflight(repo, state, role_id=review_id, role_kind="reviewer")
     attempt_id = f"{review_id}-A001"
     if review_id in state["reviews"]:
         raise HLoopError(f"review already exists: {review_id}")
@@ -14057,6 +14942,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
+    dispatch_start_preflight(repo, state, role_id=review_id, role_kind="reviewer")
     if review_id in state["reviews"]:
         raise HLoopError(f"review already exists: {review_id}")
     base = args.base or state["base_branch"]
@@ -14539,6 +15425,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
     gap_id = args.gap_id or next_id("G", state.setdefault("gaps", {}))
+    dispatch_start_preflight(repo, state, role_id=gap_id, role_kind="gap")
     if gap_id in state["gaps"]:
         raise HLoopError(f"gap audit already exists: {gap_id}")
     base = args.base or state["base_branch"]
@@ -14591,6 +15478,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
+    dispatch_start_preflight(repo, state, role_id=gap_id, role_kind="gap")
     if gap_id in state.setdefault("gaps", {}):
         raise HLoopError(f"gap audit already exists: {gap_id}")
     base = args.base or state["base_branch"]
@@ -15090,6 +15978,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     advice_state = require_advice_state(state, advice_id)
     participant_id = args.participant_id
     role_id = f"{advice_id}/{participant_id}"
+    dispatch_start_preflight(repo, state, role_id=role_id, role_kind="advisor")
     attempt_id = f"{advice_id}-{participant_id}-A001"
     participant = find_advisor_participant(advice_state, participant_id)
     if participant.get("status") not in {"queued", "failed"}:
@@ -15148,6 +16037,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
         require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
+    dispatch_start_preflight(repo, state, role_id=role_id, role_kind="advisor")
     advice_state = require_advice_state(state, advice_id)
     participant = find_advisor_participant(advice_state, participant_id)
     participant["provider"] = agent_config["provider"]
@@ -15599,6 +16489,23 @@ def render_fix_task_draft(
                 cmd.extend(["--acceptance", item])
             for item in candidate["depends_on"]:
                 cmd.extend(["--depends-on", item])
+            if candidate.get("task_origin"):
+                cmd.extend(["--task-origin", str(candidate["task_origin"])])
+            for item in normalize_list(candidate.get("plan_item_refs")):
+                cmd.extend(["--plan-item-ref", item])
+            for item in normalize_list(candidate.get("requirement_refs")):
+                cmd.extend(["--requirement-ref", item])
+            for item in normalize_list(candidate.get("scope_refs")):
+                cmd.extend(["--scope-ref", item])
+            if candidate.get("source_finding"):
+                cmd.extend(["--source-finding", str(candidate["source_finding"])])
+            if candidate.get("authorization_input_id"):
+                cmd.extend(["--authorization-input-id", str(candidate["authorization_input_id"])])
+            for key in ("why_fix_now", "origin", "contract_relation", "release_effect", "fact_status", "disposition"):
+                if candidate.get(key):
+                    cmd.extend([f"--{key.replace('_', '-')}", str(candidate[key])])
+            if candidate.get("remediation_round"):
+                cmd.extend(["--remediation-round", str(candidate["remediation_round"])])
             lines.append(shlex.join(cmd))
             lines.extend(["```", ""])
     if rejected_candidates:
@@ -15704,6 +16611,7 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
                 depends_on=candidate["depends_on"],
                 created_from=created_from,
                 allow_no_write=args.allow_no_write,
+                provenance=provenance_record_from_args(None, state, candidate=candidate),
             )
             created_task_ids.append(task_id)
         source_state.setdefault("created_fix_tasks", [])
@@ -15756,6 +16664,8 @@ def write_sets_overlap(a: list[str], b: list[str]) -> bool:
 
 
 def queued_dispatchable_tasks(state: dict[str, Any]) -> list[str]:
+    if dispatch_is_frozen(state):
+        return []
     decision_blocked = set(build_decision_scheduler(state).decision_blocked_task_ids)
     running_sets = [
         normalize_list(task.get("write_allow"))
@@ -15816,6 +16726,12 @@ def cmd_tick(args: argparse.Namespace) -> int:
     scheduler_decision = build_decision_scheduler(state)
     if scheduler_decision.loop_blocked:
         blocking_ids = ", ".join(scheduler_decision.blocking_decision_ids) or "unknown"
+        if dispatch_is_frozen(state):
+            print(
+                "dispatch is frozen; pending user decision remains for Manager handling "
+                f"({blocking_ids})"
+            )
+            return 0
         if args.dry_run:
             print(f"DRY RUN blocked: pending user decision ({blocking_ids})")
             return 2
@@ -15913,6 +16829,12 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
     if state.get("needs_review") and reported_review_exists(state):
         print("review triage required")
+        return 0
+
+    if dispatch_is_frozen(state):
+        # Validation, harvest, merge, follow-up recording, reporting, and
+        # pause remain available above; only new role starts are suppressed.
+        print("dispatch is frozen; no new roles will be started")
         return 0
 
     if (
@@ -19380,6 +20302,106 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--no-pane-probe", action="store_true", help="do not query Herdr pane state")
     status.set_defaults(func=cmd_status)
 
+    release_scope = sub.add_parser("release-scope", help="lock and amend the release contract source snapshot")
+    release_scope_sub = release_scope.add_subparsers(dest="release_scope_command", required=True)
+    release_scope_lock = release_scope_sub.add_parser("lock", help="lock source documents and references")
+    release_scope_lock.add_argument("--source", dest="source_ref", action="append")
+    release_scope_lock.add_argument("--source-ref", dest="source_ref", action="append")
+    release_scope_lock.add_argument("--scope-source", dest="source_ref", action="append")
+    release_scope_lock.add_argument("--plan-item-ref", "--plan-item-refs", dest="plan_item_ref", action="append")
+    release_scope_lock.add_argument("--requirement-ref", "--requirement-refs", dest="requirement_ref", action="append")
+    release_scope_lock.add_argument("--scope-ref", "--scope-refs", dest="scope_ref", action="append")
+    release_scope_lock.add_argument("--release-scope-ref", "--release-scope-refs", dest="release_scope_ref", action="append")
+    release_scope_lock.add_argument("--json", action="store_true")
+    release_scope_lock.set_defaults(func=cmd_release_scope_lock)
+    release_scope_status = release_scope_sub.add_parser("status", help="show scope lock and source drift")
+    release_scope_status.add_argument("--json", action="store_true")
+    release_scope_status.set_defaults(func=cmd_release_scope_status)
+    release_scope_amend = release_scope_sub.add_parser("amend", help="record an editorial, clarification, or scope amendment")
+    release_scope_amend.add_argument("--kind", choices=sorted(hloop_release_scope.AMENDMENT_KINDS), required=True)
+    release_scope_amend.add_argument("--reason", required=True)
+    release_scope_amend.add_argument("--source", dest="source_ref", action="append")
+    release_scope_amend.add_argument("--source-ref", dest="source_ref", action="append")
+    release_scope_amend.add_argument("--scope-source", dest="source_ref", action="append")
+    release_scope_amend.add_argument("--basis-ref", action="append")
+    release_scope_amend.add_argument("--user-input-id", "--input-id", dest="user_input_id")
+    release_scope_amend.add_argument("--authorization-input-id", dest="authorization_input_id")
+    release_scope_amend.add_argument("--affected-task-id", action="append")
+    release_scope_amend.add_argument("--json", action="store_true")
+    release_scope_amend.set_defaults(func=cmd_release_scope_amend)
+
+    dispatch = sub.add_parser("dispatch", help="control new role dispatch without pausing safe Manager operations")
+    dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
+    dispatch_freeze = dispatch_sub.add_parser("freeze", help="freeze new role starts")
+    dispatch_freeze.add_argument("--reason", required=True)
+    dispatch_freeze.add_argument("--source-input-id", "--input-id", dest="source_input_id")
+    dispatch_freeze.add_argument("--user-input-id", dest="user_input_id")
+    dispatch_freeze.add_argument("--allowed-running-role-id", action="append")
+    dispatch_freeze.add_argument("--json", action="store_true")
+    dispatch_freeze.set_defaults(func=cmd_dispatch_freeze)
+    dispatch_status = dispatch_sub.add_parser("status", help="show dispatch freeze state")
+    dispatch_status.add_argument("--json", action="store_true")
+    dispatch_status.set_defaults(func=cmd_dispatch_status)
+    dispatch_unfreeze = dispatch_sub.add_parser("unfreeze", help="resume new role starts with explicit provenance")
+    dispatch_unfreeze.add_argument("--reason")
+    dispatch_unfreeze.add_argument("--source-input-id", "--input-id", dest="source_input_id")
+    dispatch_unfreeze.add_argument("--user-input-id", dest="user_input_id")
+    dispatch_unfreeze.add_argument("--json", action="store_true")
+    dispatch_unfreeze.set_defaults(func=cmd_dispatch_unfreeze)
+
+    follow_up = sub.add_parser("follow-up", help="record and export stable first-class follow-ups")
+    follow_up_sub = follow_up.add_subparsers(dest="follow_up_command", required=True)
+    follow_up_add = follow_up_sub.add_parser("add", help="record or deduplicate one follow-up")
+    follow_up_add.add_argument("--title", required=True)
+    follow_up_add.add_argument("--component", required=True)
+    follow_up_add.add_argument("--trigger-class", required=True)
+    follow_up_add.add_argument("--product-impact", required=True)
+    follow_up_add.add_argument("--root-cause")
+    follow_up_add.add_argument("--status", choices=["open", "deferred", "adopted", "closed", "superseded", "active"], default="open")
+    follow_up_add.add_argument("--source-review", dest="source_review")
+    follow_up_add.add_argument("--source-gap", dest="source_gap")
+    follow_up_add.add_argument("--source-task", dest="source_task")
+    follow_up_add.add_argument("--source-finding", dest="source_finding")
+    follow_up_add.add_argument("--source-review-fingerprint", "--review-fingerprint", dest="source_review_fingerprint", action="append")
+    follow_up_add.add_argument("--discovered-head")
+    follow_up_add.add_argument("--evidence", action="append")
+    follow_up_add.add_argument("--impact", required=True)
+    follow_up_add.add_argument("--affected-path")
+    follow_up_add.add_argument("--symbol")
+    follow_up_add.add_argument("--fact-status", choices=sorted(hloop_review_policy.FACT_STATUSES), default="insufficient_evidence")
+    follow_up_add.add_argument("--severity", choices=list(hloop_review_policy.SEVERITIES), default="P2")
+    follow_up_add.add_argument("--origin", choices=sorted(hloop_review_policy.FINDING_ORIGINS), default="unknown")
+    follow_up_add.add_argument("--contract-relation", choices=sorted(hloop_review_policy.CONTRACT_RELATIONS), default="outside_release")
+    follow_up_add.add_argument("--decision-requirement", choices=sorted(hloop_review_policy.DECISION_REQUIREMENTS), default="none")
+    follow_up_add.add_argument("--release-effect", choices=sorted(hloop_review_policy.RELEASE_EFFECTS), default="non_blocking")
+    follow_up_add.add_argument("--requirement-ref", action="append")
+    follow_up_add.add_argument("--disposition", choices=sorted(hloop_review_policy.DISPOSITIONS), default="defer_follow_up")
+    follow_up_add.add_argument("--why-fix-now")
+    follow_up_add.add_argument("--remediation-round", type=int)
+    follow_up_add.add_argument("--recommended-action", default="defer_follow_up")
+    follow_up_add.add_argument("--deferred-reason", required=True)
+    follow_up_add.add_argument("--reconsider-condition", required=True)
+    follow_up_add.add_argument("--target-version")
+    follow_up_add.add_argument("--milestone")
+    follow_up_add.add_argument("--acceptance-can-be-met-without-decision", action="store_true")
+    follow_up_add.add_argument("--safety-critical", action="store_true")
+    follow_up_add.add_argument("--scope-change-authorized", action="store_true")
+    follow_up_add.add_argument("--accepted-risk-authorized", action="store_true")
+    follow_up_add.add_argument("--json", action="store_true")
+    follow_up_add.set_defaults(func=cmd_follow_up_add)
+    follow_up_list = follow_up_sub.add_parser("list", help="list follow-ups")
+    follow_up_list.add_argument("--status")
+    follow_up_list.add_argument("--json", action="store_true")
+    follow_up_list.set_defaults(func=cmd_follow_up_list)
+    follow_up_show = follow_up_sub.add_parser("show", help="show one follow-up by id or issue key")
+    follow_up_show.add_argument("follow_up_id")
+    follow_up_show.add_argument("--json", action="store_true")
+    follow_up_show.set_defaults(func=cmd_follow_up_show)
+    follow_up_export = follow_up_sub.add_parser("export", help="export follow-ups to a release report")
+    follow_up_export.add_argument("--output")
+    follow_up_export.add_argument("--json", action="store_true")
+    follow_up_export.set_defaults(func=cmd_follow_up_export)
+
     dashboard = sub.add_parser("dashboard", help="show a Manager dashboard for tasks, panes, gates, and issues")
     dashboard.add_argument("--json", action="store_true")
     dashboard.add_argument("--lines", type=int, default=80)
@@ -19772,6 +20794,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     task_new.add_argument("--write-deny", action="append")
     task_new.add_argument("--acceptance", action="append")
+    task_new.add_argument("--task-origin", choices=sorted(hloop_release_scope.TASK_ORIGINS))
+    task_new.add_argument("--release-scope-revision", type=int)
+    task_new.add_argument("--plan-item-ref", "--plan-item-refs", dest="plan_item_ref", action="append")
+    task_new.add_argument("--requirement-ref", "--requirement-refs", dest="requirement_ref", action="append")
+    task_new.add_argument("--scope-ref", "--scope-refs", dest="scope_ref", action="append")
+    task_new.add_argument("--release-scope-ref", "--release-scope-refs", dest="scope_ref", action="append")
+    task_new.add_argument("--source-finding")
+    task_new.add_argument("--authorization-input-id")
+    task_new.add_argument("--user-input-id", dest="authorization_input_id")
+    task_new.add_argument("--why-fix-now")
+    task_new.add_argument("--operational-reason")
+    task_new.add_argument("--origin", choices=sorted(hloop_release_scope.FINDING_ORIGINS))
+    task_new.add_argument("--contract-relation", choices=sorted(hloop_release_scope.CONTRACT_RELATIONS))
+    task_new.add_argument("--release-effect", choices=sorted(hloop_release_scope.RELEASE_EFFECTS))
+    task_new.add_argument("--remediation-round", type=int)
+    task_new.add_argument("--fact-status", choices=sorted(hloop_release_scope.FACT_STATUSES))
+    task_new.add_argument("--disposition", choices=sorted(hloop_release_scope.TASK_DISPOSITIONS))
+    task_new.add_argument("--scope-expanding", action="store_true")
     task_new.add_argument("--validation-minimum", action="append")
     task_new.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS))
     task_new.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
