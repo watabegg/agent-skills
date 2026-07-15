@@ -536,6 +536,79 @@ effort = "medium"
                 "unexpectedly-missing",
             )
 
+    def test_format_two_migration_rewrites_harvested_artifacts_to_manager_paths(self):
+        previous = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("migration-artifacts")
+        try:
+            state = {
+                "state_format_version": 2,
+                "skill_version": "0.4.0",
+                "tasks": {
+                    "T001": {
+                        "status": "merged",
+                        "result_path": "/tmp/old-worker/results/T001/result.md",
+                    }
+                },
+                "reviews": {
+                    "R001": {
+                        "status": "triaged",
+                        "gate_status": "triaged",
+                        "mode": "single",
+                        "review_path": "/tmp/old-review/reviews/R001.md",
+                    }
+                },
+                "gaps": {
+                    "G001": {
+                        "status": "triaged",
+                        "gate_status": "triaged",
+                        "gap_path": "/tmp/old-gap/gaps/G001.md",
+                    }
+                },
+            }
+            migrated = hloop.migrate_format_two_to_three(state)
+            loop = hloop.LOOP_DIR.as_posix()
+            self.assertEqual(
+                migrated["tasks"]["T001"]["result_path"],
+                f"{loop}/results/T001/result.md",
+            )
+            self.assertEqual(
+                migrated["reviews"]["R001"]["review_path"],
+                f"{loop}/reviews/R001.md",
+            )
+            self.assertEqual(
+                migrated["gaps"]["G001"]["gap_path"],
+                f"{loop}/gaps/G001.md",
+            )
+            self.assertIn(
+                "/tmp/old-worker",
+                migrated["tasks"]["T001"]["worktree_result_path_harvested"],
+            )
+            self.assertEqual(
+                migrated["specification_scout_run"]["status"], "skipped"
+            )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_harvested_worker_lookup_ignores_stale_recorded_worktree_path(self):
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                hloop.configure_loop_namespace("canonical-worker")
+                manager_result = hloop.result_file(repo, "T001")
+                manager_result.parent.mkdir(parents=True)
+                manager_result.write_text("manager copy\n", encoding="utf-8")
+                task = {
+                    "status": "merged",
+                    "result_path": "/tmp/removed-worktree/result.md",
+                }
+                self.assertEqual(
+                    hloop.worker_artifact_path(repo, {"tasks": {"T001": task}}, "T001", task),
+                    manager_result,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
     def test_message_envelopes_are_bound_to_each_role_without_undefined_names(self):
         state = {
             "run_id": "run-1",

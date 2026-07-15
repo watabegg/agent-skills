@@ -125,6 +125,8 @@ DEFAULT_MIN_FREE_INODES = 50_000
 DEFAULT_ADVISOR_ENABLED = False
 DEFAULT_ADVISOR_MODE = "single"
 DEFAULT_ADVISOR_MAX_ROUNDS = 2
+DEFAULT_SPECIFICATION_SCOUT = "auto"
+SPECIFICATION_SCOUT_MODES = {"auto", "always", "off"}
 DEFAULT_REVIEW_LANES = [
     "integration-contract",
     "correctness",
@@ -192,6 +194,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 BUILT_IN_CONFIG_DEFAULTS = {
     "max_workers": DEFAULT_MAX_WORKERS,
     "session_cleanup": "archive",
+    "specification_scout": DEFAULT_SPECIFICATION_SCOUT,
     "worker": {
         "provider": DEFAULT_AGENT_PROVIDER,
         "model": DEFAULT_AGENT_MODEL,
@@ -208,6 +211,7 @@ CONFIG_TEMPLATE = """version = 1
 [defaults]
 max_workers = 3
 session_cleanup = "archive"
+specification_scout = "auto"
 
 [defaults.worker]
 provider = "codex"
@@ -756,7 +760,7 @@ def migrate_format_one_to_two(state: dict[str, Any]) -> dict[str, Any]:
 def migrate_format_two_to_three(state: dict[str, Any]) -> dict[str, Any]:
     result = json.loads(json.dumps(state))
     resolved_snapshot = json.loads(json.dumps(BUILT_IN_CONFIG_DEFAULTS))
-    for key in ("max_workers", "session_cleanup"):
+    for key in ("max_workers", "session_cleanup", "specification_scout"):
         if key in state:
             resolved_snapshot[key] = state[key]
     for role in ("worker", "reviewer"):
@@ -784,7 +788,92 @@ def migrate_format_two_to_three(state: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("resume_requirements", [])
     result.setdefault("pending_fix_task_drafts", [])
     result.setdefault("terminal_outcome", {})
+    result.setdefault("specification_scout", DEFAULT_SPECIFICATION_SCOUT)
+    if "specification_scout_run" not in result:
+        already_dispatched = any(
+            str(task.get("status") or "") != "queued"
+            for task in (result.get("tasks") or {}).values()
+            if isinstance(task, dict)
+        )
+        result["specification_scout_run"] = (
+            {
+                "status": "skipped",
+                "gate_status": "skipped",
+                "policy": result["specification_scout"],
+                "reason": "migrated loop had already dispatched implementation work",
+            }
+            if already_dispatched
+            else {}
+        )
+    result.setdefault("decision_liaisons", {})
+    canonicalize_migrated_artifact_records(result)
     return result
+
+
+def canonicalize_migrated_artifact_records(state: dict[str, Any]) -> None:
+    """Rewrite harvested 0.4 artifact records to Manager-loop paths.
+
+    Older states could retain a detached role-worktree path after harvest.
+    Migration has no repository argument, so it records stable repo-relative
+    paths; ``recorded_path`` resolves those against the active Manager repo.
+    The original role path remains available as ``worktree_*_path_harvested``
+    for diagnostics.
+    """
+
+    for task_id, task in (state.get("tasks") or {}).items():
+        if not isinstance(task, dict):
+            continue
+        old_path = str(task.get("result_path") or "")
+        if not old_path and str(task.get("status") or "") not in {
+            "result_reported",
+            "merged",
+            "partial",
+            "blocked",
+            "failed",
+            "abandoned",
+        }:
+            continue
+        canonical = (LOOP_DIR / "results" / str(task_id) / "result.md").as_posix()
+        if old_path and old_path != canonical:
+            task.setdefault("worktree_result_path_harvested", old_path)
+        task["result_path"] = canonical
+
+    for review_id, review in (state.get("reviews") or {}).items():
+        if not isinstance(review, dict) or not artifact_was_harvested(review):
+            continue
+        old_path = str(review.get("review_path") or "")
+        canonical = (
+            LOOP_DIR / "reviews" / str(review_id) / "FINAL.md"
+            if str(review.get("mode") or "single") != "single"
+            else LOOP_DIR / "reviews" / f"{review_id}.md"
+        ).as_posix()
+        if old_path and old_path != canonical:
+            review.setdefault("worktree_review_path_harvested", old_path)
+        review["review_path"] = canonical
+
+    for gap_id, gap in (state.get("gaps") or {}).items():
+        if not isinstance(gap, dict) or not artifact_was_harvested(gap):
+            continue
+        old_path = str(gap.get("gap_path") or "")
+        canonical = (LOOP_DIR / "gaps" / f"{gap_id}.md").as_posix()
+        if old_path and old_path != canonical:
+            gap.setdefault("worktree_gap_path_harvested", old_path)
+        gap["gap_path"] = canonical
+
+    for advice_id, advice in (state.get("advice") or {}).items():
+        if not isinstance(advice, dict):
+            continue
+        for participant in advice.get("participants") or []:
+            if not isinstance(participant, dict) or not artifact_was_harvested(participant):
+                continue
+            participant_id = str(participant.get("participant_id") or "P1")
+            old_path = str(participant.get("advice_path") or "")
+            canonical = (
+                LOOP_DIR / "advice" / f"{advice_id}-{participant_id}.md"
+            ).as_posix()
+            if old_path and old_path != canonical:
+                participant.setdefault("worktree_advice_path_harvested", old_path)
+            participant["advice_path"] = canonical
 
 
 def migrate_format_three_revision_one(state: dict[str, Any]) -> dict[str, Any]:
@@ -952,6 +1041,12 @@ def validate_config_semantics(data: dict[str, Any]) -> None:
             errors.append(
                 f"{label}.session_cleanup must be one of {sorted(SESSION_CLEANUP_MODES)}"
             )
+        scout_policy = table.get("specification_scout")
+        if scout_policy is not None and scout_policy not in SPECIFICATION_SCOUT_MODES:
+            errors.append(
+                f"{label}.specification_scout must be one of "
+                f"{sorted(SPECIFICATION_SCOUT_MODES)}"
+            )
         for role in ("worker", "reviewer"):
             role_table = table.get(role)
             if not isinstance(role_table, dict):
@@ -1086,6 +1181,9 @@ def apply_resolved_config_to_state(
     state["resolved_config"] = resolved
     state["max_workers"] = resolved["max_workers"]
     state["session_cleanup"] = resolved["session_cleanup"]
+    state["specification_scout"] = str(
+        resolved.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT
+    )
     for role in ("worker", "reviewer"):
         role_config = resolved.get(role) or {}
         state[f"{role}_agent_provider"] = normalize_agent_provider(
@@ -1163,6 +1261,8 @@ def init_config_override(args: argparse.Namespace) -> dict[str, Any]:
         override["max_workers"] = args.max_workers
     if getattr(args, "session_cleanup", None) is not None:
         override["session_cleanup"] = args.session_cleanup
+    if getattr(args, "specification_scout", None) is not None:
+        override["specification_scout"] = args.specification_scout
     for role in ("worker", "reviewer"):
         role_values: dict[str, Any] = {}
         for key in ("provider", "model", "effort"):
@@ -1197,8 +1297,17 @@ def resolve_init_config(
             "resolved config session_cleanup must be one of: "
             + ", ".join(sorted(SESSION_CLEANUP_MODES))
         )
+    specification_scout = str(
+        resolution.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT
+    )
+    if specification_scout not in SPECIFICATION_SCOUT_MODES:
+        raise HLoopError(
+            "resolved config specification_scout must be one of: "
+            + ", ".join(sorted(SPECIFICATION_SCOUT_MODES))
+        )
     args.max_workers = max_workers
     args.session_cleanup = session_cleanup
+    args.specification_scout = specification_scout
     for role in ("worker", "reviewer"):
         setattr(
             args,
@@ -2768,6 +2877,13 @@ def artifact_was_harvested(agent: dict[str, Any]) -> bool:
         "triaged",
         "blocked_write_scope",
         "consumed",
+    } or str(agent.get("status") or "") in {
+        "result_reported",
+        "merged",
+        "partial",
+        "blocked",
+        "failed",
+        "abandoned",
     }
 
 
@@ -2775,7 +2891,7 @@ def worker_artifact_path(
     repo: Path, state: dict[str, Any], task_id: str, task: dict[str, Any]
 ) -> Path:
     if artifact_was_harvested(task):
-        return recorded_path(repo, task.get("result_path"), result_file(repo, task_id))
+        return result_file(repo, task_id)
     worktree = Path(task.get("worktree") or default_worktree(repo, task_id, state)).resolve()
     return result_file(worktree, task_id)
 
@@ -2787,7 +2903,7 @@ def review_artifact_path(repo: Path, review_id: str, review: dict[str, Any]) -> 
         else review_file(repo, review_id)
     )
     if artifact_was_harvested(review):
-        return recorded_path(repo, review.get("review_path"), fallback)
+        return fallback
     return recorded_path(
         repo,
         review.get("worktree_review_path") or review.get("review_path"),
@@ -2805,7 +2921,7 @@ def load_review_manifest(path: Path) -> hloop_review.ReviewManifest:
 
 def gap_artifact_path(repo: Path, gap_id: str, gap: dict[str, Any]) -> Path:
     if artifact_was_harvested(gap):
-        return recorded_path(repo, gap.get("gap_path"), gap_file(repo, gap_id))
+        return gap_file(repo, gap_id)
     return recorded_path(
         repo,
         gap.get("worktree_gap_path") or gap.get("gap_path"),
@@ -2816,7 +2932,7 @@ def gap_artifact_path(repo: Path, gap_id: str, gap: dict[str, Any]) -> Path:
 def advice_artifact_path(repo: Path, advice_id: str, participant: dict[str, Any]) -> Path:
     fallback = advice_file(repo, advice_id, str(participant.get("participant_id") or "P1"))
     if artifact_was_harvested(participant):
-        return recorded_path(repo, participant.get("advice_path"), fallback)
+        return fallback
     return recorded_path(
         repo,
         participant.get("worktree_advice_path") or participant.get("advice_path"),
@@ -4494,6 +4610,13 @@ def last_validation_passed(state: dict[str, Any]) -> bool:
     return bool(results) and (not target or recorded == target) and all(
         item.get("result") == "passed" for item in results
     )
+
+
+def validation_result_failed(value: Any) -> bool:
+    """Treat ``failed:<returncode>`` as failed without discarding the code."""
+
+    result = str(value or "")
+    return result == "failed" or result.startswith("failed:")
 
 
 def running_review_exists(state: dict[str, Any]) -> bool:
@@ -6569,6 +6692,13 @@ Advisor is opt-in only. It must not run from pump/tick unless Manager explicitly
 Advisor enabled: `{str(advisor_enabled).lower()}`
 Advisor mode: `{advisor_mode}`
 
+## Specification Scout
+{args.specification_scout}
+
+- `auto`: run once before implementation dispatch when requirements or tasks expose specification risk.
+- `always`: run once before the first implementation dispatch.
+- `off`: skip automatic Scout dispatch, while finish still checks unresolved decisions.
+
 ## Worktree Root
 {str(worktree_root) if worktree_root else "default sibling paths"}
 
@@ -6712,6 +6842,9 @@ None.
         "reviewer_runner": args.reviewer_runner,
         "gap_runner": args.gap_runner,
         "session_cleanup": args.session_cleanup,
+        "specification_scout": args.specification_scout,
+        "specification_scout_run": {},
+        "decision_liaisons": {},
         "review_wait_ms": args.review_wait_ms,
         "gap_wait_ms": args.gap_wait_ms,
         "review_after_merges": args.review_after_merges,
@@ -7264,7 +7397,7 @@ def decision_question_text(record: DecisionRecord, state: dict[str, Any]) -> str
     if independent:
         later = (
             "この判断に依存しない作業は継続できます。"
-            f" 現在進められる作業候補は {', '.join(independent)} です。"
+            f" 現在は {len(independent)} 件の独立した作業を進められます。"
         )
     else:
         later = "安全に進められる独立作業がなくなるため、回答を待ちます。"
@@ -7303,6 +7436,143 @@ def decision_question_text(record: DecisionRecord, state: dict[str, Any]) -> str
             "",
         ]
     )
+
+
+SPECIFICATION_RISK_MARKERS = (
+    "user-visible",
+    "public contract",
+    "security",
+    "authorization",
+    "privacy",
+    "credential",
+    "data",
+    "schema",
+    "migration",
+    "rollback",
+    "breaking",
+    "利用者",
+    "公開",
+    "認証",
+    "認可",
+    "秘密",
+    "データ",
+    "スキーマ",
+    "移行",
+    "破壊",
+    "ロールバック",
+)
+
+
+def specification_scout_reasons(state: dict[str, Any]) -> list[str]:
+    """Return stable reasons for ``auto`` Scout dispatch."""
+
+    requirements = state.get("requirements") or {}
+    implementation_tasks = [
+        task
+        for task in (state.get("tasks") or {}).values()
+        if str(task.get("kind") or "implementation") in {"implementation", "fix"}
+        and str(task.get("status") or "") == "queued"
+    ]
+    if not implementation_tasks:
+        return []
+    reasons: list[str] = []
+    if len(requirements) > 1:
+        reasons.append("multiple accepted requirements may interact")
+    text_parts = [str(state.get("goal") or state.get("goal_id") or "")]
+    for requirement in requirements.values():
+        if isinstance(requirement, dict):
+            text_parts.extend(normalize_list(requirement.get("acceptance")))
+            if normalize_list(requirement.get("dependencies")):
+                reasons.append("accepted requirements have dependencies")
+    for task in implementation_tasks:
+        text_parts.append(str(task.get("title") or ""))
+        text_parts.extend(normalize_list(task.get("acceptance")))
+        text_parts.append(str(task.get("validation_minimum") or ""))
+    searchable = "\n".join(text_parts).lower()
+    for marker in SPECIFICATION_RISK_MARKERS:
+        if marker.lower() in searchable:
+            reasons.append(f"specification-risk marker: {marker}")
+    return list(dict.fromkeys(reasons))
+
+
+def specification_scout_required(state: dict[str, Any]) -> tuple[bool, list[str]]:
+    policy = str(state.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT)
+    if policy not in SPECIFICATION_SCOUT_MODES:
+        raise HLoopError(f"invalid specification_scout policy: {policy}")
+    run = state.get("specification_scout_run") or {}
+    if str(run.get("status") or "") in {"completed", "skipped"}:
+        return False, []
+    if policy == "off":
+        return False, ["policy is off"]
+    implementation_queued = any(
+        str(task.get("status") or "") == "queued"
+        and str(task.get("kind") or "implementation") in {"implementation", "fix"}
+        for task in (state.get("tasks") or {}).values()
+    )
+    if not implementation_queued:
+        return False, []
+    if policy == "always":
+        return True, ["policy is always"]
+    reasons = specification_scout_reasons(state)
+    return bool(reasons), reasons
+
+
+def specification_scout_file(repo: Path) -> Path:
+    return loop_path(repo) / "decisions" / "SCOUT.md"
+
+
+def decision_liaison_file(repo: Path, decision_id: str) -> Path:
+    return loop_path(repo) / "decisions" / decision_id / "RESPONSE.md"
+
+
+def render_specification_scout_prompt(
+    state: dict[str, Any], *, head_sha: str, reasons: list[str]
+) -> str:
+    reason_lines = "\n".join(f"- {reason}" for reason in reasons) or "- Manager requested it."
+    artifact = (LOOP_DIR / "decisions" / "SCOUT.md").as_posix()
+    return f"""You are the Specification Scout for herdr-dev-loop {SKILL_VERSION}.
+
+Inspect MISSION.md, PLAN.md, PROFILE.md, DECISIONS.md, accepted requirements,
+queued implementation tasks, and repository evidence at `{head_sha}`. Do not
+edit product code and do not decide user-visible specifications yourself.
+
+The automatic trigger reasons were:
+{reason_lines}
+
+Write only `{artifact}` with frontmatter containing `status: reported`,
+`head_sha: {head_sha}`, and `run_id: {state.get('run_id', '')}`. In the body,
+report unresolved questions, why each decision is needed, affected requirement
+or task candidates, two or three options with tradeoffs and rollback cost,
+the repository-supported recommendation, safe work that can continue, and the
+cost of delaying the decision. If no decision is needed, state that clearly.
+
+Finish with `HERDR_LOOP_SCOUT_DONE:{state.get('run_id', '')}:S001:reported`.
+"""
+
+
+def render_decision_liaison_prompt(
+    record: DecisionRecord, state: dict[str, Any], *, head_sha: str
+) -> str:
+    question = decision_question_text(record, state)
+    artifact = (LOOP_DIR / "decisions" / record.decision_id / "RESPONSE.md").as_posix()
+    return f"""あなたは Decision Liaison です。仕様を決めるのではなく、利用者が
+判断できるよう、次の質問を平易な日本語で説明し、回答を受け取ってください。
+
+利用者向け本文に decision ID、task ID、state machine 用語、論理式を出さないでください。
+二つか三つの選択肢、利点と欠点、推奨案と根拠、後回しにした場合に進められる範囲、
+自由入力できることを示してください。
+
+{question}
+
+回答を得たら `{artifact}` だけを書き、frontmatter に
+`decision_id: {record.decision_id}`、`responded_by: liaison`、
+`responded_at`、選択肢が特定できる場合は `selected_option` を記録してください。
+本文は `# 回答` の下に利用者の回答を日本語で記録してください。
+対象 SHA は `{head_sha}` です。
+
+完了時は `HERDR_LOOP_LIAISON_DONE:{state.get('run_id', '')}:{record.decision_id}:responded`
+を表示してください。
+"""
 
 
 def write_decision_artifacts(repo: Path, state: dict[str, Any]) -> None:
@@ -7406,14 +7676,475 @@ def write_decision_artifacts(repo: Path, state: dict[str, Any]) -> None:
     }
 
 
-def cmd_decision_new(args: argparse.Namespace) -> int:
-    """Fallback Specification Scout entry point.
+def default_decision_role_worktree(
+    repo: Path, state: dict[str, Any], role_id: str, suffix: str
+) -> Path:
+    return configured_worktree_path(
+        repo,
+        state,
+        role_id,
+        f"{repo.name}.{slugify(role_id, 32)}-{suffix}",
+    )
 
-    HLoop 0.5 has no dedicated interactive decision pane in this slice, so a
-    candidate decision is recorded directly as structured JSON in
-    ``state["decisions"]``; tick/pump output and JOURNAL.md act as the
-    Liaison-fallback notification surface (see cmd_tick/pump_stop_reason).
-    """
+
+def cleanup_decision_role_worktree(
+    repo: Path,
+    role_id: str,
+    role_state: dict[str, Any],
+    *,
+    prompt_suffix: str,
+    best_effort: bool = False,
+) -> None:
+    worktree_raw = str(role_state.get("worktree") or "")
+    if not worktree_raw:
+        return
+    worktree = Path(worktree_raw).resolve()
+    if not worktree.exists() or role_state.get("worktree_cleaned_at"):
+        return
+    try:
+        cleanup_hloop_prompt_file(worktree, role_id, prompt_suffix)
+        git(repo, ["worktree", "remove", "--force", str(worktree)])
+    except (HLoopError, subprocess.CalledProcessError) as exc:
+        if best_effort:
+            record_worktree_cleanup_failure(repo, role_state, role_id, exc)
+            return
+        raise
+    role_state["worktree_cleanup_status"] = "removed"
+    role_state["worktree_cleaned_at"] = now_iso()
+
+
+def decision_role_fallback(
+    repo: Path,
+    state: dict[str, Any],
+    role_state: dict[str, Any],
+    *,
+    role_label: str,
+    reason: str,
+    user_text: str,
+) -> int:
+    role_state.update(
+        {
+            "mode": "manager-fallback",
+            "status": "waiting-manager",
+            "gate_status": "waiting-manager",
+            "fallback_reason": reason,
+            "fallback_at": now_iso(),
+        }
+    )
+    save_state(repo, state)
+    journal(repo, f"{role_label} pane fallback activated: {reason}")
+    print(f"{role_label} paneを開始できないため、Manager経由で続行します。")
+    print(user_text.rstrip())
+    return 0
+
+
+def cmd_specification_scout_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    required, reasons = specification_scout_required(state)
+    policy = str(state.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT)
+    run = state.setdefault("specification_scout_run", {})
+    if str(run.get("status") or "") in {"running", "reported", "completed"}:
+        raise HLoopError(f"Specification Scout is already {run.get('status')}")
+    if not required and not getattr(args, "force", False):
+        run.update(
+            {
+                "status": "skipped",
+                "gate_status": "skipped",
+                "policy": policy,
+                "reasons": reasons,
+                "completed_at": now_iso(),
+            }
+        )
+        save_state(repo, state)
+        print("Specification Scout skipped: " + (", ".join(reasons) or "no auto trigger"))
+        return 0
+    if not reasons:
+        reasons = ["Manager forced the Scout"]
+    head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = (
+        Path(worktree_arg).resolve()
+        if worktree_arg
+        else default_decision_role_worktree(repo, state, "S001", "scout")
+    )
+    prompt_rel = LOOP_DIR / "prompts" / "S001.scout.md"
+    artifact_rel = LOOP_DIR / "decisions" / "SCOUT.md"
+    prompt = render_specification_scout_prompt(state, head_sha=head_sha, reasons=reasons)
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        return decision_role_fallback(
+            repo,
+            state,
+            run,
+            role_label="Specification Scout",
+            reason="Herdr pane is unavailable",
+            user_text=prompt,
+        )
+    runner = getattr(args, "runner", None) or "tui"
+    agent_config = role_agent_config(
+        state,
+        "advisor",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
+    command_text, invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        output_rel=artifact_rel if runner == "exec" else None,
+    )
+    command = f"cd {shlex.quote(str(worktree))} && {command_text}"
+    worktree_preexisting = worktree.exists()
+    try:
+        if not worktree_preexisting:
+            git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+        prepare_role_worktree(repo, worktree, state, role="advisor", agent_id="S001")
+        ensure_advisor_visible_in_worktree(worktree)
+        ensure_worktree_parent_dirs(worktree, prompt_rel, artifact_rel)
+        write_text(worktree / prompt_rel, prompt)
+        baseline = porcelain_paths(worktree)
+        if getattr(args, "launcher", "pane") == "agent":
+            pane_id = start_agent_launcher(
+                name=f"hloop-{state['goal_id']}-specification-scout",
+                direction=getattr(args, "direction", "right"),
+                cwd=worktree,
+                command=command,
+            )
+        else:
+            pane_id = start_pane_launcher(
+                manager_pane=getattr(args, "manager_pane", None) or current_pane_id(),
+                direction=getattr(args, "direction", "right"),
+                cwd=worktree,
+                command=command,
+            )
+    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
+        rollback_failed_role_start(
+            repo, worktree, created_worktree=not worktree_preexisting
+        )
+        return decision_role_fallback(
+            repo,
+            state,
+            run,
+            role_label="Specification Scout",
+            reason=command_error_detail(exc),
+            user_text=prompt,
+        )
+    run.update(
+        {
+            "role_id": "S001",
+            "status": "running",
+            "gate_status": "running",
+            "mode": "agent-pane",
+            "policy": policy,
+            "reasons": reasons,
+            "head_sha": head_sha,
+            "pane_id": pane_id,
+            "worktree": str(worktree),
+            "prompt": str(worktree / prompt_rel),
+            "artifact_path": str(specification_scout_file(repo)),
+            "worktree_artifact_path": str(worktree / artifact_rel),
+            "baseline_dirty_files": baseline,
+            "agent_provider": agent_config["provider"],
+            "agent_model": agent_config["model"],
+            "runner": runner,
+            "provider_invocation": invocation.as_record(),
+            "started_at": now_iso(),
+        }
+    )
+    state["phase"] = "specification_scout"
+    save_state(repo, state)
+    journal(repo, f"Started Specification Scout in pane `{pane_id}` at `{head_sha}`.")
+    print(f"started Specification Scout in pane {pane_id}")
+    return 0
+
+
+def validate_decision_role_scope(
+    worktree: Path,
+    role_state: dict[str, Any],
+    *,
+    allowed: set[str],
+) -> list[str]:
+    baseline = set(normalize_list(role_state.get("baseline_dirty_files")))
+    return [
+        path
+        for path in porcelain_paths(worktree)
+        if path not in baseline and path not in allowed
+    ]
+
+
+def cmd_specification_scout_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    run = state.get("specification_scout_run") or {}
+    if str(run.get("status") or "") != "running":
+        raise HLoopError("Specification Scout is not running")
+    worktree = Path(str(run.get("worktree") or "")).resolve()
+    source = worktree / LOOP_DIR / "decisions" / "SCOUT.md"
+    if not source.is_file() or not read_text(source).strip():
+        raise HLoopError(f"Specification Scout artifact is missing: {source}")
+    violations = validate_decision_role_scope(
+        worktree,
+        run,
+        allowed={
+            (LOOP_DIR / "decisions" / "SCOUT.md").as_posix(),
+            (LOOP_DIR / "prompts" / "S001.scout.md").as_posix(),
+        },
+    )
+    if violations:
+        raise HLoopError(
+            "Specification Scout changed files outside its artifact: "
+            + ", ".join(violations)
+        )
+    destination = specification_scout_file(repo)
+    write_text(destination, read_text(source))
+    run.update(
+        {
+            "status": "reported",
+            "gate_status": "reported",
+            "artifact_path": str(destination),
+            "worktree_artifact_path_harvested": str(source),
+            "harvested_at": now_iso(),
+        }
+    )
+    cleanup_completed_agent_pane(
+        repo,
+        run,
+        label="Specification Scout",
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    cleanup_decision_role_worktree(
+        repo, "S001", run, prompt_suffix="scout", best_effort=True
+    )
+    save_state(repo, state)
+    journal(repo, "Harvested Specification Scout; Manager decision triage is required.")
+    print(f"harvested Specification Scout: {destination}")
+    return 0
+
+
+def cmd_specification_scout_close(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    run = state.get("specification_scout_run") or {}
+    if str(run.get("status") or "") not in {"reported", "waiting-manager"}:
+        raise HLoopError("Specification Scout is not ready to close")
+    run.update(
+        {
+            "status": "completed",
+            "gate_status": "completed",
+            "verdict": args.verdict,
+            "triage_reason": args.reason,
+            "completed_at": now_iso(),
+        }
+    )
+    state["phase"] = "blocked_user_decision" if args.verdict == "blocked" else "dispatching"
+    save_state(repo, state)
+    journal(repo, f"Closed Specification Scout as `{args.verdict}`: {args.reason}")
+    print(f"closed Specification Scout: {args.verdict}")
+    return 0
+
+
+def start_decision_liaison(
+    repo: Path,
+    state: dict[str, Any],
+    record: DecisionRecord,
+    args: argparse.Namespace,
+) -> int:
+    liaisons = state.setdefault("decision_liaisons", {})
+    liaison = liaisons.setdefault(record.decision_id, {})
+    if str(liaison.get("status") or "") in {"running", "responded", "completed"}:
+        print(f"Decision Liaison already {liaison.get('status')}: {record.decision_id}")
+        return 0
+    head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
+    prompt = render_decision_liaison_prompt(record, state, head_sha=head_sha)
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        return decision_role_fallback(
+            repo,
+            state,
+            liaison,
+            role_label="Decision Liaison",
+            reason="Herdr pane is unavailable",
+            user_text=decision_question_text(record, state),
+        )
+    role_id = f"L-{record.decision_id}"
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = (
+        Path(worktree_arg).resolve()
+        if worktree_arg
+        else default_decision_role_worktree(repo, state, role_id, "liaison")
+    )
+    prompt_rel = LOOP_DIR / "prompts" / f"{role_id}.liaison.md"
+    artifact_rel = LOOP_DIR / "decisions" / record.decision_id / "RESPONSE.md"
+    agent_config = role_agent_config(
+        state,
+        "advisor",
+        overrides={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+        },
+    )
+    command_text, invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner="tui",
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+    )
+    command = f"cd {shlex.quote(str(worktree))} && {command_text}"
+    worktree_preexisting = worktree.exists()
+    try:
+        if not worktree_preexisting:
+            git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+        prepare_role_worktree(repo, worktree, state, role="advisor", agent_id=role_id)
+        ensure_advisor_visible_in_worktree(worktree)
+        ensure_worktree_parent_dirs(worktree, prompt_rel, artifact_rel)
+        write_text(worktree / prompt_rel, prompt)
+        baseline = porcelain_paths(worktree)
+        if getattr(args, "launcher", "pane") == "agent":
+            pane_id = start_agent_launcher(
+                name=f"hloop-{state['goal_id']}-{role_id}-liaison",
+                direction=getattr(args, "direction", "right"),
+                cwd=worktree,
+                command=command,
+            )
+        else:
+            pane_id = start_pane_launcher(
+                manager_pane=getattr(args, "manager_pane", None) or current_pane_id(),
+                direction=getattr(args, "direction", "right"),
+                cwd=worktree,
+                command=command,
+            )
+    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
+        rollback_failed_role_start(
+            repo, worktree, created_worktree=not worktree_preexisting
+        )
+        return decision_role_fallback(
+            repo,
+            state,
+            liaison,
+            role_label="Decision Liaison",
+            reason=command_error_detail(exc),
+            user_text=decision_question_text(record, state),
+        )
+    liaison.update(
+        {
+            "role_id": role_id,
+            "decision_id": record.decision_id,
+            "status": "running",
+            "gate_status": "running",
+            "mode": "agent-pane",
+            "head_sha": head_sha,
+            "pane_id": pane_id,
+            "worktree": str(worktree),
+            "prompt": str(worktree / prompt_rel),
+            "response_path": str(decision_liaison_file(repo, record.decision_id)),
+            "worktree_response_path": str(worktree / artifact_rel),
+            "baseline_dirty_files": baseline,
+            "agent_provider": agent_config["provider"],
+            "agent_model": agent_config["model"],
+            "provider_invocation": invocation.as_record(),
+            "started_at": now_iso(),
+        }
+    )
+    save_state(repo, state)
+    journal(repo, f"Started Decision Liaison for `{record.decision_id}` in pane `{pane_id}`.")
+    print(f"started Decision Liaison for {record.decision_id} in pane {pane_id}")
+    return 0
+
+
+def cmd_decision_liaison_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    record = require_decision(state, args.id)
+    if record.decision_class not in hloop_decisions.USER_DECISION_CLASSES:
+        raise HLoopError("Decision Liaison is only for user decision classes")
+    return start_decision_liaison(repo, state, record, args)
+
+
+def markdown_body_after_frontmatter(text: str) -> str:
+    if not text.startswith("---\n"):
+        return text.strip()
+    marker = text.find("\n---\n", 4)
+    return text[marker + 5 :].strip() if marker >= 0 else ""
+
+
+def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    record = require_decision(state, args.id)
+    liaison = (state.get("decision_liaisons") or {}).get(args.id) or {}
+    if str(liaison.get("status") or "") != "running":
+        raise HLoopError(f"Decision Liaison is not running: {args.id}")
+    worktree = Path(str(liaison.get("worktree") or "")).resolve()
+    role_id = str(liaison.get("role_id") or f"L-{args.id}")
+    source = worktree / LOOP_DIR / "decisions" / args.id / "RESPONSE.md"
+    if not source.is_file() or not read_text(source).strip():
+        raise HLoopError(f"Decision Liaison response is missing: {source}")
+    violations = validate_decision_role_scope(
+        worktree,
+        liaison,
+        allowed={
+            (LOOP_DIR / "decisions" / args.id / "RESPONSE.md").as_posix(),
+            (LOOP_DIR / "prompts" / f"{role_id}.liaison.md").as_posix(),
+        },
+    )
+    if violations:
+        raise HLoopError(
+            "Decision Liaison changed files outside its response: "
+            + ", ".join(violations)
+        )
+    text = read_text(source)
+    meta = read_frontmatter(source)
+    selected = str(meta.get("selected_option") or record.recommendation.option_id)
+    body = markdown_body_after_frontmatter(text)
+    body = re.sub(r"^# 回答\s*", "", body).strip()
+    if not body:
+        raise HLoopError("Decision Liaison response body is empty")
+    try:
+        updated = record_response(
+            record,
+            {
+                "responded_by": str(meta.get("responded_by") or "liaison"),
+                "responded_at": str(meta.get("responded_at") or now_iso()),
+                "selected_option": selected,
+                "free_text": body,
+            },
+        )
+    except (DecisionValidationError, DecisionTransitionError) as exc:
+        raise HLoopError(str(exc)) from exc
+    state.setdefault("decisions", {})[args.id] = updated.to_record()
+    destination = decision_liaison_file(repo, args.id)
+    write_text(destination, text)
+    liaison.update(
+        {
+            "status": "responded",
+            "gate_status": "responded",
+            "response_path": str(destination),
+            "worktree_response_path_harvested": str(source),
+            "harvested_at": now_iso(),
+        }
+    )
+    cleanup_completed_agent_pane(
+        repo,
+        liaison,
+        label=f"Decision Liaison {args.id}",
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    cleanup_decision_role_worktree(
+        repo, role_id, liaison, prompt_suffix="liaison", best_effort=True
+    )
+    write_decision_artifacts(repo, state)
+    save_state(repo, state)
+    journal(repo, f"Harvested Decision Liaison response for `{args.id}`.")
+    print(f"harvested Decision Liaison response for {args.id}")
+    return 0
+
+
+def cmd_decision_new(args: argparse.Namespace) -> int:
+    """Record one structured decision, ready for Liaison presentation."""
 
     repo = repo_root(Path(args.repo).resolve())
     ensure_loop_dirs(repo)
@@ -7530,6 +8261,26 @@ def cmd_decision_respond(args: argparse.Namespace) -> int:
     except (DecisionValidationError, DecisionTransitionError) as exc:
         raise HLoopError(str(exc)) from exc
     decisions_state[args.id] = updated.to_record()
+    liaison = (state.get("decision_liaisons") or {}).get(args.id)
+    if isinstance(liaison, dict):
+        liaison["status"] = "responded"
+        liaison["gate_status"] = "responded"
+        liaison["responded_at"] = now_iso()
+        if liaison.get("pane_id"):
+            cleanup_completed_agent_pane(
+                repo,
+                liaison,
+                label=f"Decision Liaison {args.id}",
+                session_cleanup=session_cleanup_mode(args, state),
+            )
+        if liaison.get("worktree"):
+            cleanup_decision_role_worktree(
+                repo,
+                str(liaison.get("role_id") or f"L-{args.id}"),
+                liaison,
+                prompt_suffix="liaison",
+                best_effort=True,
+            )
     write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Recorded response to decision `{args.id}`: {args.text}")
@@ -9286,8 +10037,9 @@ def cleanup_merged_tasks(repo: Path, state: dict[str, Any], dry_run: bool = Fals
 
 def iter_all_roles(state: dict[str, Any]):
     """Yield ``(role_kind, role_id, role_state)`` for every Worker, Reviewer,
-    Gap Auditor, and Advisor participant so the finish gate and `cleanup
-    resolve` can address any role by a single ID."""
+    Gap Auditor, Advisor participant, Specification Scout, and Decision
+    Liaison so the finish gate and ``cleanup resolve`` can address any role by
+    a single ID."""
 
     for task_id, task in state.get("tasks", {}).items():
         yield "worker", task_id, task
@@ -9301,6 +10053,12 @@ def iter_all_roles(state: dict[str, Any]):
         for participant in advice.get("participants", []):
             participant_id = str(participant.get("participant_id") or "P1")
             yield "advisor", f"{advice_id}/{participant_id}", participant
+    scout = state.get("specification_scout_run")
+    if isinstance(scout, dict) and scout:
+        yield "specification-scout", "S001", scout
+    for decision_id, liaison in (state.get("decision_liaisons") or {}).items():
+        if isinstance(liaison, dict):
+            yield "decision-liaison", f"L-{decision_id}", liaison
 
 
 def role_cleanup_failures(role_state: dict[str, Any]) -> dict[str, tuple[str, str]]:
@@ -11405,6 +12163,17 @@ def cmd_tick(args: argparse.Namespace) -> int:
         if args.dry_run:
             print(f"DRY RUN blocked: pending user decision ({blocking_ids})")
             return 2
+        for decision_id in scheduler_decision.blocking_decision_ids:
+            record = require_decision(state, decision_id)
+            liaison = (state.get("decision_liaisons") or {}).get(decision_id) or {}
+            if str(liaison.get("status") or "") not in {
+                "running",
+                "waiting-manager",
+                "responded",
+                "completed",
+            }:
+                start_decision_liaison(repo, state, record, args)
+                state = load_state(repo)
         state["phase"] = "blocked_user_decision"
         save_state(repo, state)
         journal(
@@ -11518,6 +12287,26 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.agent_provider = getattr(args, "reviewer_agent_provider", None)
         args.agent_model = getattr(args, "reviewer_agent_model", None)
         return cmd_reviewer_start(args)
+
+    scout_required, scout_reasons = specification_scout_required(state)
+    scout_run = state.get("specification_scout_run") or {}
+    scout_status = str(scout_run.get("status") or "")
+    if scout_required:
+        if scout_status in {"running", "waiting-manager", "reported"}:
+            print(
+                "Specification Scout requires Manager attention before implementation dispatch: "
+                f"status={scout_status}"
+            )
+            return 0
+        if args.dry_run:
+            print("DRY RUN start Specification Scout: " + ", ".join(scout_reasons))
+            return 0
+        args.force = False
+        args.worktree = None
+        args.runner = "tui"
+        args.agent_provider = getattr(args, "advisor_agent_provider", None)
+        args.agent_model = getattr(args, "advisor_agent_model", None)
+        return cmd_specification_scout_start(args)
 
     running_count = sum(1 for t in state.get("tasks", {}).values() if t.get("status") == "running")
     max_workers = args.max_workers or state.get("max_workers", DEFAULT_MAX_WORKERS)
@@ -12555,6 +13344,11 @@ def next_requirement_id(existing: dict[str, Any]) -> str:
     return f"REQ-{(max(nums) if nums else 0) + 1:03d}"
 
 
+def next_requirement_draft_id(existing: dict[str, Any]) -> str:
+    nums = [int(key[4:]) for key in existing if re.fullmatch(r"DRQ-[0-9]{3}", key)]
+    return f"DRQ-{(max(nums) if nums else 0) + 1:03d}"
+
+
 def local_sensitive_input_dir(repo: Path) -> Path:
     directory = repo / LOOP_DIR / "inputs"
     directory.mkdir(parents=True, exist_ok=True)
@@ -12713,12 +13507,20 @@ def cmd_input_record(args: argparse.Namespace) -> int:
     state = load_state(repo)
     inputs_index = state.setdefault("inputs_index", {})
     input_id = next_input_id(inputs_index)
+    if getattr(args, "file", None):
+        source_path = Path(args.file).expanduser().resolve()
+        try:
+            raw_input = source_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HLoopError(f"cannot read input file {source_path}: {exc}") from exc
+    else:
+        raw_input = str(getattr(args, "text", None) or "")
     try:
         record = hloop_requirements.InputRecord.capture(
             input_id=input_id,
             received_at=now_iso(),
             source=args.source,
-            raw_input=args.text,
+            raw_input=raw_input,
         )
     except hloop_requirements.RequirementModelError as exc:
         raise HLoopError(str(exc)) from exc
@@ -12771,28 +13573,35 @@ def require_requirement(state: dict[str, Any], requirement_id: str) -> hloop_req
     return hloop_requirements.Requirement.from_record(raw)
 
 
-def cmd_requirement_new(args: argparse.Namespace) -> int:
-    repo = repo_root(Path(args.repo).resolve())
-    state = load_state(repo)
+def accept_requirement_into_state(
+    state: dict[str, Any],
+    *,
+    requirement_id: str,
+    source_inputs: tuple[str, ...],
+    acceptance: tuple[str, ...],
+    priority: str,
+    dependencies: tuple[str, ...] = (),
+    supersedes: tuple[str, ...] = (),
+) -> hloop_requirements.Requirement:
+    """Promote one Manager-confirmed requirement into the immutable ledger."""
+
     requirements_state = state.setdefault("requirements", {})
-    requirement_id = args.id or next_requirement_id(requirements_state)
     if requirement_id in requirements_state:
         raise HLoopError(f"requirement already exists: {requirement_id}")
     unknown_inputs = sorted(
-        set(args.source_input) - set((state.get("inputs_index") or {}).keys())
+        set(source_inputs) - set((state.get("inputs_index") or {}).keys())
     )
     if unknown_inputs:
         raise HLoopError(
             "requirement source input is not recorded: " + ", ".join(unknown_inputs)
         )
-    supersedes = tuple(getattr(args, "supersedes", None) or ())
     try:
         requirement = hloop_requirements.Requirement(
             requirement_id=requirement_id,
-            source_inputs=tuple(args.source_input),
-            acceptance=tuple(args.acceptance),
-            priority=args.priority,
-            dependencies=tuple(args.depends_on or ()),
+            source_inputs=source_inputs,
+            acceptance=acceptance,
+            priority=priority,
+            dependencies=dependencies,
             accepted_at=now_iso(),
             supersedes=supersedes,
         )
@@ -12823,10 +13632,121 @@ def cmd_requirement_new(args: argparse.Namespace) -> int:
                 )
             raw["progress"] = progress.to_record()
         requirements_state[item.requirement_id] = raw
+    return requirement
+
+
+def cmd_requirement_new(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    requirements_state = state.setdefault("requirements", {})
+    requirement_id = args.id or next_requirement_id(requirements_state)
+    requirement = accept_requirement_into_state(
+        state,
+        requirement_id=requirement_id,
+        source_inputs=tuple(args.source_input),
+        acceptance=tuple(args.acceptance),
+        priority=args.priority,
+        dependencies=tuple(args.depends_on or ()),
+        supersedes=tuple(getattr(args, "supersedes", None) or ()),
+    )
     write_requirement_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Accepted requirement `{requirement_id}` ({requirement.priority}).")
     print(f"created {requirement_id}")
+    return 0
+
+
+def requirement_draft_file(repo: Path, draft_id: str) -> Path:
+    return loop_path(repo) / "requirements" / "drafts" / f"{draft_id}.json"
+
+
+def cmd_requirements_extract(args: argparse.Namespace) -> int:
+    """Create a non-accepted draft from recorded, already-redacted input."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    source_inputs = tuple(args.input)
+    raw_records: list[hloop_requirements.InputRecord] = []
+    for input_id in source_inputs:
+        if input_id not in (state.get("inputs_index") or {}):
+            raise HLoopError(f"unknown input: {input_id}")
+        path = local_sensitive_input_dir(repo) / f"{input_id}.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_records.append(hloop_requirements.InputRecord.from_record(payload))
+        except (OSError, json.JSONDecodeError, hloop_requirements.RequirementModelError) as exc:
+            raise HLoopError(f"cannot load recorded input {input_id}: {exc}") from exc
+    acceptance = tuple(
+        args.acceptance
+        or [record.raw_input.strip() for record in raw_records if record.raw_input.strip()]
+    )
+    if not acceptance:
+        raise HLoopError("requirement draft acceptance is empty")
+    drafts = state.setdefault("requirement_drafts", {})
+    draft_id = args.id or next_requirement_draft_id(drafts)
+    if draft_id in drafts:
+        raise HLoopError(f"requirement draft already exists: {draft_id}")
+    draft = {
+        "id": draft_id,
+        "status": "draft",
+        "source_inputs": list(source_inputs),
+        "acceptance": list(acceptance),
+        "priority": args.priority,
+        "dependencies": list(args.depends_on or ()),
+        "supersedes": list(args.supersedes or ()),
+        "extracted_at": now_iso(),
+        "confirmation_required": True,
+    }
+    drafts[draft_id] = draft
+    write_text(
+        requirement_draft_file(repo, draft_id),
+        json.dumps(draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Extracted requirement draft `{draft_id}` from {', '.join(source_inputs)}; "
+        "Manager acceptance is still required.",
+    )
+    print(f"drafted {draft_id}; inspect and run `hloop requirements accept --draft {draft_id}`")
+    return 0
+
+
+def cmd_requirements_accept(args: argparse.Namespace) -> int:
+    """Promote exactly one reviewed draft after explicit Manager confirmation."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    drafts = state.setdefault("requirement_drafts", {})
+    draft = drafts.get(args.draft)
+    if not isinstance(draft, dict):
+        raise HLoopError(f"unknown requirement draft: {args.draft}")
+    if str(draft.get("status") or "") != "draft":
+        raise HLoopError(
+            f"requirement draft is not pending confirmation: {args.draft} "
+            f"status={draft.get('status')}"
+        )
+    requirement_id = args.id or next_requirement_id(state.setdefault("requirements", {}))
+    requirement = accept_requirement_into_state(
+        state,
+        requirement_id=requirement_id,
+        source_inputs=tuple(draft.get("source_inputs") or ()),
+        acceptance=tuple(args.acceptance or draft.get("acceptance") or ()),
+        priority=args.priority or str(draft.get("priority") or "P1"),
+        dependencies=tuple(args.depends_on or draft.get("dependencies") or ()),
+        supersedes=tuple(args.supersedes or draft.get("supersedes") or ()),
+    )
+    draft["status"] = "accepted"
+    draft["accepted_requirement_id"] = requirement_id
+    draft["accepted_at"] = requirement.accepted_at
+    write_text(
+        requirement_draft_file(repo, args.draft),
+        json.dumps(draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    write_requirement_artifacts(repo, state)
+    save_state(repo, state)
+    journal(repo, f"Accepted requirement draft `{args.draft}` as `{requirement_id}`.")
+    print(f"accepted {args.draft} as {requirement_id}")
     return 0
 
 
@@ -13002,6 +13922,12 @@ def running_agent_ids(state: dict[str, Any]) -> list[str]:
         for participant in advice.get("participants", []):
             if agent_gate_status(participant) == "running":
                 ids.append(f"{advice_id}/{participant.get('participant_id', 'P1')}")
+    scout = state.get("specification_scout_run")
+    if isinstance(scout, dict) and agent_gate_status(scout) == "running":
+        ids.append("S001")
+    for decision_id, liaison in (state.get("decision_liaisons") or {}).items():
+        if isinstance(liaison, dict) and agent_gate_status(liaison) == "running":
+            ids.append(f"L-{decision_id}")
     return ids
 
 
@@ -13662,6 +14588,22 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("current completion target lacks a closed gap gate")
     if not manager_qa_passed(state):
         errors.append("current completion target lacks passing Manager QA")
+    unresolved_decisions = [
+        record.decision_id
+        for record in decision_records_from_state(state).values()
+        if record.unresolved
+    ]
+    if unresolved_decisions:
+        errors.append(
+            "unresolved specification decisions remain: "
+            + ", ".join(unresolved_decisions)
+        )
+    scout_run = state.get("specification_scout_run") or {}
+    if scout_run and str(scout_run.get("status") or "") not in {"completed", "skipped"}:
+        errors.append(
+            "Specification Scout has not completed Manager triage: "
+            + str(scout_run.get("status") or "unknown")
+        )
     requirement_ids = sorted((state.get("requirements") or {}).keys())
     if not requirement_ids:
         errors.append("no accepted requirements are recorded")
@@ -13758,7 +14700,9 @@ def build_outcome_report(
         for item in validation_results
     ]
     validation_status = "passed" if last_validation_passed(state) else (
-        "failed" if any(item.get("result") == "failed" for item in validation_results) else "pending"
+        "failed"
+        if any(validation_result_failed(item.get("result")) for item in validation_results)
+        else "pending"
     )
     gates = [
         outcome_gate(
@@ -13881,6 +14825,40 @@ def build_outcome_report(
             if str(task.get("status") or "") == "merged"
         )
     )
+    review_findings: list[str] = []
+    review_fixes: list[str] = []
+    accepted_risks: list[str] = []
+    tasks = state.get("tasks") or {}
+    for review_id, review in (state.get("reviews") or {}).items():
+        if not isinstance(review, dict):
+            continue
+        for fingerprint in normalize_list(review.get("confirmed_finding_fingerprints")):
+            review_findings.append(f"{review_id}: {fingerprint}")
+        for task_id in normalize_list(review.get("created_fix_tasks")):
+            task = tasks.get(task_id) or {}
+            title = str(task.get("title") or task_id)
+            status = str(task.get("status") or "unknown")
+            review_fixes.append(f"{review_id}/{task_id}: {title} ({status})")
+        if str(review.get("verdict") or "") == "accepted-risk":
+            accepted_risks.append(
+                f"{review_id}: {review.get('triage_reason') or 'review risk accepted'}"
+            )
+    for gap_id, gap in (state.get("gaps") or {}).items():
+        if isinstance(gap, dict) and str(gap.get("verdict") or "") == "accepted-risk":
+            accepted_risks.append(
+                f"{gap_id}: {gap.get('triage_reason') or 'gap risk accepted'}"
+            )
+    if str(state.get("manager_qa_status") or "") == "accepted-risk":
+        accepted_risks.append(
+            "Manager QA: " + str(state.get("manager_qa_summary") or "risk accepted")
+        )
+    for role_kind, role_id, role_state in iter_all_roles(state):
+        for resolution in (role_state.get("cleanup_resolutions") or {}).values():
+            if isinstance(resolution, dict) and resolution.get("status") == "accepted-risk":
+                accepted_risks.append(
+                    f"{role_kind} {role_id} cleanup: "
+                    + str(resolution.get("reason") or "risk accepted")
+                )
     kwargs = {
         "run_id": str(state.get("run_id") or "local"),
         "goal": str(state.get("goal") or state.get("goal_id") or "HLoop goal"),
@@ -13891,6 +14869,9 @@ def build_outcome_report(
         "current_branch_sha": current,
         "user_changes": tuple(user_changes),
         "validation_evidence": validation_evidence,
+        "review_findings": tuple(dict.fromkeys(review_findings)),
+        "review_fixes": tuple(dict.fromkeys(review_fixes)),
+        "accepted_risks": tuple(dict.fromkeys(accepted_risks)),
         "decisions": tuple(resolved_decisions),
         "unresolved_items": tuple(unresolved_decisions),
         "cleanup_status": "passed" if cleanup_ok else "pending",
@@ -14105,6 +15086,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--reviewer-runner", choices=["exec", "tui"], default="tui")
     init.add_argument("--gap-runner", choices=["exec", "tui"], default="tui")
     init.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    init.add_argument(
+        "--specification-scout",
+        choices=sorted(SPECIFICATION_SCOUT_MODES),
+        help="run the Specification Scout automatically, always, or never",
+    )
     init.add_argument("--review-wait-ms", type=int, default=DEFAULT_REVIEW_WAIT_MS)
     init.add_argument("--gap-wait-ms", type=int, default=DEFAULT_GAP_WAIT_MS)
     init.add_argument("--review-after-merges", type=int, default=DEFAULT_REVIEW_AFTER_MERGES)
@@ -14305,7 +15291,9 @@ def build_parser() -> argparse.ArgumentParser:
     input_sub = input_cmd.add_subparsers(dest="input_command", required=True)
     input_record = input_sub.add_parser("record", help="capture one input")
     input_record.add_argument("--source", required=True)
-    input_record.add_argument("--text", required=True)
+    input_source = input_record.add_mutually_exclusive_group(required=True)
+    input_source.add_argument("--text")
+    input_source.add_argument("--file", help="read UTF-8 user input from a file")
     input_record.set_defaults(func=cmd_input_record)
 
     requirement = sub.add_parser("requirement", help="Manager-accepted requirement ledger")
@@ -14325,6 +15313,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     requirement_status.add_argument("--json", action="store_true")
     requirement_status.set_defaults(func=cmd_requirement_status)
+
+    requirements = sub.add_parser(
+        "requirements",
+        help="extract requirement drafts and accept them only after Manager confirmation",
+    )
+    requirements_sub = requirements.add_subparsers(
+        dest="requirements_command", required=True
+    )
+    requirements_extract = requirements_sub.add_parser(
+        "extract", help="create a draft without changing the accepted ledger"
+    )
+    requirements_extract.add_argument("--id", help="optional DRQ-NNN draft id")
+    requirements_extract.add_argument("--input", action="append", required=True)
+    requirements_extract.add_argument(
+        "--acceptance",
+        action="append",
+        help="override deterministic extraction with an observable criterion",
+    )
+    requirements_extract.add_argument(
+        "--priority", choices=["P0", "P1", "P2", "P3"], default="P1"
+    )
+    requirements_extract.add_argument("--depends-on", action="append")
+    requirements_extract.add_argument("--supersedes", action="append")
+    requirements_extract.set_defaults(func=cmd_requirements_extract)
+    requirements_accept = requirements_sub.add_parser(
+        "accept", help="promote one reviewed draft into the accepted ledger"
+    )
+    requirements_accept.add_argument("--draft", required=True)
+    requirements_accept.add_argument("--id", help="optional REQ-NNN id")
+    requirements_accept.add_argument("--acceptance", action="append")
+    requirements_accept.add_argument(
+        "--priority", choices=["P0", "P1", "P2", "P3"]
+    )
+    requirements_accept.add_argument("--depends-on", action="append")
+    requirements_accept.add_argument("--supersedes", action="append")
+    requirements_accept.set_defaults(func=cmd_requirements_accept)
+    requirements_status = requirements_sub.add_parser(
+        "status", help="compatibility plural for requirement status"
+    )
+    requirements_status.add_argument("--json", action="store_true")
+    requirements_status.set_defaults(func=cmd_requirement_status)
 
     context_cmd = sub.add_parser("context", help="source-linked durable Manager context")
     context_sub = context_cmd.add_subparsers(dest="context_command", required=True)
@@ -14446,6 +15475,35 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
     task_update.set_defaults(func=cmd_task_update)
 
+    specification_scout = sub.add_parser(
+        "specification-scout",
+        help="run and triage the pre-dispatch specification decision scout",
+    )
+    specification_scout_sub = specification_scout.add_subparsers(
+        dest="specification_scout_command", required=True
+    )
+    scout_start = specification_scout_sub.add_parser("start")
+    scout_start.add_argument("--force", action="store_true")
+    scout_start.add_argument("--worktree")
+    scout_start.add_argument("--manager-pane")
+    scout_start.add_argument("--direction", choices=["right", "down"], default="right")
+    scout_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    scout_start.add_argument("--runner", choices=["tui", "exec"], default="tui")
+    scout_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
+    scout_start.add_argument("--agent-model")
+    scout_start.set_defaults(func=cmd_specification_scout_start)
+    scout_harvest = specification_scout_sub.add_parser("harvest")
+    scout_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    scout_harvest.set_defaults(func=cmd_specification_scout_harvest)
+    scout_close = specification_scout_sub.add_parser("close")
+    scout_close.add_argument(
+        "--verdict",
+        choices=["no-decision", "decisions-created", "blocked"],
+        required=True,
+    )
+    scout_close.add_argument("--reason", required=True)
+    scout_close.set_defaults(func=cmd_specification_scout_close)
+
     decision = sub.add_parser("decision", help="specification decision operations")
     decision_sub = decision.add_subparsers(dest="decision_command", required=True)
     decision_new = decision_sub.add_parser("new", help="open a new decision record")
@@ -14505,6 +15563,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted({DECISION_ADVISORY, DECISION_DEFERRED_USER, DECISION_BLOCKING_USER}),
     )
     decision_reclassify.set_defaults(func=cmd_decision_reclassify)
+    decision_liaison = decision_sub.add_parser(
+        "liaison", help="start or harvest the plain-Japanese Decision Liaison"
+    )
+    decision_liaison_sub = decision_liaison.add_subparsers(
+        dest="decision_liaison_command", required=True
+    )
+    liaison_start = decision_liaison_sub.add_parser("start")
+    liaison_start.add_argument("--id", required=True)
+    liaison_start.add_argument("--worktree")
+    liaison_start.add_argument("--manager-pane")
+    liaison_start.add_argument("--direction", choices=["right", "down"], default="right")
+    liaison_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
+    liaison_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
+    liaison_start.add_argument("--agent-model")
+    liaison_start.set_defaults(func=cmd_decision_liaison_start)
+    liaison_harvest = decision_liaison_sub.add_parser("harvest")
+    liaison_harvest.add_argument("--id", required=True)
+    liaison_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
+    liaison_harvest.set_defaults(func=cmd_decision_liaison_harvest)
 
     worker = sub.add_parser("worker", help="worker operations")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)

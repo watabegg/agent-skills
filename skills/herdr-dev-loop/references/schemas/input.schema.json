@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Local-sensitive Input Record",
+  "description": "Redacted record produced from exactly one hloop input record --text or --file source; both capture routes share this durable shape.",
   "type": "object",
   "required": [
     "id",

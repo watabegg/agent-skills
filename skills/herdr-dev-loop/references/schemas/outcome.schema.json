@@ -63,11 +63,12 @@
     },
     "review": {
       "type": "object",
+      "description": "Manager-confirmed review findings, the fix tasks created from them, and explicitly accepted residual risks. FINAL and BLOCKED projections preserve all three lists.",
       "required": ["confirmed_findings", "fixes", "accepted_risks"],
       "properties": {
-        "confirmed_findings": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "fixes": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "accepted_risks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        "confirmed_findings": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "fixes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "accepted_risks": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
       },
       "additionalProperties": false
     },

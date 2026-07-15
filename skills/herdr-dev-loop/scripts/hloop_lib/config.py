@@ -26,10 +26,17 @@ DEFAULT_MATCH_KIND = "repo"
 SUPPORTED_AGENT_PROVIDERS = ("codex", "claude")
 SUPPORTED_SESSION_CLEANUP_MODES = ("archive", "none", "delete")
 SUPPORTED_REVIEW_MODES = ("single", "swarm", "dual", "dual-swarm")
+SUPPORTED_SPECIFICATION_SCOUT_MODES = ("auto", "always", "off")
 MIN_REVIEW_PROBES = 4
 MAX_REVIEW_PROBES = 8
 _KNOWN_TOP_LEVEL_KEYS = ("version", "defaults", "scope")
-_DEFAULT_KEYS = ("max_workers", "session_cleanup", "worker", "reviewer")
+_DEFAULT_KEYS = (
+    "max_workers",
+    "session_cleanup",
+    "specification_scout",
+    "worker",
+    "reviewer",
+)
 _SCOPE_KEYS = ("path", "match", *_DEFAULT_KEYS)
 _WORKER_ROLE_KEYS = ("provider", "model", "effort")
 _REVIEWER_ROLE_KEYS = (
@@ -263,6 +270,14 @@ def _validate_defaults_table(desc: str, table: Any, errors: list[str]) -> None:
             SUPPORTED_SESSION_CLEANUP_MODES,
             errors,
         )
+    if "specification_scout" in table:
+        _validate_enum(
+            desc,
+            "specification_scout",
+            table["specification_scout"],
+            SUPPORTED_SPECIFICATION_SCOUT_MODES,
+            errors,
+        )
     for role_key in ("worker", "reviewer"):
         if role_key in table:
             _validate_role_table(f"{desc}.{role_key}", table[role_key], errors, role=role_key)
@@ -299,6 +314,14 @@ def _validate_scope_entry(desc: str, entry: Any, errors: list[str]) -> None:
             "session_cleanup",
             entry["session_cleanup"],
             SUPPORTED_SESSION_CLEANUP_MODES,
+            errors,
+        )
+    if "specification_scout" in entry:
+        _validate_enum(
+            desc,
+            "specification_scout",
+            entry["specification_scout"],
+            SUPPORTED_SPECIFICATION_SCOUT_MODES,
             errors,
         )
     for role_key in ("worker", "reviewer"):

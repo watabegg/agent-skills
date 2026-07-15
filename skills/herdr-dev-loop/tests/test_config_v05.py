@@ -210,10 +210,27 @@ class ValidateConfigTests(unittest.TestCase):
             },
             "review-mode": {"version": 1, "defaults": {"reviewer": {"mode": "many"}}},
             "scoped-cleanup": {"version": 1, "scope": [{"path": "/tmp", "session_cleanup": "later"}]},
+            "specification-scout": {
+                "version": 1,
+                "defaults": {"specification_scout": "sometimes"},
+            },
         }
         for name, data in invalid_configs.items():
             with self.subTest(name=name), self.assertRaises(config.ConfigValidationError):
                 config.validate_config(data)
+
+    def test_specification_scout_modes_are_valid_at_defaults_and_scope(self):
+        for mode in ("auto", "always", "off"):
+            with self.subTest(mode=mode):
+                config.validate_config(
+                    {
+                        "version": 1,
+                        "defaults": {"specification_scout": mode},
+                        "scope": [
+                            {"path": "/tmp/repo", "specification_scout": mode}
+                        ],
+                    }
+                )
 
     def test_invalid_integer_ranges_are_errors(self):
         invalid_configs = {
