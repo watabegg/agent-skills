@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop First-Class Follow-Up",
+  "description": "A namespaced follow-up with a stable semantic issue key and auditable relations.",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "status",
+    "issue_key",
+    "issue_key_version",
+    "provisional",
+    "component",
+    "trigger_class",
+    "product_impact",
+    "source_review_fingerprints",
+    "discovered_head",
+    "evidence",
+    "impact",
+    "fact_status",
+    "severity",
+    "origin",
+    "contract_relation",
+    "decision_requirement",
+    "release_effect",
+    "requirement_refs",
+    "recommended_action",
+    "deferred_reason",
+    "reconsider_condition",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "id": {"type": "string", "pattern": "^F[0-9]{3}$"},
+    "title": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": ["open", "deferred", "adopted", "closed", "superseded", "active"]
+    },
+    "issue_key": {
+      "type": "string",
+      "pattern": "^fu:v[1-9][0-9]*:sha256:[0-9a-f]{64}$"
+    },
+    "issue_key_version": {"type": "integer", "minimum": 1},
+    "provisional": {"type": "boolean"},
+    "component": {"type": "string", "minLength": 1},
+    "trigger_class": {"type": "string", "minLength": 1},
+    "product_impact": {"type": "string", "minLength": 1},
+    "root_cause": {"type": ["string", "null"]},
+    "source_review": {"type": "string"},
+    "source_gap": {"type": "string"},
+    "source_task": {"type": "string"},
+    "source_finding": {"type": "string"},
+    "source_review_fingerprints": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+    },
+    "duplicate_relation": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/relation"}
+      ]
+    },
+    "aliases": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^fu:v[1-9][0-9]*:sha256:[0-9a-f]{64}$"}
+    },
+    "discovered_head": {"type": "string", "minLength": 1},
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "anyOf": [
+          {"type": "string", "minLength": 1},
+          {"type": "object", "minProperties": 1}
+        ]
+      }
+    },
+    "impact": {"type": "string", "minLength": 1},
+    "affected_path": {"type": "string"},
+    "symbol": {"type": "string"},
+    "fact_status": {
+      "enum": ["confirmed", "refuted", "insufficient_evidence"]
+    },
+    "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+    "origin": {
+      "enum": [
+        "introduced",
+        "diff-expanded-pre-existing",
+        "unrelated-pre-existing",
+        "unknown"
+      ]
+    },
+    "contract_relation": {
+      "enum": ["in_scope", "outside_release", "ambiguous"]
+    },
+    "decision_requirement": {"enum": ["none", "spec", "user"]},
+    "release_effect": {"enum": ["blocking", "non_blocking"]},
+    "requirement_refs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "recommended_action": {"type": "string", "minLength": 1},
+    "deferred_reason": {"type": "string", "minLength": 1},
+    "target_version": {"type": "string"},
+    "milestone": {"type": "string"},
+    "reconsider_condition": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "issue_key": {
+      "type": "string",
+      "pattern": "^fu:v[1-9][0-9]*:sha256:[0-9a-f]{64}$"
+    },
+    "relation": {
+      "type": "object",
+      "required": ["relation", "target_issue_key"],
+      "properties": {
+        "relation": {"enum": ["duplicate_of", "supersedes", "alias_of"]},
+        "target_issue_key": {"$ref": "#/$defs/issue_key"},
+        "source_issue_key": {"$ref": "#/$defs/issue_key"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "anyOf": [
+        {"required": ["affected_path"]},
+        {"required": ["symbol"]}
+      ]
+    },
+    {
+      "if": {"properties": {"provisional": {"const": true}}},
+      "then": {
+        "properties": {
+          "root_cause": {"anyOf": [{"type": "null"}, {"const": ""}]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"provisional": {"const": false}}},
+      "then": {
+        "required": ["root_cause"],
+        "properties": {"root_cause": {"type": "string", "minLength": 1}}
+      }
+    },
+    {
+      "if": {"properties": {"recommended_action": {"const": "defer_follow_up"}}},
+      "then": {"properties": {"release_effect": {"const": "non_blocking"}}}
+    }
+  ],
+  "additionalProperties": false
+}
