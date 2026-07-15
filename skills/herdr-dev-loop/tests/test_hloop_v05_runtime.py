@@ -1585,6 +1585,162 @@ class ReviewGroupRuntimeTests(unittest.TestCase):
         )
 
 
+class SpecificationDecisionRoleTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-specification-roles")
+
+    def tearDown(self):
+        hloop.configure_loop_namespace(self.previous_namespace)
+
+    def decision(self):
+        return hloop.DecisionRecord(
+            decision_id="D001",
+            decision_class=hloop.DECISION_BLOCKING_USER,
+            status=hloop.DECISION_PENDING,
+            question="公開 API の互換性を維持しますか",
+            options=(
+                {"id": "opt_1", "label": "維持する", "tradeoffs": ["安全だが移行期間が必要"]},
+                {"id": "opt_2", "label": "変更する", "tradeoffs": ["簡潔だが既存利用者へ影響"]},
+            ),
+            recommendation={"option_id": "opt_1", "rationale": "既存利用者を保護できるため"},
+            affected_task_ids=("T001",),
+        )
+
+    def test_specification_scout_auto_always_and_off(self):
+        base = {
+            "tasks": {
+                "T001": {
+                    "status": "queued",
+                    "kind": "implementation",
+                    "title": "公開 API schema migration",
+                }
+            },
+            "requirements": {},
+            "specification_scout_run": {},
+        }
+        required, reasons = hloop.specification_scout_required(
+            {**base, "specification_scout": "auto"}
+        )
+        self.assertTrue(required)
+        self.assertTrue(any("公開" in reason or "schema" in reason for reason in reasons))
+        self.assertEqual(
+            hloop.specification_scout_required(
+                {**base, "specification_scout": "always"}
+            ),
+            (True, ["policy is always"]),
+        )
+        self.assertFalse(
+            hloop.specification_scout_required(
+                {**base, "specification_scout": "off"}
+            )[0]
+        )
+
+    def test_scout_and_liaison_fallbacks_are_durable_and_plain_japanese(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            state = {
+                "state_format_version": hloop.STATE_FORMAT_VERSION,
+                "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                "run_id": "run-spec",
+                "goal_id": "spec",
+                "phase": "dispatching",
+                "integration_branch": "main",
+                "specification_scout": "always",
+                "specification_scout_run": {},
+                "tasks": {"T001": {"status": "queued", "kind": "implementation"}},
+                "requirements": {},
+                "decisions": {"D001": self.decision().to_record()},
+            }
+            hloop.save_state(repo, state)
+            args = SimpleNamespace(
+                repo=str(repo),
+                force=False,
+                worktree=None,
+                runner="tui",
+                agent_provider=None,
+                agent_model=None,
+                launcher="pane",
+                manager_pane=None,
+                direction="right",
+            )
+            output = io.StringIO()
+            with mock.patch.object(hloop, "repo_root", return_value=repo), mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "git", return_value="a" * 40
+            ), mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output):
+                self.assertEqual(hloop.cmd_specification_scout_start(args), 0)
+            scout = hloop.load_state(repo)["specification_scout_run"]
+            self.assertEqual(scout["mode"], "manager-fallback")
+            self.assertEqual(scout["status"], "waiting-manager")
+
+            state = hloop.load_state(repo)
+            output = io.StringIO()
+            with mock.patch.object(hloop, "git", return_value="a" * 40), mock.patch.dict(
+                os.environ, {}, clear=True
+            ), contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    hloop.start_decision_liaison(repo, state, self.decision(), args),
+                    0,
+                )
+            liaison = hloop.load_state(repo)["decision_liaisons"]["D001"]
+            self.assertEqual(liaison["mode"], "manager-fallback")
+            self.assertEqual(liaison["status"], "waiting-manager")
+            rendered = output.getvalue()
+            self.assertIn("# 判断のお願い", rendered)
+            self.assertNotIn("D001", rendered)
+            self.assertNotIn("T001", rendered)
+
+    def test_successful_liaison_start_records_dedicated_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "liaison"
+            repo.mkdir()
+            worktree.mkdir()
+            state = {
+                "state_format_version": hloop.STATE_FORMAT_VERSION,
+                "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                "run_id": "run-liaison",
+                "goal_id": "liaison",
+                "integration_branch": "main",
+                "decision_liaisons": {},
+            }
+            invocation = SimpleNamespace(as_record=lambda: {"provider": "codex"})
+            args = SimpleNamespace(
+                worktree=str(worktree),
+                agent_provider="codex",
+                agent_model="auto",
+                launcher="pane",
+                manager_pane="w:p1",
+                direction="right",
+            )
+            with mock.patch.object(hloop, "git", return_value="b" * 40), mock.patch.object(
+                hloop, "command_exists", return_value=True
+            ), mock.patch.object(
+                hloop, "role_agent_command", return_value=("codex", invocation)
+            ), mock.patch.object(
+                hloop, "prepare_role_worktree"
+            ), mock.patch.object(
+                hloop, "ensure_advisor_visible_in_worktree"
+            ), mock.patch.object(
+                hloop, "porcelain_paths", return_value=[]
+            ), mock.patch.object(
+                hloop, "start_pane_launcher", return_value="w:p2"
+            ), mock.patch.dict(
+                os.environ, {"HERDR_ENV": "1"}, clear=True
+            ):
+                self.assertEqual(
+                    hloop.start_decision_liaison(repo, state, self.decision(), args),
+                    0,
+                )
+            liaison = hloop.load_state(repo)["decision_liaisons"]["D001"]
+            self.assertEqual(liaison["mode"], "agent-pane")
+            self.assertEqual(liaison["pane_id"], "w:p2")
+            self.assertEqual(liaison["role_id"], "L-D001")
+
+
 class RequirementProgressOutcomeTests(unittest.TestCase):
     """Exercises input record / requirement new / progress record / outcome show."""
 
@@ -1745,6 +1901,134 @@ class RequirementProgressOutcomeTests(unittest.TestCase):
             self.assertIn("U0001", context)
             self.assertNotIn("context-secret-12345678", context)
             self.assertIn("[REDACTED]", context)
+
+    def test_input_file_extract_and_accept_preserve_confirmation_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            source = root / "instruction.txt"
+            source.write_text(
+                "公開 API の互換性を検証可能な形で維持する。\n",
+                encoding="utf-8",
+            )
+            hloop.cmd_input_record(
+                SimpleNamespace(
+                    repo=str(repo),
+                    source="manager-file",
+                    text=None,
+                    file=str(source),
+                )
+            )
+            hloop.cmd_requirements_extract(
+                SimpleNamespace(
+                    repo=str(repo),
+                    id=None,
+                    input=["U0001"],
+                    acceptance=None,
+                    priority="P1",
+                    depends_on=None,
+                    supersedes=None,
+                )
+            )
+            draft_state = hloop.load_state(repo)
+            self.assertEqual(draft_state["requirement_drafts"]["DRQ-001"]["status"], "draft")
+            self.assertEqual(draft_state.get("requirements", {}), {})
+            hloop.cmd_requirements_accept(
+                SimpleNamespace(
+                    repo=str(repo),
+                    draft="DRQ-001",
+                    id=None,
+                    acceptance=["公開 API の互換性テストが通る"],
+                    priority=None,
+                    depends_on=None,
+                    supersedes=None,
+                )
+            )
+            accepted = hloop.load_state(repo)
+            self.assertEqual(
+                accepted["requirement_drafts"]["DRQ-001"]["accepted_requirement_id"],
+                "REQ-001",
+            )
+            self.assertIn("REQ-001", accepted["requirements"])
+            with self.assertRaises(hloop.HLoopError):
+                hloop.cmd_requirements_accept(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        draft="DRQ-001",
+                        id=None,
+                        acceptance=None,
+                        priority=None,
+                        depends_on=None,
+                        supersedes=None,
+                    )
+                )
+
+    def test_outcome_projects_confirmed_review_fixes_risks_and_failed_returncode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            state = hloop.load_state(repo)
+            state.update(
+                {
+                    "run_id": "run-outcome",
+                    "goal": "outcome projection",
+                    "integration_head_sha": head,
+                    "completion_target_sha": head,
+                    "last_validation": {
+                        "head_sha": head,
+                        "results": [
+                            {
+                                "command": "false",
+                                "result": "failed:7",
+                                "returncode": 7,
+                                "log": "validation/failed.log",
+                            }
+                        ],
+                    },
+                    "max_reviewers": 1,
+                    "needs_review": False,
+                    "max_gap_auditors": 0,
+                    "manager_qa_profile": "none",
+                    "manager_qa_status": "not-required",
+                    "tasks": {
+                        "T009": {
+                            "title": "Fix confirmed race",
+                            "status": "merged",
+                        }
+                    },
+                    "reviews": {
+                        "R001": {
+                            "status": "triaged",
+                            "gate_status": "triaged",
+                            "head_sha": head,
+                            "closed_head_sha": head,
+                            "confirmed_finding_fingerprints": ["sha256:" + "a" * 64],
+                            "created_fix_tasks": ["T009"],
+                            "verdict": "accepted-risk",
+                            "triage_reason": "legacy client remains unsupported",
+                            "review_path": "reviews/R001/FINAL.md",
+                        }
+                    },
+                }
+            )
+            report = hloop.build_outcome_report(repo, state, kind="DRAFT")
+            validation = next(
+                gate for gate in report.gates if gate.name == "integration-validation"
+            )
+            self.assertEqual(validation.status, "failed")
+            self.assertEqual(len(report.review_findings), 1)
+            self.assertIn("T009", report.review_fixes[0])
+            self.assertIn("legacy client", report.accepted_risks[0])
+            rendered = hloop.hloop_reports.render_outcome_markdown(report)
+            self.assertIn("Confirmed findings", rendered)
+            self.assertIn("failed", rendered)
 
     def test_config_apply_is_explicit_dry_run_safe_and_idle_guarded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1962,7 +2246,22 @@ effort = "high"
                     "run_id": "run-blocked",
                     "phase": "blocked_user_decision",
                     "requirements": {"REQ-001": requirement},
-                    "tasks": {},
+                    "tasks": {
+                        "T009": {
+                            "title": "Applied confirmed fix",
+                            "status": "merged",
+                        }
+                    },
+                    "reviews": {
+                        "R001": {
+                            "status": "triaged",
+                            "gate_status": "triaged",
+                            "confirmed_finding_fingerprints": ["sha256:" + "b" * 64],
+                            "created_fix_tasks": ["T009"],
+                            "verdict": "accepted-risk",
+                            "triage_reason": "blocked run retains a known compatibility risk",
+                        }
+                    },
                 }
             )
             hloop.save_state(repo, state)
@@ -1975,6 +2274,9 @@ effort = "high"
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("# Blocked Outcome", report)
             self.assertIn("same user decision blocks all safe work", report)
+            self.assertIn("sha256:" + "b" * 64, report)
+            self.assertIn("T009", report)
+            self.assertIn("known compatibility risk", report)
 
 
 if __name__ == "__main__":

@@ -445,11 +445,42 @@ class SchemaContractTests(unittest.TestCase):
             schemas["input.schema.json"]["properties"]["checkpoint_included"]["const"],
             False,
         )
+        draft = schemas["requirement.schema.json"]["$defs"]["requirement_draft"]
+        self.assertEqual(draft["properties"]["confirmation_required"]["const"], True)
+        self.assertEqual(draft["properties"]["id"]["pattern"], "^DRQ-[0-9]{3}$")
         self.assertIn("verified", json.dumps(schemas["progress.schema.json"]))
         self.assertEqual(
             schemas["outcome.schema.json"]["properties"]["kind"]["enum"],
             ["DRAFT", "FINAL", "BLOCKED"],
         )
+
+    @unittest.skipUnless(jsonschema is not None, "jsonschema is not installed")
+    def test_requirement_draft_schema_preserves_confirmation_boundary(self):
+        schema = json.loads((SCHEMAS / "requirement.schema.json").read_text())
+        validator = jsonschema.Draft202012Validator(
+            schema["$defs"]["requirement_draft"]
+        )
+        draft = {
+            "id": "DRQ-001",
+            "status": "draft",
+            "source_inputs": ["U0001"],
+            "acceptance": ["The observable result is confirmed."],
+            "priority": "P1",
+            "dependencies": [],
+            "supersedes": [],
+            "extracted_at": NOW,
+            "confirmation_required": True,
+        }
+        self.assertTrue(validator.is_valid(draft))
+
+        unconfirmed = copy.deepcopy(draft)
+        unconfirmed["status"] = "accepted"
+        self.assertFalse(validator.is_valid(unconfirmed))
+
+        accepted = copy.deepcopy(unconfirmed)
+        accepted["accepted_requirement_id"] = "REQ-001"
+        accepted["accepted_at"] = NOW
+        self.assertTrue(validator.is_valid(accepted))
 
     @unittest.skipUnless(jsonschema is not None, "jsonschema is not installed")
     def test_progress_schema_rejects_incomplete_verified_evidence(self):
