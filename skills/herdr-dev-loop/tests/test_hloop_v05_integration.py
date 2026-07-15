@@ -783,7 +783,9 @@ effort = "medium"
                         )
 
                 with mock.patch.object(hloop, "preflight_loop", return_value=state):
-                    with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
+                    with self.assertRaisesRegex(
+                        hloop.HLoopError, "merge_ready is true with a non-passed validation result"
+                    ):
                         hloop.cmd_worker_harvest(
                             argparse.Namespace(
                                 repo=str(repo),
@@ -1222,7 +1224,7 @@ effort = "medium"
                 hloop.write_text(result_path, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n")
                 with mock.patch.object(hloop, "preflight_loop", return_value=state):
                     with self.assertRaisesRegex(
-                        hloop.HLoopError, "Worker-reported validation is inconsistent"
+                        hloop.HLoopError, "invalid validation record in handoff artifact"
                     ):
                         hloop.cmd_worker_seal(self.seal_args(repo))
                 self.assertNotEqual(hloop.porcelain_paths(worktree), [])
@@ -1599,6 +1601,481 @@ effort = "medium"
         finally:
             hloop.configure_loop_namespace(previous)
 
+    def test_worker_seal_resume_fails_closed_on_tampered_staged_tree(self):
+        """Same staged paths but different content after a crash must fail closed."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-tampered-tree", status="done"
+                )
+
+                real_run_cmd = hloop.run_cmd
+
+                class SimulatedCrash(Exception):
+                    pass
+
+                def crashing_run_cmd(cmd, *cmd_args, **cmd_kwargs):
+                    if isinstance(cmd, list) and "commit" in cmd:
+                        raise SimulatedCrash("process died before commit")
+                    return real_run_cmd(cmd, *cmd_args, **cmd_kwargs)
+
+                with mock.patch.object(hloop, "run_cmd", side_effect=crashing_run_cmd):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            with self.assertRaises(SimulatedCrash):
+                                hloop.cmd_worker_seal(
+                                    self.seal_args(
+                                        repo, validation_command=["exit 0"], validation_summary="ok"
+                                    )
+                                )
+
+                transaction = state["tasks"]["T001"]["seal_transaction"]
+                self.assertIn("staged_tree", transaction)
+                head_before = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+
+                # Tamper: the same staged path (`keep.txt`) now carries different
+                # content than what was durably recorded before the crash --
+                # simulating something re-staging or altering it in the window
+                # between the crash and the next seal attempt.
+                (worktree / "keep.txt").write_text("tampered\n", encoding="utf-8")
+                subprocess.run(["git", "add", "keep.txt"], cwd=worktree, check=True)
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "staged tree identity"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+
+                # Fail closed: nothing committed, and the transaction is cleared
+                # rather than left around to authorize a later silent resume.
+                self.assertNotIn("seal_transaction", state["tasks"]["T001"])
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+                head_after = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                self.assertEqual(head_before, head_after)
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_resume_fails_closed_when_tree_identity_not_yet_durable(self):
+        """A crash before the tree-identity checkpoint lands must not resume-commit."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-pretree-crash", status="done"
+                )
+
+                real_git = hloop.git
+
+                class SimulatedCrash(Exception):
+                    pass
+
+                def crashing_git(repo_path, args, check=True):
+                    if args and args[0] == "write-tree":
+                        raise SimulatedCrash("process died before tree identity was durable")
+                    return real_git(repo_path, args, check=check)
+
+                with mock.patch.object(hloop, "git", side_effect=crashing_git):
+                    with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            with self.assertRaises(SimulatedCrash):
+                                hloop.cmd_worker_seal(
+                                    self.seal_args(
+                                        repo, validation_command=["exit 0"], validation_summary="ok"
+                                    )
+                                )
+
+                # The index is staged (`add -A`/`add -f` already ran) but the
+                # crash happened before the durable tree-identity checkpoint,
+                # so the recorded transaction must not carry a `staged_tree`.
+                transaction = state["tasks"]["T001"]["seal_transaction"]
+                self.assertNotIn("staged_tree", transaction)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    1,
+                )
+                head_before = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "already has staged changes"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+
+                # Must not silently resume-commit an unverified tree -- the
+                # transaction record must survive for inspection, and nothing
+                # may have been committed without validation running again.
+                self.assertIn("seal_transaction", state["tasks"]["T001"])
+                head_after = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                self.assertEqual(head_before, head_after)
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_validation_rollback_restores_already_dirty_file_and_deletion_exactly(self):
+        """Rollback must restore already-dirty content/mode and a pre-existing
+        deletion exactly, not just delete paths the validation command newly
+        introduced."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-rollback-bytes", status="done"
+                )
+                keep_path = worktree / "keep.txt"
+                drop_path = worktree / "drop.txt"
+                self.assertFalse(os.access(keep_path, os.X_OK))
+
+                mutate_and_fail = (
+                    f"echo further-mutated > {shlex.quote(str(keep_path))}; "
+                    f"chmod +x {shlex.quote(str(keep_path))}; "
+                    f"echo resurrected > {shlex.quote(str(drop_path))}; "
+                    "exit 1"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "Manager validation command failed"):
+                        hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=[mutate_and_fail])
+                        )
+
+                # Restored exactly to the pre-validation dirty state -- not the
+                # further-mutated content, not HEAD's content, and not made
+                # executable.
+                self.assertEqual(keep_path.read_text(encoding="utf-8"), "changed\n")
+                self.assertFalse(os.access(keep_path, os.X_OK))
+                # The pre-validation deletion must be restored, not resurrected.
+                self.assertFalse(drop_path.exists())
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "diff", "--cached", "--quiet"], cwd=worktree, check=False
+                    ).returncode,
+                    0,
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_validation_rollback_removes_new_untracked_directory(self):
+        """A validation command creating a whole new untracked directory must
+        have it fully removed on rollback, not just the files inside it."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-rollback-newdir", status="done"
+                )
+                new_dir = worktree / "build-output"
+                mutate_and_fail = (
+                    f"mkdir -p {shlex.quote(str(new_dir))}; "
+                    f"echo artifact > {shlex.quote(str(new_dir / 'out.bin'))}; "
+                    "exit 1"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "Manager validation command failed"):
+                        hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=[mutate_and_fail])
+                        )
+                self.assertFalse(new_dir.exists())
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_validation_rollback_restores_symlink_replaced_by_directory(self):
+        """Rollback must recover a dirty symlink even after a validation command
+        replaces it with a directory (type change), using `shutil.rmtree` to
+        clear the directory first."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                namespace = "worker-seal-rollback-symlink-dir"
+                hloop.configure_loop_namespace(namespace)
+                repo = self.make_repo(root)
+                (repo / "target.txt").write_text("target\n", encoding="utf-8")
+                subprocess.run(["git", "add", "target.txt"], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "seed target"], cwd=repo, check=True, capture_output=True
+                )
+                base_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                worktree = root / "worker"
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", "worker-seal-symlink-dir", str(worktree), "master"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                run_id = f"run-{namespace}"
+                task_meta = {
+                    "id": "T001",
+                    "run_id": run_id,
+                    "kind": "fix",
+                    "status": "running",
+                    "branch": "worker-seal-symlink-dir",
+                    "base_ref": "master",
+                    "base_sha": base_sha,
+                    "write_allow": ["target.txt", "link.txt"],
+                    "write_deny": [],
+                    "acceptance": ["handoff seals cleanly"],
+                }
+                hloop.write_text(
+                    hloop.task_file(repo, "T001"), hloop.frontmatter(task_meta) + "\n\n# Task T001\n"
+                )
+                (worktree / "link.txt").symlink_to("target.txt")
+                result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+                result_meta = {
+                    "task_id": "T001",
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "attempt_id": "T001-A001",
+                    "status": "done",
+                    "merge_ready": False,
+                    "branch": "worker-seal-symlink-dir",
+                    "head_sha": "HEAD",
+                    "base_sha": base_sha,
+                    "changed_files": ["link.txt", result_rel.as_posix()],
+                    "validation_recorded": False,
+                    "validation_commands": [],
+                    "validation_results": [],
+                    "validation_summary": "",
+                    "blocking_questions": [],
+                    "handoff": True,
+                }
+                hloop.write_text(
+                    worktree / result_rel, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n"
+                )
+                task_state = {
+                    **task_meta,
+                    "worktree": str(worktree),
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "worker_base_sha": base_sha,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "semantic_ack_barrier": {"status": "approved"},
+                    "pane_closed_at": "2026-01-01T00:00:00+00:00",
+                }
+                state = {
+                    "state_format_version": hloop.STATE_FORMAT_VERSION,
+                    "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                    "namespace": hloop.LOOP_NAMESPACE,
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "phase": "running",
+                    "integration_branch": "master",
+                    "merge_mode": "squash",
+                    "persistence": "local-only",
+                    "tasks": {"T001": task_state},
+                }
+
+                link_path = worktree / "link.txt"
+                mutate_symlink_to_directory_and_fail = (
+                    f"rm {shlex.quote(str(link_path))}; "
+                    f"mkdir -p {shlex.quote(str(link_path))}; "
+                    f"echo stray > {shlex.quote(str(link_path / 'stray.txt'))}; "
+                    "exit 1"
+                )
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "Manager validation command failed"):
+                        hloop.cmd_worker_seal(
+                            self.seal_args(
+                                repo, validation_command=[mutate_symlink_to_directory_and_fail]
+                            )
+                        )
+
+                self.assertTrue(link_path.is_symlink())
+                self.assertEqual(os.readlink(link_path), "target.txt")
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_force_stages_result_artifact_when_ai_is_gitignored(self):
+        """The namespaced result artifact must land in the seal commit even in
+        a repository that gitignores `.ai`; product paths keep normal
+        `git add -A` semantics."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                namespace = "worker-seal-gitignore-ai"
+                hloop.configure_loop_namespace(namespace)
+                repo = self.make_repo(root)
+                (repo / ".gitignore").write_text(".ai/\n", encoding="utf-8")
+                (repo / "keep.txt").write_text("base\n", encoding="utf-8")
+                subprocess.run(["git", "add", ".gitignore", "keep.txt"], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "seed with gitignore"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                base_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                worktree = root / "worker"
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", "worker-seal-gitignore", str(worktree), "master"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                run_id = f"run-{namespace}"
+                task_meta = {
+                    "id": "T001",
+                    "run_id": run_id,
+                    "kind": "fix",
+                    "status": "running",
+                    "branch": "worker-seal-gitignore",
+                    "base_ref": "master",
+                    "base_sha": base_sha,
+                    "write_allow": ["keep.txt"],
+                    "write_deny": [],
+                    "acceptance": ["handoff seals cleanly"],
+                }
+                hloop.write_text(
+                    hloop.task_file(repo, "T001"), hloop.frontmatter(task_meta) + "\n\n# Task T001\n"
+                )
+                (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
+                result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+                result_meta = {
+                    "task_id": "T001",
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "attempt_id": "T001-A001",
+                    "status": "partial",
+                    "merge_ready": False,
+                    "branch": "worker-seal-gitignore",
+                    "head_sha": "HEAD",
+                    "base_sha": base_sha,
+                    "changed_files": ["keep.txt", result_rel.as_posix()],
+                    "validation_recorded": False,
+                    "validation_commands": [],
+                    "validation_results": [],
+                    "validation_summary": "",
+                    "blocking_questions": [],
+                    "handoff": True,
+                }
+                hloop.write_text(
+                    worktree / result_rel, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n"
+                )
+                task_state = {
+                    **task_meta,
+                    "worktree": str(worktree),
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "worker_base_sha": base_sha,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "semantic_ack_barrier": {"status": "approved"},
+                    "pane_closed_at": "2026-01-01T00:00:00+00:00",
+                }
+                state = {
+                    "state_format_version": hloop.STATE_FORMAT_VERSION,
+                    "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                    "namespace": hloop.LOOP_NAMESPACE,
+                    "run_id": run_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "phase": "running",
+                    "integration_branch": "master",
+                    "merge_mode": "squash",
+                    "persistence": "local-only",
+                    "tasks": {"T001": task_state},
+                }
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(self.seal_args(repo))
+                self.assertEqual(code, 0)
+                committed_files = subprocess.run(
+                    ["git", "show", "--stat", "--name-only", "-1"],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout
+                self.assertIn(result_rel.as_posix(), committed_files)
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_result_contract_rejects_missing_required_field_consistently(self):
+        """A Worker result missing a schema-required field (`base_sha`) must be
+        rejected identically by artifact readiness, seal precheck, and
+        harvest -- the one shared validator, not three independent checks."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, state, result_rel = self.make_worker_seal_fixture(
+                    root, namespace="worker-seal-contract-incomplete", status="partial"
+                )
+                result_path = worktree / result_rel
+                result_meta = hloop.parse_frontmatter_text(hloop.read_text(result_path))
+                del result_meta["base_sha"]
+                hloop.write_text(
+                    result_path, hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n"
+                )
+
+                ready, reason = hloop.artifact_readiness(
+                    repo, state, "T001", "worker", state["tasks"]["T001"], result_path
+                )
+                self.assertFalse(ready)
+                self.assertIn("base_sha", reason)
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "base_sha"):
+                        hloop.cmd_worker_seal(self.seal_args(repo))
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with self.assertRaisesRegex(hloop.HLoopError, "base_sha"):
+                        hloop.cmd_worker_harvest(
+                            argparse.Namespace(
+                                repo=str(repo), task_id="T001", keep_pane=False, session_cleanup=None
+                            )
+                        )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_seal_required_action_text_includes_validation_command_placeholder(self):
+        text = hloop.seal_required_action_text("T001")
+        self.assertTrue(text.startswith("hloop worker seal T001"))
+        self.assertIn("--validation-command", text)
+        self.assertIn("<manager-approved-command>", text)
+
+    def test_frontmatter_round_trips_string_values_equal_to_true_or_false(self):
+        """A validation command literally named `true`/`false` must round-trip
+        as the exact string, not be silently reinterpreted as a Python bool --
+        the shared Worker result contract validator strictly requires
+        `validation_commands` items to be `str`."""
+
+        text = hloop.frontmatter(
+            {
+                "validation_commands": ["false", "true"],
+                "validation_summary": "false",
+            }
+        )
+        meta = hloop.parse_frontmatter_text(text)
+        self.assertEqual(meta["validation_commands"], ["false", "true"])
+        self.assertTrue(all(type(item) is str for item in meta["validation_commands"]))
+        self.assertEqual(meta["validation_summary"], "false")
+        self.assertIs(type(meta["validation_summary"]), str)
+
     def test_worker_seal_pending_handoff_is_seal_required_not_terminal(self):
         """A valid uncommitted handoff must read as seal-required, never terminal-without-artifact."""
 
@@ -1647,6 +2124,7 @@ effort = "medium"
                 self.assertEqual(code, 3)
                 self.assertIn("seal required", out.getvalue())
                 self.assertIn("hloop worker seal T001", out.getvalue())
+                self.assertIn("--validation-command", out.getvalue())
         finally:
             hloop.configure_loop_namespace(previous)
 
