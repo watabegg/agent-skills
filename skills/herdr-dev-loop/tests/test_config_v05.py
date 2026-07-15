@@ -1,6 +1,7 @@
 """Unit tests for hloop_lib.config (herdr-dev-loop 0.5.0 config primitives)."""
 
 import os
+import re
 import sys
 import types
 import unittest
@@ -9,6 +10,34 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from hloop_lib import config  # noqa: E402
+
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+# Any absolute path under a specific user's home directory (e.g.
+# /home/watabegg/...), regardless of username -- required-command blocks
+# must only ever discover installs via $HOME/$CODEX_HOME/$CLAUDE_SKILLS_HOME
+# or a project-relative path, so they work for every author's machine.
+_AUTHOR_HOME_PATH = re.compile(r"/home/[^/\s\"'()]+/")
+
+_PORTABLE_DOC_PATHS = (
+    "README.md",
+    "docs/RELEASE-0.5.0.md",
+    "docs/2026-07-14-v0.5.0-plan.md",
+    "references/migration-install.md",
+)
+
+
+class RequiredCommandPortabilityTests(unittest.TestCase):
+    def test_release_readme_migration_and_plan_docs_avoid_author_home_paths(self):
+        for relative_path in _PORTABLE_DOC_PATHS:
+            with self.subTest(doc=relative_path):
+                text = (SKILL_ROOT / relative_path).read_text(encoding="utf-8")
+                matches = _AUTHOR_HOME_PATH.findall(text)
+                self.assertEqual(
+                    matches,
+                    [],
+                    f"{relative_path} hard-codes an author-machine home path: {matches}",
+                )
 
 
 class CheckPythonCapabilityTests(unittest.TestCase):
@@ -400,6 +429,43 @@ class DeepMergeWithSourceTests(unittest.TestCase):
         resolution = config.deep_merge_with_source([("built-in-default", {"a": 1}), ("config-defaults", None)])
         self.assertEqual(resolution.get("a"), 1)
 
+    def test_later_layer_probes_per_provider_clears_inherited_probe_count(self):
+        resolution = config.deep_merge_with_source(
+            [
+                ("config-defaults", {"reviewer": {"mode": "swarm", "probe_count": 6}}),
+                (
+                    "scope:cwd:/high-risk",
+                    {"reviewer": {"mode": "dual-swarm", "probes_per_provider": 4}},
+                ),
+            ]
+        )
+        self.assertEqual(resolution.get("reviewer", "probes_per_provider"), 4)
+        self.assertIsNone(resolution.get("reviewer", "probe_count"))
+
+    def test_later_layer_probe_count_clears_inherited_probes_per_provider(self):
+        resolution = config.deep_merge_with_source(
+            [
+                ("config-defaults", {"reviewer": {"probes_per_provider": 4}}),
+                ("scope:cwd:/other", {"reviewer": {"probe_count": 8}}),
+            ]
+        )
+        self.assertEqual(resolution.get("reviewer", "probe_count"), 8)
+        self.assertIsNone(resolution.get("reviewer", "probes_per_provider"))
+
+    def test_exclusive_clearing_does_not_affect_unrelated_keys(self):
+        resolution = config.deep_merge_with_source(
+            [
+                (
+                    "config-defaults",
+                    {"reviewer": {"provider": "codex", "probe_count": 6}},
+                ),
+                ("scope:cwd:/x", {"reviewer": {"probes_per_provider": 4}}),
+            ]
+        )
+        self.assertEqual(resolution.get("reviewer", "provider"), "codex")
+        self.assertEqual(resolution.get("reviewer", "probes_per_provider"), 4)
+        self.assertIsNone(resolution.get("reviewer", "probe_count"))
+
 
 class ResolveConfigTests(unittest.TestCase):
     def setUp(self):
@@ -480,6 +546,40 @@ class ResolveConfigTests(unittest.TestCase):
     def test_invalid_config_data_raises_during_resolve(self):
         with self.assertRaises(config.ConfigValidationError):
             config.resolve_config({}, {"bogus": True}, target_dir=self.nested)
+
+    def test_shipped_high_risk_example_resolves_probes_per_provider_only(self):
+        """Reproduce the shipped examples/config.toml high-risk-service scope.
+
+        `[defaults.reviewer]` sets `probe_count`; the deeper cwd-matched
+        `high-risk-service` scope sets only `probes_per_provider`. The
+        resolved reviewer topology must carry exactly one of the two
+        exclusive knobs, or a dual-swarm 4-probes-per-provider review start
+        raises "set only one of --probe-count or --probes-per-provider".
+        """
+
+        high_risk = self.nested / "high-risk-service"
+        high_risk.mkdir()
+        config_data = {
+            "version": 1,
+            "defaults": {
+                "reviewer": {"mode": "swarm", "provider": "codex", "probe_count": 6}
+            },
+            "scope": [
+                {
+                    "path": str(high_risk),
+                    "match": "cwd",
+                    "reviewer": {
+                        "mode": "dual-swarm",
+                        "providers": ["codex", "claude"],
+                        "probes_per_provider": 4,
+                    },
+                }
+            ],
+        }
+        resolution = config.resolve_config({}, config_data, target_dir=high_risk)
+        self.assertEqual(resolution.get("reviewer", "mode"), "dual-swarm")
+        self.assertEqual(resolution.get("reviewer", "probes_per_provider"), 4)
+        self.assertIsNone(resolution.get("reviewer", "probe_count"))
 
 
 class LoadAndResolveTests(unittest.TestCase):

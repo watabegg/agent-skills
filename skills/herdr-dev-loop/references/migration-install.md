@@ -31,7 +31,9 @@ CODEX_SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop"
 CLAUDE_SKILL_DIR="${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/herdr-dev-loop"
 
 python3 "$SKILL_DIR/scripts/hloop" selftest
-python3 /home/watabegg/.codex/skills/.system/skill-creator/scripts/quick_validate.py "$SKILL_DIR"
+QUICK_VALIDATE="$(find "${CODEX_HOME:-$HOME/.codex}" "$HOME/.claude" -iname quick_validate.py 2>/dev/null | head -n1)"
+test -n "$QUICK_VALIDATE" || { echo "quick_validate.py not found under the Codex or Claude skill-creator install" >&2; exit 1; }
+python3 "$QUICK_VALIDATE" "$SKILL_DIR"
 
 test ! -e "$CODEX_SKILL_DIR" || cp -a "$CODEX_SKILL_DIR" "${CODEX_SKILL_DIR}.backup-${STAMP}"
 test ! -e "$CLAUDE_SKILL_DIR" || cp -a "$CLAUDE_SKILL_DIR" "${CLAUDE_SKILL_DIR}.backup-${STAMP}"

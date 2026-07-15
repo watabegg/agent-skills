@@ -479,6 +479,26 @@ class ConfigResolution:
         return result
 
 
+# Keys that form a single coherent reviewer topology unit: setting one in a
+# layer must clear any sibling inherited from a lower-priority layer, or the
+# two can both resolve simultaneously even though only one was ever chosen
+# at any single layer (e.g. `probe_count` from `[defaults.reviewer]` plus
+# `probes_per_provider` from a deeper `[[scope]]` entry).
+_EXCLUSIVE_KEY_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("reviewer",), ("probe_count", "probes_per_provider")),
+)
+
+
+def _clear_exclusive_siblings(
+    entries: dict[tuple[str, ...], ResolvedValue], parent: tuple[str, ...], key: str
+) -> None:
+    for group_parent, group_keys in _EXCLUSIVE_KEY_GROUPS:
+        if parent == group_parent and key in group_keys:
+            for sibling in group_keys:
+                if sibling != key:
+                    entries.pop(parent + (sibling,), None)
+
+
 def _merge_layer(
     entries: dict[tuple[str, ...], ResolvedValue],
     mapping: Mapping,
@@ -490,6 +510,7 @@ def _merge_layer(
         if isinstance(value, Mapping):
             _merge_layer(entries, value, source, path)
         else:
+            _clear_exclusive_siblings(entries, prefix, key)
             entries[path] = ResolvedValue(value=value, source=source)
 
 

@@ -28,7 +28,9 @@ python3 -m py_compile skills/herdr-dev-loop/scripts/hloop \
 python3 -m unittest discover -s skills/herdr-dev-loop/tests -v
 python3 skills/herdr-dev-loop/scripts/hloop version --json
 python3 skills/herdr-dev-loop/scripts/hloop selftest
-python3 /home/watabegg/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/herdr-dev-loop
+QUICK_VALIDATE="$(find "${CODEX_HOME:-$HOME/.codex}" "$HOME/.claude" -iname quick_validate.py 2>/dev/null | head -n1)"
+test -n "$QUICK_VALIDATE" || { echo "quick_validate.py not found under the Codex or Claude skill-creator install" >&2; exit 1; }
+python3 "$QUICK_VALIDATE" skills/herdr-dev-loop
 python3 skills/herdr-dev-loop/tests/run_synthetic_e2e.py --json
 ```
 

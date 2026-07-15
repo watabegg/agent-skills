@@ -17,10 +17,12 @@ from unittest import mock
 try:
     import jsonschema
     from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
 except ImportError:  # pragma: no cover - exercised by minimal installations
     jsonschema = None
     Registry = None
     Resource = None
+    DRAFT202012 = None
 
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
@@ -74,6 +76,52 @@ def review_schema_validator(schema_path: Path):
             path.resolve().as_uri(),
             Resource.from_contents(json.loads(path.read_text(encoding="utf-8"))),
         )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    return jsonschema.Draft202012Validator(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": schema_path.resolve().as_uri(),
+        },
+        registry=registry,
+    )
+
+
+def offline_file_ref_validator(schema_path: Path):
+    """Build a validator for a schema using only generic file-based $ref retrieval.
+
+    Unlike ``review_schema_validator``, this does not pre-register every
+    dependency file in a hand-built registry. It retrieves whatever a
+    relative ``$ref`` resolves to, purely from local disk, and raises
+    instead of attempting network access -- the behavior expected of a
+    standard offline JSON Schema validator pointed at a single schema file.
+    """
+
+    if (
+        jsonschema is None
+        or Registry is None
+        or Resource is None
+        or not hasattr(jsonschema, "Draft202012Validator")
+    ):
+        raise AssertionError(
+            "review schema tests require jsonschema.Draft202012Validator "
+            "and the referencing registry"
+        )
+
+    def retrieve(uri: str):
+        if not uri.startswith("file://"):
+            raise AssertionError(
+                f"offline validator attempted non-file retrieval for {uri!r}"
+            )
+        from urllib.parse import unquote, urlparse
+
+        local_path = Path(unquote(urlparse(uri).path))
+        return Resource.from_contents(
+            json.loads(local_path.read_text(encoding="utf-8")),
+            default_specification=DRAFT202012,
+        )
+
+    registry = Registry(retrieve=retrieve)
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
     return jsonschema.Draft202012Validator(
@@ -711,6 +759,56 @@ class ReviewSchemaTests(unittest.TestCase):
                     [],
                     "\n".join(error.message for error in errors),
                 )
+
+    def test_public_wrapper_validates_manifest_offline_without_network(self):
+        """The public schemas/ wrapper must be directly, offline-validatable.
+
+        Regression for a wrapper whose $ref only resolved correctly when a
+        network-facing $id hijacked relative-ref resolution; a standard
+        offline validator pointed only at this file (no hand-built registry
+        of every dependency, no network) must accept a real manifest and
+        reject an invalid one.
+        """
+
+        wrapper_schema = json.loads(
+            (RUNTIME_SCHEMAS / "review-manifest.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertNotIn(
+            "$id",
+            wrapper_schema,
+            "a network $id would hijack the relative $ref away from the "
+            "sibling references/schemas/ file during offline resolution",
+        )
+
+        group = plan_review_group("dual-swarm", head_sha=HEAD, probes_per_provider=4)
+        findings = normalize_findings(
+            (candidate(), candidate("A-F001", provider="claude"))
+        )
+        verification = plan_verification(group, findings)
+        manifest = ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=completed_lanes(group, findings),
+            findings=findings,
+            verification_plan=verification,
+            verifications=confirmed_records(verification),
+        )
+        manifest_record = manifest.to_record()
+
+        validator = offline_file_ref_validator(
+            RUNTIME_SCHEMAS / "review-manifest.schema.json"
+        )
+        errors = list(validator.iter_errors(manifest_record))
+        self.assertEqual(errors, [], "\n".join(error.message for error in errors))
+
+        invalid_record = dict(manifest_record)
+        invalid_record["mode"] = "not-a-real-mode"
+        invalid_errors = list(validator.iter_errors(invalid_record))
+        self.assertTrue(
+            invalid_errors, "offline validator must reject an invalid manifest"
+        )
 
     def test_review_schemas_capture_manifest_finding_and_verification_contracts(self):
         finding_schema = json.loads(
