@@ -64,6 +64,36 @@ def milestone_event(event_id: str = "18b79cf0-8e32-4b89-88af-e332ee5a5dbe"):
     )
 
 
+def attention_event(
+    *,
+    role_id: str = "T012",
+    attempt_id: str = "T012-A001",
+    event_id: str = "38b79cf0-8e32-4b89-88af-e332ee5a5dbe",
+    summary: str = "second role needs a decision",
+):
+    return events.prepare_client_event(
+        {
+            "run_id": "run-011",
+            "role_id": role_id,
+            "attempt_id": attempt_id,
+            "task_contract_digest": hashlib.sha256(role_id.encode("utf-8")).hexdigest(),
+            "type": "attention",
+            "stage": "blocked",
+            "summary": summary,
+            "next": "wait for manager",
+            "needs_manager": True,
+            "impact": "cannot proceed without a decision",
+            "attempted": ["investigated the fault"],
+            "options": ["escalate to the Manager"],
+            "recommendation": "escalate",
+            "blocked_scope": ["material edits"],
+            "evidence_refs": ["tasks/T012.md"],
+            "created_at": CREATED_AT,
+        },
+        event_id=event_id,
+    )
+
+
 def report_authentication(event, token="report-token"):
     return {
         "run_id": event["run_id"],
@@ -371,6 +401,82 @@ class SupervisorPrimitiveTests(unittest.TestCase):
                 [item["event_id"] for item in self.store.inbox(transaction)],
                 [event["event_id"]],
             )
+
+    def test_cross_role_burst_within_the_window_is_delivered_as_one_batch(self):
+        first = client_event()
+        second = attention_event()
+        errors: list[BaseException] = []
+
+        def report_second_role():
+            try:
+                time.sleep(0.05)
+                with self.store.transaction() as transaction:
+                    self.store.accept_report(transaction, second)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with self.store.transaction() as transaction:
+            self.store.accept_report(transaction, first)
+
+        reporter = threading.Thread(target=report_second_role, daemon=True)
+        reporter.start()
+        result = self.make_supervisor().sleep(
+            timeout_seconds=2,
+            wake_burst_window_seconds=0.3,
+            wake_burst_poll_seconds=0.02,
+        )
+        reporter.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(result.reason, "report")
+        self.assertEqual(
+            set(result.event_ids), {first["event_id"], second["event_id"]}
+        )
+        with self.store.transaction() as transaction:
+            self.assertEqual(len(self.store.events(transaction)), 2)
+            self.assertEqual(len(self.store.inbox(transaction)), 2)
+
+    def test_cross_role_burst_outside_the_window_still_wakes_on_the_next_sleep(self):
+        first = client_event()
+        second = attention_event()
+        errors: list[BaseException] = []
+
+        def report_second_role_late():
+            try:
+                time.sleep(0.25)
+                with self.store.transaction() as transaction:
+                    self.store.accept_report(transaction, second)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with self.store.transaction() as transaction:
+            self.store.accept_report(transaction, first)
+
+        reporter = threading.Thread(target=report_second_role_late, daemon=True)
+        reporter.start()
+        first_result = self.make_supervisor().sleep(
+            timeout_seconds=2,
+            wake_burst_window_seconds=0.05,
+            wake_burst_poll_seconds=0.01,
+        )
+        self.assertEqual(first_result.reason, "report")
+        self.assertEqual(first_result.event_ids, (first["event_id"],))
+
+        reporter.join(timeout=2)
+        self.assertEqual(errors, [])
+
+        # The Manager explicitly acknowledges the delivered event so the next
+        # sleep call is scoped to what is still genuinely unread.
+        with self.store.transaction() as transaction:
+            self.store.acknowledge_inbox(
+                transaction, event_id=first["event_id"], run_id="run-011"
+            )
+
+        # Every event is preserved even though it missed the bounded batch
+        # window: the next sleep call still delivers it, undropped.
+        second_result = self.make_supervisor().sleep(timeout_seconds=2)
+        self.assertEqual(second_result.reason, "report")
+        self.assertEqual(second_result.event_ids, (second["event_id"],))
 
     def test_timeout_invalidates_lease_and_cleans_foreground_owner(self):
         result = self.make_supervisor().sleep(
