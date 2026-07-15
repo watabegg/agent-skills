@@ -13565,11 +13565,15 @@ def cmd_manager_next(args: argparse.Namespace) -> int:
     state = load_state(repo)
     store = _open_broker_store(repo)
     spool_dir = broker_spool_dir(repo)
-    spooled = list(hloop_broker.iter_spooled_events(spool_dir))
-    if spooled:
+    if hloop_broker.spool_has_entries(spool_dir):
         with store.transaction() as txn:
             replayed = store.replay_spool(txn, spool_dir)
-        journal(repo, f"Replayed {len(replayed)} spooled report(s) into the broker.")
+        quarantined = hloop_broker.spool_quarantine_count(spool_dir)
+        journal(
+            repo,
+            f"Replayed {len(replayed)} spooled report(s) into the broker; "
+            f"{quarantined} quarantined poison entrie(s) total.",
+        )
         print(f"replayed {len(replayed)} spooled report(s); re-run to see pending wakes")
         return 0
     with store.transaction() as txn:
@@ -13593,11 +13597,13 @@ def cmd_broker_status(args: argparse.Namespace) -> int:
         events = store.events(txn)
         inbox_rows = store.inbox(txn)
         owner = store.current_owner(txn, namespace=LOOP_NAMESPACE, run_id=run_id)
-    spooled = list(hloop_broker.iter_spooled_events(broker_spool_dir(repo)))
+    spool_dir = broker_spool_dir(repo)
+    spooled = list(hloop_broker.iter_spooled_events(spool_dir))
     status = {
         "events": len(events),
         "inbox": len(inbox_rows),
         "spooled": len(spooled),
+        "spool_quarantined": hloop_broker.spool_quarantine_count(spool_dir),
         "owner": owner,
         "lease": state.get("broker_lease"),
     }
@@ -13611,8 +13617,14 @@ def cmd_broker_recover(args: argparse.Namespace) -> int:
     spool_dir = broker_spool_dir(repo)
     with store.transaction() as txn:
         replayed = store.replay_spool(txn, spool_dir)
-    journal(repo, f"Broker recover replayed {len(replayed)} spooled report(s).")
+    quarantined = hloop_broker.spool_quarantine_count(spool_dir)
+    journal(
+        repo,
+        f"Broker recover replayed {len(replayed)} spooled report(s); "
+        f"{quarantined} quarantined poison entrie(s) total.",
+    )
     print(f"replayed {len(replayed)} spooled report(s)")
+    print(f"quarantined {quarantined} poison entrie(s) total")
     return 0
 
 
@@ -14099,6 +14111,15 @@ def cmd_progress_record(args: argparse.Namespace) -> int:
             )
         except hloop_requirements.ProgressEvidenceError as exc:
             raise HLoopError(str(exc)) from exc
+    clear_blockers = bool(getattr(args, "clear_blockers", False))
+    if clear_blockers and args.blocker:
+        raise HLoopError("--clear-blockers cannot be combined with --blocker")
+    if clear_blockers:
+        blockers: tuple[str, ...] = ()
+    elif args.blocker:
+        blockers = tuple(args.blocker)
+    else:
+        blockers = current.blockers
     try:
         updated = hloop_requirements.transition_progress(
             current,
@@ -14106,7 +14127,7 @@ def cmd_progress_record(args: argparse.Namespace) -> int:
             task_ids=tuple(args.task_id) if args.task_id else current.task_ids,
             evidence=tuple(evidence),
             remaining_work=args.remaining_work if args.remaining_work is not None else current.remaining_work,
-            blockers=tuple(args.blocker) if args.blocker else current.blockers,
+            blockers=blockers,
         )
     except (hloop_requirements.RequirementModelError, hloop_requirements.ProgressEvidenceError) as exc:
         raise HLoopError(str(exc)) from exc
@@ -15678,6 +15699,11 @@ def build_parser() -> argparse.ArgumentParser:
     progress_record.add_argument("--result")
     progress_record.add_argument("--remaining-work")
     progress_record.add_argument("--blocker", action="append")
+    progress_record.add_argument(
+        "--clear-blockers",
+        action="store_true",
+        help="explicitly clear all blockers instead of retaining the current list",
+    )
     progress_record.set_defaults(func=cmd_progress_record)
 
     outcome = sub.add_parser("outcome", help="requirement-oriented outcome projection")
