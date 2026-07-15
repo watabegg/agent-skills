@@ -299,19 +299,31 @@ def run_cmd(
     )
 
 
+# The absolute path of the git executable this process has verified (or
+# bootstrapped) against STATE.json's recorded identity.  `main()` resolves this
+# once, before any other code path can execute a PATH `git`, and every git
+# invocation below reads this instead of the bare `"git"` string so a PATH
+# mutation after that check cannot retarget a later call (TOCTOU).  Direct
+# library/test callers that never go through `main()` keep the prior
+# PATH-lookup behavior via this default.
+TRUSTED_GIT_PATH = "git"
+
+
 def git(repo: Path, args: list[str], check: bool = True) -> str:
-    proc = run_cmd(["git", "-C", str(repo), *args], check=check)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), *args], check=check)
     if proc.returncode != 0 and check:
         raise HLoopError(proc.stderr.strip())
     return (proc.stdout or "").strip()
 
 
-def git_executable_identity() -> dict[str, Any]:
-    """Resolve the git binary HLoop is about to trust and fingerprint it.
+def resolve_git_binary_fingerprint() -> dict[str, Any]:
+    """Fingerprint the PATH git binary's path/device/inode/hash without executing it.
 
-    Recorded at ``init``/migration time and re-checked on every ``preflight_loop``
-    so a PATH-substituted or replaced ``git`` cannot silently change HLoop's
-    trust boundary mid-run.
+    Every field here is gathered with filesystem calls only (``shutil.which``,
+    ``os.stat``, reading bytes for a hash), so this can run and be compared
+    against a recorded identity *before* this process ever executes a
+    PATH-resolved ``git``, closing the window a malicious PATH substitution
+    would otherwise get to run in.
     """
 
     resolved = shutil.which("git")
@@ -320,15 +332,60 @@ def git_executable_identity() -> dict[str, Any]:
     real = os.path.realpath(resolved)
     stat = os.stat(real)
     digest = hashlib.sha256(Path(real).read_bytes()).hexdigest()
-    version_proc = run_cmd(["git", "--version"], check=False, capture=True)
     return {
         "path": real,
         "st_dev": stat.st_dev,
         "st_ino": stat.st_ino,
         "sha256": digest,
+    }
+
+
+def git_executable_identity() -> dict[str, Any]:
+    """Resolve the git binary HLoop is about to trust and fingerprint it.
+
+    Recorded at ``init``/migration/``trust-git`` time and re-checked on every
+    ``preflight_loop`` so a PATH-substituted or replaced ``git`` cannot silently
+    change HLoop's trust boundary mid-run. The one intentional execution here
+    (``--version``, for the human-readable record) targets the already-resolved
+    absolute path, not a fresh PATH lookup.
+    """
+
+    fingerprint = resolve_git_binary_fingerprint()
+    version_proc = run_cmd([fingerprint["path"], "--version"], check=False, capture=True)
+    return {
+        **fingerprint,
         "version": (version_proc.stdout or "").strip(),
         "recorded_at": now_iso(),
     }
+
+
+def resolve_trusted_git_path(repo: Path | None) -> str:
+    """Verify the PATH git binary against any recorded identity, with no exec.
+
+    Called once at the very top of ``main()``, before ``repo_root()`` or any
+    other code path executes a git subprocess. ``repo`` is located by a plain
+    filesystem walk (see ``hloop_config.find_repo_root``), and STATE.json is
+    read directly, so no git invocation happens before this decision is made.
+    Raises before anything is trusted if a recorded identity does not match.
+    """
+
+    fingerprint = resolve_git_binary_fingerprint()
+    if repo is not None:
+        state_path = repo / LOOP_DIR / "STATE.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                state = None
+            recorded = state.get("git_identity") if isinstance(state, dict) else None
+            if isinstance(recorded, dict) and recorded:
+                drift = git_identity_drift(recorded, fingerprint)
+                if drift:
+                    raise HLoopError(
+                        "git executable identity drift detected: "
+                        f"{drift}; run `hloop runtime trust-git --reason <text>` to accept it"
+                    )
+    return fingerprint["path"]
 
 
 def git_identity_drift(recorded: dict[str, Any], current: dict[str, Any]) -> str:
@@ -368,7 +425,7 @@ def is_environment_git_error(detail: str) -> bool:
 
 
 def repo_root(path: Path) -> Path:
-    proc = run_cmd(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
     if proc.returncode != 0:
         raise HLoopError(f"not inside a git repository: {path}")
     return Path(proc.stdout.strip()).resolve()
@@ -496,7 +553,7 @@ def storage_preflight(repo: Path, state: dict[str, Any]) -> list[dict[str, Any]]
 
 def ensure_local_only_git_excludes(repo: Path) -> None:
     git_common = run_cmd(
-        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"], check=False
+        [TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--git-common-dir"], check=False
     )
     if git_common.returncode != 0:
         raise HLoopError((git_common.stderr or git_common.stdout or "cannot resolve git common dir").strip())
@@ -1162,7 +1219,7 @@ def resolve_init_config(
 
 
 def repo_lock_path(repo: Path) -> Path:
-    proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--git-path", "hloop.lock"], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--git-path", "hloop.lock"], check=False)
     if proc.returncode != 0:
         raise HLoopError((proc.stderr or proc.stdout or "failed to resolve git lock path").strip())
     raw = (proc.stdout or "").strip()
@@ -1218,7 +1275,7 @@ def retire_legacy_loop_lock(repo: Path) -> None:
     if not legacy.exists() or not legacy.is_file():
         return
     tracked = run_cmd(
-        ["git", "-C", str(repo), "ls-files", "--error-unmatch", str(LOOP_DIR / "LOCK")],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "ls-files", "--error-unmatch", str(LOOP_DIR / "LOCK")],
         check=False,
     )
     if tracked.returncode == 0:
@@ -1679,7 +1736,7 @@ def current_branch(repo: Path) -> str:
 
 
 def branch_exists(repo: Path, branch: str) -> bool:
-    proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", branch], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--verify", "--quiet", branch], check=False)
     return proc.returncode == 0
 
 
@@ -1687,7 +1744,7 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     if not ancestor or not descendant:
         return False
     proc = run_cmd(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
         check=False,
     )
     return proc.returncode == 0
@@ -2918,7 +2975,7 @@ def changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
 
 
 def git_show(repo: Path, ref_path: str) -> str:
-    proc = run_cmd(["git", "-C", str(repo), "show", ref_path], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "show", ref_path], check=False)
     if proc.returncode != 0:
         raise HLoopError((proc.stderr or proc.stdout or "").strip())
     return proc.stdout or ""
@@ -3048,7 +3105,7 @@ def validate_change_scope(task_id: str, task_meta: dict[str, Any], files: list[s
 
 def porcelain_paths(repo: Path) -> list[str]:
     proc = run_cmd(
-        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
         check=False,
     )
     return parse_porcelain_paths(proc.stdout or "")
@@ -3069,7 +3126,7 @@ def parse_porcelain_paths(text: str) -> list[str]:
 
 def porcelain_paths_for(repo: Path, pathspec: str) -> list[str]:
     proc = run_cmd(
-        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all", "--", pathspec],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "status", "--porcelain", "--untracked-files=all", "--", pathspec],
         check=False,
     )
     if proc.returncode != 0:
@@ -3140,6 +3197,7 @@ def preflight_loop(
     require_herdr: bool = False,
     require_codex: bool = False,
     require_agent_provider: str | None = None,
+    require_agent_invocation: hloop_providers.ProviderInvocation | None = None,
     require_integration_branch: bool = False,
     allow_loop_dirty: bool = True,
     skip_dirty_check: bool = False,
@@ -3175,7 +3233,7 @@ def preflight_loop(
     recorded_identity = state.get("git_identity")
     if isinstance(recorded_identity, dict) and recorded_identity:
         try:
-            current_identity = git_executable_identity()
+            current_identity = resolve_git_binary_fingerprint()
         except HLoopError as exc:
             fail(f"git identity probe failed: {exc}")
             raise AssertionError("unreachable")
@@ -3203,7 +3261,19 @@ def preflight_loop(
             fail(str(exc))
     if require_codex and not command_exists("codex"):
         fail("codex command not found")
-    if require_agent_provider:
+    if require_agent_invocation is not None:
+        # Probe the exact role invocation the caller is about to launch (same
+        # runner/model/effort/permission/sandbox/argv), so preflight evidence
+        # and `last_provider_preflight.argv` describe the real launch, not a
+        # generic stand-in that can pass while the real configuration cannot.
+        capability = hloop_providers.probe_provider_capability(require_agent_invocation)
+        state["last_provider_preflight"] = {
+            "at": now_iso(),
+            **capability.as_record(),
+        }
+        if not capability.launch_allowed:
+            fail(capability.reason)
+    elif require_agent_provider:
         provider = normalize_agent_provider(require_agent_provider)
         invocation = hloop_providers.build_provider_invocation(
             provider=provider,
@@ -3272,7 +3342,7 @@ def safe_current_branch(repo: Path) -> str:
 def safe_short_sha(repo: Path, ref: str) -> str:
     if not ref:
         return ""
-    proc = run_cmd(["git", "-C", str(repo), "rev-parse", "--short", ref], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--short", ref], check=False)
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
@@ -3307,11 +3377,11 @@ def safe_result_commit_state(worktree: Path, task_id: str, head_sha: str) -> str
         return "missing"
     resolved_head = head_sha
     if not resolved_head or resolved_head == "HEAD":
-        proc = run_cmd(["git", "-C", str(worktree), "rev-parse", "HEAD"], check=False)
+        proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "rev-parse", "HEAD"], check=False)
         if proc.returncode != 0:
             return "head-unreadable"
         resolved_head = (proc.stdout or "").strip()
-    proc = run_cmd(["git", "-C", str(worktree), "show", f"{resolved_head}:{rel}"], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "show", f"{resolved_head}:{rel}"], check=False)
     if proc.returncode != 0:
         return "not-committed"
     try:
@@ -4492,7 +4562,7 @@ def current_integration_target(repo: Path, state: dict[str, Any]) -> str:
     branch = str(state.get("integration_branch") or "")
     if not branch:
         return ""
-    proc = run_cmd(["git", "-C", str(repo), "rev-parse", branch], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", branch], check=False)
     return (proc.stdout or "").strip() if proc.returncode == 0 else ""
 
 
@@ -4500,7 +4570,7 @@ def advancing_commit_count(repo: Path, old_sha: str, new_sha: str) -> int | None
     if not old_sha or not new_sha or not is_ancestor(repo, old_sha, new_sha):
         return None
     proc = run_cmd(
-        ["git", "-C", str(repo), "rev-list", "--count", f"{old_sha}..{new_sha}"],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "rev-list", "--count", f"{old_sha}..{new_sha}"],
         check=False,
     )
     if proc.returncode != 0:
@@ -4676,6 +4746,19 @@ def gap_after_merges(state: dict[str, Any]) -> int:
     return max(1, normalize_int(state.get("gap_after_merges"), DEFAULT_GAP_AFTER_MERGES))
 
 
+def final_strict_gate_armed(state: dict[str, Any]) -> bool:
+    """Whether the Manager has explicitly armed the final strict gates.
+
+    Cadence review/gap gates during ongoing dispatch are unaffected by this;
+    only the "all tasks are merged" final-completion trigger requires it, so
+    a single explicit `hloop final-gates arm` -- not just merging the last
+    task -- decides when strict final review/gap replace the periodic cadence.
+    """
+
+    final_gate = final_gate_from_state(state)
+    return final_gate is not None and final_gate.status == "armed"
+
+
 def should_open_review_gate(state: dict[str, Any]) -> bool:
     if int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) <= 0:
         return False
@@ -4684,7 +4767,9 @@ def should_open_review_gate(state: dict[str, Any]) -> bool:
     count = normalize_int(state.get("unreviewed_merge_count"), 0)
     if count >= review_after_merges(state):
         return True
-    return all_tasks_merged(state) and (count > 0 or not review_gate_passed(state))
+    if not all_tasks_merged(state) or not final_strict_gate_armed(state):
+        return False
+    return count > 0 or not review_gate_passed(state)
 
 
 def should_open_gap_gate(state: dict[str, Any]) -> bool:
@@ -4695,7 +4780,9 @@ def should_open_gap_gate(state: dict[str, Any]) -> bool:
     count = normalize_int(state.get("ungapped_merge_count"), 0)
     if count >= gap_after_merges(state):
         return True
-    return all_tasks_merged(state) and (count > 0 or not gap_gate_passed(state))
+    if not all_tasks_merged(state) or not final_strict_gate_armed(state):
+        return False
+    return count > 0 or not gap_gate_passed(state)
 
 
 def review_wait_ms(args: argparse.Namespace, state: dict[str, Any]) -> int:
@@ -5186,15 +5273,82 @@ HERDR_LOOP_ROLE_DONE:{str(state.get("run_id") or "")}:{task_id}:{str(task_meta.g
 """
 
 
+def resolved_reviewer_topology(
+    state: dict[str, Any],
+    *,
+    mode: str | None = None,
+    providers: Sequence[str] | None = None,
+    probe_count: int | None = None,
+    probes_per_provider: int | None = None,
+) -> dict[str, Any]:
+    """Merge CLI-explicit reviewer topology with the resolved config.
+
+    Explicit CLI values always win. Anything left unset falls back to
+    ``resolved_config.reviewer`` (the full hierarchical config precedence
+    chain already applied by ``config apply``), then to legacy STATE fields,
+    then to built-in defaults -- so a configured swarm/dual/probe-count
+    topology is never silently narrowed by an unrelated CLI default.
+    """
+
+    reviewer_config = state.get("resolved_config", {}).get("reviewer", {})
+    if not isinstance(reviewer_config, dict):
+        reviewer_config = {}
+    resolved_mode = mode or reviewer_config.get("mode") or state.get("review_mode") or "single"
+    if resolved_mode not in hloop_review.REVIEW_MODES:
+        raise HLoopError(f"unsupported review mode: {resolved_mode}")
+    resolved_providers = list(providers) if providers else reviewer_config.get("providers")
+    resolved_probe_count = (
+        probe_count if probe_count is not None else reviewer_config.get("probe_count")
+    )
+    resolved_probes_per_provider = (
+        probes_per_provider
+        if probes_per_provider is not None
+        else reviewer_config.get("probes_per_provider")
+    )
+    if resolved_probe_count is not None and resolved_probes_per_provider is not None:
+        raise HLoopError("set only one of --probe-count or --probes-per-provider")
+    return {
+        "mode": resolved_mode,
+        "providers": resolved_providers or None,
+        "probe_count": resolved_probe_count,
+        "probes_per_provider": resolved_probes_per_provider,
+    }
+
+
+def review_capacity_evidence(
+    review_plan: hloop_review.ReviewGroupPlan,
+) -> dict[str, tuple[str, str]]:
+    """Real per-provider swarm-concurrency probe evidence for ``review_plan``.
+
+    Checked by ``check_review_capacity`` before any Coordinator pane exists,
+    alongside the configured numeric ceiling, so an installed CLI that does
+    not verifiably support the plan's concurrency requirements fails closed
+    instead of only being compared against a fixed default.
+    """
+
+    return {
+        provider: hloop_providers.probe_provider_review_capacity(provider)
+        for provider in review_plan.providers
+    }
+
+
 def build_reviewer_group_plan(
-    mode: str, head_sha: str, agent_config: dict[str, str]
+    mode: str,
+    head_sha: str,
+    agent_config: dict[str, str],
+    *,
+    topology: dict[str, Any] | None = None,
 ) -> hloop_review.ReviewGroupPlan:
+    topology = topology or {}
     return hloop_review.plan_review_group(
         mode,
         head_sha=head_sha,
         provider=agent_config["provider"],
+        providers=topology.get("providers"),
         model=DEFAULT_AGENT_MODEL,
         models={agent_config["provider"]: agent_config["model"]},
+        probe_count=topology.get("probe_count"),
+        probes_per_provider=topology.get("probes_per_provider"),
     )
 
 
@@ -5533,6 +5687,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             }
             checks["warnings"].append(f"{role} provider capability failed: {exc}")
     checks["role_capabilities"] = role_capabilities
+    topology = resolved_reviewer_topology(role_state)
+    review_capacity: dict[str, Any] = {}
+    for provider in hloop_review.SUPPORTED_PROVIDERS:
+        status, reason = hloop_providers.probe_provider_review_capacity(provider)
+        review_capacity[provider] = {
+            "capacity_probe": status,
+            "reason": reason,
+            "ceiling": hloop_providers.review_capacity_ceiling(
+                provider, limits=role_state.get("review_capacity_limits")
+            ),
+        }
+        if status in {"unsupported", "unavailable"}:
+            checks["warnings"].append(
+                f"{provider} review swarm capacity probe failed: {reason}"
+            )
+    checks["review_capacity"] = {"resolved_mode": topology["mode"], "providers": review_capacity}
     if not checks["skills"]["herdr"]["exists"]:
         checks["warnings"].append("herdr skill file not found; continuing because the herdr CLI is authoritative")
     if checks["herdr_dev_loop"].get("version_mismatch"):
@@ -7770,7 +7940,7 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     if not base_ref:
         raise HLoopError(f"task base_ref is missing: {task_id}")
     base_proc = run_cmd(
-        ["git", "-C", str(repo), "merge-base", "HEAD", base_ref], check=False
+        [TRUSTED_GIT_PATH, "-C", str(repo), "merge-base", "HEAD", base_ref], check=False
     )
     if base_proc.returncode != 0 or not (base_proc.stdout or "").strip():
         raise HLoopError(f"cannot resolve Worker branch point against {base_ref}")
@@ -7808,14 +7978,14 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         # Loop artifacts are intentionally gitignored in some repositories. The
         # committed artifact is still the Worker/Manager hand-off contract, so
         # stage this one known path explicitly even in local-only loop setups.
-        run_cmd(["git", "-C", str(repo), "add", "-f", "--", result_rel.as_posix()], check=True)
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "add", "-f", "--", result_rel.as_posix()], check=True)
         staged = run_cmd(
-            ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", result_rel.as_posix()],
+            [TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--quiet", "--", result_rel.as_posix()],
             check=False,
         )
         if staged.returncode == 1:
             run_cmd(
-                ["git", "-C", str(repo), "commit", "-m", f"ai-loop({task_id}): finalize worker result"],
+                [TRUSTED_GIT_PATH, "-C", str(repo), "commit", "-m", f"ai-loop({task_id}): finalize worker result"],
                 check=True,
                 capture=False,
             )
@@ -7989,11 +8159,11 @@ def rollback_failed_role_start(
 ) -> None:
     if created_worktree and worktree.exists():
         run_cmd(
-            ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
+            [TRUSTED_GIT_PATH, "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
             check=False,
         )
     if created_branch and branch and branch_exists(repo, branch):
-        run_cmd(["git", "-C", str(repo), "branch", "-D", branch], check=False)
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "branch", "-D", branch], check=False)
 
 
 def close_pane_best_effort(pane_id: str) -> None:
@@ -8310,7 +8480,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    agent_command, _preview_invocation = role_agent_command(
+    agent_command, preview_invocation = role_agent_command(
         repo, agent_config, runner=runner, prompt_rel=prompt_rel, cwd=worktree
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
@@ -8322,7 +8492,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_agent_provider=agent_config["provider"],
+        require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
     task_state = state.get("tasks", {}).get(task_id)
@@ -9011,14 +9181,14 @@ def cmd_merge(args: argparse.Namespace) -> int:
     }
     save_state(repo, state)
     try:
-        staged = run_cmd(["git", "-C", str(repo), "diff", "--cached", "--quiet"], check=False)
+        staged = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--quiet"], check=False)
         if staged.returncode != 0:
             raise HLoopError("index has staged changes; commit or unstage them before integration")
         if mode == "squash":
             git(repo, ["merge", "--squash", branch])
             if state_persistence(state) == "local-only":
                 reset_loop = run_cmd(
-                    ["git", "-C", str(repo), "reset", "HEAD", "--", LOOP_DIR.as_posix()],
+                    [TRUSTED_GIT_PATH, "-C", str(repo), "reset", "HEAD", "--", LOOP_DIR.as_posix()],
                     check=False,
                 )
                 if reset_loop.returncode != 0:
@@ -9405,14 +9575,14 @@ def cmd_validation_configure(args: argparse.Namespace) -> int:
 def cmd_reviewer_start(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
-    mode = str(
-        getattr(args, "mode", None)
-        or state.get("review_mode")
-        or state.get("resolved_config", {}).get("reviewer", {}).get("mode")
-        or "single"
+    topology = resolved_reviewer_topology(
+        state,
+        mode=getattr(args, "mode", None),
+        providers=getattr(args, "providers", None),
+        probe_count=getattr(args, "probe_count", None),
+        probes_per_provider=getattr(args, "probes_per_provider", None),
     )
-    if mode not in hloop_review.REVIEW_MODES:
-        raise HLoopError(f"unsupported review mode: {mode}")
+    mode = topology["mode"]
     review_id = args.review_id or next_id("R", state.setdefault("reviews", {}))
     if review_id in state["reviews"]:
         raise HLoopError(f"review already exists: {review_id}")
@@ -9434,7 +9604,10 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    review_plan = build_reviewer_group_plan(mode, head_sha, agent_config)
+    review_plan = build_reviewer_group_plan(mode, head_sha, agent_config, topology=topology)
+    # Numeric-only preview: this runs even for --dry-run, before any provider
+    # is required to be installed. The real per-provider capability probe
+    # only runs on the actual launch path below, after `--dry-run` returns.
     hloop_providers.check_review_capacity(
         hloop_review.required_provider_capacity(review_plan),
         limits=state.get("review_capacity_limits"),
@@ -9459,7 +9632,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         head_sha=head_sha,
         review_plan=review_plan,
     )
-    agent_command, _preview_invocation = role_agent_command(
+    agent_command, preview_invocation = role_agent_command(
         repo,
         agent_config,
         runner=runner,
@@ -9476,7 +9649,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_agent_provider=agent_config["provider"],
+        require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
     if review_id in state["reviews"]:
@@ -9498,10 +9671,11 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
-    review_plan = build_reviewer_group_plan(mode, head_sha, agent_config)
+    review_plan = build_reviewer_group_plan(mode, head_sha, agent_config, topology=topology)
     capacity_check = hloop_providers.check_review_capacity(
         hloop_review.required_provider_capacity(review_plan),
         limits=state.get("review_capacity_limits"),
+        capability=review_capacity_evidence(review_plan),
     )
     review_rel = (
         LOOP_DIR / "reviews" / review_id / "FINAL.md"
@@ -9989,7 +10163,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     prompt_without_identity = render_gap_prompt(
         gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
     )
-    agent_command, _preview_invocation = role_agent_command(
+    agent_command, preview_invocation = role_agent_command(
         repo,
         agent_config,
         runner=runner,
@@ -10006,7 +10180,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_agent_provider=agent_config["provider"],
+        require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
     if gap_id in state.setdefault("gaps", {}):
@@ -10540,7 +10714,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     prompt = render_advisor_prompt(
         advice_id, participant, advice_state, state, advice_rel, head_sha=head_sha
     )
-    agent_command, provider_invocation = role_agent_command(
+    agent_command, preview_invocation = role_agent_command(
         repo,
         agent_config,
         runner=runner,
@@ -10557,7 +10731,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     state = preflight_loop(
         repo,
         require_herdr=True,
-        require_agent_provider=agent_config["provider"],
+        require_agent_invocation=preview_invocation,
         require_integration_branch=True,
     )
     advice_state = require_advice_state(state, advice_id)
@@ -13063,7 +13237,7 @@ def checkpoint_paths(repo: Path, args: argparse.Namespace) -> list[str]:
 def ignored_untracked_paths_for(repo: Path, pathspec: str) -> list[str]:
     proc = run_cmd(
         [
-            "git",
+            TRUSTED_GIT_PATH,
             "-C",
             str(repo),
             "ls-files",
@@ -13085,7 +13259,7 @@ def ignored_untracked_paths_for(repo: Path, pathspec: str) -> list[str]:
 
 
 def staged_paths(repo: Path) -> list[str]:
-    proc = run_cmd(["git", "-C", str(repo), "diff", "--cached", "--name-only"], check=False)
+    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--name-only"], check=False)
     if proc.returncode != 0:
         raise HLoopError((proc.stderr or proc.stdout or "git diff --cached failed").strip())
     return [normalize_match_path(line) for line in (proc.stdout or "").splitlines() if line.strip()]
@@ -13124,7 +13298,7 @@ def checkpoint_commit_message(message: str, batch_id: str) -> str:
 
 def head_reachable_from_upstream(repo: Path) -> bool:
     upstream = run_cmd(
-        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
         check=False,
     )
     if upstream.returncode != 0:
@@ -13135,7 +13309,7 @@ def head_reachable_from_upstream(repo: Path) -> bool:
 
 def head_changed_paths(repo: Path) -> list[str]:
     proc = run_cmd(
-        ["git", "-C", str(repo), "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"],
         check=False,
     )
     if proc.returncode != 0:
@@ -13146,7 +13320,7 @@ def head_changed_paths(repo: Path) -> list[str]:
 def checkpoint_amend_blocker(repo: Path, batch_id: str) -> str:
     if not batch_id:
         return "no batch id"
-    head = run_cmd(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"], check=False)
+    head = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", "--verify", "HEAD"], check=False)
     if head.returncode != 0:
         return "repository has no HEAD commit"
     message = git(repo, ["log", "-1", "--format=%B"])
@@ -13196,14 +13370,14 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
             blocker = checkpoint_amend_blocker(repo, batch_id)
             print("DRY RUN rollup: " + ("would amend HEAD" if not blocker else f"would create new commit ({blocker})"))
         return 0
-    add_cmd = ["git", "-C", str(repo), "add"]
+    add_cmd = [TRUSTED_GIT_PATH, "-C", str(repo), "add"]
     if args.force:
         add_cmd.append("-f")
     add_cmd.extend(["--", *paths])
     run_cmd(add_cmd, check=True)
     ensure_checkpoint_staged_scope(staged_paths(repo), paths)
     diff_proc = run_cmd(
-        ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", *paths],
+        [TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--quiet", "--", *paths],
         check=False,
     )
     if diff_proc.returncode not in {0, 1}:
@@ -13215,14 +13389,14 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     amend_blocker = checkpoint_amend_blocker(repo, batch_id) if args.rollup else "rollup disabled"
     if args.rollup and not amend_blocker:
         run_cmd(
-            ["git", "-C", str(repo), "commit", "--amend", "-m", commit_message],
+            [TRUSTED_GIT_PATH, "-C", str(repo), "commit", "--amend", "-m", commit_message],
             check=True,
             capture=False,
         )
         sha = git(repo, ["rev-parse", "--short", "HEAD"])
         print(f"checkpoint amended {sha}")
         return 0
-    run_cmd(["git", "-C", str(repo), "commit", "-m", commit_message], check=True, capture=False)
+    run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "commit", "-m", commit_message], check=True, capture=False)
     sha = git(repo, ["rev-parse", "--short", "HEAD"])
     print(f"checkpoint committed {sha}")
     if args.rollup and amend_blocker:
@@ -14565,7 +14739,24 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_start.add_argument(
         "--mode",
         choices=sorted(hloop_review.REVIEW_MODES),
-        default="single",
+        default=None,
+        help="defaults to resolved_config.reviewer.mode, then `single`",
+    )
+    reviewer_start.add_argument(
+        "--providers",
+        nargs="+",
+        choices=sorted(AGENT_PROVIDERS),
+        help="dual/dual-swarm provider pair; defaults to resolved_config.reviewer.providers",
+    )
+    reviewer_start.add_argument(
+        "--probe-count",
+        type=int,
+        help="swarm discovery lanes per provider; defaults to resolved_config.reviewer.probe_count",
+    )
+    reviewer_start.add_argument(
+        "--probes-per-provider",
+        type=int,
+        help="alias of --probe-count for dual-swarm; defaults to resolved_config.reviewer.probes_per_provider",
     )
     reviewer_start.add_argument("--dry-run", action="store_true")
     reviewer_start.set_defaults(func=cmd_reviewer_start)
@@ -14862,6 +15053,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         configure_loop_namespace(getattr(args, "namespace", None))
+        # Resolve/verify the trusted git executable before any code path below
+        # can execute a PATH `git` -- `find_repo_root` and STATE.json reads are
+        # plain filesystem operations, so no git subprocess runs before this
+        # decision is made. `repo_root()` (which does exec git) always runs
+        # after this point.
+        global TRUSTED_GIT_PATH
+        no_exec_repo = hloop_config.find_repo_root(Path(args.repo).resolve())
+        TRUSTED_GIT_PATH = resolve_trusted_git_path(no_exec_repo)
         repo: Path | None = None
         if command_requires_state_schema_guard(args):
             repo = repo_root(Path(args.repo).resolve())

@@ -454,6 +454,37 @@ effort = "medium"
                 self.assertEqual(disarmed["status"], "disarmed")
                 self.assertIn("new task created", disarmed["disarm_reason"])
 
+    def test_final_strict_review_and_gap_gates_require_manager_arm(self):
+        """Merging the last task alone must not open the final strict gates.
+
+        Cadence review/gap thresholds during ongoing dispatch are untouched;
+        only the all-tasks-merged "final completion" trigger requires an
+        explicit `hloop final-gates arm`, and a subsequent disarm (from a new
+        fix task) must return that trigger to closed, not leave it armed.
+        """
+
+        state = {"tasks": {"T001": {"status": "merged"}}, "reviews": {}, "gaps": {}}
+        self.assertFalse(hloop.should_open_review_gate(state))
+        self.assertFalse(hloop.should_open_gap_gate(state))
+
+        state["final_gate"] = {
+            "generation": 1,
+            "status": "armed",
+            "target_sha": "deadbeef",
+            "armed_at": "2026-01-01T00:00:00+00:00",
+            "armed_by": "manager",
+            "disarmed_at": "",
+            "disarmed_by": "",
+            "disarm_reason": "",
+        }
+        self.assertTrue(hloop.should_open_review_gate(state))
+        self.assertTrue(hloop.should_open_gap_gate(state))
+
+        hloop.disarm_final_gate_for_new_task(state, "T002")
+        self.assertEqual(state["final_gate"]["status"], "disarmed")
+        self.assertFalse(hloop.should_open_review_gate(state))
+        self.assertFalse(hloop.should_open_gap_gate(state))
+
     def test_done_target_drift_is_p0_on_status_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

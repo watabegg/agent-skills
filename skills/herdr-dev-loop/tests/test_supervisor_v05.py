@@ -206,6 +206,61 @@ class ProviderPrimitiveTests(unittest.TestCase):
         self.assertEqual(result.capability, "unsupported")
         self.assertIn("--effort", result.reason)
 
+    def test_review_capacity_probe_is_supported_when_help_documents_config_override(self):
+        status, reason = providers.probe_provider_review_capacity(
+            "codex",
+            executable_finder=lambda name: f"/fake/{name}",
+            command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 0, stdout="usage: codex [-c key=value] ...", stderr=""
+            ),
+        )
+        self.assertEqual(status, "supported")
+        self.assertIn("agents.max_threads", reason)
+
+    def test_review_capacity_probe_stays_unknown_without_documented_controls(self):
+        status, reason = providers.probe_provider_review_capacity(
+            "claude",
+            executable_finder=lambda name: f"/fake/{name}",
+            command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 0, stdout="usage: claude [--print]", stderr=""
+            ),
+        )
+        self.assertEqual(status, "unknown")
+        self.assertNotEqual(status, "supported")
+
+    def test_review_capacity_probe_is_unavailable_when_provider_missing(self):
+        status, reason = providers.probe_provider_review_capacity(
+            "codex", executable_finder=lambda name: None
+        )
+        self.assertEqual(status, "unavailable")
+        self.assertIn("not found", reason)
+
+    def test_check_review_capacity_fails_closed_on_unsupported_capacity_probe(self):
+        with self.assertRaisesRegex(providers.ProviderError, "review swarm capacity exceeded"):
+            providers.check_review_capacity(
+                {"codex": 3},
+                capability={"codex": ("unsupported", "codex --help lacks -c")},
+            )
+
+    def test_check_review_capacity_passes_with_supported_or_unverified_probe(self):
+        results = providers.check_review_capacity(
+            {"codex": 3, "claude": 2},
+            capability={
+                "codex": ("supported", "documents -c overrides"),
+                "claude": ("unknown", "no documented controls"),
+            },
+        )
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(
+            {result.provider: result.capacity_probe for result in results},
+            {"codex": "supported", "claude": "unknown"},
+        )
+
+    def test_check_review_capacity_without_capability_argument_stays_backward_compatible(self):
+        results = providers.check_review_capacity({"codex": 3})
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].capacity_probe, "unknown")
+
 
 class SupervisorPrimitiveTests(unittest.TestCase):
     def setUp(self):

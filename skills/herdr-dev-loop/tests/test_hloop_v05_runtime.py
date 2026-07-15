@@ -111,6 +111,50 @@ class ProviderPreflightIntegrationTests(unittest.TestCase):
             self.assertEqual(preflight["capability"], "supported")
             self.assertTrue(preflight["launch_allowed"])
 
+    def test_preflight_probes_the_exact_role_invocation_not_a_generic_stand_in(self):
+        """`require_agent_invocation` must probe the real launch argv.
+
+        A role-specific invocation (explicit model/effort/exec runner) that
+        the generic TUI/auto preflight probe would never construct must still
+        be exactly what gets probed and recorded, so `last_provider_preflight`
+        describes the actual launch, not a fixed stand-in.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            self.write_fake_provider(
+                bin_dir,
+                "codex",
+                "usage: codex exec --sandbox <mode> -c <key=value> --output-last-message <path>",
+            )
+            output_path = root / "last.txt"
+            invocation = hloop.hloop_providers.build_provider_invocation(
+                provider="codex",
+                runner="exec",
+                sandbox="workspace-write",
+                prompt_path=root / "prompt.md",
+                model="auto",
+                effort="high",
+                output_path=output_path,
+            )
+
+            with self.prepended_path_env(bin_dir):
+                state = hloop.preflight_loop(
+                    repo,
+                    require_agent_invocation=invocation,
+                    require_integration_branch=True,
+                )
+
+            preflight = state.get("last_provider_preflight")
+            self.assertIsNotNone(preflight)
+            self.assertEqual(preflight["argv"], list(invocation.argv))
+            self.assertEqual(preflight["runner"], "exec")
+            self.assertEqual(preflight["effort"], "high")
+            self.assertTrue(preflight["launch_allowed"])
+
     def test_preflight_fails_when_provider_lacks_required_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -183,6 +227,58 @@ class ProviderPreflightIntegrationTests(unittest.TestCase):
                 trusted["git_identity"]["sha256"], hloop.git_executable_identity()["sha256"]
             )
             hloop.preflight_loop(repo, require_integration_branch=True)
+
+    def test_main_never_executes_a_malicious_path_git_before_identity_check(self):
+        """A PATH-substituted `git` must be refused, and never executed.
+
+        `main()` resolves/verifies the trusted git identity before
+        `repo_root()`/`loop_lock()` (or any other code path) executes a PATH
+        `git`. Fingerprinting is filesystem-only (path/device/inode/hash), so
+        the substituted binary should never run even once.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            recorded = hloop.git_executable_identity()
+            state = hloop.load_state(repo)
+            state["git_identity"] = recorded
+            hloop.save_state(repo, state)
+
+            marker = root / "malicious-git-ran.marker"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            malicious_git = bin_dir / "git"
+            malicious_git.write_text(
+                "#!/bin/sh\n"
+                f"echo ran >> {marker}\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            malicious_git.chmod(
+                malicious_git.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+            previous_trusted = hloop.TRUSTED_GIT_PATH
+            try:
+                with self.prepended_path_env(bin_dir), contextlib.redirect_stderr(io.StringIO()):
+                    code = hloop.main(
+                        [
+                            "--repo",
+                            str(repo),
+                            "--namespace",
+                            hloop.LOOP_NAMESPACE,
+                            "status",
+                        ]
+                    )
+            finally:
+                hloop.TRUSTED_GIT_PATH = previous_trusted
+
+            self.assertEqual(code, 2)
+            self.assertFalse(marker.exists(), "malicious PATH git must never execute")
+
+            unchanged = hloop.load_state(repo)
+            self.assertEqual(unchanged, state)
 
 
 class BrokerReportLifecycleTests(unittest.TestCase):
@@ -1363,6 +1459,59 @@ class ReviewGroupRuntimeTests(unittest.TestCase):
                             set(review_state["provider_report_paths"]),
                             set(plan.providers),
                         )
+
+    def test_config_only_topology_resolves_mode_providers_and_probe_count(self):
+        """An unset CLI --mode must not silently narrow a configured topology."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            state["resolved_config"] = {
+                "reviewer": {
+                    "mode": "dual-swarm",
+                    "providers": ["codex", "claude"],
+                    "probes_per_provider": 8,
+                }
+            }
+            state["review_capacity_limits"] = {"codex": 20, "claude": 20}
+            hloop.save_state(repo, state)
+
+            topology = hloop.resolved_reviewer_topology(state)
+            self.assertEqual(topology["mode"], "dual-swarm")
+            self.assertEqual(topology["providers"], ["codex", "claude"])
+            self.assertEqual(topology["probes_per_provider"], 8)
+            self.assertIsNone(topology["probe_count"])
+
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            agent_config = hloop.role_agent_config(state, "reviewer")
+            plan = hloop.build_reviewer_group_plan(
+                topology["mode"], head_sha, agent_config, topology=topology
+            )
+            self.assertEqual(plan.mode, "dual-swarm")
+            self.assertEqual(set(plan.providers), {"codex", "claude"})
+            for provider_plan in plan.provider_plans:
+                self.assertEqual(len(provider_plan.lanes), 8)
+
+            args = self.start_args(repo, None, "R901")
+            args.providers = None
+            args.probe_count = None
+            args.probes_per_provider = None
+            with contextlib.redirect_stdout(io.StringIO()) as buffer:
+                self.assertEqual(hloop.cmd_reviewer_start(args), 0)
+            self.assertIn("DRY RUN", buffer.getvalue())
+
+    def test_explicit_cli_mode_overrides_configured_reviewer_topology(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            state["resolved_config"] = {"reviewer": {"mode": "dual-swarm"}}
+            hloop.save_state(repo, state)
+            topology = hloop.resolved_reviewer_topology(state, mode="single")
+            self.assertEqual(topology["mode"], "single")
 
     def test_incomplete_swarm_harvests_but_close_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
