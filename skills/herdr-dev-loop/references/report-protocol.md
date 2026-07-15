@@ -11,6 +11,8 @@ herdr-dev-loop 0.5.0 treats role progress as structured input to the Manager. Re
 
 Every report is bound to `run_id`, role and attempt identity, task contract digest, stage, summary, next action, evidence references, timestamp, and a client event UUID. The broker assigns the monotonic sequence. Reusing the same event ID with different content is rejected.
 
+Every long-running Worker, Reviewer, Gap Auditor, and Advisor participant receives a registered report token in its rendered prompt. Reports from an unknown role, revoked role, stale attempt, mismatched contract digest, or wrong token fail closed. The fallback spool is local-only and carries the same private authentication envelope; replay reauthenticates it before accepting the event.
+
 ## Sending a semantic report
 
 The role submits reports through the repository-local helper. The following ACK is the minimum material-edit barrier for a Worker:
@@ -26,6 +28,8 @@ $HLOOP agent report \
   --approach '既存の境界を保った最小変更' \
   --next 'material editを開始する'
 ```
+
+After sending the initial ACK, the role enters the semantic ACK barrier and must not begin material work. The Manager approves or rejects the newest authenticated ACK with `hloop agent ack resolve <role-id> --decision approve|reject|timeout --reason <text>`. Reject and timeout remain blocking; approval then requires a newer corrected ACK event. The same rule applies when a later Manager message changes goal, scope, acceptance, or public behavior.
 
 If the broker store is unavailable, the client atomically writes the event to the run-specific fallback spool. `hloop broker recover` replays valid events idempotently. Invalid, stale-run, or digest-conflicting events fail closed.
 
@@ -44,13 +48,17 @@ When no event needs action, the Manager registers a wake lease and waits:
 $HLOOP manager sleep --ttl-seconds 3600
 ```
 
-The lease is bound to the run, Manager session, pane, generation, and expiry. Registration and unread-event inspection share the broker transaction, closing the lost-wake window between checking the inbox and sleeping. Delivery is at least once, so the Manager consumes a handled event by its stable ID:
+The lease is bound to the run, Manager session, pane, generation, and expiry. Registration and actionable-event inspection share the broker transaction, closing the lost-wake window between checking the inbox and sleeping. `manager sleep` is a foreground blocking operation and returns only for an ACK, attention or completion report, a Herdr fallback signal, or timeout. Those actionable reports signal the supervisor socket after the durable broker transaction commits; milestones remain inbox-only.
+
+Wake delivery and inbox acknowledgement are separate. A stale-generation wake remains unprocessed, and an unacknowledged event is projected again when a fresh lease is registered. The Manager explicitly acknowledges the stable event ID exactly once:
 
 ```bash
 $HLOOP inbox ack <event-id>
 ```
 
 Duplicate wakes are harmless only when the Manager uses the event ID and lease generation. A role's free-form output must not be forwarded as a Manager prompt; wake messages contain fixed identifiers and the command needed to inspect the durable event.
+
+Manager messages durably distinguish `delivered`, `acknowledged`, `applied`, `undelivered`, `unknown`, and `superseded`. Record a transport ACK or application result with `hloop message resolve <role-id> <message-id> --status acknowledged|applied`; `applied` requires `--result`. Resolve an ambiguous delivery explicitly instead of auto-resending it. `hloop message drain` retries only `undelivered` messages and never `unknown` messages.
 
 ## Recovery and privacy
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -46,6 +47,10 @@ class LeaseGenerationMismatch(BrokerStorageError):
     """A wake references a stale or otherwise different Manager lease."""
 
 
+class ReportAuthenticationError(BrokerStorageError):
+    """A live or spooled report does not match an active role identity."""
+
+
 @dataclass(frozen=True)
 class StoredEvent:
     event: dict[str, Any]
@@ -60,6 +65,12 @@ class StoredWake:
 
 @dataclass(frozen=True)
 class WakeConsumption:
+    accepted: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class InboxAcknowledgement:
     accepted: bool
     reason: str
 
@@ -89,6 +100,7 @@ def _schema_sql() -> str:
         "wake_leases",
         "wake_outbox",
         "wake_consumptions",
+        "inbox_acknowledgements",
         "broker_owners",
         "active_roles",
     )
@@ -174,6 +186,14 @@ def _schema_sql() -> str:
             UNIQUE(event_id, lease_generation),
             FOREIGN KEY(event_id, run_id, lease_generation)
                 REFERENCES wake_outbox(event_id, run_id, lease_generation)
+        );
+
+        CREATE TABLE IF NOT EXISTS inbox_acknowledgements (
+            acknowledgement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL,
+            acknowledged_at TEXT NOT NULL,
+            FOREIGN KEY(event_id, run_id) REFERENCES events(event_id, run_id)
         );
 
         CREATE TABLE IF NOT EXISTS broker_owners (
@@ -394,6 +414,29 @@ class BrokerStore:
         ).fetchall()
         return [json.loads(row["event_json"]) for row in rows]
 
+    def latest_role_event(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        run_id: str,
+        role_id: str,
+        attempt_id: str,
+        report_type: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest authenticated event for one active attempt."""
+
+        transaction.require_active(self)
+        row = transaction.connection.execute(
+            """
+            SELECT event_json FROM events
+            WHERE run_id = ? AND role_id = ? AND attempt_id = ?
+              AND report_type = ?
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (run_id, role_id, attempt_id, report_type),
+        ).fetchone()
+        return json.loads(row["event_json"]) if row is not None else None
+
     def inbox(self, transaction: BrokerTransaction) -> list[dict[str, Any]]:
         transaction.require_active(self)
         rows = transaction.connection.execute(
@@ -408,7 +451,7 @@ class BrokerStore:
     def unconsumed_inbox(
         self, transaction: BrokerTransaction, *, run_id: str
     ) -> list[dict[str, Any]]:
-        """Return inbox rows for a run that have never been consumed by any wake.
+        """Return inbox rows for a run without an explicit Manager ACK.
 
         This checks the raw append-only inbox rather than ``wake_outbox``, so a
         report that arrived while no lease was active (or under a lease
@@ -426,12 +469,49 @@ class BrokerStore:
                    inbox.report_type, inbox.projected_at
             FROM inbox
             WHERE inbox.run_id = ?
-              AND inbox.event_id NOT IN (SELECT event_id FROM wake_consumptions)
+              AND inbox.event_id NOT IN (
+                  SELECT event_id FROM inbox_acknowledgements
+              )
             ORDER BY inbox.sequence
             """,
             (run_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def enqueue_unacknowledged_for_lease(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        run_id: str,
+        lease_generation: int,
+        manager_session_id: str,
+        pane_id: str,
+        report_types: frozenset[str] | None = None,
+        created_at: str | None = None,
+    ) -> list[StoredWake]:
+        """Project every unacknowledged report onto the current lease.
+
+        Old wake rows remain append-only and unconsumed.  A fresh generation
+        receives a new outbox row, so an expired/crashed Manager lease cannot
+        silently discard a report.
+        """
+
+        transaction.require_active(self)
+        stored: list[StoredWake] = []
+        for row in self.unconsumed_inbox(transaction, run_id=run_id):
+            if report_types is not None and row["report_type"] not in report_types:
+                continue
+            stored.append(
+                self.enqueue_wake(
+                    transaction,
+                    event_id=row["event_id"],
+                    lease_generation=lease_generation,
+                    manager_session_id=manager_session_id,
+                    pane_id=pane_id,
+                    created_at=created_at,
+                )
+            )
+        return stored
 
     def register_wake_lease(
         self,
@@ -589,7 +669,12 @@ class BrokerStore:
     def pending_wakes(
         self, transaction: BrokerTransaction, *, at: str | None = None
     ) -> list[dict[str, Any]]:
-        """Return deliverable wakes and terminalize stale lease generations."""
+        """Return only wakes deliverable under the current lease generation.
+
+        Stale wakes are intentionally left unprocessed.  Registering a later
+        lease re-enqueues the still-unacknowledged inbox event for that fresh
+        generation.
+        """
 
         transaction.require_active(self)
         timestamp = at or utc_now()
@@ -602,7 +687,10 @@ class BrokerStore:
             LEFT JOIN wake_consumptions AS c
               ON c.event_id = w.event_id
              AND c.lease_generation = w.lease_generation
+            LEFT JOIN inbox_acknowledgements AS a
+              ON a.event_id = w.event_id
             WHERE c.consumption_id IS NULL
+              AND a.acknowledgement_id IS NULL
             ORDER BY w.wake_id
             """
         ).fetchall()
@@ -616,15 +704,41 @@ class BrokerStore:
                 at=timestamp,
             ):
                 pending.append(wake)
-                continue
-            self._record_wake_terminal(
-                transaction,
-                event_id=wake["event_id"],
-                run_id=wake["run_id"],
-                lease_generation=wake["lease_generation"],
-                terminal_at=timestamp,
-            )
         return pending
+
+    def acknowledge_inbox(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        event_id: str,
+        run_id: str,
+        acknowledged_at: str | None = None,
+    ) -> InboxAcknowledgement:
+        """Explicitly acknowledge one inbox event exactly once."""
+
+        transaction.require_active(self)
+        event_id = _nonempty_line(event_id, "event_id")
+        run_id = _nonempty_line(run_id, "run_id")
+        row = transaction.connection.execute(
+            "SELECT run_id FROM inbox WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if row is None or row["run_id"] != run_id:
+            return InboxAcknowledgement(False, "missing")
+        existing = transaction.connection.execute(
+            "SELECT 1 FROM inbox_acknowledgements WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if existing is not None:
+            return InboxAcknowledgement(False, "duplicate")
+        timestamp = acknowledged_at or utc_now()
+        parse_rfc3339(timestamp, field="acknowledged_at")
+        transaction.connection.execute(
+            """
+            INSERT INTO inbox_acknowledgements(event_id, run_id, acknowledged_at)
+            VALUES (?, ?, ?)
+            """,
+            (event_id, run_id, timestamp),
+        )
+        return InboxAcknowledgement(True, "acknowledged")
 
     def consume_wake(
         self,
@@ -654,13 +768,6 @@ class BrokerStore:
             generation=lease_generation,
             at=timestamp,
         ):
-            self._record_wake_terminal(
-                transaction,
-                event_id=event_id,
-                run_id=row["run_id"],
-                lease_generation=lease_generation,
-                terminal_at=timestamp,
-            )
             return WakeConsumption(False, "stale-lease")
         existing = transaction.connection.execute(
             """
@@ -708,7 +815,20 @@ class BrokerStore:
 
         transaction.require_active(self)
         replayed: list[StoredEvent] = []
-        for path, event in iter_spooled_events(spool_directory):
+        for path, event, authentication in _iter_spooled_entries(spool_directory):
+            if authentication is None or not self.authenticate_role_report(
+                transaction,
+                run_id=event["run_id"],
+                role_id=event["role_id"],
+                attempt_id=event["attempt_id"],
+                task_contract_digest=event["task_contract_digest"],
+                token=str(authentication.get("token") or ""),
+            ):
+                raise ReportAuthenticationError(
+                    "spooled report does not match an active "
+                    "run/role/attempt/digest/token identity: "
+                    f"{event['role_id']}/{event['attempt_id']}"
+                )
             stored = self.accept_report(transaction, event)
             replayed.append(stored)
             expected_digest = event["payload_digest"]
@@ -901,12 +1021,7 @@ class BrokerStore:
         task_contract_digest: str,
         token: str,
     ) -> bool:
-        """Return whether a submitted report matches the registered active identity.
-
-        A role with no registration at all is not authenticated by this
-        method; callers decide whether that means reject or allow (for roles
-        that do not yet register, e.g. during incremental rollout).
-        """
+        """Return whether a submitted report matches the registered active identity."""
 
         transaction.require_active(self)
         current = self._latest_active_role(transaction, run_id=run_id, role_id=role_id)
@@ -917,7 +1032,7 @@ class BrokerStore:
         if current["task_contract_digest"] != task_contract_digest.lower():
             return False
         token_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return current["token_digest"] == token_digest
+        return hmac.compare_digest(current["token_digest"], token_digest)
 
     def has_active_role_registration(
         self, transaction: BrokerTransaction, *, run_id: str, role_id: str
@@ -990,10 +1105,16 @@ def derive_runtime_socket_path(
     return path
 
 
-def spool_client_event(spool_directory: Path, client_event: Mapping[str, Any]) -> Path:
-    """Atomically persist a report when the broker socket is unavailable."""
+def spool_client_event(
+    spool_directory: Path,
+    client_event: Mapping[str, Any],
+    *,
+    authentication: Mapping[str, Any] | None = None,
+) -> Path:
+    """Atomically persist a report and its local-only authentication envelope."""
 
     event = validate_client_event(client_event)
+    auth = _validate_spool_authentication(authentication, event=event)
     directory = Path(spool_directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -1005,23 +1126,33 @@ def spool_client_event(spool_directory: Path, client_event: Mapping[str, Any]) -
     with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         if os.path.lexists(target):
-            existing = _read_spool_file(target)
-            if existing["payload_digest"] != event["payload_digest"]:
+            _, existing, existing_auth = _read_spool_entry(target)
+            if (
+                existing["payload_digest"] != event["payload_digest"]
+                or existing_auth != auth
+            ):
                 raise IdempotencyConflict(
-                    f"spooled event_id {event['event_id']} has a different digest"
+                    f"spooled event_id {event['event_id']} has different content or authentication"
                 )
             return target
         sequence = _next_spool_sequence(directory)
         try:
             _atomic_create_json(
                 target,
-                {"spool_sequence": sequence, "event": event},
+                {
+                    "spool_sequence": sequence,
+                    "event": event,
+                    "authentication": auth,
+                },
             )
         except FileExistsError:
-            existing = _read_spool_file(target)
-            if existing["payload_digest"] != event["payload_digest"]:
+            _, existing, existing_auth = _read_spool_entry(target)
+            if (
+                existing["payload_digest"] != event["payload_digest"]
+                or existing_auth != auth
+            ):
                 raise IdempotencyConflict(
-                    f"spooled event_id {event['event_id']} has a different digest"
+                    f"spooled event_id {event['event_id']} has different content or authentication"
                 )
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -1033,7 +1164,7 @@ def _next_spool_sequence(directory: Path) -> int:
     for path in directory.glob("*.json"):
         if path.is_symlink() or not path.is_file():
             raise BrokerStorageError(f"unsafe spool entry: {path}")
-        sequence, event = _read_spool_entry(path)
+        sequence, event, _ = _read_spool_entry(path)
         if path.stem != event["event_id"]:
             raise BrokerStorageError(
                 f"spool filename does not match event_id: {path.name}"
@@ -1043,42 +1174,83 @@ def _next_spool_sequence(directory: Path) -> int:
     return highest + 1
 
 
-def _read_spool_entry(path: Path) -> tuple[int | None, dict[str, Any]]:
+def _read_spool_entry(
+    path: Path,
+) -> tuple[int | None, dict[str, Any], dict[str, str] | None]:
     if path.is_symlink() or not path.is_file():
         raise BrokerStorageError(f"unsafe spool entry: {path}")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(value, Mapping) and set(value) == {"spool_sequence", "event"}:
+        if isinstance(value, Mapping) and set(value) in (
+            {"spool_sequence", "event"},
+            {"spool_sequence", "event", "authentication"},
+        ):
             sequence = value["spool_sequence"]
             if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
                 raise BrokerStorageError(
                     f"invalid spool entry {path}: spool_sequence must be positive"
                 )
-            return sequence, validate_client_event(value["event"])
-        return None, validate_client_event(value)
-    except (OSError, json.JSONDecodeError, ReportValidationError) as exc:
+            event = validate_client_event(value["event"])
+            auth = _validate_spool_authentication(
+                value.get("authentication"), event=event, allow_missing=True
+            )
+            return sequence, event, auth
+        return None, validate_client_event(value), None
+    except (OSError, json.JSONDecodeError, ReportValidationError, BrokerStorageError) as exc:
         raise BrokerStorageError(f"invalid spool entry {path}: {exc}") from exc
 
 
 def _read_spool_file(path: Path) -> dict[str, Any]:
-    _, event = _read_spool_entry(path)
+    _, event, _ = _read_spool_entry(path)
     return event
 
 
-def iter_spooled_events(
+def _validate_spool_authentication(
+    authentication: Mapping[str, Any] | None,
+    *,
+    event: Mapping[str, Any],
+    allow_missing: bool = False,
+) -> dict[str, str] | None:
+    if authentication is None:
+        if allow_missing:
+            return None
+        raise ReportAuthenticationError("spooled report authentication is required")
+    fields = {
+        "run_id",
+        "role_id",
+        "attempt_id",
+        "task_contract_digest",
+        "token",
+    }
+    if not isinstance(authentication, Mapping) or set(authentication) != fields:
+        raise ReportAuthenticationError(
+            "spooled report authentication has an invalid field set"
+        )
+    normalized = {key: _nonempty_line(authentication[key], key) for key in fields}
+    for key in ("run_id", "role_id", "attempt_id", "task_contract_digest"):
+        if normalized[key] != event[key]:
+            raise ReportAuthenticationError(
+                f"spooled authentication {key} does not match the event"
+            )
+    return normalized
+
+
+def _iter_spooled_entries(
     spool_directory: Path,
-) -> Iterator[tuple[Path, dict[str, Any]]]:
-    """Yield validated spool entries in durable enqueue order."""
+) -> Iterator[tuple[Path, dict[str, Any], dict[str, str] | None]]:
+    """Yield validated spool entries including the private auth envelope."""
 
     directory = Path(spool_directory)
     if not directory.exists():
         return
-    entries: list[tuple[int | None, Path, dict[str, Any]]] = []
+    entries: list[
+        tuple[int | None, Path, dict[str, Any], dict[str, str] | None]
+    ] = []
     seen_sequences: dict[int, Path] = {}
     for path in directory.glob("*.json"):
         if path.is_symlink() or not path.is_file():
             raise BrokerStorageError(f"unsafe spool entry: {path}")
-        sequence, event = _read_spool_entry(path)
+        sequence, event, authentication = _read_spool_entry(path)
         if path.stem != event["event_id"]:
             raise BrokerStorageError(
                 f"spool filename does not match event_id: {path.name}"
@@ -1090,7 +1262,7 @@ def iter_spooled_events(
             )
         if sequence is not None:
             seen_sequences[sequence] = path
-        entries.append((sequence, path, event))
+        entries.append((sequence, path, event, authentication))
     entries.sort(
         key=lambda item: (
             item[0] is not None,
@@ -1098,7 +1270,16 @@ def iter_spooled_events(
             item[1].name,
         )
     )
-    for _, path, event in entries:
+    for _, path, event, authentication in entries:
+        yield path, event, authentication
+
+
+def iter_spooled_events(
+    spool_directory: Path,
+) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Yield validated spool entries in durable enqueue order."""
+
+    for path, event, _ in _iter_spooled_entries(spool_directory):
         yield path, event
 
 

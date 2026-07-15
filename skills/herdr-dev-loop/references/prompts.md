@@ -24,6 +24,8 @@ Follow the HLoop Worker Protocol unless the task explicitly chooses compatibilit
 
 Report protocol:
 - after read-only investigation, submit `hloop agent report --type ack` with understood goal, scope, acceptance, and approach before material edits
+- stop at the initial semantic ACK barrier until Manager approval; reject or timeout requires a corrected new ACK
+- include the rendered run, role, attempt, contract digest, and report token identity on every report
 - send `milestone` only for a meaningful state change
 - send `attention` when Manager action is required
 - send `completion` with artifact, head SHA, validation references, residual risks, and handoff before the terminal sentinel
@@ -105,7 +107,7 @@ Review group:
 - record `single`, `swarm`, `dual`, or `dual-swarm`
 - pin every Coordinator lane and Verifier to the prompt-provided head SHA
 - retain budget or verifier shortfalls as `insufficient_evidence`
-- submit semantic ACK before investigation and completion only after manifest and artifact validation
+- submit semantic ACK after read-only preparation, wait for approval before material review work, and send completion only after manifest and artifact validation
 
 Rules:
 - do not edit code

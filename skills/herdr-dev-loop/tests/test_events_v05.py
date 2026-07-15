@@ -97,6 +97,16 @@ def client_event(
     )
 
 
+def report_authentication(event: dict[str, object], token: str = "report-token"):
+    return {
+        "run_id": event["run_id"],
+        "role_id": event["role_id"],
+        "attempt_id": event["attempt_id"],
+        "task_contract_digest": event["task_contract_digest"],
+        "token": token,
+    }
+
+
 class ReportValidationTests(unittest.TestCase):
     def test_client_assigns_uuid_and_digest_while_sequence_is_broker_only(self):
         prepared = events.prepare_client_event(
@@ -188,6 +198,13 @@ class BrokerStorageTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.store = broker.BrokerStore(self.root / "broker")
+        self.report_token = "report-token"
+        sample = client_event()
+        with self.store.transaction() as transaction:
+            self.store.register_active_role(
+                transaction,
+                **report_authentication(sample, self.report_token),
+            )
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -357,7 +374,7 @@ class BrokerStorageTests(unittest.TestCase):
                 )
             )
 
-    def test_stale_wakes_are_terminalized_and_never_return_to_pending(self):
+    def test_stale_wakes_remain_unprocessed_and_reenqueue_on_fresh_lease(self):
         first_event = client_event(summary="旧lease向け")
         second_event = client_event(summary="新lease向け")
         with self.store.transaction() as transaction:
@@ -391,22 +408,31 @@ class BrokerStorageTests(unittest.TestCase):
                 lease_generation=new_lease["generation"],
                 created_at=CREATED_AT,
             )
+            requeued = self.store.enqueue_unacknowledged_for_lease(
+                transaction,
+                run_id="run-001",
+                lease_generation=new_lease["generation"],
+                manager_session_id="session-2",
+                pane_id="wH:p2",
+                created_at=CREATED_AT,
+            )
 
             pending = self.store.pending_wakes(transaction, at=CREATED_AT)
             self.assertEqual(
                 [(item["event_id"], item["lease_generation"]) for item in pending],
-                [(new_wake.wake["event_id"], new_lease["generation"])],
+                [
+                    (new_wake.wake["event_id"], new_lease["generation"]),
+                    (old_wake.wake["event_id"], new_lease["generation"]),
+                ],
             )
+            self.assertEqual(len(requeued), 2)
             terminals = transaction.connection.execute(
                 """
                 SELECT event_id, lease_generation FROM wake_consumptions
                 ORDER BY consumption_id
                 """
             ).fetchall()
-            self.assertEqual(
-                [(row["event_id"], row["lease_generation"]) for row in terminals],
-                [(old_wake.wake["event_id"], old_lease["generation"])],
-            )
+            self.assertEqual(list(terminals), [])
             self.assertEqual(
                 self.store.consume_wake(
                     transaction,
@@ -417,15 +443,37 @@ class BrokerStorageTests(unittest.TestCase):
                 broker.WakeConsumption(False, "stale-lease"),
             )
             self.assertEqual(
+                self.store.acknowledge_inbox(
+                    transaction,
+                    event_id=old_wake.wake["event_id"],
+                    run_id="run-001",
+                    acknowledged_at=CREATED_AT,
+                ),
+                broker.InboxAcknowledgement(True, "acknowledged"),
+            )
+            self.assertEqual(
+                self.store.acknowledge_inbox(
+                    transaction,
+                    event_id=old_wake.wake["event_id"],
+                    run_id="run-001",
+                    acknowledged_at=CREATED_AT,
+                ),
+                broker.InboxAcknowledgement(False, "duplicate"),
+            )
+            self.assertEqual(
+                [item["event_id"] for item in self.store.pending_wakes(transaction, at=CREATED_AT)],
+                [new_wake.wake["event_id"]],
+            )
+            self.assertEqual(
                 self.store.pending_wakes(transaction, at=EXPIRES_AT), []
             )
             terminal_count = transaction.connection.execute(
                 "SELECT COUNT(*) AS count FROM wake_consumptions"
             ).fetchone()["count"]
-            self.assertEqual(terminal_count, 2)
+            self.assertEqual(terminal_count, 0)
             with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
                 transaction.connection.execute(
-                    "UPDATE wake_consumptions SET consumed_at = ?",
+                    "UPDATE inbox_acknowledgements SET acknowledged_at = ?",
                     (EXPIRES_AT,),
                 )
 
@@ -433,7 +481,9 @@ class BrokerStorageTests(unittest.TestCase):
         spool = self.root / "spool"
         first = client_event(event_id="ffffffff-ffff-4fff-8fff-ffffffffffff")
         second = client_event(event_id="00000000-0000-4000-8000-000000000001")
-        broker.spool_client_event(spool, first)
+        broker.spool_client_event(
+            spool, first, authentication=report_authentication(first, self.report_token)
+        )
         with self.assertRaises(broker.IdempotencyConflict):
             broker.spool_client_event(
                 spool,
@@ -441,8 +491,11 @@ class BrokerStorageTests(unittest.TestCase):
                     event_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
                     summary="same id, different report",
                 ),
+                authentication=report_authentication(first, self.report_token),
             )
-        broker.spool_client_event(spool, second)
+        broker.spool_client_event(
+            spool, second, authentication=report_authentication(second, self.report_token)
+        )
 
         restarted = broker.BrokerStore(self.root / "broker")
         with restarted.transaction() as transaction:
@@ -455,12 +508,56 @@ class BrokerStorageTests(unittest.TestCase):
             self.assertEqual(len(list(spool.glob("*.json"))), 2)
         self.assertEqual(list(spool.glob("*.json")), [])
 
-        broker.spool_client_event(spool, first)
+        broker.spool_client_event(
+            spool, first, authentication=report_authentication(first, self.report_token)
+        )
         with restarted.transaction() as transaction:
             replayed = restarted.replay_spool(transaction, spool)
             self.assertFalse(replayed[0].inserted)
             self.assertEqual(replayed[0].event["sequence"], 1)
         self.assertEqual(list(spool.glob("*.json")), [])
+
+    def test_spool_replay_reauthenticates_unknown_role_and_stale_attempt(self):
+        spool = self.root / "spool"
+        unknown = client_event()
+        unknown["role_id"] = "T999"
+        unknown["payload_digest"] = events.payload_digest(
+            {key: value for key, value in unknown.items() if key not in {"event_id", "payload_digest"}}
+        )
+        broker.spool_client_event(
+            spool,
+            unknown,
+            authentication=report_authentication(unknown, "unknown-token"),
+        )
+        with self.assertRaisesRegex(
+            broker.ReportAuthenticationError, "does not match an active"
+        ):
+            with self.store.transaction() as transaction:
+                self.store.replay_spool(transaction, spool)
+        self.assertEqual(len(list(spool.glob("*.json"))), 1)
+
+        for path in spool.glob("*.json"):
+            path.unlink()
+        stale = client_event()
+        with self.store.transaction() as transaction:
+            self.store.register_active_role(
+                transaction,
+                run_id="run-001",
+                role_id="T003",
+                attempt_id="T003-A002",
+                task_contract_digest=stale["task_contract_digest"],
+                token="new-token",
+            )
+        broker.spool_client_event(
+            spool,
+            stale,
+            authentication=report_authentication(stale, self.report_token),
+        )
+        with self.assertRaisesRegex(
+            broker.ReportAuthenticationError, "T003/T003-A001"
+        ):
+            with self.store.transaction() as transaction:
+                self.store.replay_spool(transaction, spool)
 
     def test_future_schema_is_rejected_without_ddl_mutation(self):
         future_root = self.root / "future-broker"
@@ -564,7 +661,10 @@ class BrokerStorageTests(unittest.TestCase):
 
     def test_invalid_spool_entry_rolls_back_the_whole_replay_batch(self):
         spool = self.root / "spool"
-        broker.spool_client_event(spool, client_event())
+        event = client_event()
+        broker.spool_client_event(
+            spool, event, authentication=report_authentication(event, self.report_token)
+        )
         invalid = spool / "ffffffff-ffff-4fff-8fff-ffffffffffff.json"
         invalid.write_text(json.dumps({"not": "an event"}), encoding="utf-8")
 
