@@ -4,7 +4,7 @@ Worker receives one task and one worktree.
 
 After committing product changes and completing validation, use `hloop worker finalize` to generate and commit `result.md`. Do not hand-copy `task_id`, `run_id`, `skill_version`, `base_sha`, `head_sha`, `changed_files`, or `merge_ready` when the helper is available.
 
-A Codex `workspace-write` Worker that cannot write Git metadata at all uses `hloop worker finalize <task-id> --handoff` instead: it writes `result.md` marked `handoff: true` and never touches Git, even when in-scope product changes are still dirty. Ask the Manager to run `hloop worker seal <task-id>` to validate and commit the handoff; do not attempt to commit it yourself.
+A Codex `workspace-write` Worker that cannot write Git metadata at all uses `hloop worker finalize <task-id> --handoff` instead: it writes `result.md` marked `handoff: true` and performs no Git metadata writes, even when in-scope product changes are still dirty. Ask the Manager to run `hloop worker seal <task-id>` to validate and commit the handoff; do not attempt to commit it yourself.
 
 Default runner: interactive role-agent TUI. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md`, task frontmatter, or `hloop worker start`. This keeps the Worker visible in Herdr so the Manager can add requirements, inspect progress, or interrupt the Worker before it finishes. Use `--runner exec` only for well-bounded automation tasks that should complete without interaction.
 
