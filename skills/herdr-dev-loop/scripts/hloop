@@ -7981,7 +7981,13 @@ def decision_liaison_file(repo: Path, decision_id: str) -> Path:
 
 
 def render_specification_scout_prompt(
-    state: dict[str, Any], *, head_sha: str, reasons: list[str]
+    state: dict[str, Any],
+    *,
+    head_sha: str,
+    reasons: list[str],
+    report_credential_file: str = "",
+    task_contract_digest: str = "",
+    attempt_id: str = "S001-A001",
 ) -> str:
     reason_lines = "\n".join(f"- {reason}" for reason in reasons) or "- Manager requested it."
     artifact = (LOOP_DIR / "decisions" / "SCOUT.md").as_posix()
@@ -7994,7 +8000,10 @@ edit product code and do not decide user-visible specifications yourself.
 The automatic trigger reasons were:
 {reason_lines}
 
+{report_contract_text("S001", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+
 Write only `{artifact}` with frontmatter containing `status: reported`,
+`role_id: S001`, `attempt_id: {attempt_id}`, `skill_version: {SKILL_VERSION}`,
 `head_sha: {head_sha}`, and `run_id: {state.get('run_id', '')}`. In the body,
 report unresolved questions, why each decision is needed, affected requirement
 or task candidates, two or three options with tradeoffs and rollback cost,
@@ -8006,7 +8015,13 @@ Finish with `HERDR_LOOP_SCOUT_DONE:{state.get('run_id', '')}:S001:reported`.
 
 
 def render_decision_liaison_prompt(
-    record: DecisionRecord, state: dict[str, Any], *, head_sha: str
+    record: DecisionRecord,
+    state: dict[str, Any],
+    *,
+    head_sha: str,
+    report_credential_file: str = "",
+    task_contract_digest: str = "",
+    attempt_id: str = "",
 ) -> str:
     question = decision_question_text(record, state)
     artifact = (LOOP_DIR / "decisions" / record.decision_id / "RESPONSE.md").as_posix()
@@ -8019,15 +8034,103 @@ def render_decision_liaison_prompt(
 
 {question}
 
+{report_contract_text(f"L-{record.decision_id}", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+
 回答を得たら `{artifact}` だけを書き、frontmatter に
 `decision_id: {record.decision_id}`、`responded_by: liaison`、
-`responded_at`、選択肢が特定できる場合は `selected_option` を記録してください。
+`responded_at`、`attempt_id: {attempt_id}`、`run_id: {state.get('run_id', '')}`、
+`skill_version: {SKILL_VERSION}`、`head_sha: {head_sha}`、選択肢が特定できる場合は
+`selected_option` を記録してください。
 本文は `# 回答` の下に利用者の回答を日本語で記録してください。
 対象 SHA は `{head_sha}` です。
 
 完了時は `HERDR_LOOP_LIAISON_DONE:{state.get('run_id', '')}:{record.decision_id}:responded`
 を表示してください。
 """
+
+
+def decision_attention_notice(
+    repo: Path, state: dict[str, Any], record: DecisionRecord
+) -> None:
+    """Notify Manager once when a canonical user-decision question is created.
+
+    The state record is persisted before calling Herdr so a retry after a crash
+    cannot emit a duplicate tab notification. An interrupted or failed delivery
+    remains auditable and the plain-language question is printed as the Manager
+    fallback.
+    """
+
+    if not (
+        record.unresolved
+        and record.decision_class in hloop_decisions.USER_DECISION_CLASSES
+    ):
+        return
+    notices = state.setdefault("decision_attention", {})
+    previous = notices.get(record.decision_id)
+    if isinstance(previous, dict):
+        if previous.get("status") == "dispatching":
+            previous["status"] = "unknown"
+            previous["fallback_at"] = now_iso()
+            previous["fallback_reason"] = (
+                "previous notification delivery was interrupted and is intentionally not retried"
+            )
+            print(
+                f"HERDR_LOOP_DECISION_ATTENTION_FALLBACK:{state.get('run_id', '')}:"
+                f"{record.decision_id}"
+            )
+            print(decision_question_text(record, state).rstrip())
+            save_state(repo, state)
+        return
+
+    question_rel = (
+        LOOP_DIR / "decisions" / record.decision_id / "QUESTION.md"
+    ).as_posix()
+    manager_notice = (
+        f"HERDR_LOOP_DECISION_ATTENTION:{state.get('run_id', '')}:"
+        f"{record.decision_id}:{question_rel}"
+    )
+    notice = {
+        "decision_id": record.decision_id,
+        "status": "dispatching",
+        "question_path": question_rel,
+        "manager_notice": manager_notice,
+        "attempted_at": now_iso(),
+    }
+    notices[record.decision_id] = notice
+    save_state(repo, state)
+    print(manager_notice)
+    try:
+        if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+            raise HLoopError("Herdr notification is unavailable")
+        run_cmd(
+            [
+                "herdr",
+                "notification",
+                "show",
+                f"HLoop decision {record.decision_id}",
+                "--body",
+                record.question,
+                "--sound",
+                "request",
+            ],
+            check=True,
+            capture=True,
+        )
+        notice["status"] = "notified"
+        notice["notified_at"] = now_iso()
+        notice["herdr_tab_attention"] = True
+    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
+        notice["status"] = "manager-fallback"
+        notice["fallback_at"] = now_iso()
+        notice["fallback_reason"] = command_error_detail(exc)
+        notice["herdr_tab_attention"] = False
+        print(
+            f"HERDR_LOOP_DECISION_ATTENTION_FALLBACK:{state.get('run_id', '')}:"
+            f"{record.decision_id}"
+        )
+        print(decision_question_text(record, state).rstrip())
+    state.setdefault("decision_attention_events", []).append(dict(notice))
+    save_state(repo, state)
 
 
 def write_decision_artifacts(repo: Path, state: dict[str, Any]) -> None:
@@ -8050,6 +8153,7 @@ def write_decision_artifacts(repo: Path, state: dict[str, Any]) -> None:
             + "\n"
             + decision_question_text(record, state),
         )
+        decision_attention_notice(repo, state, record)
         if record.response is not None:
             response_fields = {
                 "decision_id": decision_id,
@@ -8140,6 +8244,13 @@ def default_decision_role_worktree(
         role_id,
         f"{repo.name}.{slugify(role_id, 32)}-{suffix}",
     )
+
+
+def next_decision_role_attempt(
+    role_id: str, role_state: dict[str, Any]
+) -> tuple[int, str]:
+    attempt_no = normalize_int(role_state.get("attempt_no"), 0) + 1
+    return attempt_no, f"{role_id}-A{attempt_no:03d}"
 
 
 def cleanup_decision_role_worktree(
@@ -8235,6 +8346,12 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
             reason="Herdr pane is unavailable",
             user_text=prompt,
         )
+    role_id = "S001"
+    attempt_no, attempt_id = next_decision_role_attempt(role_id, run)
+    prompt_without_identity = render_specification_scout_prompt(
+        state, head_sha=head_sha, reasons=reasons, attempt_id=attempt_id
+    )
+    task_contract_digest = prompt_contract_digest(prompt_without_identity)
     runner = getattr(args, "runner", None) or "tui"
     agent_config = role_agent_config(
         state,
@@ -8257,9 +8374,24 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
     try:
         if not worktree_preexisting:
             git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
-        prepare_role_worktree(repo, worktree, state, role="advisor", agent_id="S001")
+        prepare_role_worktree(repo, worktree, state, role="advisor", agent_id=role_id)
         ensure_advisor_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, artifact_rel)
+        report_credential_file, initial_ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=role_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_specification_scout_prompt(
+            state,
+            head_sha=head_sha,
+            reasons=reasons,
+            report_credential_file=str(report_credential_file),
+            task_contract_digest=task_contract_digest,
+            attempt_id=attempt_id,
+        )
         write_text(worktree / prompt_rel, prompt)
         baseline = porcelain_paths(worktree)
         if getattr(args, "launcher", "pane") == "agent":
@@ -8276,10 +8408,18 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
-    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
-        rollback_failed_role_start(
-            repo, worktree, created_worktree=not worktree_preexisting
-        )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, role_id)
         return decision_role_fallback(
             repo,
             state,
@@ -8290,7 +8430,7 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
         )
     run.update(
         {
-            "role_id": "S001",
+            "role_id": role_id,
             "status": "running",
             "gate_status": "running",
             "mode": "agent-pane",
@@ -8305,10 +8445,20 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
             "baseline_dirty_files": baseline,
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
+            "attempt_no": attempt_no,
+            "attempt_id": attempt_id,
+            "skill_version": SKILL_VERSION,
+            "task_contract_digest": task_contract_digest,
             "runner": runner,
             "provider_invocation": invocation.as_record(),
             "started_at": now_iso(),
         }
+    )
+    arm_initial_semantic_ack_barrier(
+        run,
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=initial_ack_floor,
     )
     state["phase"] = "specification_scout"
     save_state(repo, state)
@@ -8331,16 +8481,54 @@ def validate_decision_role_scope(
     ]
 
 
+def decision_role_artifact_identity_error(
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    role_state: dict[str, Any],
+    meta: dict[str, Any],
+    decision_id: str = "",
+) -> str:
+    if decision_id:
+        if str(meta.get("decision_id") or "") != decision_id:
+            return "decision_id mismatch"
+    elif str(meta.get("role_id") or "") != role_id:
+        return "role_id mismatch"
+    expected = {
+        "run_id": str(state.get("run_id") or ""),
+        "skill_version": str(role_state.get("skill_version") or SKILL_VERSION),
+        "attempt_id": str(role_state.get("attempt_id") or ""),
+        "head_sha": str(role_state.get("head_sha") or ""),
+    }
+    for field, value in expected.items():
+        if value and str(meta.get(field) or "") != value:
+            return f"{field} mismatch"
+    return ""
+
+
 def cmd_specification_scout_harvest(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     run = state.get("specification_scout_run") or {}
     if str(run.get("status") or "") != "running":
         raise HLoopError("Specification Scout is not running")
+    block_reason = semantic_ack_barrier_blocking(run)
+    if block_reason:
+        raise HLoopError(f"cannot harvest S001: {block_reason}")
     worktree = Path(str(run.get("worktree") or "")).resolve()
     source = worktree / LOOP_DIR / "decisions" / "SCOUT.md"
     if not source.is_file() or not read_text(source).strip():
         raise HLoopError(f"Specification Scout artifact is missing: {source}")
+    identity_error = decision_role_artifact_identity_error(
+        state,
+        role_id="S001",
+        role_state=run,
+        meta=read_frontmatter(source),
+    )
+    if identity_error:
+        raise HLoopError(
+            f"stale or mismatched Specification Scout artifact: {identity_error}: {source}"
+        )
     violations = validate_decision_role_scope(
         worktree,
         run,
@@ -8374,6 +8562,7 @@ def cmd_specification_scout_harvest(args: argparse.Namespace) -> int:
     cleanup_decision_role_worktree(
         repo, "S001", run, prompt_suffix="scout", best_effort=True
     )
+    revoke_active_role_report_identity(repo, state, "S001")
     save_state(repo, state)
     journal(repo, "Harvested Specification Scout; Manager decision triage is required.")
     print(f"harvested Specification Scout: {destination}")
@@ -8384,6 +8573,9 @@ def cmd_specification_scout_close(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     run = state.get("specification_scout_run") or {}
+    block_reason = semantic_ack_barrier_blocking(run)
+    if str(run.get("status") or "") == "running" and block_reason:
+        raise HLoopError(f"cannot close S001: {block_reason}")
     if str(run.get("status") or "") not in {"reported", "waiting-manager"}:
         raise HLoopError("Specification Scout is not ready to close")
     run.update(
@@ -8396,6 +8588,7 @@ def cmd_specification_scout_close(args: argparse.Namespace) -> int:
         }
     )
     state["phase"] = "blocked_user_decision" if args.verdict == "blocked" else "dispatching"
+    revoke_active_role_report_identity(repo, state, "S001")
     save_state(repo, state)
     journal(repo, f"Closed Specification Scout as `{args.verdict}`: {args.reason}")
     print(f"closed Specification Scout: {args.verdict}")
@@ -8425,6 +8618,7 @@ def start_decision_liaison(
             user_text=decision_question_text(record, state),
         )
     role_id = f"L-{record.decision_id}"
+    attempt_no, attempt_id = next_decision_role_attempt(role_id, liaison)
     worktree_arg = getattr(args, "worktree", None)
     worktree = (
         Path(worktree_arg).resolve()
@@ -8433,6 +8627,10 @@ def start_decision_liaison(
     )
     prompt_rel = LOOP_DIR / "prompts" / f"{role_id}.liaison.md"
     artifact_rel = LOOP_DIR / "decisions" / record.decision_id / "RESPONSE.md"
+    prompt_without_identity = render_decision_liaison_prompt(
+        record, state, head_sha=head_sha, attempt_id=attempt_id
+    )
+    task_contract_digest = prompt_contract_digest(prompt_without_identity)
     agent_config = role_agent_config(
         state,
         "advisor",
@@ -8456,6 +8654,21 @@ def start_decision_liaison(
         prepare_role_worktree(repo, worktree, state, role="advisor", agent_id=role_id)
         ensure_advisor_visible_in_worktree(worktree)
         ensure_worktree_parent_dirs(worktree, prompt_rel, artifact_rel)
+        report_credential_file, initial_ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=role_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_decision_liaison_prompt(
+            record,
+            state,
+            head_sha=head_sha,
+            report_credential_file=str(report_credential_file),
+            task_contract_digest=task_contract_digest,
+            attempt_id=attempt_id,
+        )
         write_text(worktree / prompt_rel, prompt)
         baseline = porcelain_paths(worktree)
         if getattr(args, "launcher", "pane") == "agent":
@@ -8472,10 +8685,18 @@ def start_decision_liaison(
                 cwd=worktree,
                 command=command,
             )
-    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
-        rollback_failed_role_start(
-            repo, worktree, created_worktree=not worktree_preexisting
-        )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, role_id)
         return decision_role_fallback(
             repo,
             state,
@@ -8500,9 +8721,19 @@ def start_decision_liaison(
             "baseline_dirty_files": baseline,
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
+            "attempt_no": attempt_no,
+            "attempt_id": attempt_id,
+            "skill_version": SKILL_VERSION,
+            "task_contract_digest": task_contract_digest,
             "provider_invocation": invocation.as_record(),
             "started_at": now_iso(),
         }
+    )
+    arm_initial_semantic_ack_barrier(
+        liaison,
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=initial_ack_floor,
     )
     save_state(repo, state)
     journal(repo, f"Started Decision Liaison for `{record.decision_id}` in pane `{pane_id}`.")
@@ -8533,6 +8764,9 @@ def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
     liaison = (state.get("decision_liaisons") or {}).get(args.id) or {}
     if str(liaison.get("status") or "") != "running":
         raise HLoopError(f"Decision Liaison is not running: {args.id}")
+    block_reason = semantic_ack_barrier_blocking(liaison)
+    if block_reason:
+        raise HLoopError(f"cannot harvest L-{args.id}: {block_reason}")
     worktree = Path(str(liaison.get("worktree") or "")).resolve()
     role_id = str(liaison.get("role_id") or f"L-{args.id}")
     source = worktree / LOOP_DIR / "decisions" / args.id / "RESPONSE.md"
@@ -8553,6 +8787,17 @@ def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
         )
     text = read_text(source)
     meta = read_frontmatter(source)
+    identity_error = decision_role_artifact_identity_error(
+        state,
+        role_id=role_id,
+        role_state=liaison,
+        meta=meta,
+        decision_id=args.id,
+    )
+    if identity_error:
+        raise HLoopError(
+            f"stale or mismatched Decision Liaison response: {identity_error}: {source}"
+        )
     selected = str(meta.get("selected_option") or record.recommendation.option_id)
     body = markdown_body_after_frontmatter(text)
     body = re.sub(r"^# 回答\s*", "", body).strip()
@@ -8591,6 +8836,7 @@ def cmd_decision_liaison_harvest(args: argparse.Namespace) -> int:
     cleanup_decision_role_worktree(
         repo, role_id, liaison, prompt_suffix="liaison", best_effort=True
     )
+    revoke_active_role_report_identity(repo, state, role_id)
     write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Harvested Decision Liaison response for `{args.id}`.")
@@ -8700,6 +8946,11 @@ def cmd_decision_respond(args: argparse.Namespace) -> int:
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     decisions_state = state.setdefault("decisions", {})
     record = require_decision(state, args.id)
+    liaison = (state.get("decision_liaisons") or {}).get(args.id)
+    if isinstance(liaison, dict) and str(liaison.get("status") or "") == "running":
+        block_reason = semantic_ack_barrier_blocking(liaison)
+        if block_reason:
+            raise HLoopError(f"cannot close L-{args.id}: {block_reason}")
     selected_option = args.option or record.recommendation.option_id
     response = {
         "responded_by": args.responded_by or "manager",
@@ -8716,7 +8967,6 @@ def cmd_decision_respond(args: argparse.Namespace) -> int:
     except (DecisionValidationError, DecisionTransitionError) as exc:
         raise HLoopError(str(exc)) from exc
     decisions_state[args.id] = updated.to_record()
-    liaison = (state.get("decision_liaisons") or {}).get(args.id)
     if isinstance(liaison, dict):
         liaison["status"] = "responded"
         liaison["gate_status"] = "responded"
@@ -8736,6 +8986,9 @@ def cmd_decision_respond(args: argparse.Namespace) -> int:
                 prompt_suffix="liaison",
                 best_effort=True,
             )
+        revoke_active_role_report_identity(
+            repo, state, str(liaison.get("role_id") or f"L-{args.id}")
+        )
     write_decision_artifacts(repo, state)
     save_state(repo, state)
     journal(repo, f"Recorded response to decision `{args.id}`: {args.text}")
@@ -11502,6 +11755,28 @@ def send_manager_message_and_record(
     return 0
 
 
+def long_running_role_states(state: dict[str, Any]) -> list[dict[str, Any]]:
+    roles = [
+        *state.get("tasks", {}).values(),
+        *state.get("reviews", {}).values(),
+        *state.get("gaps", {}).values(),
+        *(
+            participant
+            for advice in state.get("advice", {}).values()
+            for participant in advice.get("participants", [])
+        ),
+    ]
+    scout = state.get("specification_scout_run")
+    if isinstance(scout, dict) and scout:
+        roles.append(scout)
+    roles.extend(
+        liaison
+        for liaison in (state.get("decision_liaisons") or {}).values()
+        if isinstance(liaison, dict)
+    )
+    return roles
+
+
 def cmd_worker_message(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -11539,16 +11814,7 @@ def cmd_message_drain(args: argparse.Namespace) -> int:
 
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_herdr=True)
-    agent_states = [
-        *state.get("tasks", {}).values(),
-        *state.get("reviews", {}).values(),
-        *state.get("gaps", {}).values(),
-        *(
-            participant
-            for advice in state.get("advice", {}).values()
-            for participant in advice.get("participants", [])
-        ),
-    ]
+    agent_states = long_running_role_states(state)
     total_drained = 0
     total_remaining = 0
     for agent_state in agent_states:
@@ -14796,7 +15062,15 @@ def cmd_harvest(args: argparse.Namespace) -> int:
         args.advice_id = advice_id
         args.participant_id = participant_id
         return cmd_advisor_harvest(args)
-    raise HLoopError(f"cannot infer harvest target from id: {agent_id}; use T..., R..., G..., or A...")
+    if agent_id == "S001":
+        return cmd_specification_scout_harvest(args)
+    if agent_id.startswith("L-D"):
+        args.id = agent_id.removeprefix("L-")
+        return cmd_decision_liaison_harvest(args)
+    raise HLoopError(
+        f"cannot infer harvest target from id: {agent_id}; "
+        "use T..., R..., G..., A..., S001, or L-D..."
+    )
 
 
 def split_advice_target(agent_id: str, participant_id: str | None = None) -> tuple[str, str]:
@@ -14810,6 +15084,15 @@ def split_advice_target(agent_id: str, participant_id: str | None = None) -> tup
 
 
 def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict[str, Any]]:
+    if agent_id == "S001":
+        agent = state.get("specification_scout_run")
+        if isinstance(agent, dict) and agent:
+            return "scout", agent
+    if agent_id.startswith("L-D"):
+        decision_id = agent_id.removeprefix("L-")
+        agent = (state.get("decision_liaisons") or {}).get(decision_id)
+        if isinstance(agent, dict) and agent:
+            return "liaison", agent
     if agent_id.startswith("T"):
         agent = state.get("tasks", {}).get(agent_id)
         if agent:
@@ -14828,6 +15111,38 @@ def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict
         if isinstance(advice, dict):
             return "advisor", find_advisor_participant(advice, participant_id)
     raise HLoopError(f"unknown agent id: {agent_id}")
+
+
+def cmd_agent_message(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_integration_branch=True,
+    )
+    role, agent = resolve_agent_state(state, args.agent_id)
+    if agent.get("status") != "running" and agent.get("gate_status") != "running":
+        raise HLoopError(
+            f"agent is not running: {args.agent_id} "
+            f"status={agent.get('gate_status') or agent.get('status')}"
+        )
+    pane_id = str(agent.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"agent has no pane_id: {args.agent_id}")
+    message, source = manager_message_from_args(args)
+    if not message.strip():
+        raise HLoopError("manager message is empty")
+    return send_manager_message_and_record(
+        repo,
+        state,
+        agent,
+        role=role.title(),
+        agent_id=args.agent_id,
+        pane_id=pane_id,
+        message=message,
+        source=source,
+        args=args,
+    )
 
 
 def product_dirty_paths_for_agent(worktree: Path) -> list[str]:
@@ -14868,7 +15183,7 @@ def cmd_agent_abort(args: argparse.Namespace) -> int:
     state = load_state(repo)
     role, agent = resolve_agent_state(state, args.agent_id)
     lifecycle_status = str(agent.get("gate_status") or agent.get("status") or "")
-    if lifecycle_status in {"merged", "triaged", "closed"}:
+    if lifecycle_status in {"merged", "triaged", "closed", "completed", "responded"}:
         raise HLoopError(f"cannot abort completed {role} {args.agent_id}: {lifecycle_status}")
     cleanup_completed_agent_pane(
         repo,
@@ -14959,7 +15274,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
     state = load_state(repo)
     role, agent = resolve_agent_state(state, args.agent_id)
     lifecycle_status = str(agent.get("gate_status") or agent.get("status") or "")
-    if lifecycle_status in {"merged", "triaged", "closed"}:
+    if lifecycle_status in {"merged", "triaged", "closed", "completed", "responded"}:
         raise HLoopError(f"cannot requeue completed {role} {args.agent_id}: {lifecycle_status}")
     previous = json.loads(json.dumps(agent))
     cleanup_completed_agent_pane(
@@ -15045,7 +15360,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
         state.get("reviews", {}).pop(args.agent_id, None)
     elif role == "gap":
         state.get("gaps", {}).pop(args.agent_id, None)
-    else:
+    elif role == "advisor":
         advice_id, participant_id = split_advice_target(args.agent_id)
         advice = require_advice_state(state, advice_id)
         advice["participants"] = [
@@ -15061,6 +15376,41 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
                 "status": "queued",
             }
         )
+    else:
+        for key in (
+            "pane_id",
+            "pane_closed_at",
+            "pane_cleanup_status",
+            "pane_cleanup_error",
+            "prompt",
+            "worktree",
+            "worktree_cleaned_at",
+            "worktree_cleanup_status",
+            "started_at",
+            "harvested_at",
+            "completed_at",
+            "responded_at",
+            "artifact_path",
+            "worktree_artifact_path",
+            "worktree_artifact_path_harvested",
+            "response_path",
+            "worktree_response_path",
+            "worktree_response_path_harvested",
+            "agent_session_id",
+            "codex_session_id",
+            "agent_session_cleanup",
+            "codex_session_cleanup",
+            "manager_messages",
+            "pending_manager_messages",
+            "unknown_manager_messages",
+            "semantic_ack_barrier",
+            "task_contract_digest",
+        ):
+            agent.pop(key, None)
+        agent["status"] = "queued"
+        agent["gate_status"] = "queued"
+        agent["requeued_at"] = now_iso()
+        agent["requeue_reason"] = args.reason
     state["phase"] = "dispatching"
     save_state(repo, state)
     journal(repo, f"Requeued {role} `{args.agent_id}`: {args.reason}")
@@ -15298,24 +15648,11 @@ def _open_broker_store(repo: Path) -> "hloop_broker.BrokerStore":
 
 
 def any_active_roles(state: dict[str, Any]) -> bool:
-    """True while any Worker, Reviewer, Gap Auditor, or Advisor is running."""
+    """True while any long-running role, including Scout/Liaison, is running."""
 
-    tasks = state.get("tasks", {}).values()
-    reviews = state.get("reviews", {}).values()
-    gaps = state.get("gaps", {}).values()
-    participants = [
-        participant
-        for advice in state.get("advice", {}).values()
-        for participant in advice.get("participants", [])
-    ]
-    return (
-        any(item.get("status") == "running" for item in tasks)
-        or any(item.get("gate_status") == "running" for item in reviews)
-        or any(item.get("gate_status") == "running" for item in gaps)
-        or any(
-            item.get("gate_status") == "running" or item.get("status") == "running"
-            for item in participants
-        )
+    return any(
+        item.get("gate_status") == "running" or item.get("status") == "running"
+        for item in long_running_role_states(state)
     )
 
 
@@ -15757,16 +16094,7 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
     )
     pane_id = args.pane_id or os.environ.get("HERDR_PANE_ID") or "manager"
     fallback_watches: list[hloop_supervisor.FallbackWatch] = []
-    role_states = [
-        *state.get("tasks", {}).values(),
-        *state.get("reviews", {}).values(),
-        *state.get("gaps", {}).values(),
-        *(
-            participant
-            for advice in state.get("advice", {}).values()
-            for participant in advice.get("participants", [])
-        ),
-    ]
+    role_states = long_running_role_states(state)
     for role_state in role_states:
         if (
             role_state.get("status") != "running"
@@ -17760,18 +18088,56 @@ def build_parser() -> argparse.ArgumentParser:
     agent = sub.add_parser("agent", help="generic role lifecycle recovery")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     agent_abort = agent_sub.add_parser("abort", help="abort a role even when no artifact exists")
-    agent_abort.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    agent_abort.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
     agent_abort.add_argument("--reason", required=True)
     agent_abort.add_argument("--keep-worktree", action="store_true")
     agent_abort.add_argument("--force-cleanup", action="store_true")
     agent_abort.set_defaults(func=cmd_agent_abort)
     agent_requeue = agent_sub.add_parser("requeue", help="clean a failed attempt and make it startable again")
-    agent_requeue.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    agent_requeue.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
     agent_requeue.add_argument("--reason", required=True)
     agent_requeue.add_argument("--force-cleanup", action="store_true")
     agent_requeue.set_defaults(func=cmd_agent_requeue)
+    agent_message = agent_sub.add_parser(
+        "message", help="send a durable Manager message to any running role"
+    )
+    agent_message.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
+    agent_message.add_argument("message", nargs="?")
+    agent_message.add_argument("--file")
+    agent_message.add_argument("--timeout-ms", type=int, default=30_000)
+    agent_message.add_argument(
+        "--input-settle-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+    )
+    agent_message.add_argument(
+        "--submit-verify-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+    )
+    agent_message.add_argument(
+        "--submit-attempts",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
+    )
+    agent_message.add_argument(
+        "--contract-changing",
+        action="store_true",
+        help="arm a semantic ACK barrier that blocks material work until resolved",
+    )
+    agent_message.set_defaults(func=cmd_agent_message)
     agent_report = agent_sub.add_parser("report", help="submit a semantic agent report to the broker")
-    agent_report.add_argument("--role-id", required=True, help="T..., R..., G..., or A.../P...")
+    agent_report.add_argument(
+        "--role-id",
+        required=True,
+        help="T..., R..., G..., A.../P..., S001, or L-D...",
+    )
     agent_report.add_argument("--attempt-id")
     agent_report.add_argument("--run-id")
     agent_report.add_argument("--event-id")
@@ -18365,8 +18731,12 @@ def build_parser() -> argparse.ArgumentParser:
     validation_configure.add_argument("--command", dest="validation_command", action="append", required=True)
     validation_configure.set_defaults(func=cmd_validation_configure)
 
-    harvest = sub.add_parser("harvest", help="harvest a Worker/Reviewer/Gap/Advisor artifact by id prefix")
-    harvest.add_argument("agent_id", help="T..., R..., G..., A..., or A.../P... id")
+    harvest = sub.add_parser(
+        "harvest", help="harvest a role artifact by id prefix"
+    )
+    harvest.add_argument(
+        "agent_id", help="T..., R..., G..., A..., A.../P..., S001, or L-D... id"
+    )
     harvest.add_argument("--participant-id", default="P1", help="Advisor participant id when harvesting A... without /P...")
     harvest.add_argument("--keep-pane", action="store_true")
     harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
