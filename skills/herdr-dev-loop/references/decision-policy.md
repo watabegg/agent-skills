@@ -10,7 +10,7 @@ Specification decisions that cannot be resolved from the original plan/spec belo
 - `always` runs the Scout before queued implementation work.
 - `off` skips the automatic check. Manager may still run `hloop specification-scout start --force`.
 
-When Herdr is available, the Scout runs as the dedicated `S001` role in a detached worktree and may write only `decisions/SCOUT.md`. If its pane cannot be started, HLoop records `manager-fallback` and prints the same investigation prompt for Manager to perform. Implementation dispatch remains closed while the Scout is running, awaiting Manager work, or reported. After inspecting the report and creating any necessary decision records, Manager closes the Scout with `hloop specification-scout close`.
+When Herdr is available, the Scout runs as the dedicated `S001` role in a detached worktree and may write only `decisions/SCOUT.md`. Each attempt receives a private `0600` report credential and must submit a semantic ACK after its initial read-only preparation, then wait for Manager approval before material investigation. If its pane cannot be started, HLoop records `manager-fallback` and prints the same investigation prompt for Manager to perform. Implementation dispatch remains closed while the Scout is running, awaiting Manager work, or reported. After inspecting the report and creating any necessary decision records, Manager closes the Scout with `hloop specification-scout close`.
 
 Use `DECISIONS.md` as the durable decision ledger:
 
@@ -30,7 +30,9 @@ Create a user-decision record with two or three options, an explicit recommendat
 
 For `deferred-user` and `blocking-user` records, HLoop starts a dedicated Decision Liaison before entering a loop-wide wait. The Liaison explains one decision in plain Japanese, with two or three choices, their tradeoffs, the recommended choice and rationale, what can continue while waiting, and a free-text response route. User-facing text must not expose decision IDs, task IDs, state-machine terms, or logical expressions.
 
-When Herdr is available, the Liaison runs in a detached role worktree and may write only `decisions/<decision-id>/RESPONSE.md`. `hloop decision liaison harvest` validates and records that response; Manager still owns the terminal `decision resolve` step. When the pane is unavailable or fails to launch, HLoop records `manager-fallback` and prints the same plain-Japanese question so Manager can relay the answer through `hloop decision respond`.
+When Herdr is available, the Liaison runs as `L-<decision-id>` in a detached role worktree and may write only `decisions/<decision-id>/RESPONSE.md`. Each attempt receives a private `0600` report credential and must submit a semantic ACK after read-only preparation, then wait for Manager approval before beginning user dialogue. `hloop decision liaison harvest` validates and records that response; Manager still owns the terminal `decision resolve` step. When the pane is unavailable or fails to launch, HLoop records `manager-fallback` and prints the same plain-Japanese question so Manager can relay the answer through `hloop decision respond`.
+
+The first canonical unresolved user-decision `QUESTION.md` creation emits exactly one fixed Manager notice, `HERDR_LOOP_DECISION_ATTENTION:<run-id>:<decision-id>:<question-path>`, and requests Herdr tab attention. Delivery is idempotent per decision ID. If Herdr notification is unavailable, fails, or its result is ambiguous after interruption, HLoop records the outcome in `STATE.json`, prints `HERDR_LOOP_DECISION_ATTENTION_FALLBACK:<run-id>:<decision-id>`, and presents the same plain-language question in the Manager pane instead of silently retrying or losing the question.
 
 ## Blocking Decisions
 

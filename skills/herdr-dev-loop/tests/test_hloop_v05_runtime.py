@@ -2686,6 +2686,98 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
             affected_task_ids=("T001",),
         )
 
+    def init_repo(self, root: Path) -> tuple[Path, dict]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        state = {
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "namespace": hloop.LOOP_NAMESPACE,
+            "run_id": "run-spec",
+            "goal_id": "spec",
+            "phase": "dispatching",
+            "integration_branch": "main",
+            "specification_scout": "always",
+            "specification_scout_run": {},
+            "decision_liaisons": {},
+            "tasks": {"T001": {"status": "queued", "kind": "implementation"}},
+            "requirements": {},
+            "decisions": {"D001": self.decision().to_record()},
+        }
+        hloop.save_state(repo, state)
+        return repo, state
+
+    def report_args(
+        self,
+        repo: Path,
+        credential: Path,
+        *,
+        role_id: str,
+        attempt_id: str,
+        digest: str,
+        report_type: str = "ack",
+    ) -> SimpleNamespace:
+        completion = report_type == "completion"
+        attention = report_type == "attention"
+        ack = report_type == "ack"
+        nonce = uuid.uuid4().hex
+        return SimpleNamespace(
+            repo=str(repo),
+            run_id="run-spec",
+            role_id=role_id,
+            attempt_id=attempt_id,
+            event_id=None,
+            task_contract_digest=digest,
+            report_token=None,
+            report_credential_file=str(credential),
+            file=None,
+            stdin=False,
+            type=report_type,
+            stage="completed" if completion else ("blocked" if attention else "planning"),
+            summary=(
+                f"role completed {nonce}"
+                if completion
+                else (f"Manager attention needed {nonce}" if attention else f"contract understood {nonce}")
+            ),
+            next="Manager handoff" if completion else "wait for Manager",
+            evidence_ref=["skills/herdr-dev-loop/scripts/hloop:1"],
+            understood_goal="perform the bounded decision role" if ack else None,
+            scope=["decision artifact only"] if ack else None,
+            acceptance=["Manager approves before material work"] if ack else None,
+            approach="reuse the common report contract" if ack else None,
+            risk=[],
+            impact="Manager must inspect the decision role" if attention else None,
+            attempted=["persisted role evidence"] if attention else None,
+            option_text=["inspect the durable report"] if attention else None,
+            recommendation="inspect and respond" if attention else None,
+            blocked_scope=["decision role"] if attention else None,
+            artifact="decisions/artifact.md" if completion else None,
+            head_sha="a" * 40 if completion else None,
+            validation_result_ref=["synthetic role validation"] if completion else None,
+            residual_risk=["none"] if completion else None,
+            handoff="Manager may harvest" if completion else None,
+        )
+
     def test_specification_scout_auto_always_and_off(self):
         base = {
             "tasks": {
@@ -2778,6 +2870,9 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
             worktree = root / "liaison"
             repo.mkdir()
             worktree.mkdir()
+            credential = root / "liaison-credential.json"
+            credential.write_text("{}\n", encoding="utf-8")
+            credential.chmod(0o600)
             state = {
                 "state_format_version": hloop.STATE_FORMAT_VERSION,
                 "schema_revision": hloop.STATE_SCHEMA_REVISION,
@@ -2795,6 +2890,16 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
                 manager_pane="w:p1",
                 direction="right",
             )
+            calls = []
+
+            def register(*_args, **_kwargs):
+                calls.append("register")
+                return credential, 0
+
+            def start_pane(**_kwargs):
+                calls.append("pane")
+                return "w:p2"
+
             with mock.patch.object(hloop, "git", return_value="b" * 40), mock.patch.object(
                 hloop, "command_exists", return_value=True
             ), mock.patch.object(
@@ -2806,7 +2911,11 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
             ), mock.patch.object(
                 hloop, "porcelain_paths", return_value=[]
             ), mock.patch.object(
-                hloop, "start_pane_launcher", return_value="w:p2"
+                hloop,
+                "register_role_report_identity_and_ack_floor",
+                side_effect=register,
+            ), mock.patch.object(
+                hloop, "start_pane_launcher", side_effect=start_pane
             ), mock.patch.dict(
                 os.environ, {"HERDR_ENV": "1"}, clear=True
             ):
@@ -2818,6 +2927,421 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
             self.assertEqual(liaison["mode"], "agent-pane")
             self.assertEqual(liaison["pane_id"], "w:p2")
             self.assertEqual(liaison["role_id"], "L-D001")
+            self.assertEqual(liaison["attempt_id"], "L-D001-A001")
+            self.assertEqual(liaison["semantic_ack_barrier"]["status"], "awaiting_ack")
+            self.assertEqual(calls, ["register", "pane"])
+            prompt = Path(liaison["prompt"]).read_text(encoding="utf-8")
+            self.assertIn(str(credential), prompt)
+            self.assertIn("agent report", prompt)
+            self.assertIn("stop before material work", prompt)
+            self.assertEqual(stat.S_IMODE(credential.stat().st_mode), 0o600)
+
+    def test_successful_scout_start_registers_identity_before_pane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, state = self.init_repo(root)
+            worktree = root / "scout"
+            worktree.mkdir()
+            credential = root / "scout-credential.json"
+            credential.write_text("{}\n", encoding="utf-8")
+            credential.chmod(0o600)
+            invocation = SimpleNamespace(as_record=lambda: {"provider": "codex"})
+            args = SimpleNamespace(
+                repo=str(repo),
+                force=True,
+                worktree=str(worktree),
+                runner="tui",
+                agent_provider="codex",
+                agent_model="auto",
+                launcher="pane",
+                manager_pane="w:p1",
+                direction="right",
+            )
+            calls = []
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "git", return_value="a" * 40
+            ), mock.patch.object(
+                hloop, "command_exists", return_value=True
+            ), mock.patch.object(
+                hloop, "role_agent_command", return_value=("codex", invocation)
+            ), mock.patch.object(
+                hloop, "prepare_role_worktree"
+            ), mock.patch.object(
+                hloop, "ensure_advisor_visible_in_worktree"
+            ), mock.patch.object(
+                hloop, "porcelain_paths", return_value=[]
+            ), mock.patch.object(
+                hloop,
+                "register_role_report_identity_and_ack_floor",
+                side_effect=lambda *_args, **_kwargs: (calls.append("register") or (credential, 0)),
+            ), mock.patch.object(
+                hloop,
+                "start_pane_launcher",
+                side_effect=lambda **_kwargs: (calls.append("pane") or "w:p2"),
+            ), mock.patch.dict(
+                os.environ, {"HERDR_ENV": "1"}, clear=True
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(hloop.cmd_specification_scout_start(args), 0)
+            scout = hloop.load_state(repo)["specification_scout_run"]
+            self.assertEqual(scout["attempt_id"], "S001-A001")
+            self.assertEqual(scout["semantic_ack_barrier"]["status"], "awaiting_ack")
+            self.assertEqual(calls, ["register", "pane"])
+            prompt = Path(scout["prompt"]).read_text(encoding="utf-8")
+            self.assertIn(str(credential), prompt)
+            self.assertIn("agent report", prompt)
+
+    def test_scout_and_liaison_ack_reject_timeout_completion_abort_and_requeue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            identities = {}
+            for role_id, attempt_id in (
+                ("S001", "S001-A001"),
+                ("L-D001", "L-D001-A001"),
+            ):
+                digest = hashlib.sha256(role_id.encode("utf-8")).hexdigest()
+                credential, floor = hloop.register_role_report_identity_and_ack_floor(
+                    repo,
+                    state,
+                    role_id=role_id,
+                    attempt_id=attempt_id,
+                    task_contract_digest=digest,
+                )
+                self.assertEqual(stat.S_IMODE(credential.stat().st_mode), 0o600)
+                identities[role_id] = (attempt_id, digest, credential)
+                role_state = {
+                    "role_id": role_id,
+                    "status": "running",
+                    "gate_status": "running",
+                    "attempt_no": 1,
+                    "attempt_id": attempt_id,
+                    "skill_version": hloop.SKILL_VERSION,
+                    "task_contract_digest": digest,
+                }
+                hloop.arm_initial_semantic_ack_barrier(
+                    role_state,
+                    attempt_id=attempt_id,
+                    contract_digest=digest,
+                    required_reack_after_sequence=floor,
+                )
+                if role_id == "S001":
+                    state["specification_scout_run"] = role_state
+                else:
+                    state["decision_liaisons"]["D001"] = {
+                        **role_state,
+                        "decision_id": "D001",
+                    }
+            hloop.save_state(repo, state)
+
+            scout_attempt, scout_digest, scout_credential = identities["S001"]
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    scout_credential,
+                    role_id="S001",
+                    attempt_id=scout_attempt,
+                    digest=scout_digest,
+                )
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="S001",
+                        decision="approve",
+                        reason="Scout scope confirmed",
+                    )
+                )
+            self.assertEqual(
+                hloop.load_state(repo)["specification_scout_run"]["semantic_ack_barrier"]["status"],
+                "approved",
+            )
+
+            liaison_attempt, liaison_digest, liaison_credential = identities["L-D001"]
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    liaison_credential,
+                    role_id="L-D001",
+                    attempt_id=liaison_attempt,
+                    digest=liaison_digest,
+                )
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="L-D001",
+                        decision="reject",
+                        reason="question wording is incomplete",
+                    )
+                )
+                with self.assertRaisesRegex(hloop.HLoopError, "corrected semantic ACK"):
+                    hloop.cmd_agent_ack_resolve(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            agent_id="L-D001",
+                            decision="approve",
+                            reason="old ACK must not pass",
+                        )
+                    )
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    liaison_credential,
+                    role_id="L-D001",
+                    attempt_id=liaison_attempt,
+                    digest=liaison_digest,
+                )
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="L-D001",
+                        decision="approve",
+                        reason="corrected ACK accepted",
+                    )
+                )
+            reloaded = hloop.load_state(repo)
+            liaison = reloaded["decision_liaisons"]["D001"]
+            floor = hloop.latest_semantic_ack_sequence(
+                repo, reloaded, role_id="L-D001", agent_state=liaison
+            )
+            hloop.arm_semantic_ack_barrier(
+                liaison,
+                message_id="contract-change",
+                digest="updated",
+                required_reack_after_sequence=floor,
+            )
+            hloop.save_state(repo, reloaded)
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="L-D001",
+                        decision="timeout",
+                        reason="Manager approval timed out",
+                    )
+                )
+                with self.assertRaisesRegex(hloop.HLoopError, "corrected semantic ACK"):
+                    hloop.cmd_agent_ack_resolve(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            agent_id="L-D001",
+                            decision="approve",
+                            reason="stale ACK",
+                        )
+                    )
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    liaison_credential,
+                    role_id="L-D001",
+                    attempt_id=liaison_attempt,
+                    digest=liaison_digest,
+                )
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="L-D001",
+                        decision="approve",
+                        reason="fresh ACK after timeout",
+                    )
+                )
+
+            for role_id, (attempt_id, digest, credential) in identities.items():
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        credential,
+                        role_id=role_id,
+                        attempt_id=attempt_id,
+                        digest=digest,
+                        report_type="attention",
+                    )
+                )
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        credential,
+                        role_id=role_id,
+                        attempt_id=attempt_id,
+                        digest=digest,
+                        report_type="completion",
+                    )
+                )
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                events = store.events(transaction)
+                completions = [event for event in events if event["type"] == "completion"]
+                attentions = [event for event in events if event["type"] == "attention"]
+            self.assertEqual({event["role_id"] for event in completions}, {"S001", "L-D001"})
+            self.assertEqual({event["role_id"] for event in attentions}, {"S001", "L-D001"})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_abort(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="S001",
+                        reason="synthetic abort",
+                        keep_worktree=False,
+                        force_cleanup=False,
+                    )
+                )
+                hloop.cmd_agent_requeue(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="L-D001",
+                        reason="synthetic requeue",
+                        force_cleanup=False,
+                    )
+                )
+            final = hloop.load_state(repo)
+            self.assertEqual(final["specification_scout_run"]["status"], "aborted")
+            self.assertEqual(final["decision_liaisons"]["D001"]["status"], "queued")
+            self.assertFalse(scout_credential.exists())
+            self.assertFalse(liaison_credential.exists())
+
+    def test_agent_message_and_manager_sleep_include_scout_and_liaison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            state["specification_scout_run"] = {
+                "role_id": "S001",
+                "status": "running",
+                "gate_status": "running",
+                "attempt_id": "S001-A001",
+                "pane_id": "w:p2",
+                "agent_provider": "codex",
+            }
+            state["decision_liaisons"]["D001"] = {
+                "role_id": "L-D001",
+                "decision_id": "D001",
+                "status": "running",
+                "gate_status": "running",
+                "attempt_id": "L-D001-A001",
+                "pane_id": "w:p3",
+                "agent_provider": "codex",
+            }
+            hloop.save_state(repo, state)
+            args = SimpleNamespace(
+                repo=str(repo),
+                message="scope changed",
+                file=None,
+                timeout_ms=100,
+                input_settle_ms=0,
+                submit_verify_ms=1,
+                submit_attempts=1,
+                contract_changing=True,
+            )
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(hloop, "send_agent_tui_message") as send:
+                for role_id in ("S001", "L-D001"):
+                    args.agent_id = role_id
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(hloop.cmd_agent_message(args), 0)
+            self.assertEqual(send.call_count, 2)
+            reloaded = hloop.load_state(repo)
+            self.assertEqual(
+                reloaded["specification_scout_run"]["semantic_ack_barrier"]["status"],
+                "awaiting_ack",
+            )
+            self.assertEqual(
+                reloaded["decision_liaisons"]["D001"]["semantic_ack_barrier"]["status"],
+                "awaiting_ack",
+            )
+            with mock.patch.object(hloop, "preflight_loop", return_value=reloaded):
+                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                    hloop.cmd_specification_scout_harvest(
+                        SimpleNamespace(repo=str(repo))
+                    )
+                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                    hloop.cmd_specification_scout_close(
+                        SimpleNamespace(
+                            repo=str(repo), verdict="no-decision", reason="too early"
+                        )
+                    )
+                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                    hloop.cmd_decision_liaison_harvest(
+                        SimpleNamespace(repo=str(repo), id="D001")
+                    )
+                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
+                    hloop.cmd_decision_respond(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            id="D001",
+                            option="opt_1",
+                            responded_by="manager",
+                            text="too early",
+                            recommendation=None,
+                        )
+                    )
+
+            sleep_result = SimpleNamespace(
+                lease_generation=1,
+                reason="fallback",
+                event_ids=(),
+                drained_reports=0,
+                fallback=SimpleNamespace(pane_id="w:p2", status="done", returncode=0),
+            )
+            supervisor_instance = mock.Mock()
+            supervisor_instance.sleep.return_value = sleep_result
+            with mock.patch.object(
+                hloop.hloop_supervisor,
+                "ManagerSleepSupervisor",
+                return_value=supervisor_instance,
+            ), contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_manager_sleep(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        ttl_seconds=1,
+                        manager_session_id="manager",
+                        pane_id="w:p1",
+                    )
+                )
+            watches = {
+                (watch.pane_id, watch.status)
+                for watch in supervisor_instance.sleep.call_args.kwargs["fallback_watches"]
+            }
+            for pane_id in ("w:p2", "w:p3"):
+                self.assertEqual(
+                    {status for watched_pane, status in watches if watched_pane == pane_id},
+                    set(hloop.hloop_supervisor.FALLBACK_STATUSES),
+                )
+
+    def test_decision_attention_is_idempotent_and_falls_back_auditably(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state = self.init_repo(Path(directory))
+            output = io.StringIO()
+            with mock.patch.object(hloop, "command_exists", return_value=True), mock.patch.object(
+                hloop, "run_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")
+            ) as notify, mock.patch.dict(
+                os.environ, {"HERDR_ENV": "1"}, clear=True
+            ), contextlib.redirect_stdout(output):
+                hloop.write_decision_artifacts(repo, state)
+                hloop.write_decision_artifacts(repo, state)
+            self.assertEqual(notify.call_count, 1)
+            self.assertEqual(output.getvalue().count("HERDR_LOOP_DECISION_ATTENTION:"), 1)
+            self.assertEqual(state["decision_attention"]["D001"]["status"], "notified")
+
+            second = self.decision().to_record()
+            second["id"] = "D002"
+            state["decisions"]["D002"] = second
+            fallback = io.StringIO()
+            with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(fallback):
+                hloop.write_decision_artifacts(repo, state)
+                hloop.write_decision_artifacts(repo, state)
+            self.assertEqual(
+                fallback.getvalue().count("HERDR_LOOP_DECISION_ATTENTION_FALLBACK:"), 1
+            )
+            self.assertIn("# 判断のお願い", fallback.getvalue())
+            self.assertEqual(
+                state["decision_attention"]["D002"]["status"], "manager-fallback"
+            )
 
 
 class RequirementProgressOutcomeTests(unittest.TestCase):
@@ -3277,21 +3801,24 @@ effort = "high"
                 "T002": {"status": "queued", "depends_on": []},
             }
             hloop.save_state(repo, state)
-            hloop.cmd_decision_new(
-                SimpleNamespace(
-                    repo=str(repo),
-                    id="D001",
-                    title="既存データの表示方法をどちらにするか",
-                    decision_class="deferred-user",
-                    affects=["T001"],
-                    option=["従来表示を保つ", "新表示へ切り替える"],
-                    tradeoff=["互換性を保てる", "操作を簡潔にできる"],
-                    recommend_option="opt_1",
-                    recommend_rationale="既存利用者への影響が小さいため",
-                    source_finding=["scout:F001"],
-                    created_from="specification-scout",
+            with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                hloop.cmd_decision_new(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        id="D001",
+                        title="既存データの表示方法をどちらにするか",
+                        decision_class="deferred-user",
+                        affects=["T001"],
+                        option=["従来表示を保つ", "新表示へ切り替える"],
+                        tradeoff=["互換性を保てる", "操作を簡潔にできる"],
+                        recommend_option="opt_1",
+                        recommend_rationale="既存利用者への影響が小さいため",
+                        source_finding=["scout:F001"],
+                        created_from="specification-scout",
+                    )
                 )
-            )
             state = hloop.load_state(repo)
             scheduler = hloop.build_decision_scheduler(state)
             self.assertFalse(scheduler.loop_blocked)
