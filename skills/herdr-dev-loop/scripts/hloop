@@ -9,6 +9,7 @@ repositories.
 from __future__ import annotations
 
 import argparse
+import errno
 import fnmatch
 import fcntl
 import hashlib
@@ -9327,6 +9328,61 @@ def snapshot_worktree_paths(worktree: Path, paths: Iterable[str]) -> dict[str, d
     return snapshot
 
 
+def snapshot_worktree_directories(worktree: Path) -> set[str]:
+    """Record every real directory that exists before Manager validation.
+
+    Rollback may remove directories created by a failing validation command,
+    but it must never infer that an ancestor is new merely because Git did not
+    report the directory itself. Git tracks files, not directories, so a clean
+    tracked sibling can make an existing directory invisible to the dirty-path
+    snapshot. Capture directory existence explicitly and prune only paths that
+    are absent from this set.
+    """
+
+    directories: set[str] = set()
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for root, dirnames, _filenames in os.walk(
+        worktree, topdown=True, followlinks=False, onerror=raise_walk_error
+    ):
+        root_path = Path(root)
+        if root_path == worktree and ".git" in dirnames:
+            dirnames.remove(".git")
+        for dirname in list(dirnames):
+            full = root_path / dirname
+            if full.is_symlink():
+                # A symlink is path content, not a directory rollback may
+                # later prune with rmdir(2).
+                dirnames.remove(dirname)
+                continue
+            directories.add(full.relative_to(worktree).as_posix())
+    return directories
+
+
+def prune_empty_worktree_directories(worktree: Path, candidates: Iterable[str]) -> None:
+    """Prune candidate directories deepest-first without recursive deletion."""
+
+    for rel in sorted(
+        set(candidates),
+        key=lambda path: (path.count("/"), path),
+        reverse=True,
+    ):
+        full = worktree / rel
+        if full.is_symlink():
+            continue
+        try:
+            full.rmdir()
+        except FileNotFoundError:
+            pass
+        except NotADirectoryError:
+            pass
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                raise
+
+
 def restore_worktree_paths_snapshot(worktree: Path, snapshot: dict[str, dict[str, str]]) -> None:
     """Restore paths to the exact byte-for-byte state captured by `snapshot_worktree_paths`."""
 
@@ -9367,6 +9423,7 @@ def rollback_validation_command_side_effects(
     worktree: Path,
     pre_validation_scope: set[str],
     pre_validation_snapshot: dict[str, dict[str, str]],
+    pre_validation_directories: set[str],
 ) -> None:
     """Undo whatever a failing Manager validation command left behind, byte for byte.
 
@@ -9385,38 +9442,64 @@ def rollback_validation_command_side_effects(
 
     current = set(porcelain_paths_no_renames(worktree))
     new_paths = sorted(current - pre_validation_scope)
+    current_directories = snapshot_worktree_directories(worktree)
+    candidate_directories = current_directories - pre_validation_directories
     if new_paths:
-        # `-d` is required to remove a newly introduced *untracked directory*
-        # (e.g. a validation command creating a build output directory) --
-        # plain `-f` only removes untracked files and silently leaves
-        # directories behind. `git status --untracked-files=all` reports the
-        # individual files inside a wholly new untracked directory rather
-        # than the directory itself, so also pass every ancestor directory of
-        # each new path as a clean pathspec -- harmless for directories that
-        # also contain tracked content (clean never touches tracked files),
-        # and it is what actually clears an empty untracked directory left
-        # behind once its files are gone.
-        ancestor_dirs: set[str] = set()
+        # Split exact file paths against the index. `git ls-files -- <dir>`
+        # expands recursively, so intersect with the complete tracked-file
+        # list instead of treating a pathspec match as proof that the path
+        # itself was tracked.
+        tracked_paths = set(git(worktree, ["ls-files", "-z"]).split("\0"))
+        tracked_paths.discard("")
+        tracked_new_paths = sorted(set(new_paths) & tracked_paths)
+        untracked_new_paths = sorted(set(new_paths) - tracked_paths)
+
         for rel in new_paths:
             parent = PurePosixPath(rel).parent
             while str(parent) not in {"", "."}:
-                ancestor_dirs.add(str(parent))
+                candidate_directories.add(str(parent))
                 parent = parent.parent
-        clean_targets = set(new_paths) | ancestor_dirs
-        run_cmd(
-            [TRUSTED_GIT_PATH, "-C", str(worktree), "clean", "-fd", "--", *sorted(clean_targets)],
-            check=False,
-        )
-        # `git clean` can leave an emptied ancestor directory behind when both
-        # the directory and a file inside it are passed as pathspecs together
-        # in the same invocation. Every path in `ancestor_dirs` is guaranteed
-        # to be entirely new (outside `pre_validation_scope`), so sweep any
-        # that still exist directly -- removing them outright is safe.
-        for rel in sorted(ancestor_dirs, key=len, reverse=True):
+
+        # Remove only the newly reported leaf content. Never recursively
+        # delete a directory: it may have existed before validation and still
+        # contain a clean tracked sibling that Git status does not mention.
+        for rel in sorted(
+            untracked_new_paths,
+            key=lambda path: (path.count("/"), path),
+            reverse=True,
+        ):
             full = worktree / rel
-            if full.is_dir():
-                shutil.rmtree(full, ignore_errors=True)
-        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "checkout", "HEAD", "--", *new_paths], check=False)
+            if full.is_symlink() or (full.exists() and not full.is_dir()):
+                full.unlink()
+            elif full.is_dir():
+                candidate_directories.add(rel)
+
+        # Paths that were clean tracked files before validation are restored
+        # from HEAD after newly created replacement directories are pruned.
+        if tracked_new_paths:
+            # A tracked file may have been replaced by a directory. Prune
+            # proven-new empty directories before checkout needs to recreate
+            # that file; the complete pass below handles all remaining
+            # candidates after leaf restoration.
+            prune_empty_worktree_directories(worktree, candidate_directories)
+            run_cmd(
+                [
+                    TRUSTED_GIT_PATH,
+                    "-C",
+                    str(worktree),
+                    "checkout",
+                    "HEAD",
+                    "--",
+                    *tracked_new_paths,
+                ],
+                check=True,
+            )
+
+    # Git porcelain omits empty untracked directories entirely. The explicit
+    # before/after directory snapshots make those paths candidates too. Prune
+    # deepest-first and only with rmdir(2), so non-empty or pre-existing
+    # directories (including ones with clean tracked siblings) survive.
+    prune_empty_worktree_directories(worktree, candidate_directories)
     restore_worktree_paths_snapshot(worktree, pre_validation_snapshot)
 
 
@@ -9466,18 +9549,20 @@ def worker_result_contract_error(
         if type(value) is not str or not value.strip():
             return f"missing or invalid {field} in {artifact_noun} artifact"
 
-    # An empty/missing `attempt_id` must fail closed exactly like a
-    # mismatched one -- it must never be silently treated as belonging to
-    # the active attempt. Only compared when the caller can name an active
-    # attempt to compare against.
-    if expected_attempt:
-        raw_attempt = meta.get("attempt_id")
-        reported_attempt = raw_attempt if type(raw_attempt) is str else ""
-        if reported_attempt != expected_attempt:
-            return (
-                f"{artifact_noun} attempt_id mismatch: expected active attempt {expected_attempt}, "
-                f"got {reported_attempt or '(empty)'}"
-            )
+    # Both sides of the attempt binding are mandatory. A missing active
+    # attempt in Manager state is not permission to skip identity checking,
+    # and a whitespace-only artifact value is not a valid attempt id.
+    if type(expected_attempt) is not str or not expected_attempt.strip():
+        return f"missing or invalid active attempt for {artifact_noun} artifact"
+    raw_attempt = meta.get("attempt_id")
+    reported_attempt = raw_attempt if type(raw_attempt) is str else ""
+    if not reported_attempt.strip():
+        return f"missing or invalid attempt_id in {artifact_noun} artifact"
+    if reported_attempt != expected_attempt:
+        return (
+            f"{artifact_noun} attempt_id mismatch: expected active attempt {expected_attempt}, "
+            f"got {reported_attempt}"
+        )
 
     # Required boolean fields (schema `required`, `type: boolean`).
     for field in ("merge_ready", "validation_recorded"):
@@ -9581,6 +9666,136 @@ def read_worker_handoff_artifact(
     return handoff_meta
 
 
+def validate_recorded_seal_commit(
+    worktree: Path,
+    commit_sha: str,
+    expected_tree: str,
+    expected_parent: str,
+    commit_message: str,
+) -> None:
+    """Fail closed unless `commit_sha` is exactly the recorded seal commit."""
+
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
+        raise HLoopError(f"recorded seal commit has an invalid object id: {commit_sha or '(empty)'}")
+    tree = git(worktree, ["show", "-s", "--format=%T", commit_sha])
+    parents = git(worktree, ["rev-list", "--parents", "-n", "1", commit_sha]).split()
+    message = git(worktree, ["show", "-s", "--format=%B", commit_sha])
+    mismatches: list[str] = []
+    if tree != expected_tree:
+        mismatches.append(f"tree {tree} != recorded {expected_tree}")
+    if parents != [commit_sha, expected_parent]:
+        mismatches.append("parent does not match the recorded expected parent")
+    if message != commit_message:
+        mismatches.append("message does not match the recorded seal transaction")
+    if mismatches:
+        raise HLoopError(
+            f"recorded seal commit {commit_sha} does not match its transaction: "
+            + "; ".join(mismatches)
+        )
+
+
+def commit_recorded_seal_tree(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    worktree: Path,
+    expected_branch: str,
+) -> str:
+    """Commit the immutable seal tree and CAS-advance the Worker branch.
+
+    The mutable index is only a staging/recovery aid. The commit object is
+    always constructed from the transaction's durable `staged_tree` and
+    `expected_parent`, then installed with `git update-ref <new> <old>`.
+    Finally a mixed reset reconciles the index to the landed commit while
+    preserving any concurrent worktree content as ordinary unstaged changes.
+    """
+
+    transaction = task_state.get("seal_transaction")
+    if not isinstance(transaction, dict):
+        raise HLoopError(f"seal transaction disappeared before commit for {task_id}")
+    expected_tree = str(transaction.get("staged_tree") or "")
+    expected_parent = str(transaction.get("expected_parent") or "")
+    commit_message = str(transaction.get("commit_message") or "")
+    branch_ref = str(transaction.get("branch_ref") or "")
+    required_ref = f"refs/heads/{expected_branch}"
+    if not expected_tree or not expected_parent or not commit_message:
+        raise HLoopError(f"seal transaction is incomplete before commit for {task_id}")
+    if branch_ref != required_ref:
+        raise HLoopError(
+            f"seal transaction branch ref mismatch for {task_id}: "
+            f"expected {required_ref}, got {branch_ref or '(empty)'}"
+        )
+    symbolic_head = git(worktree, ["symbolic-ref", "-q", "HEAD"], check=False)
+    if symbolic_head != branch_ref:
+        raise HLoopError(
+            f"Worker HEAD is no longer attached to the recorded branch ref for {task_id}: "
+            f"expected {branch_ref}, got {symbolic_head or '(detached)'}"
+        )
+
+    commit_sha = str(transaction.get("commit_sha") or "")
+    if commit_sha:
+        validate_recorded_seal_commit(
+            worktree, commit_sha, expected_tree, expected_parent, commit_message
+        )
+    else:
+        commit_sha = git(
+            worktree,
+            ["commit-tree", expected_tree, "-p", expected_parent, "-m", commit_message],
+        )
+        validate_recorded_seal_commit(
+            worktree, commit_sha, expected_tree, expected_parent, commit_message
+        )
+        # Persist the exact commit object before the ref CAS. If the process
+        # dies after update-ref wins, the next seal invocation can recognize
+        # and reconcile that already-landed transaction without recommitting.
+        transaction["commit_sha"] = commit_sha
+        save_state(repo, state)
+
+    current_head = git(worktree, ["rev-parse", "HEAD"])
+    if current_head != commit_sha:
+        if current_head != expected_parent:
+            raise HLoopError(
+                f"seal commit aborted for {task_id}: Worker branch moved from recorded parent "
+                f"{expected_parent} to {current_head}; refusing concurrent ref movement"
+            )
+        update = run_cmd(
+            [
+                TRUSTED_GIT_PATH,
+                "-C",
+                str(worktree),
+                "update-ref",
+                branch_ref,
+                commit_sha,
+                expected_parent,
+            ],
+            check=False,
+        )
+        if update.returncode != 0:
+            observed = git(worktree, ["rev-parse", branch_ref], check=False)
+            detail = (update.stderr or update.stdout or "compare-and-swap failed").strip()
+            raise HLoopError(
+                f"seal commit aborted for {task_id}: compare-and-swap refused branch ref "
+                f"movement from {expected_parent} to {commit_sha}; current={observed or '(missing)'}; "
+                f"{detail}"
+            )
+
+    landed_head = git(worktree, ["rev-parse", "HEAD"])
+    if landed_head != commit_sha:
+        raise HLoopError(
+            f"seal commit ref update for {task_id} did not land at the recorded commit: "
+            f"expected {commit_sha}, got {landed_head}"
+        )
+
+    # Never use `reset --hard`: same-path content written or re-staged after
+    # `staged_tree` was recorded must survive as an unstaged worktree change.
+    run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(worktree), "reset", "--mixed", "--quiet", commit_sha],
+        check=True,
+    )
+    return commit_sha
+
+
 def resume_staged_seal_transaction(
     repo: Path,
     state: dict[str, Any],
@@ -9591,16 +9806,16 @@ def resume_staged_seal_transaction(
     result_rel: Path,
     pre_staged: list[str],
 ) -> int | None:
-    """Finish a seal that staged its commit and then crashed before committing.
+    """Finish or reconcile a seal that crashed after its durable checkpoints.
 
     `cmd_worker_seal` records a `seal_transaction` marker in Worker state --
-    the attempt, result path, exact staged paths, and commit message -- right
-    before `git add -A`, and clears it right after the commit lands. If the
-    Manager process dies in between, the next `hloop worker seal` invocation
-    finds the index already staged; if that staged content exactly matches
-    the recorded transaction, this completes the commit directly, without
-    losing work, without manual Git repair, and without re-running Manager
-    validation commands that already ran and were recorded before the crash.
+    the attempt, result path, exact staged paths, commit message, branch ref,
+    and expected parent -- before staging, then the immutable tree and commit
+    ids as later checkpoints. If the Manager process dies, the next `hloop
+    worker seal` either completes the recorded commit-tree/ref-CAS operation
+    from an exactly matching staged index or recognizes an already-landed
+    commit and finishes index/state reconciliation. Neither path loses
+    worktree content or re-runs Manager validation that already passed.
     Returns the seal exit code if this was a recognized, matching, and safely
     resumable transaction; returns ``None`` if the staged index cannot be
     attributed to a recorded transaction (including a partial `git add -A`
@@ -9616,9 +9831,18 @@ def resume_staged_seal_transaction(
         return None
     expected_scope = normalize_list(transaction.get("staged_paths"))
     commit_message = str(transaction.get("commit_message") or "")
-    if not expected_scope or not commit_message:
-        return None
-    if set(pre_staged) != set(expected_scope):
+    expected_tree = str(transaction.get("staged_tree") or "")
+    expected_parent = str(transaction.get("expected_parent") or "")
+    branch_ref = str(transaction.get("branch_ref") or "")
+    expected_branch = str(task_state.get("branch") or "")
+    if (
+        not expected_scope
+        or not commit_message
+        or not expected_tree
+        or not expected_parent
+        or not expected_branch
+        or branch_ref != f"refs/heads/{expected_branch}"
+    ):
         return None
     # `staged_tree` is only written *after* `git add -A` finished and the
     # staged scope was re-verified (see `cmd_worker_seal` below) -- it is the
@@ -9631,8 +9855,32 @@ def resume_staged_seal_transaction(
     # raises "already has staged changes" and a human/Manager must inspect
     # and re-run the full seal (including validation) rather than trusting an
     # unverified tree.
-    expected_tree = str(transaction.get("staged_tree") or "")
-    if not expected_tree:
+    current_head = git(worktree, ["rev-parse", "HEAD"])
+    recorded_commit = str(transaction.get("commit_sha") or "")
+    if recorded_commit and current_head == recorded_commit:
+        # update-ref won before a crash, but index reconciliation and state
+        # cleanup did not. Validate the object and finish those idempotently.
+        head_sha = commit_recorded_seal_tree(
+            repo, state, task_id, task_state, worktree, expected_branch
+        )
+        task_state.pop("seal_transaction", None)
+        save_state(repo, state)
+        journal(
+            repo,
+            f"Reconciled already-landed Worker seal for `{task_id}` at attempt "
+            f"`{expected_attempt}` ({head_sha}).",
+        )
+        print(
+            f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha} "
+            "(reconciled after crash)"
+        )
+        return 0
+    if current_head != expected_parent:
+        raise HLoopError(
+            f"seal resume aborted for {task_id}: Worker branch moved from recorded parent "
+            f"{expected_parent} to {current_head}; refusing concurrent ref movement"
+        )
+    if set(pre_staged) != set(expected_scope):
         return None
 
     # `pre_staged` already matches the recorded scope exactly, so the prior
@@ -9667,12 +9915,9 @@ def resume_staged_seal_transaction(
             "worktree before retrying"
         )
 
-    run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(worktree), "commit", "-m", commit_message],
-        check=True,
-        capture=False,
+    head_sha = commit_recorded_seal_tree(
+        repo, state, task_id, task_state, worktree, expected_branch
     )
-    head_sha = git(worktree, ["rev-parse", "HEAD"])
     task_state.pop("seal_transaction", None)
     save_state(repo, state)
     journal(
@@ -9731,12 +9976,12 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     result_path = worktree / result_rel
 
     pre_staged = cached_diff_paths_no_renames(worktree)
+    resumed = resume_staged_seal_transaction(
+        repo, state, task_id, task_state, worktree, expected_attempt, result_rel, pre_staged
+    )
+    if resumed is not None:
+        return resumed
     if pre_staged:
-        resumed = resume_staged_seal_transaction(
-            repo, state, task_id, task_state, worktree, expected_attempt, result_rel, pre_staged
-        )
-        if resumed is not None:
-            return resumed
         raise HLoopError(
             f"cannot seal {task_id}: worktree index already has staged changes, which a "
             f"durable handoff must never produce: {sorted(pre_staged)}"
@@ -9786,6 +10031,7 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         )
     status = str(handoff_meta.get("status") or "")
     blocking_questions = normalize_list(handoff_meta.get("blocking_questions"))
+    expected_parent = git(worktree, ["rev-parse", "HEAD"])
 
     base_ref = str(task_state.get("base_ref") or meta.get("base_ref") or state.get("integration_branch") or "")
     if not base_ref:
@@ -9798,7 +10044,7 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         if base_proc.returncode != 0 or not (base_proc.stdout or "").strip():
             raise HLoopError(f"cannot resolve Worker branch point against {base_ref}")
         base_sha = (base_proc.stdout or "").strip()
-    if not is_ancestor(worktree, base_sha, "HEAD"):
+    if not is_ancestor(worktree, base_sha, expected_parent):
         raise HLoopError(f"active attempt base is not an ancestor of HEAD: {base_sha}")
 
     # The complete write scope is whatever the Worker already committed on top
@@ -9808,7 +10054,7 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     # files before switching to a handoff for the rest. Rename detection is
     # disabled throughout so a rename's source path cannot escape scope
     # checking by hiding behind its destination.
-    committed_files = changed_files(worktree, base_sha, "HEAD")
+    committed_files = changed_files(worktree, base_sha, expected_parent)
     full_scope = list(dict.fromkeys([*committed_files, *dirty]))
 
     declared_changed_files = normalize_list(handoff_meta.get("changed_files"))
@@ -9834,6 +10080,7 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
             )
         pre_validation_scope = set(full_scope)
         pre_validation_snapshot = snapshot_worktree_paths(worktree, pre_validation_scope)
+        pre_validation_directories = snapshot_worktree_directories(worktree)
         for command in manager_validation_commands:
             passed, output = run_seal_validation_command(worktree, command)
             manager_validation_results.append("passed" if passed else "failed")
@@ -9846,7 +10093,10 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 # fail closed forever on "stale handoff artifact" with no
                 # way to recover short of manual cleanup.
                 rollback_validation_command_side_effects(
-                    worktree, pre_validation_scope, pre_validation_snapshot
+                    worktree,
+                    pre_validation_scope,
+                    pre_validation_snapshot,
+                    pre_validation_directories,
                 )
                 raise HLoopError(
                     f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
@@ -9858,7 +10108,13 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         # it introduced; nothing may be committed unless every changed path,
         # old and new, is in scope.
         post_dirty = porcelain_paths_no_renames(worktree)
-        post_committed = changed_files(worktree, base_sha, "HEAD")
+        observed_parent = git(worktree, ["rev-parse", "HEAD"])
+        if observed_parent != expected_parent:
+            raise HLoopError(
+                f"Worker branch moved during Manager validation for {task_id}: "
+                f"expected {expected_parent}, got {observed_parent}"
+            )
+        post_committed = changed_files(worktree, base_sha, expected_parent)
         post_scope = list(dict.fromkeys([*post_committed, *post_dirty]))
         new_paths = sorted(set(post_scope) - set(full_scope))
         if new_paths:
@@ -9910,17 +10166,30 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         dirty = [*dirty, result_rel.as_posix()]
 
     commit_message = f"ai-loop({task_id}): seal worker handoff ({expected_attempt})"
+    observed_parent = git(worktree, ["rev-parse", "HEAD"])
+    if observed_parent != expected_parent:
+        raise HLoopError(
+            f"seal aborted for {task_id}: Worker branch moved before transaction record; "
+            f"expected {expected_parent}, got {observed_parent}"
+        )
+    branch_ref = git(worktree, ["symbolic-ref", "-q", "HEAD"], check=False)
+    expected_branch_ref = f"refs/heads/{expected_branch}"
+    if branch_ref != expected_branch_ref:
+        raise HLoopError(
+            f"seal aborted for {task_id}: Worker HEAD is not attached to {expected_branch_ref}"
+        )
 
-    # Record this transaction before staging so a crash between `git add -A`
-    # and `git commit` leaves a recoverable trail: the next `hloop worker
-    # seal` invocation recognizes and resumes exactly this staged state via
-    # `resume_staged_seal_transaction` instead of failing closed and
-    # requiring manual Git repair.
+    # Record this transaction before staging so a crash between `git add -A`,
+    # exact-tree commit creation, ref CAS, and index reconciliation leaves a
+    # recoverable trail. The next `hloop worker seal` invocation resumes only
+    # a transaction whose durable identities still match.
     task_state["seal_transaction"] = {
         "attempt_id": expected_attempt,
         "result_rel": result_rel.as_posix(),
         "staged_paths": dirty,
         "commit_message": commit_message,
+        "expected_parent": expected_parent,
+        "branch_ref": branch_ref,
     }
     save_state(repo, state)
 
@@ -9961,19 +10230,9 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     task_state["seal_transaction"]["staged_tree"] = staged_tree
     save_state(repo, state)
 
-    run_cmd(
-        [
-            TRUSTED_GIT_PATH,
-            "-C",
-            str(worktree),
-            "commit",
-            "-m",
-            commit_message,
-        ],
-        check=True,
-        capture=False,
+    head_sha = commit_recorded_seal_tree(
+        repo, state, task_id, task_state, worktree, expected_branch
     )
-    head_sha = git(worktree, ["rev-parse", "HEAD"])
     task_state.pop("seal_transaction", None)
     save_state(repo, state)
     journal(repo, f"Sealed Worker handoff for `{task_id}` at attempt `{expected_attempt}` ({head_sha}).")
