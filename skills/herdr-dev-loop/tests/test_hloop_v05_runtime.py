@@ -340,6 +340,7 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             event_id=None,
             task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
             report_token="test-report-token",
+            report_credential_file=None,
             type="milestone",
             stage="implementing",
             summary="made progress",
@@ -1060,13 +1061,17 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             }
             for role_id, attempt_id in identities.items():
                 digest = hashlib.sha256(role_id.encode()).hexdigest()
-                token = hloop.register_role_report_identity(
+                credential_file, _ = hloop.register_role_report_identity_and_ack_floor(
                     repo,
                     state,
                     role_id=role_id,
                     attempt_id=attempt_id,
                     task_contract_digest=digest,
                 )
+                credential_payload = json.loads(credential_file.read_text(encoding="utf-8"))
+                token = credential_payload["token"]
+                self.assertEqual(stat.S_IMODE(credential_file.stat().st_mode), 0o600)
+                self.assertFalse(credential_file.is_relative_to(repo / hloop.LOOP_DIR))
                 with store.transaction() as transaction:
                     self.assertTrue(
                         store.authenticate_role_report(
@@ -1082,11 +1087,13 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                     role_id,
                     attempt_id,
                     state,
-                    report_token=token,
+                    report_credential_file=str(credential_file),
                     task_contract_digest=digest,
                 )
                 self.assertIn(f"--role-id {role_id}", contract)
                 self.assertIn(f"--attempt-id {attempt_id}", contract)
+                self.assertIn("--report-credential-file", contract)
+                self.assertNotIn(token, contract)
                 self.assertIn("stop before material work", contract)
 
             with store.transaction() as transaction:
@@ -1099,6 +1106,122 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                         task_contract_digest="0" * 64,
                         token="unknown",
                     )
+                )
+
+    def test_report_credential_permissions_and_diagnostics_fail_closed_without_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            digest = hashlib.sha256(b"T010").hexdigest()
+            credential_file, _ = hloop.register_role_report_identity_and_ack_floor(
+                repo,
+                state,
+                role_id="T010",
+                attempt_id="T010-A001",
+                task_contract_digest=digest,
+            )
+            secret = json.loads(credential_file.read_text(encoding="utf-8"))["token"]
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        role_id="T010",
+                        attempt_id="T010-A001",
+                        task_contract_digest=digest,
+                        report_token=None,
+                        report_credential_file=str(credential_file),
+                    )
+                )
+            self.assertIn("accepted", output.getvalue())
+            self.assertNotIn(secret, output.getvalue())
+            credential_file.chmod(0o644)
+
+            with self.assertRaises(hloop.HLoopError) as raised:
+                hloop.read_role_report_credential(
+                    repo,
+                    str(credential_file),
+                    run_id="run-001",
+                    role_id="T010",
+                    attempt_id="T010-A001",
+                )
+
+            self.assertIn("mode 0600", str(raised.exception))
+            self.assertNotIn(secret, str(raised.exception))
+
+    def test_codex_transcript_visibility_is_delivery_evidence(self):
+        message = "Manager message id: 00000000-0000-0000-0000-000000000001\napply fix"
+        typed_snapshot = f"input> {message}"
+        submitted_snapshot = f"user> {message}\nstatus: queued"
+        pane = {"agent": "codex", "agent_status": "idle", "session_id": "session-1"}
+        with mock.patch.object(hloop, "pane_info", return_value=pane), mock.patch.object(
+            hloop, "pane_text", return_value=submitted_snapshot
+        ):
+            self.assertTrue(
+                hloop.manager_message_submitted(
+                    "codex",
+                    "pane-1",
+                    message,
+                    typed_snapshot,
+                    "session-1",
+                    0,
+                )
+            )
+
+    def test_visible_message_transport_failure_is_unknown_and_never_auto_drained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "attempt_id": "T001-A001",
+                "pane_id": "pane-1",
+                "agent_provider": "codex",
+            }
+            state["tasks"] = {"T001": task_state}
+            args = SimpleNamespace(
+                contract_changing=False,
+                timeout_ms=1,
+                input_settle_ms=0,
+                submit_verify_ms=1,
+                submit_attempts=1,
+            )
+            with mock.patch.object(
+                hloop,
+                "send_agent_tui_message",
+                side_effect=hloop.ManagerMessageDeliveryUnknown("visible but ambiguous"),
+            ), contextlib.redirect_stderr(io.StringIO()):
+                code = hloop.send_manager_message_and_record(
+                    repo,
+                    state,
+                    task_state,
+                    role="Worker",
+                    agent_id="T001",
+                    pane_id="pane-1",
+                    message="apply the fix once",
+                    source="argv",
+                    args=args,
+                )
+
+            self.assertEqual(code, 3)
+            self.assertEqual(task_state["manager_messages"][-1]["delivery_status"], "unknown")
+            self.assertEqual(task_state.get("pending_manager_messages", []), [])
+            self.assertEqual(len(task_state["unknown_manager_messages"]), 1)
+
+    def test_successful_send_text_with_unconfirmed_visibility_is_unknown(self):
+        with mock.patch.object(hloop, "check_herdr_env"), mock.patch.object(
+            hloop,
+            "wait_agent_tui_ready",
+            return_value=({"agent": "codex", "session_id": "session-1"}, ""),
+        ), mock.patch.object(
+            hloop, "run_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")
+        ), mock.patch.object(
+            hloop,
+            "wait_manager_message_visible",
+            side_effect=hloop.HLoopError("visibility timed out"),
+        ):
+            with self.assertRaises(hloop.ManagerMessageDeliveryUnknown):
+                hloop.send_agent_tui_message(
+                    "codex", "pane-1", "apply once", 1, 0, 1, 1
                 )
 
     def test_semantic_ack_barrier_blocks_worker_finalize_done_until_resolved(self):
