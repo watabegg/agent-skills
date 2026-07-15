@@ -9,6 +9,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -221,16 +223,27 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             "integration_branch": "main",
         }
         hloop.save_state(repo, state)
+        store = hloop._open_broker_store(repo)
+        with store.transaction() as transaction:
+            store.register_active_role(
+                transaction,
+                run_id="run-001",
+                role_id="T001",
+                attempt_id="T001-A001",
+                task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+                token="test-report-token",
+            )
         return repo
 
     def report_args(self, repo: Path, **overrides) -> SimpleNamespace:
         base = dict(
             repo=str(repo),
-            run_id=None,
+            run_id="run-001",
             role_id="T001",
-            attempt_id=None,
+            attempt_id="T001-A001",
             event_id=None,
-            task_contract_digest=None,
+            task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+            report_token="test-report-token",
             type="milestone",
             stage="implementing",
             summary="made progress",
@@ -260,13 +273,48 @@ class BrokerReportLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = self.init_repo(root)
-
-            hloop.cmd_manager_sleep(
-                SimpleNamespace(
-                    repo=str(repo), ttl_seconds=3600, manager_session_id="sess", pane_id="pane"
-                )
+            errors = []
+            runtime_dir = root / "runtime"
+            socket_path = hloop_broker.derive_runtime_socket_path(
+                hloop.LOOP_NAMESPACE, "run-001", runtime_directory=runtime_dir
             )
-            hloop.cmd_agent_report(self.report_args(repo, event_id=event_id))
+
+            def report_after_sleep_starts():
+                try:
+                    deadline = time.monotonic() + 2
+                    while not socket_path.exists():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("manager sleep socket was not created")
+                        time.sleep(0.005)
+                    hloop.cmd_agent_report(
+                        self.report_args(
+                            repo,
+                            event_id=event_id,
+                            type="attention",
+                            impact="Manager must inspect the fault-path report",
+                            attempted=["persisted the report before signalling"],
+                            option_text=["inspect the durable inbox event"],
+                            recommendation="inspect and explicitly acknowledge the event",
+                            blocked_scope=["manager sleep"],
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            reporter = threading.Thread(target=report_after_sleep_starts, daemon=True)
+            reporter.start()
+            sleep_output = io.StringIO()
+            with mock.patch.dict(os.environ, {"HLOOP_RUNTIME_DIR": str(runtime_dir)}):
+                with contextlib.redirect_stdout(sleep_output):
+                    hloop.cmd_manager_sleep(
+                        SimpleNamespace(
+                            repo=str(repo), ttl_seconds=2, manager_session_id="sess", pane_id="pane"
+                        )
+                    )
+            reporter.join(timeout=2)
+            self.assertEqual(errors, [])
+            self.assertIn("manager sleep returned: report", sleep_output.getvalue())
+            self.assertIn(event_id, sleep_output.getvalue())
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
@@ -279,6 +327,10 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             self.assertIn(event_id, buffer.getvalue())
 
             hloop.cmd_inbox_ack(SimpleNamespace(repo=str(repo), event_id=event_id))
+            with self.assertRaisesRegex(hloop.HLoopError, "duplicate"):
+                hloop.cmd_inbox_ack(
+                    SimpleNamespace(repo=str(repo), event_id=event_id)
+                )
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
@@ -355,17 +407,27 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             "integration_branch": "main",
         }
         hloop.save_state(repo, state)
+        store = hloop._open_broker_store(repo)
+        with store.transaction() as transaction:
+            store.register_active_role(
+                transaction,
+                run_id="run-001",
+                role_id="T001",
+                attempt_id="T001-A001",
+                task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+                token="test-report-token",
+            )
         return repo
 
     def report_args(self, repo: Path, **overrides) -> SimpleNamespace:
         base = dict(
             repo=str(repo),
-            run_id=None,
+            run_id="run-001",
             role_id="T001",
-            attempt_id=None,
+            attempt_id="T001-A001",
             event_id=None,
-            task_contract_digest=None,
-            report_token=None,
+            task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+            report_token="test-report-token",
             type="milestone",
             stage="implementing",
             summary="made progress",
@@ -495,17 +557,30 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             root = Path(directory)
             repo = self.init_repo(root)
             event_id = str(uuid.uuid4())
-            hloop.cmd_agent_report(self.report_args(repo, event_id=event_id))
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    event_id=event_id,
+                    type="attention",
+                    impact="Manager must inspect the pending report",
+                    attempted=["persisted the report"],
+                    option_text=["inspect the durable inbox event"],
+                    recommendation="inspect and explicitly acknowledge the event",
+                    blocked_scope=["manager sleep"],
+                )
+            )
 
             buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
+            with mock.patch.dict(
+                os.environ, {"HLOOP_RUNTIME_DIR": str(root / "runtime")}
+            ), contextlib.redirect_stdout(buffer):
                 hloop.cmd_manager_sleep(
                     SimpleNamespace(
                         repo=str(repo), ttl_seconds=3600, manager_session_id="sess", pane_id="pane"
                     )
                 )
             output = buffer.getvalue()
-            self.assertIn("unread reports already pending: 1", output)
+            self.assertIn("manager sleep returned: report", output)
             self.assertIn(event_id, output)
 
     def test_hooks_install_status_uninstall_round_trip_preserves_user_hooks(self):
@@ -563,11 +638,15 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             response = json.loads(buffer.getvalue())
             self.assertIn("additionalContext", response["hookSpecificOutput"])
 
-            hloop.cmd_manager_sleep(
-                SimpleNamespace(
-                    repo=str(repo), ttl_seconds=3600, manager_session_id="sess", pane_id="pane"
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                store.register_wake_lease(
+                    transaction,
+                    run_id="run-001",
+                    manager_session_id="sess",
+                    pane_id="pane",
+                    expires_at="2999-01-01T00:00:00+00:00",
                 )
-            )
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
                 hloop.cmd_hooks_guard(
@@ -697,6 +776,65 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertFalse((repo / undelivered_rel).exists())
             self.assertTrue((repo / unknown_rel).exists())
 
+    def test_message_drain_preserves_undelivered_entry_when_payload_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "pane_id": "pane-1",
+                "agent_provider": "codex",
+                "pending_manager_messages": [
+                    {
+                        "at": hloop.now_iso(),
+                        "source": "argv",
+                        "pending_path": ".ai/missing-message.md",
+                        "error": "original delivery failed",
+                        "status": "undelivered",
+                    }
+                ],
+            }
+            state["tasks"] = {"T001": task_state}
+
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(hloop, "send_agent_tui_message") as send, contextlib.redirect_stdout(
+                io.StringIO()
+            ) as buffer:
+                hloop.cmd_message_drain(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        timeout_ms=1,
+                        input_settle_ms=0,
+                        submit_verify_ms=1,
+                        submit_attempts=1,
+                    )
+                )
+
+            send.assert_not_called()
+            self.assertIn("0 pending message(s); 1 still pending", buffer.getvalue())
+            self.assertEqual(len(task_state["pending_manager_messages"]), 1)
+            self.assertIn("file is missing", task_state["pending_manager_messages"][0]["error"])
+
+    def test_supersede_marks_every_non_applied_message_terminal(self):
+        agent_state = {
+            "manager_messages": [
+                {"message_id": "delivered", "delivery_status": "delivered"},
+                {"message_id": "acked", "delivery_status": "acknowledged"},
+                {"message_id": "applied", "delivery_status": "applied"},
+            ]
+        }
+
+        hloop.supersede_pending_manager_messages(Path("/unused"), agent_state)
+
+        statuses = {
+            entry["message_id"]: entry["delivery_status"]
+            for entry in agent_state["manager_messages"]
+        }
+        self.assertEqual(statuses["delivered"], "superseded")
+        self.assertEqual(statuses["acked"], "superseded")
+        self.assertEqual(statuses["applied"], "applied")
+
     def test_record_manager_message_carries_digest_and_valid_delivery_status(self):
         target = {}
         hloop.record_manager_message(target, "argv", "hello world")
@@ -706,12 +844,129 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
         with self.assertRaisesRegex(hloop.HLoopError, "unsupported message delivery status"):
             hloop.record_manager_message(target, "argv", "hello", delivery_status="bogus")
 
+    def test_message_unknown_ack_and_applied_resolution_is_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "attempt_id": "T001-A001",
+                "unknown_manager_messages": [],
+            }
+            _, envelope = hloop.manager_message_envelope(
+                state, "T001", task_state, "apply the bounded fix"
+            )
+            entry = hloop.record_manager_message(
+                task_state,
+                "argv",
+                envelope,
+                delivery_status="unknown",
+                delivery_error="visual confirmation timed out",
+            )
+            task_state["unknown_manager_messages"].append(
+                {
+                    "message_id": entry["message_id"],
+                    "error": "visual confirmation timed out",
+                }
+            )
+            state["tasks"] = {"T001": task_state}
+            hloop.save_state(repo, state)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_message_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="T001",
+                        message_id=entry["message_id"],
+                        status="acknowledged",
+                        result=None,
+                        error=None,
+                    )
+                )
+                hloop.cmd_message_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="T001",
+                        message_id=entry["message_id"],
+                        status="applied",
+                        result="fix applied and tests queued",
+                        error=None,
+                    )
+                )
+            reloaded = hloop.load_state(repo)["tasks"]["T001"]
+            resolved = hloop.manager_message_by_id(reloaded, entry["message_id"])
+            self.assertEqual(resolved["delivery_status"], "applied")
+            self.assertEqual(resolved["result"], "fix applied and tests queued")
+            self.assertEqual(
+                [item["to"] for item in reloaded["manager_message_events"]],
+                ["acknowledged", "applied"],
+            )
+            self.assertEqual(reloaded["unknown_manager_messages"], [])
+
+    def test_every_long_running_role_identity_and_prompt_is_authenticated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            store = hloop._open_broker_store(repo)
+            identities = {
+                "T009": "T009-A001",
+                "R009": "R009-A001",
+                "G009": "G009-A001",
+                "A009/P1": "A009-P1-A001",
+            }
+            for role_id, attempt_id in identities.items():
+                digest = hashlib.sha256(role_id.encode()).hexdigest()
+                token = hloop.register_role_report_identity(
+                    repo,
+                    state,
+                    role_id=role_id,
+                    attempt_id=attempt_id,
+                    task_contract_digest=digest,
+                )
+                with store.transaction() as transaction:
+                    self.assertTrue(
+                        store.authenticate_role_report(
+                            transaction,
+                            run_id="run-001",
+                            role_id=role_id,
+                            attempt_id=attempt_id,
+                            task_contract_digest=digest,
+                            token=token,
+                        )
+                    )
+                contract = hloop.report_contract_text(
+                    role_id,
+                    attempt_id,
+                    state,
+                    report_token=token,
+                    task_contract_digest=digest,
+                )
+                self.assertIn(f"--role-id {role_id}", contract)
+                self.assertIn(f"--attempt-id {attempt_id}", contract)
+                self.assertIn("stop before material work", contract)
+
+            with store.transaction() as transaction:
+                self.assertFalse(
+                    store.authenticate_role_report(
+                        transaction,
+                        run_id="run-001",
+                        role_id="R999",
+                        attempt_id="R999-A001",
+                        task_contract_digest="0" * 64,
+                        token="unknown",
+                    )
+                )
+
     def test_semantic_ack_barrier_blocks_worker_finalize_done_until_resolved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = self.init_repo(root)
             state = hloop.load_state(repo)
-            task_state = {"status": "running", "result_status": "in_progress"}
+            task_state = {
+                "status": "running",
+                "result_status": "in_progress",
+                "attempt_id": "T001-A001",
+            }
             hloop.arm_semantic_ack_barrier(task_state, message_id="msg-1", digest="deadbeef")
             state["tasks"] = {"T001": task_state}
             hloop.save_state(repo, state)
@@ -719,10 +974,24 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 hloop.task_file(repo, "T001"),
                 hloop.frontmatter({"id": "T001", "run_id": state["run_id"]}) + "\n\n# Task T001\n",
             )
+            hloop.cmd_agent_report(
+                self.report_args(
+                    repo,
+                    type="ack",
+                    stage="planning",
+                    summary="contract understood",
+                    next="wait for approval",
+                    risk=[],
+                    understood_goal="complete T001",
+                    scope=["tracked.txt"],
+                    acceptance=["validation passes"],
+                    approach="smallest safe change",
+                )
+            )
 
             self.assertTrue(hloop.semantic_ack_barrier_blocking(task_state))
             with contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK approval"):
+                with self.assertRaisesRegex(hloop.HLoopError, "semantic ACK barrier"):
                     hloop.cmd_worker_finalize(
                         SimpleNamespace(
                             repo=str(repo),
@@ -746,12 +1015,88 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
     def test_contract_changing_message_rearms_an_already_resolved_barrier(self):
         agent_state = {}
         hloop.arm_semantic_ack_barrier(agent_state, message_id="msg-1", digest="aaa")
-        hloop.resolve_semantic_ack_barrier(agent_state, decision="approve", reason="ok")
+        hloop.resolve_semantic_ack_barrier(
+            agent_state,
+            decision="approve",
+            reason="ok",
+            latest_ack={"event_id": "ack-1", "sequence": 1},
+        )
         self.assertEqual(agent_state["semantic_ack_barrier"]["status"], "approved")
-        hloop.arm_semantic_ack_barrier(agent_state, message_id="msg-2", digest="bbb")
-        self.assertEqual(agent_state["semantic_ack_barrier"]["status"], "pending")
+        hloop.arm_semantic_ack_barrier(
+            agent_state,
+            message_id="msg-2",
+            digest="bbb",
+            required_reack_after_sequence=1,
+        )
+        self.assertEqual(agent_state["semantic_ack_barrier"]["status"], "awaiting_ack")
         self.assertEqual(agent_state["semantic_ack_barrier"]["message_id"], "msg-2")
         self.assertTrue(hloop.semantic_ack_barrier_blocking(agent_state))
+        with self.assertRaisesRegex(hloop.HLoopError, "corrected semantic ACK"):
+            hloop.resolve_semantic_ack_barrier(
+                agent_state,
+                decision="approve",
+                reason="old ACK must not approve a new contract",
+                latest_ack={"event_id": "ack-1", "sequence": 1},
+            )
+
+    def test_reject_and_timeout_require_a_fresh_corrected_ack(self):
+        state = {}
+        hloop.arm_initial_semantic_ack_barrier(
+            state, attempt_id="T001-A001", contract_digest="a" * 64
+        )
+        first = {"event_id": "ack-1", "sequence": 1}
+        hloop.resolve_semantic_ack_barrier(
+            state, decision="reject", reason="scope is wrong", latest_ack=first
+        )
+        self.assertTrue(hloop.semantic_ack_barrier_blocking(state))
+        with self.assertRaisesRegex(hloop.HLoopError, "corrected semantic ACK"):
+            hloop.resolve_semantic_ack_barrier(
+                state, decision="approve", reason="retry", latest_ack=first
+            )
+        hloop.resolve_semantic_ack_barrier(
+            state,
+            decision="approve",
+            reason="corrected",
+            latest_ack={"event_id": "ack-2", "sequence": 2},
+        )
+        self.assertEqual(hloop.semantic_ack_barrier_blocking(state), "")
+
+        hloop.arm_initial_semantic_ack_barrier(
+            state, attempt_id="T001-A002", contract_digest="b" * 64
+        )
+        hloop.resolve_semantic_ack_barrier(
+            state, decision="timeout", reason="manager lease expired", latest_ack=None
+        )
+        self.assertEqual(state["semantic_ack_barrier"]["status"], "timed_out")
+        self.assertTrue(hloop.semantic_ack_barrier_blocking(state))
+        hloop.resolve_semantic_ack_barrier(
+            state,
+            decision="approve",
+            reason="fresh ACK after timeout",
+            latest_ack={"event_id": "ack-3", "sequence": 3},
+        )
+        self.assertEqual(hloop.semantic_ack_barrier_blocking(state), "")
+
+        hloop.arm_initial_semantic_ack_barrier(
+            state,
+            attempt_id="T001-A003",
+            contract_digest="c" * 64,
+            required_reack_after_sequence=7,
+        )
+        with self.assertRaisesRegex(hloop.HLoopError, "corrected semantic ACK"):
+            hloop.resolve_semantic_ack_barrier(
+                state,
+                decision="approve",
+                reason="pre-registration ACK must not approve a new role start",
+                latest_ack={"event_id": "ack-old", "sequence": 7},
+            )
+        hloop.resolve_semantic_ack_barrier(
+            state,
+            decision="approve",
+            reason="post-registration ACK",
+            latest_ack={"event_id": "ack-new", "sequence": 8},
+        )
+        self.assertEqual(hloop.semantic_ack_barrier_blocking(state), "")
 
 
 class ReviewGroupRuntimeTests(unittest.TestCase):

@@ -44,6 +44,36 @@ def client_event(event_id: str = "28b79cf0-8e32-4b89-88af-e332ee5a5dbe"):
     )
 
 
+def milestone_event(event_id: str = "18b79cf0-8e32-4b89-88af-e332ee5a5dbe"):
+    return events.prepare_client_event(
+        {
+            "run_id": "run-011",
+            "role_id": "T011",
+            "attempt_id": "T011-A001",
+            "task_contract_digest": hashlib.sha256(b"contract").hexdigest(),
+            "type": "milestone",
+            "stage": "testing",
+            "summary": "targeted tests passed",
+            "next": "continue validation",
+            "needs_manager": False,
+            "risks": ["manager final QA remains"],
+            "evidence_refs": ["tests/test_supervisor_v05.py"],
+            "created_at": CREATED_AT,
+        },
+        event_id=event_id,
+    )
+
+
+def report_authentication(event, token="report-token"):
+    return {
+        "run_id": event["run_id"],
+        "role_id": event["role_id"],
+        "attempt_id": event["attempt_id"],
+        "task_contract_digest": event["task_contract_digest"],
+        "token": token,
+    }
+
+
 class ProviderPrimitiveTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -185,6 +215,11 @@ class SupervisorPrimitiveTests(unittest.TestCase):
         self.socket_path = self.root / "runtime" / "run.sock"
         self.metadata_path = self.root / "broker" / "owner.json"
         self.spool = self.root / "broker" / "spool"
+        sample = client_event()
+        with self.store.transaction() as transaction:
+            self.store.register_active_role(
+                transaction, **report_authentication(sample)
+            )
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -251,7 +286,11 @@ class SupervisorPrimitiveTests(unittest.TestCase):
                 client.settimeout(1)
                 try:
                     client.connect(str(self.socket_path))
-                    broker.spool_client_event(self.spool, event)
+                    broker.spool_client_event(
+                        self.spool,
+                        event,
+                        authentication=report_authentication(event),
+                    )
                     client.sendall(supervisor.WAKE_SIGNAL)
                 finally:
                     client.close()
@@ -300,7 +339,9 @@ class SupervisorPrimitiveTests(unittest.TestCase):
 
     def test_report_present_before_sleep_is_returned_without_lost_wake(self):
         event = client_event()
-        broker.spool_client_event(self.spool, event)
+        broker.spool_client_event(
+            self.spool, event, authentication=report_authentication(event)
+        )
         result = self.make_supervisor().sleep(timeout_seconds=1)
 
         self.assertEqual(result.reason, "report")
@@ -316,6 +357,27 @@ class SupervisorPrimitiveTests(unittest.TestCase):
                     pane_id="wH:p1",
                 )
             )
+
+    def test_milestone_remains_inbox_only_and_does_not_wake_manager(self):
+        event = milestone_event()
+        with self.store.transaction() as transaction:
+            self.store.accept_report(transaction, event)
+
+        result = self.make_supervisor().sleep(
+            timeout_seconds=0.03,
+            poll_interval_seconds=0.005,
+        )
+
+        self.assertEqual(result.reason, "timeout")
+        self.assertEqual(result.event_ids, ())
+        with self.store.transaction() as transaction:
+            self.assertEqual(
+                [row["event_id"] for row in self.store.unconsumed_inbox(
+                    transaction, run_id="run-011"
+                )],
+                [event["event_id"]],
+            )
+            self.assertEqual(self.store.pending_wakes(transaction), [])
 
     def test_timeout_terminates_hookless_herdr_wait_process(self):
         processes = []
