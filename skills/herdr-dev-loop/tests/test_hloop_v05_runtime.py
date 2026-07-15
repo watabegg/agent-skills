@@ -975,7 +975,9 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             with mock.patch.object(
                 hloop,
                 "_open_broker_store",
-                side_effect=hloop_broker.BrokerStorageError("simulated broker outage"),
+                side_effect=hloop_broker.BrokerUnavailableError(
+                    "simulated broker outage"
+                ),
             ):
                 buffer = io.StringIO()
                 with contextlib.redirect_stdout(buffer):
@@ -1066,7 +1068,7 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(hloop.HLoopError, "unknown fields"):
                 hloop.cmd_agent_report(self.body_args(repo, file=str(unknown_field_path)))
 
-    def test_agent_report_retry_reuses_the_outbox_event_id_without_duplicating_the_event(self):
+    def test_two_successful_identical_agent_reports_receive_distinct_event_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = self.init_repo(root)
@@ -1082,23 +1084,292 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             ]
             self.assertEqual(len(outbox_files), 1)
             self.assertEqual(stat.S_IMODE(outbox_files[0].stat().st_mode), 0o600)
+            first_outbox = json.loads(outbox_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                [entry["status"] for entry in first_outbox["entries"]],
+                ["confirmed"],
+            )
 
-            # A retry of the identical report content (no explicit --event-id,
-            # as a caller that never observed the first call's outcome would
-            # send) must resolve to the same event ID the outbox already
-            # recorded, not a fresh one.
+            # The first successful broker delivery confirmed its outbox
+            # envelope. A later implicit invocation with the same semantic
+            # content is a distinct report, not a crash retry.
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
                 hloop.cmd_agent_report(self.report_args(repo))
             second_event_id = buffer.getvalue().split()[1]
-            self.assertEqual(first_event_id, second_event_id)
+            self.assertNotEqual(first_event_id, second_event_id)
+            second_outbox = json.loads(outbox_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                [entry["status"] for entry in second_outbox["entries"]],
+                ["confirmed", "confirmed"],
+            )
 
             store = hloop._open_broker_store(repo)
             with store.transaction() as transaction:
                 events = store.events(transaction)
                 inbox_rows = store.inbox(transaction)
-            self.assertEqual([event["event_id"] for event in events], [first_event_id])
+            self.assertEqual(
+                [event["event_id"] for event in events],
+                [first_event_id, second_event_id],
+            )
+            self.assertEqual(len(inbox_rows), 2)
+
+    def test_agent_report_crash_after_broker_commit_reuses_pending_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            first_created_at = "2026-07-15T00:00:00+00:00"
+            retry_created_at = "2026-07-15T00:05:00+00:00"
+
+            real_confirm = hloop_broker.confirm_role_outbox_delivery
+            confirmation_calls = 0
+
+            def crash_before_first_confirmation(*args, **kwargs):
+                nonlocal confirmation_calls
+                confirmation_calls += 1
+                if confirmation_calls == 1:
+                    raise OSError("simulated crash before delivery confirmation")
+                return real_confirm(*args, **kwargs)
+
+            with mock.patch.object(
+                hloop, "now_iso", side_effect=[first_created_at, retry_created_at]
+            ), mock.patch.object(
+                hloop_broker,
+                "confirm_role_outbox_delivery",
+                side_effect=crash_before_first_confirmation,
+            ):
+                with self.assertRaisesRegex(
+                    hloop.HLoopError, "cannot confirm broker report delivery"
+                ):
+                    hloop.cmd_agent_report(
+                        self.report_args(
+                            repo,
+                            type="attention",
+                            impact="inspect",
+                            attempted=["checked"],
+                            option_text=["continue"],
+                            recommendation="continue",
+                            blocked_scope=["broker"],
+                        )
+                    )
+
+                store = hloop._open_broker_store(repo)
+                with store.transaction() as transaction:
+                    first_stored_events = store.events(transaction)
+                self.assertEqual(len(first_stored_events), 1)
+                first_event_id = first_stored_events[0]["event_id"]
+                outbox_path = hloop.role_report_outbox_path(
+                    repo,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                )
+                pending_outbox = json.loads(outbox_path.read_text(encoding="utf-8"))
+                self.assertEqual(pending_outbox["entries"][-1]["status"], "pending")
+
+                second_output = io.StringIO()
+                with contextlib.redirect_stdout(second_output):
+                    hloop.cmd_agent_report(
+                        self.report_args(
+                            repo,
+                            type="attention",
+                            impact="inspect",
+                            attempted=["checked"],
+                            option_text=["continue"],
+                            recommendation="continue",
+                            blocked_scope=["broker"],
+                        )
+                    )
+
+            second_event_id = second_output.getvalue().split()[1]
+            self.assertEqual(second_event_id, first_event_id)
+
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                stored_events = store.events(transaction)
+                inbox_rows = store.inbox(transaction)
+            self.assertEqual(len(stored_events), 1)
             self.assertEqual(len(inbox_rows), 1)
+            self.assertEqual(stored_events[0]["created_at"], first_created_at)
+            confirmed_outbox = json.loads(outbox_path.read_text(encoding="utf-8"))
+            self.assertEqual(confirmed_outbox["entries"][-1]["status"], "confirmed")
+
+    def test_explicit_event_id_retry_reuses_confirmed_full_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            event_id = str(uuid.uuid4())
+            first_created_at = "2026-07-15T00:00:00+00:00"
+            retry_created_at = "2026-07-15T00:05:00+00:00"
+
+            with mock.patch.object(
+                hloop, "now_iso", side_effect=[first_created_at, retry_created_at]
+            ):
+                first_output = io.StringIO()
+                with contextlib.redirect_stdout(first_output):
+                    hloop.cmd_agent_report(
+                        self.report_args(repo, event_id=event_id)
+                    )
+                second_output = io.StringIO()
+                with contextlib.redirect_stdout(second_output):
+                    hloop.cmd_agent_report(
+                        self.report_args(repo, event_id=event_id)
+                    )
+
+            self.assertIn(f"accepted {event_id}", first_output.getvalue())
+            self.assertIn(f"accepted {event_id}", second_output.getvalue())
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                stored_events = store.events(transaction)
+                inbox_rows = store.inbox(transaction)
+            self.assertEqual(len(stored_events), 1)
+            self.assertEqual(len(inbox_rows), 1)
+            self.assertEqual(stored_events[0]["created_at"], first_created_at)
+
+    def test_two_successful_identical_spooled_reports_receive_distinct_event_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+
+            outputs = []
+            with mock.patch.object(
+                hloop,
+                "_open_broker_store",
+                side_effect=hloop_broker.BrokerUnavailableError(
+                    "simulated broker outage"
+                ),
+            ):
+                for _ in range(2):
+                    buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer):
+                        hloop.cmd_agent_report(self.report_args(repo))
+                    outputs.append(buffer.getvalue())
+
+            first_event_id = outputs[0].split()[1]
+            second_event_id = outputs[1].split()[1]
+            self.assertNotEqual(first_event_id, second_event_id)
+            self.assertEqual(
+                len(list(hloop.broker_spool_dir(repo).glob("*.json"))), 2
+            )
+
+    def test_agent_report_idempotency_conflict_fails_closed_without_spooling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            event_id = str(uuid.uuid4())
+
+            hloop.cmd_agent_report(
+                self.report_args(repo, event_id=event_id, summary="first report")
+            )
+            with mock.patch.object(hloop, "_open_broker_store") as open_store:
+                with self.assertRaisesRegex(
+                    hloop.HLoopError,
+                    "cannot persist report outbox.*different semantic content",
+                ):
+                    hloop.cmd_agent_report(
+                        self.report_args(
+                            repo,
+                            event_id=event_id,
+                            summary="different report",
+                        )
+                    )
+                open_store.assert_not_called()
+
+            spool_dir = hloop.broker_spool_dir(repo)
+            self.assertEqual(list(spool_dir.glob("*.json")), [])
+
+    def test_main_reports_permanent_broker_errors_without_traceback_or_spooling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            digest = hashlib.sha256(b"T001").hexdigest()
+            argv = [
+                "--repo",
+                str(repo),
+                "--namespace",
+                hloop.LOOP_NAMESPACE,
+                "agent",
+                "report",
+                "--role-id",
+                "T001",
+                "--attempt-id",
+                "T001-A001",
+                "--run-id",
+                "run-001",
+                "--task-contract-digest",
+                digest,
+                "--report-token",
+                "test-report-token",
+                "--type",
+                "milestone",
+                "--stage",
+                "implementing",
+                "--summary",
+                "made progress",
+                "--next",
+                "continue implementation",
+                "--evidence-ref",
+                "skills/herdr-dev-loop/scripts/hloop:1",
+                "--risk",
+                "none identified",
+            ]
+            permanent_errors = [
+                hloop_broker.IdempotencyConflict("different digest"),
+                hloop_broker.ReportAuthenticationError("identity rejected"),
+                hloop_broker.BrokerIntegrityError("invalid broker schema"),
+                hloop_broker.BrokerStorageError("unsupported storage semantics"),
+            ]
+
+            previous_trusted_git = hloop.TRUSTED_GIT_PATH
+            try:
+                for error in permanent_errors:
+                    with self.subTest(error=type(error).__name__), mock.patch.object(
+                        hloop, "_open_broker_store", side_effect=error
+                    ):
+                        stderr = io.StringIO()
+                        with contextlib.redirect_stderr(stderr):
+                            code = hloop.main(argv)
+                        self.assertEqual(code, 2)
+                        self.assertIn("hloop: report rejected by broker", stderr.getvalue())
+                        self.assertNotIn("Traceback", stderr.getvalue())
+            finally:
+                hloop.TRUSTED_GIT_PATH = previous_trusted_git
+
+            self.assertEqual(
+                list(hloop.broker_spool_dir(repo).glob("*.json")), []
+            )
+
+    def test_agent_report_does_not_spool_an_unclassified_broker_os_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            args = self.report_args(repo)
+
+            with mock.patch.object(
+                hloop, "_open_broker_store", side_effect=OSError("permission denied")
+            ):
+                with self.assertRaisesRegex(
+                    hloop.HLoopError, "cannot access report broker: permission denied"
+                ):
+                    hloop.cmd_agent_report(args)
+
+            self.assertEqual(
+                list(hloop.broker_spool_dir(repo).glob("*.json")), []
+            )
+
+    def test_agent_report_spools_when_sqlite_database_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            database_path = hloop.broker_root(repo) / "broker.sqlite3"
+            database_path.write_bytes(b"not a sqlite database")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                hloop.cmd_agent_report(self.report_args(repo))
+
+            self.assertIn("spooled", buffer.getvalue())
+            self.assertEqual(len(list(hloop.broker_spool_dir(repo).glob("*.json"))), 1)
 
     def test_agent_report_reuses_a_pre_persisted_outbox_event_id_after_a_simulated_crash(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1168,7 +1439,9 @@ class BrokerReportLifecycleTests(unittest.TestCase):
             with mock.patch.object(
                 hloop,
                 "_open_broker_store",
-                side_effect=hloop_broker.BrokerStorageError("simulated broker outage"),
+                side_effect=hloop_broker.BrokerUnavailableError(
+                    "simulated broker outage"
+                ),
             ):
                 buffer = io.StringIO()
                 with contextlib.redirect_stdout(buffer):
@@ -1417,6 +1690,50 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             output = buffer.getvalue()
             self.assertIn("manager sleep returned: report", output)
             self.assertIn(event_id, output)
+
+    def test_manager_sleep_merges_only_sleep_fields_into_latest_locked_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+
+            def concurrent_update(**_kwargs):
+                latest = hloop.load_state(repo)
+                latest["phase"] = "reviewing"
+                latest["tasks"] = {
+                    "T999": {"status": "merged", "head_sha": "a" * 40}
+                }
+                latest["decisions"] = {
+                    "D999": {"status": "accepted", "selected_option": "opt_1"}
+                }
+                latest["last_harvested_task"] = "T999"
+                hloop.save_state(repo, latest)
+                return hloop.hloop_supervisor.ManagerSleepResult(
+                    reason="timeout",
+                    lease_generation=7,
+                    drained_reports=0,
+                )
+
+            with mock.patch.object(
+                hloop.hloop_supervisor.ManagerSleepSupervisor,
+                "sleep",
+                side_effect=concurrent_update,
+            ):
+                hloop.cmd_manager_sleep(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        ttl_seconds=1,
+                        manager_session_id="sess",
+                        pane_id="pane",
+                    )
+                )
+
+            current = hloop.load_state(repo)
+            self.assertEqual(current["phase"], "reviewing")
+            self.assertEqual(current["tasks"]["T999"]["status"], "merged")
+            self.assertEqual(current["decisions"]["D999"]["status"], "accepted")
+            self.assertEqual(current["last_harvested_task"], "T999")
+            self.assertEqual(current["broker_lease"]["generation"], 7)
+            self.assertEqual(current["last_manager_sleep"]["reason"], "timeout")
 
     def test_hooks_install_status_uninstall_round_trip_preserves_user_hooks(self):
         with tempfile.TemporaryDirectory() as directory:

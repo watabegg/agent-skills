@@ -27,8 +27,11 @@ from .events import (
     canonical_json,
     new_event_id,
     parse_rfc3339,
+    payload_digest,
+    prepare_client_event,
     utc_now,
     validate_client_event,
+    validate_report,
 )
 
 
@@ -38,6 +41,14 @@ UNIX_SOCKET_PATH_MAX_BYTES = 103
 
 class BrokerStorageError(RuntimeError):
     """Base error for broker persistence failures."""
+
+
+class BrokerUnavailableError(BrokerStorageError):
+    """A retryable broker/SQLite availability failure."""
+
+
+class BrokerIntegrityError(BrokerStorageError):
+    """A permanent broker storage invariant or schema failure."""
 
 
 class IdempotencyConflict(BrokerStorageError):
@@ -50,6 +61,24 @@ class LeaseGenerationMismatch(BrokerStorageError):
 
 class ReportAuthenticationError(BrokerStorageError):
     """A live or spooled report does not match an active role identity."""
+
+
+def _classify_sqlite_error(
+    error: sqlite3.DatabaseError, *, operation: str
+) -> BrokerStorageError:
+    """Separate retryable SQLite availability from permanent semantics."""
+
+    if isinstance(
+        error,
+        (
+            sqlite3.IntegrityError,
+            sqlite3.DataError,
+            sqlite3.ProgrammingError,
+            sqlite3.NotSupportedError,
+        ),
+    ):
+        return BrokerIntegrityError(f"{operation} failed integrity checks: {error}")
+    return BrokerUnavailableError(f"{operation} is unavailable: {error}")
 
 
 @dataclass(frozen=True)
@@ -243,7 +272,10 @@ class BrokerStore:
             self.root.chmod(0o700)
         except OSError:
             pass
-        self._initialize()
+        try:
+            self._initialize()
+        except sqlite3.DatabaseError as exc:
+            raise _classify_sqlite_error(exc, operation="initialize broker") from exc
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -315,6 +347,7 @@ class BrokerStore:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 connection = self._connect()
                 transaction = BrokerTransaction(self, connection)
+                primary_error: BaseException | None = None
                 try:
                     connection.execute("BEGIN IMMEDIATE")
                     yield transaction
@@ -322,13 +355,26 @@ class BrokerStore:
                     connection.commit()
                     committed = True
                     callbacks = list(transaction._after_commit)
-                except BaseException:
-                    connection.rollback()
+                except BaseException as exc:
+                    primary_error = exc
+                    try:
+                        connection.rollback()
+                    except sqlite3.DatabaseError:
+                        # Preserve the primary semantic/storage exception. A
+                        # failed rollback cannot make a permanent conflict
+                        # eligible for fallback spooling.
+                        pass
                     raise
                 finally:
                     transaction.active = False
-                    connection.close()
+                    try:
+                        connection.close()
+                    except sqlite3.DatabaseError:
+                        if primary_error is None:
+                            raise
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except sqlite3.DatabaseError as exc:
+            raise _classify_sqlite_error(exc, operation="broker transaction") from exc
         finally:
             if committed:
                 for callback in callbacks:
@@ -1261,6 +1307,263 @@ def role_outbox_event_id(
                 entries = entries[len(entries) - max_entries :]
             _atomic_write_json(outbox_path, {"entries": entries})
             return event_id
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def role_outbox_client_event(
+    outbox_path: Path,
+    *,
+    report: Mapping[str, Any],
+    requested_event_id: str | None = None,
+    max_entries: int = 64,
+) -> dict[str, Any]:
+    """Persist and reuse a pending client event for one semantic report.
+
+    ``created_at`` is transport metadata, not part of the caller's semantic
+    report identity. A retry therefore looks up the normalized report without
+    ``created_at`` and returns the exact previously persisted *pending* event,
+    including its original timestamp, payload digest, and event ID. Once the
+    caller confirms broker or spool persistence, a later implicit invocation
+    creates a distinct event even when its semantic report fields are equal;
+    an explicit retained event ID still selects its exact original envelope.
+    """
+
+    normalized = validate_report(report)
+    semantic_payload = dict(normalized)
+    semantic_payload.pop("created_at", None)
+    semantic_digest = hashlib.sha256(
+        canonical_json(semantic_payload).encode("utf-8")
+    ).hexdigest()
+    current_payload_digest = payload_digest(normalized)
+
+    directory = outbox_path.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    lock_fd = os.open(
+        directory / f".{outbox_path.name}.lock", os.O_RDWR | os.O_CREAT, 0o600
+    )
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            raw_entries: list[Any] = []
+            if outbox_path.exists():
+                try:
+                    raw = json.loads(outbox_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BrokerIntegrityError(
+                        f"cannot read role report outbox {outbox_path}: {exc}"
+                    ) from exc
+                if not isinstance(raw, Mapping) or not isinstance(
+                    raw.get("entries"), list
+                ):
+                    raise BrokerIntegrityError(
+                        f"role report outbox has an invalid shape: {outbox_path}"
+                    )
+                raw_entries = list(raw["entries"])
+
+            retained: list[Any] = []
+            existing_event: dict[str, Any] | None = None
+            requested_event: tuple[str, dict[str, Any]] | None = None
+            legacy_event_id: str | None = None
+            for entry in raw_entries:
+                if isinstance(entry, Mapping):
+                    if set(entry) not in (
+                        {"semantic_digest", "event"},
+                        {"semantic_digest", "event", "status"},
+                    ):
+                        raise BrokerIntegrityError(
+                            f"role report outbox entry has an invalid shape: {outbox_path}"
+                        )
+                    event = validate_client_event(entry["event"])
+                    recorded_semantic_digest = str(entry["semantic_digest"])
+                    status = str(entry.get("status", "pending"))
+                    if status not in {"pending", "confirmed"}:
+                        raise BrokerIntegrityError(
+                            f"role report outbox entry has an invalid status: {outbox_path}"
+                        )
+                    event_semantic_payload = {
+                        key: value
+                        for key, value in event.items()
+                        if key not in {"created_at", "event_id", "payload_digest"}
+                    }
+                    actual_semantic_digest = hashlib.sha256(
+                        canonical_json(event_semantic_payload).encode("utf-8")
+                    ).hexdigest()
+                    if recorded_semantic_digest != actual_semantic_digest:
+                        raise BrokerIntegrityError(
+                            f"role report outbox semantic digest mismatch: {outbox_path}"
+                        )
+                    retained.append(
+                        {
+                            "semantic_digest": recorded_semantic_digest,
+                            "event": event,
+                            "status": status,
+                        }
+                    )
+                    if (
+                        recorded_semantic_digest == semantic_digest
+                        and status == "pending"
+                    ):
+                        existing_event = event
+                    if event["event_id"] == requested_event_id:
+                        requested_event = (recorded_semantic_digest, event)
+                    continue
+
+                # Read the 0.5.0 pre-fix digest/event-id pair format so an
+                # already persisted, same-second send still upgrades without
+                # allocating a duplicate ID.
+                if (
+                    isinstance(entry, list)
+                    and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], str)
+                ):
+                    retained.append([entry[0], entry[1]])
+                    if entry[0] == current_payload_digest:
+                        legacy_event_id = entry[1]
+                    continue
+                raise BrokerIntegrityError(
+                    f"role report outbox entry has an invalid shape: {outbox_path}"
+                )
+
+            if requested_event is not None:
+                recorded_semantic_digest, event = requested_event
+                if recorded_semantic_digest != semantic_digest:
+                    raise IdempotencyConflict(
+                        f"requested event id {requested_event_id} is retained for "
+                        "different semantic content"
+                    )
+                return event
+
+            if requested_event_id is None and existing_event is not None:
+                return existing_event
+
+            event_id = requested_event_id or legacy_event_id or new_event_id()
+            client_event = prepare_client_event(normalized, event_id=event_id)
+            retained = [
+                entry
+                for entry in retained
+                if not (
+                    isinstance(entry, list)
+                    and len(entry) == 2
+                    and entry[0] == current_payload_digest
+                )
+            ]
+            retained.append(
+                {
+                    "semantic_digest": semantic_digest,
+                    "event": client_event,
+                    "status": "pending",
+                }
+            )
+            if len(retained) > max_entries:
+                retained = retained[len(retained) - max_entries :]
+            _atomic_write_json(outbox_path, {"entries": retained})
+            return client_event
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def confirm_role_outbox_delivery(
+    outbox_path: Path,
+    *,
+    event_id: str,
+    payload_digest_value: str,
+) -> bool:
+    """Mark one exact pending outbox envelope as durably delivered.
+
+    Matching both event ID and payload digest prevents a late confirmation
+    from changing a newer identical report's pending envelope. Missing entries
+    are an idempotent no-op, which is required when concurrent callers both
+    retried the same pending event.
+    """
+
+    directory = outbox_path.parent
+    lock_fd = os.open(
+        directory / f".{outbox_path.name}.lock", os.O_RDWR | os.O_CREAT, 0o600
+    )
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                raw = json.loads(outbox_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise BrokerIntegrityError(
+                    f"cannot read role report outbox {outbox_path}: {exc}"
+                ) from exc
+            if not isinstance(raw, Mapping) or not isinstance(
+                raw.get("entries"), list
+            ):
+                raise BrokerIntegrityError(
+                    f"role report outbox has an invalid shape: {outbox_path}"
+                )
+
+            changed = False
+            entries: list[Any] = []
+            for entry in raw["entries"]:
+                if isinstance(entry, Mapping):
+                    if set(entry) not in (
+                        {"semantic_digest", "event"},
+                        {"semantic_digest", "event", "status"},
+                    ):
+                        raise BrokerIntegrityError(
+                            f"role report outbox entry has an invalid shape: {outbox_path}"
+                        )
+                    event = validate_client_event(entry["event"])
+                    status = str(entry.get("status", "pending"))
+                    if status not in {"pending", "confirmed"}:
+                        raise BrokerIntegrityError(
+                            f"role report outbox entry has an invalid status: {outbox_path}"
+                        )
+                    event_semantic_payload = {
+                        key: value
+                        for key, value in event.items()
+                        if key not in {"created_at", "event_id", "payload_digest"}
+                    }
+                    actual_semantic_digest = hashlib.sha256(
+                        canonical_json(event_semantic_payload).encode("utf-8")
+                    ).hexdigest()
+                    recorded_semantic_digest = str(entry["semantic_digest"])
+                    if recorded_semantic_digest != actual_semantic_digest:
+                        raise BrokerIntegrityError(
+                            f"role report outbox semantic digest mismatch: {outbox_path}"
+                        )
+                    if event["event_id"] == event_id:
+                        if event["payload_digest"] != payload_digest_value:
+                            raise BrokerIntegrityError(
+                                "role report outbox delivery confirmation digest mismatch: "
+                                f"{outbox_path}"
+                            )
+                        if status == "pending":
+                            status = "confirmed"
+                            changed = True
+                    entries.append(
+                        {
+                            "semantic_digest": recorded_semantic_digest,
+                            "event": event,
+                            "status": status,
+                        }
+                    )
+                    continue
+                if (
+                    isinstance(entry, list)
+                    and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], str)
+                ):
+                    entries.append(entry)
+                    continue
+                raise BrokerIntegrityError(
+                    f"role report outbox entry has an invalid shape: {outbox_path}"
+                )
+
+            if changed:
+                _atomic_write_json(outbox_path, {"entries": entries})
+            return changed
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
