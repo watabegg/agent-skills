@@ -17,19 +17,21 @@ git status --short --branch
 既存ループを再開するときは、スレッドの記憶ではなくリポジトリ上の `.ai/herdr-dev-loop/loops/<namespace>` を基準にします。namespaceは省略せず、セッション中の全コマンドで同じ値を使います。旧 `.ai/loop` は古い別形式として無視され、自動移行もされません。
 
 ```bash
-HLOOP="python3 \"${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop/scripts/hloop\" --namespace <namespace>"
-$HLOOP namespaces
-$HLOOP version
-$HLOOP doctor
-$HLOOP dashboard
-$HLOOP conductor --no-fail
+hloop() {
+  python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop/scripts/hloop" --namespace <namespace> "$@"
+}
+hloop namespaces
+hloop version
+hloop doctor
+hloop dashboard
+hloop conductor --no-fail
 ```
 
 `hloop` がPATHにないこと自体は問題ではありません。Skillの絶対パスを使えます。
 
 ## バージョンとセッションの識別
 
-Skillを使うManagerは、ほかの調査や変更より先に `$HLOOP version` を実行し、最初の進捗メッセージで `herdr-dev-loop <runtime-version> を使用します` と表示します。既存loopでは同時に `loop_skill_version` と `run_id` も表示します。これにより、Codexのセッション履歴だけを見ても、そのセッションがどの版のHLoop契約で動いたかを判別できます。
+Skillを使うManagerは、ほかの調査や変更より先に `hloop version` を実行し、最初の進捗メッセージで `herdr-dev-loop <runtime-version> を使用します` と表示します。既存loopでは同時に `loop_skill_version` と `run_id` も表示します。これにより、Codexのセッション履歴だけを見ても、そのセッションがどの版のHLoop契約で動いたかを判別できます。
 
 新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
 
@@ -44,9 +46,9 @@ herdr-dev-loop 0.5.0 / namespace <namespace> を使用します（loop_skill_ver
 0.5.0はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
 
 ```bash
-$HLOOP config path --json
-$HLOOP config validate --json
-$HLOOP config explain --repo <repo> --json
+hloop config path --json
+hloop config validate --json
+hloop config explain --repo <repo> --json
 ```
 
 探索順は`$HLOOP_CONFIG_HOME/config.toml`、`$XDG_CONFIG_HOME/herdr-dev-loop/config.toml`、`~/.config/herdr-dev-loop/config.toml`です。最初に見つかった1ファイルだけを読み、複数ファイルをmergeしません。
@@ -62,7 +64,7 @@ $HLOOP config explain --repo <repo> --json
 worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
 
 ```bash
-$HLOOP init ... \
+hloop init ... \
   --worker-setup-command 'pnpm install --frozen-lockfile' \
   --worker-setup-command 'pnpm generate' \
   --reviewer-setup-command 'pnpm install --frozen-lockfile'
@@ -71,8 +73,8 @@ $HLOOP init ... \
 実行結果はnamespace外の `.ai/herdr-dev-loop/experience/worktree-setup.json` に最大200件蓄積されます。保存するのはcommand、成否、return code、所要時間、role/run識別子だけで、stdout/stderrは秘密値混入を避けるため保存しません。成功した経験を次回の既定値にする場合は次を使います。
 
 ```bash
-$HLOOP experience recommend --command 'pnpm install --frozen-lockfile'
-$HLOOP experience show
+hloop experience recommend --command 'pnpm install --frozen-lockfile'
+hloop experience show
 ```
 
 明示的なsetup commandを付けずに次のloopを初期化すると、recommended commandsが引き継がれます。
@@ -82,8 +84,8 @@ $HLOOP experience show
 roleがartifactを書かず終了しても、artifactを捏造せず終了・再投入できます。
 
 ```bash
-$HLOOP agent abort R002 --reason 'Reviewer exited before artifact'
-$HLOOP agent requeue R002 --reason 'Retry with supported model'
+hloop agent abort R002 --reason 'Reviewer exited before artifact'
+hloop agent requeue R002 --reason 'Retry with supported model'
 ```
 
 paneは閉じられ、再投入時は古いworktreeを整理します。product差分が残るworktreeは誤消去を避けて停止し、Managerが本当に破棄すると判断した場合だけ `--force-cleanup` を付けます。
@@ -143,8 +145,8 @@ Reviewer protocolとreview modeは別の設定です。`single`は1 provider、1
 全laneとVerifierは同じhead SHAへ固定されます。CodexとClaudeが同じsemantic fingerprintを報告したfindingは`consensus`、一方だけなら`unique`です。どちらも二次確認へ進みます。P0、P1、仕様判断候補は2回の独立検証を必要とし、予算や独立Verifierが足りないfindingは`insufficient_evidence`として残ります。
 
 ```bash
-$HLOOP reviewer start --mode swarm --dry-run
-$HLOOP reviewer start --mode dual-swarm --dry-run
+hloop reviewer start --mode swarm --dry-run
+hloop reviewer start --mode dual-swarm --dry-run
 ```
 
 詳細は[Review Swarm And Dual Review Contract](references/review-swarm.md)を参照してください。
@@ -154,8 +156,8 @@ $HLOOP reviewer start --mode dual-swarm --dry-run
 利用者から新しい指示を受けたら、taskを変える前に入力を保存し、observableな受入条件へ変換します。
 
 ```bash
-$HLOOP input record --source manager-chat --text '<利用者の指示>'
-$HLOOP requirement new \
+hloop input record --source manager-chat --text '<利用者の指示>'
+hloop requirement new \
   --source-input U0001 \
   --acceptance '<観測可能な完了条件>' \
   --priority P1
@@ -166,7 +168,7 @@ raw inputは自動redactionされたlocal-only artifactで、checkpointやproduc
 元のmissionやplanから決まらない選択は`decision new`で記録します。`blocking-user`には影響taskを必ず指定し、そのtaskと未mergeの依存taskだけを止めます。ほかの安全な作業が残る間はloop全体をblockedにしません。利用者回答は`decision respond`、Managerが確認した確定結果は`decision resolve`で分けて記録します。
 
 ```bash
-$HLOOP decision new \
+hloop decision new \
   --title '<平易な質問>' --class blocking-user \
   --affects T004 \
   --option '<選択肢1>' --option '<選択肢2>' \
@@ -180,14 +182,14 @@ $HLOOP decision new \
 Managerはpaneを巡回する前にdurable inboxを処理します。
 
 ```bash
-$HLOOP inbox list
-$HLOOP manager next
+hloop inbox list
+hloop manager next
 ```
 
 対応事項がなければwake leaseを登録します。
 
 ```bash
-$HLOOP manager sleep --ttl-seconds 3600
+hloop manager sleep --ttl-seconds 3600
 ```
 
 report brokerはat-least-onceでwakeを記録するため、Managerはevent IDとlease generationで重複を除き、処理後に`hloop inbox ack <event-id>`を実行します。brokerを利用できないreportはrun専用spoolへ退避され、`hloop broker recover`で冪等に再生します。paneの確認は無言終了やcrashのfallbackであり、通常進捗のpollingには使いません。
@@ -268,10 +270,12 @@ Advisor policy:
 ### 1. Skillと環境を検査する
 
 ```bash
-HLOOP="python3 \"${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop/scripts/hloop\" --namespace <namespace>"
-$HLOOP version
-$HLOOP selftest
-$HLOOP doctor
+hloop() {
+  python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop/scripts/hloop" --namespace <namespace> "$@"
+}
+hloop version
+hloop selftest
+hloop doctor
 ```
 
 `selftest` はSkill内のschemaとartifact契約を検査します。Skill更新後は必ず実行します。`doctor` はHerdr、git、agent CLIなどを確認します。
@@ -279,7 +283,7 @@ $HLOOP doctor
 ### 2. ループを初期化する
 
 ```bash
-$HLOOP --repo <repo> init \
+hloop --repo <repo> init \
   --goal-id <goal-id> \
   --goal "<完了条件を含む具体的な目標>" \
   --base main --create-branch \
@@ -299,8 +303,8 @@ $HLOOP --repo <repo> init \
 ### 3. batchとtaskを作る
 
 ```bash
-$HLOOP --repo <repo> batch start "Initial implementation batch"
-$HLOOP --repo <repo> task new "<担当範囲の実装>" \
+hloop --repo <repo> batch start "Initial implementation batch"
+hloop --repo <repo> task new "<担当範囲の実装>" \
   --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 ```
 
@@ -309,7 +313,7 @@ $HLOOP --repo <repo> task new "<担当範囲の実装>" \
 契約変更にはtaskファイルと`STATE.json`の手編集ではなく、次を使います。`local-only`では変更後のcheckpointは不要です。`branch-history`を選んだ場合だけ、Worker起動前にcheckpointします。
 
 ```bash
-$HLOOP --repo <repo> task update T001 \
+hloop --repo <repo> task update T001 \
   --add-write-allow 'src/shared/**' \
   --add-acceptance '共有処理の回帰テストが通る'
 ```
@@ -319,14 +323,14 @@ $HLOOP --repo <repo> task update T001 \
 ### 4. bounded tickから始める
 
 ```bash
-$HLOOP --repo <repo> dashboard
-$HLOOP --repo <repo> tick --once --max-workers 3 --stop-on-user-decision
+hloop --repo <repo> dashboard
+hloop --repo <repo> tick --once --max-workers 3 --stop-on-user-decision
 ```
 
 初回は `tick --once` でWorkerの起動、artifact、pane、worktreeの対応を確認します。安定してからpumpへ進みます。
 
 ```bash
-$HLOOP --repo <repo> pump \
+hloop --repo <repo> pump \
   --max-transitions 20 --max-workers 3 --stop-on-triage
 ```
 
@@ -337,20 +341,20 @@ $HLOOP --repo <repo> pump \
 通常は `tick` または `pump` に任せます。確認や手動介入が必要な場合だけ次を使います。
 
 ```bash
-$HLOOP worker watch T001
-$HLOOP reviewer watch R001
-$HLOOP gap watch G001
-$HLOOP wait next --harvest
+hloop worker watch T001
+hloop reviewer watch R001
+hloop gap watch G001
+hloop wait next --harvest
 
-$HLOOP worker message T001 --file prompt.md
-$HLOOP reviewer message R001 --file review-followup.md
-$HLOOP gap message G001 --file gap-followup.md
+hloop worker message T001 --file prompt.md
+hloop reviewer message R001 --file review-followup.md
+hloop gap message G001 --file gap-followup.md
 ```
 
 Workerはproduct変更をcommitした後、成果物を次のように確定します。branch、base SHA、変更ファイル、`run_id`、`merge_ready`はhloopが生成します。
 
 ```bash
-$HLOOP worker finalize T001 \
+hloop worker finalize T001 \
   --validation-command 'pnpm test --filter target' \
   --validation-result passed \
   --validation-summary 'targeted test passed'
@@ -365,8 +369,8 @@ $HLOOP worker finalize T001 \
 レビューまたはGap Auditorのartifactは、先にfix-task draftへ変換します。
 
 ```bash
-$HLOOP triage review R001
-$HLOOP triage gap G001
+hloop triage review R001
+hloop triage gap G001
 ```
 
 Managerがdraftを確認した後、必要なものだけ `--create-tasks` でqueued taskにします。Advisorは `request`、`start`、`harvest`、`close` を明示的に実行します。`tick` と `pump` はAdvisorを自動起動しません。
@@ -399,7 +403,7 @@ Workerの結果をManagerが書き換えて `done` にすることはできま�
 - **`HERDR_ENV=1` がない**：Herdrの管理下で再実行します。通常のCodexセッションでpane操作を代替しません。
 - **dirty fileで止まる**：`git status --short` で対象外の変更を確認し、既存作業を壊さないよう別worktreeや専用ブランチへ移します。
 - **role起動前にcheckpointを要求される**：taskやManager-owned loop入力が対象HEADと一致していません。表示された`hloop checkpoint`を実行してから再起動します。失敗時点では新しいworktreeは作られません。
-- **paneがない、agentが固まった**：まず `$HLOOP conductor --no-fail` を実行し、表示された状態に対応する `watch`、`message`、`harvest` を使います。
+- **paneがない、agentが固まった**：まず `hloop conductor --no-fail` を実行し、表示された状態に対応する `watch`、`message`、`harvest` を使います。
 - **レビュー指摘がある**：`triage` 後に、修正、仕様判断、accepted risk、false positiveのいずれかをManagerが決めます。
 - **仕様判断が必要**：`DECISIONS.md` に候補と根拠を記録し、ユーザー判断が必要なら `USER_ACTION_REQUIRED.md` に分けて停止します。
 - **validationが失敗した**：失敗コマンドと統合ブランチの状態を確認します。rollbackが自明でない場合は勝手に戻しません。
@@ -409,12 +413,12 @@ Workerの結果をManagerが書き換えて `done` にすることはできま�
 ## 完了前の確認
 
 ```bash
-$HLOOP --repo <repo> dashboard
-$HLOOP --repo <repo> conductor --no-fail
-$HLOOP --repo <repo> validate
-$HLOOP --repo <repo> final-gates arm
-$HLOOP --repo <repo> finish
-$HLOOP --repo <repo> report
+hloop --repo <repo> dashboard
+hloop --repo <repo> conductor --no-fail
+hloop --repo <repo> validate
+hloop --repo <repo> final-gates arm
+hloop --repo <repo> finish
+hloop --repo <repo> report
 ```
 
 `manager_qa_profile` が `none` 以外なら、最終QAを `qa/FINAL.md` に記録します。`final-gates arm`は全task merge、batch close、review triage完了、fix-task draftなしを同一SHAで確認します。新taskを作るとarmは解除されます。`finish`だけがcurrent-headのvalidation、review、gap、Manager QA、cleanup、final gateを再確認してdoneへ進めます。

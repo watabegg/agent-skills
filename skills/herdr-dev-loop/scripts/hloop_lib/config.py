@@ -242,6 +242,11 @@ def _validate_role_table(desc: str, table: Any, errors: list[str], *, role: str)
                 minimum=MIN_REVIEW_PROBES,
                 maximum=MAX_REVIEW_PROBES,
             )
+    if "probe_count" in table and "probes_per_provider" in table:
+        errors.append(
+            f"{desc} must not set both probe_count and probes_per_provider in the same table; "
+            "they are exclusive reviewer topology knobs"
+        )
     if "providers" in table:
         value = table["providers"]
         if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):

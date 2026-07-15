@@ -40,6 +40,105 @@ class RequiredCommandPortabilityTests(unittest.TestCase):
                 )
 
 
+def _extract_hloop_function_snippets(text):
+    """Find each `hloop() { ... }` block, tracking brace depth (the body
+    contains a nested `${CODEX_HOME:-$HOME/.codex}` brace pair, so a naive
+    `[^}]*` regex would truncate at the wrong `}`)."""
+    snippets = []
+    start_marker = "hloop() {"
+    cursor = 0
+    while True:
+        start = text.find(start_marker, cursor)
+        if start == -1:
+            break
+        depth = 0
+        end = None
+        for pos in range(start, len(text)):
+            char = text[pos]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = pos
+                    break
+        if end is None:
+            break
+        snippets.append(text[start : end + 1])
+        cursor = end + 1
+    return snippets
+
+
+class PortableReadmeSnippetExecutionTests(unittest.TestCase):
+    """Actually execute README.md's `hloop()` snippet against HOME/CODEX_HOME paths containing spaces.
+
+    A plain `HLOOP="python3 \"...\" --namespace ..."` string variable does not
+    re-quote on `$HLOOP` expansion, so a space in $HOME/$CODEX_HOME used to
+    split the resolved path into multiple argv words. The shell function form
+    re-evaluates the quoted path fresh on every call, so it must keep working
+    even when those directories contain spaces.
+    """
+
+    def _snippets(self):
+        text = (SKILL_ROOT / "README.md").read_text(encoding="utf-8")
+        snippets = _extract_hloop_function_snippets(text)
+        self.assertTrue(snippets, "README.md must contain at least one hloop() shell function snippet")
+        return snippets
+
+    def _run_version(self, snippet, env):
+        import subprocess
+
+        script = snippet.replace("<namespace>", "test-namespace") + "\nhloop version"
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result
+
+    def test_snippet_resolves_default_codex_home_under_spaced_home(self):
+        import tempfile
+
+        snippets = self._snippets()
+        with tempfile.TemporaryDirectory() as tmp:
+            spaced_home = Path(tmp) / "home with space"
+            install_root = spaced_home / ".codex" / "skills" / "herdr-dev-loop"
+            install_root.parent.mkdir(parents=True)
+            os.symlink(SKILL_ROOT, install_root)
+
+            env = dict(os.environ)
+            env["HOME"] = str(spaced_home)
+            env.pop("CODEX_HOME", None)
+
+            for index, snippet in enumerate(snippets):
+                with self.subTest(snippet_index=index):
+                    result = self._run_version(snippet, env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("herdr-dev-loop", result.stdout)
+
+    def test_snippet_resolves_explicit_codex_home_under_spaced_path(self):
+        import tempfile
+
+        snippets = self._snippets()
+        with tempfile.TemporaryDirectory() as tmp:
+            spaced_codex_home = Path(tmp) / "codex home with space"
+            install_root = spaced_codex_home / "skills" / "herdr-dev-loop"
+            install_root.parent.mkdir(parents=True)
+            os.symlink(SKILL_ROOT, install_root)
+
+            env = dict(os.environ)
+            env["HOME"] = str(Path(tmp) / "unused-home")
+            env["CODEX_HOME"] = str(spaced_codex_home)
+
+            for index, snippet in enumerate(snippets):
+                with self.subTest(snippet_index=index):
+                    result = self._run_version(snippet, env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("herdr-dev-loop", result.stdout)
+
+
 class CheckPythonCapabilityTests(unittest.TestCase):
     def test_current_interpreter_is_capable(self):
         config.check_python_capability()
@@ -318,6 +417,44 @@ class ValidateConfigTests(unittest.TestCase):
             ],
         }
         config.validate_config(data)
+
+    def test_same_table_probe_count_and_probes_per_provider_is_error(self):
+        data = {
+            "version": 1,
+            "defaults": {
+                "reviewer": {"mode": "dual-swarm", "probe_count": 6, "probes_per_provider": 4}
+            },
+        }
+        with self.assertRaises(config.ConfigValidationError) as ctx:
+            config.validate_config(data)
+        self.assertIn("must not set both probe_count and probes_per_provider", str(ctx.exception))
+
+    def test_same_table_conflict_is_error_regardless_of_key_order(self):
+        forward = {
+            "version": 1,
+            "defaults": {"reviewer": {"probe_count": 6, "probes_per_provider": 4}},
+        }
+        reversed_order = {
+            "version": 1,
+            "defaults": {"reviewer": {"probes_per_provider": 4, "probe_count": 6}},
+        }
+        for name, data in (("forward", forward), ("reversed", reversed_order)):
+            with self.subTest(name=name), self.assertRaises(config.ConfigValidationError):
+                config.validate_config(data)
+
+    def test_same_table_conflict_in_scope_reviewer_is_error(self):
+        data = {
+            "version": 1,
+            "scope": [
+                {
+                    "path": "/tmp/repo",
+                    "reviewer": {"probes_per_provider": 4, "probe_count": 6},
+                }
+            ],
+        }
+        with self.assertRaises(config.ConfigValidationError) as ctx:
+            config.validate_config(data)
+        self.assertIn("must not set both probe_count and probes_per_provider", str(ctx.exception))
 
     def test_reviewer_providers_must_be_string_list(self):
         data = {"version": 1, "defaults": {"reviewer": {"providers": ["codex", 5]}}}
