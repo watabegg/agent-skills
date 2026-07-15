@@ -180,7 +180,7 @@ Treat P0 conductor findings as unsafe to continue. In particular, `danger-full-a
 
 `review_after_merges` and `gap_after_merges` count validated integration merges that have not yet been covered by a closed review or gap gate. Review is intentionally frequent; Gap Auditor is intentionally less frequent but still required before final completion when enabled.
 
-Structured role reports use `agent report`; Manager reads them through `inbox list` and `manager next`, registers a wake lease with `manager sleep`, and consumes a handled event with `inbox ack`. `broker recover` replays the local outage spool. These broker, inbox, input, and spool paths remain local-only and are never checkpointed.
+Structured role reports use `agent report --invocation-id <opaque-key>`; callers create one visible-ASCII, whitespace-free key per logical report and reuse it for uncertain retries before sending a newer report. `--invocation-id` is mutually exclusive with compatibility `--event-id`, and its guarantee ends when the bounded 64-entry role outbox evicts the original envelope. Manager reads reports through `inbox list` and `manager next`, registers a wake lease with `manager sleep`, and consumes a handled event with `inbox ack`. `broker recover` replays the local outage spool. These broker, inbox, input, and spool paths remain local-only and are never checkpointed.
 
 Use `pump` for queue-drain behavior:
 
