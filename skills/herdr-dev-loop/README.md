@@ -194,6 +194,14 @@ hloop manager sleep --ttl-seconds 3600
 
 report brokerはat-least-onceでwakeを記録するため、Managerはevent IDとlease generationで重複を除き、処理後に`hloop inbox ack <event-id>`を実行します。brokerを利用できないreportはrun専用spoolへ退避され、`hloop broker recover`で冪等に再生します。paneの確認は無言終了やcrashのfallbackであり、通常進捗のpollingには使いません。
 
+## 同一UIDの信頼境界
+
+HLoopは、同じOS UIDで動くAgentを信頼済みの協調主体として扱います。attempt-scoped credentialが保証するのは、reportの誤配送、stale attempt、role identityの取り違えを拒否することです。credential fileのmode `0600`は、別のOSユーザーと意図しない公開からtokenを守りますが、同じUIDのprocessから秘密を分離するものではありません。HLoopは、悪意あるsame-UID processに対する秘密分離、暗号学的なManager認証、強いsandbox境界を保証しません。
+
+subordinate roleの起動commandは、`HLOOP_ROLE_CONTEXT=1`、`HLOOP_ROLE_ID`、`HLOOP_ROLE_ATTEMPT_ID`、`HLOOP_MANAGER_REPO`をbest-effort contextとして継承します。このcontextを検出した場合、`hloop inbox list|show|ack`と`hloop manager next|sleep`は実行を拒否し、可能なら`HLOOP_MANAGER_REPO`の既存`JOURNAL.md`へ記録します。監査記録に失敗しても拒否は維持します。ただし、同じUIDのprocessは環境変数を削除または変更できるため、このguardはsubordinate roleによる誤操作を減らすpreflightであり、security boundaryではありません。
+
+semantic ACKはintegration gateです。未承認のattemptはfinalize、harvest、mergeを通過できませんが、ACK前の最初のfilesystem writeをOS権限で防ぐ機構ではありません。
+
 ## `/goal` のプロンプト例
 
 ### 標準的な統合ブランチ
