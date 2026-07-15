@@ -25,6 +25,7 @@ from .events import (
     ReportValidationError,
     assign_broker_sequence,
     canonical_json,
+    new_event_id,
     parse_rfc3339,
     utc_now,
     validate_client_event,
@@ -459,6 +460,12 @@ class BrokerStore:
         registering a wake lease in the same transaction, this closes the
         window where a report could otherwise be lost between an inbox check
         and a Manager going to sleep.
+
+        Unread ``milestone`` rows that share the same role, attempt, stage, and
+        summary as a later unread milestone are collapsed to that later row in
+        this projection only; the underlying append-only ``events`` and
+        ``inbox`` tables are untouched, and ``attention`` rows are never
+        collapsed even when their content repeats an earlier report.
         """
 
         transaction.require_active(self)
@@ -466,8 +473,9 @@ class BrokerStore:
         rows = transaction.connection.execute(
             """
             SELECT inbox.event_id, inbox.sequence, inbox.run_id, inbox.role_id,
-                   inbox.report_type, inbox.projected_at
+                   inbox.report_type, inbox.projected_at, events.event_json
             FROM inbox
+            JOIN events ON events.event_id = inbox.event_id
             WHERE inbox.run_id = ?
               AND inbox.event_id NOT IN (
                   SELECT event_id FROM inbox_acknowledgements
@@ -476,7 +484,7 @@ class BrokerStore:
             """,
             (run_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return _coalesce_unread_milestones([dict(row) for row in rows])
 
     def enqueue_unacknowledged_for_lease(
         self,
@@ -1104,6 +1112,93 @@ class BrokerStore:
         result = dict(row)
         result["active"] = bool(result["active"])
         return result
+
+
+def _coalesce_unread_milestones(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse unread ``milestone`` duplicates in the returned projection.
+
+    Only the last unread milestone for each ``(role_id, attempt_id, stage,
+    summary)`` key survives; earlier duplicates are dropped from the returned
+    list but were never mutated or deleted in storage. Every non-milestone
+    row (including every ``attention``) is always kept.
+    """
+
+    keep_index: dict[tuple[str, str, str, str], int] = {}
+    for index, row in enumerate(rows):
+        if row["report_type"] != "milestone":
+            continue
+        event = json.loads(row["event_json"])
+        key = (row["role_id"], event["attempt_id"], event["stage"], event["summary"])
+        keep_index[key] = index
+    kept = set(keep_index.values())
+    result: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if row["report_type"] == "milestone" and index not in kept:
+            continue
+        result.append({key: value for key, value in row.items() if key != "event_json"})
+    return result
+
+
+def role_outbox_event_id(
+    outbox_path: Path,
+    *,
+    payload_digest: str,
+    requested_event_id: str | None = None,
+    max_entries: int = 64,
+) -> str:
+    """Resolve and atomically persist one role's event ID before it is sent.
+
+    The event ID must be durable before the caller ever reaches the broker (or
+    the fallback spool): if the client is interrupted after the broker commits
+    but before it observes success, or the broker call itself never lands, a
+    retry that rebuilds an identical report body reuses the same event ID
+    recorded here instead of minting a fresh one. The broker's own per-event
+    idempotency then guarantees the retry produces no duplicate event, inbox
+    projection, or wake.
+    """
+
+    directory = outbox_path.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    lock_fd = os.open(directory / f".{outbox_path.name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # `_atomic_write_json` canonicalizes with `sort_keys=True`, which
+            # would silently reorder a top-level `{digest: event_id}` mapping
+            # alphabetically on every write. An explicit oldest-first list of
+            # pairs is the only way to actually trim by recency below.
+            entries: list[list[str]] = []
+            if outbox_path.exists():
+                try:
+                    raw = json.loads(outbox_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    raw = {}
+                if isinstance(raw, Mapping) and isinstance(raw.get("entries"), list):
+                    entries = [
+                        [str(pair[0]), str(pair[1])]
+                        for pair in raw["entries"]
+                        if isinstance(pair, list)
+                        and len(pair) == 2
+                        and isinstance(pair[0], str)
+                        and isinstance(pair[1], str)
+                    ]
+            existing = next(
+                (event_id for digest, event_id in entries if digest == payload_digest),
+                None,
+            )
+            event_id = requested_event_id or existing or new_event_id()
+            entries = [pair for pair in entries if pair[0] != payload_digest]
+            entries.append([payload_digest, event_id])
+            if len(entries) > max_entries:
+                entries = entries[len(entries) - max_entries :]
+            _atomic_write_json(outbox_path, {"entries": entries})
+            return event_id
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def fixed_wake_message(event: Mapping[str, Any], lease_generation: int) -> str:

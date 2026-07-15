@@ -29,6 +29,8 @@ from . import broker
 WAKE_SIGNAL = b"HLOOP_WAKE\n"
 WAKE_REPORT_TYPES = frozenset({"ack", "attention", "completion"})
 FALLBACK_STATUSES = frozenset({"idle", "blocked", "done", "unknown"})
+DEFAULT_WAKE_BURST_WINDOW_SECONDS = 0.2
+DEFAULT_WAKE_BURST_POLL_SECONDS = 0.02
 
 
 class SupervisorError(RuntimeError):
@@ -291,6 +293,8 @@ class ManagerSleepSupervisor:
         fallback_watches: Iterable[FallbackWatch] = (),
         seen_event_ids: Iterable[str] = (),
         poll_interval_seconds: float = 0.05,
+        wake_burst_window_seconds: float = DEFAULT_WAKE_BURST_WINDOW_SECONDS,
+        wake_burst_poll_seconds: float = DEFAULT_WAKE_BURST_POLL_SECONDS,
     ) -> ManagerSleepResult:
         """Register a lease and block until report, fallback, or timeout.
 
@@ -298,12 +302,23 @@ class ManagerSleepSupervisor:
         closes the report-arrives-before-sleep lost-wake window.  Report socket
         bytes are only a wake signal; durable spool/inbox records remain the
         source of truth and no role output is interpreted as a Manager prompt.
+
+        Once any wake-eligible (``ack``/``attention``/``completion``) report is
+        seen, the return is held open for a bounded ``wake_burst_window_seconds``
+        so a cross-role burst that lands moments later is delivered as one
+        batch instead of triggering a separate Manager wake per event. Every
+        event that arrives is still preserved in the durable inbox either way;
+        this window only changes how many are handed back together.
         """
 
         if timeout_seconds <= 0:
             raise SupervisorError("timeout_seconds must be positive")
         if poll_interval_seconds <= 0:
             raise SupervisorError("poll_interval_seconds must be positive")
+        if wake_burst_window_seconds < 0:
+            raise SupervisorError("wake_burst_window_seconds must not be negative")
+        if wake_burst_poll_seconds <= 0:
+            raise SupervisorError("wake_burst_poll_seconds must be positive")
         seen = {_single_line(item, "seen_event_id") for item in seen_event_ids}
         watches = tuple(fallback_watches)
         acquired_for_call = not self.acquired
@@ -334,7 +349,16 @@ class ManagerSleepSupervisor:
                     seen,
                     self.run_id,
                 )
-                if unread:
+            if unread:
+                unread, burst_drained = self._settle_wake_burst(
+                    seen,
+                    unread,
+                    deadline=deadline,
+                    burst_window_seconds=wake_burst_window_seconds,
+                    burst_poll_seconds=wake_burst_poll_seconds,
+                )
+                drained_total += burst_drained
+                with self.store.transaction() as transaction:
                     self.store.enqueue_unacknowledged_for_lease(
                         transaction,
                         run_id=self.run_id,
@@ -345,8 +369,7 @@ class ManagerSleepSupervisor:
                         created_at=created_at,
                     )
                     self._cancel_lease_in_transaction(transaction, created_at)
-                    lease_cancelled = True
-            if unread:
+                lease_cancelled = True
                 return ManagerSleepResult(
                     reason="report",
                     lease_generation=lease["generation"],
@@ -364,6 +387,14 @@ class ManagerSleepSupervisor:
                 unread, drained = self._drain_and_unread(seen)
                 drained_total += drained
                 if unread:
+                    unread, burst_drained = self._settle_wake_burst(
+                        seen,
+                        unread,
+                        deadline=deadline,
+                        burst_window_seconds=wake_burst_window_seconds,
+                        burst_poll_seconds=wake_burst_poll_seconds,
+                    )
+                    drained_total += burst_drained
                     return ManagerSleepResult(
                         reason="report",
                         lease_generation=lease["generation"],
@@ -418,6 +449,35 @@ class ManagerSleepSupervisor:
                 self.run_id,
             )
             return unread, len(drained)
+
+    def _settle_wake_burst(
+        self,
+        seen: set[str],
+        initial_unread: list[dict[str, Any]],
+        *,
+        deadline: float,
+        burst_window_seconds: float,
+        burst_poll_seconds: float,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Hold a detected wake open briefly to batch a cross-role burst.
+
+        Every unconsumed wake-eligible event is already durable before this
+        runs; this only widens what one ``ManagerSleepResult`` reports back so
+        near-simultaneous reports from other roles do not each force their own
+        Manager wake.
+        """
+
+        if burst_window_seconds <= 0:
+            return initial_unread, 0
+        burst_deadline = min(self._monotonic() + burst_window_seconds, deadline)
+        unread = initial_unread
+        drained_total = 0
+        while self._monotonic() < burst_deadline:
+            remaining = burst_deadline - self._monotonic()
+            time.sleep(min(burst_poll_seconds, max(remaining, 0.0)))
+            unread, drained = self._drain_and_unread(seen)
+            drained_total += drained
+        return unread, drained_total
 
     def _cancel_lease_in_transaction(
         self, transaction: broker.BrokerTransaction, timestamp: str
