@@ -231,6 +231,52 @@ class MergeTransactionTests(unittest.TestCase):
             ("watch", "continue", "abort", "retry"),
         )
 
+    def test_cherry_pick_progress_is_an_append_only_source_prefix(self):
+        active = replace(
+            self.transaction(),
+            mode="cherry-pick",
+            source_commits=("source-one", "source-two", "source-three"),
+        )
+        first_conflict = replace(
+            active,
+            status=MERGE_CONTENT_CONFLICT,
+            applied_commits=("source-one",),
+            applied_head="applied-head-one",
+        )
+        second_conflict = replace(
+            first_conflict,
+            applied_commits=("source-one", "source-two"),
+            applied_head="applied-head-two",
+        )
+        completed = replace(
+            second_conflict,
+            status=MERGE_COMPLETED,
+            applied_commits=active.source_commits,
+            applied_head="applied-head-three",
+        )
+
+        self.assertTrue(validate_merge_transaction(active, first_conflict).ok)
+        self.assertTrue(validate_merge_transaction(first_conflict, second_conflict).ok)
+        self.assertTrue(validate_merge_transaction(second_conflict, completed).ok)
+
+        rewritten = replace(
+            second_conflict,
+            applied_commits=("source-one",),
+            applied_head="applied-head-one",
+        )
+        result = validate_merge_transaction(second_conflict, rewritten)
+        self.assertIn("manual-integration-trace", {issue.code for issue in result.issues})
+
+    def test_cherry_pick_progress_rejects_head_change_without_prefix_change(self):
+        active = replace(
+            self.transaction(),
+            mode="cherry-pick",
+            source_commits=("source-one", "source-two"),
+        )
+        tampered = replace(active, applied_head="manual-head")
+        result = validate_merge_transaction(active, tampered)
+        self.assertEqual(result.issues[0].code, "manual-integration-trace")
+
 
 class CompletionLifecycleTests(unittest.TestCase):
     def test_done_target_drift_includes_both_shas_and_commit_count(self):

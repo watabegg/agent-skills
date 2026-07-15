@@ -820,6 +820,165 @@ effort = "medium"
         finally:
             hloop.configure_loop_namespace(previous)
 
+    def make_cherry_pick_recovery_fixture(self, root: Path):
+        repo = self.make_repo(root)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        subprocess.run(["git", "switch", "-c", "worker"], cwd=repo, check=True, capture_output=True)
+        (repo / "prefix.txt").write_text("prefix\n", encoding="utf-8")
+        subprocess.run(["git", "add", "prefix.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "prefix"], cwd=repo, check=True, capture_output=True)
+        (repo / "README.md").write_text("worker\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "conflict"], cwd=repo, check=True, capture_output=True)
+        (repo / "tail.txt").write_text("tail\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tail.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "tail"], cwd=repo, check=True, capture_output=True)
+        worker_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        source_commits = tuple(
+            subprocess.run(
+                ["git", "rev-list", "--reverse", f"{base}..{worker_head}"],
+                cwd=repo,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+        )
+        subprocess.run(["git", "switch", "master"], cwd=repo, check=True, capture_output=True)
+        (repo / "README.md").write_text("manager\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "manager"], cwd=repo, check=True, capture_output=True)
+        start_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        transaction = hloop.build_merge_transaction(
+            task_id="T001",
+            attempt_id="T001-A001",
+            branch="worker",
+            pre_merge_head=start_head,
+            worker_head=worker_head,
+            index_state=hloop.merge_transaction_index_state(repo, "HEAD"),
+            changed_paths=("README.md", "prefix.txt", "tail.txt"),
+            mode="cherry-pick",
+            source_commits=source_commits,
+        )
+        state = {
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "namespace": hloop.LOOP_NAMESPACE,
+            "phase": "blocked_conflict",
+            "integration_branch": "master",
+            "merge_mode": "cherry-pick",
+            "manager_qa_profile": "none",
+            "tasks": {
+                "T001": {
+                    "status": "blocked_merge_conflict",
+                    "branch": "worker",
+                    "write_allow": ["README.md", "prefix.txt", "tail.txt"],
+                    "write_deny": [],
+                }
+            },
+            "active_merge": {
+                **transaction.to_record(),
+                "worker_base_sha": base,
+            },
+        }
+        hloop.save_state(repo, state)
+        cherry_pick = subprocess.run(
+            ["git", "cherry-pick", *source_commits],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(cherry_pick.returncode, 0)
+        observed = hloop.observed_merge_transaction(repo, transaction)
+        hloop.transition_merge_transaction(
+            repo,
+            state,
+            transaction,
+            hloop.MERGE_CONTENT_CONFLICT,
+            observed=observed,
+        )
+        hloop.save_state(repo, state)
+        return repo, state, start_head, source_commits, observed
+
+    def test_multi_commit_cherry_pick_continue_and_abort_accept_applied_prefix(self):
+        previous = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-cherry-pick-recovery")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repo, state, _, source_commits, observed = self.make_cherry_pick_recovery_fixture(
+                    Path(directory)
+                )
+                self.assertEqual(observed.applied_commits, source_commits[:1])
+                legacy_active = dict(state["active_merge"])
+                for field in ("source_commits", "applied_commits", "applied_head"):
+                    legacy_active.pop(field, None)
+                legacy_observed = hloop.preflight_merge_transaction(
+                    repo, legacy_active, "continue"
+                )
+                self.assertEqual(legacy_observed.source_commits, source_commits)
+                (repo / "README.md").write_text("resolved\n", encoding="utf-8")
+                subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+
+                self.assertEqual(hloop.cmd_merge_continue(repo, state, "T001"), 0)
+
+                self.assertEqual(state["tasks"]["T001"]["status"], "merged")
+                self.assertEqual((repo / "prefix.txt").read_text(encoding="utf-8"), "prefix\n")
+                self.assertEqual((repo / "tail.txt").read_text(encoding="utf-8"), "tail\n")
+                self.assertNotIn("active_merge", state)
+
+            with tempfile.TemporaryDirectory() as directory:
+                repo, state, start_head, _, _ = self.make_cherry_pick_recovery_fixture(
+                    Path(directory)
+                )
+                active = state["active_merge"]
+                self.assertEqual(
+                    hloop.preflight_merge_transaction(repo, active, "retry").pre_merge_head,
+                    start_head,
+                )
+                self.assertEqual(hloop.cmd_merge_abort(repo, state, "T001"), 0)
+                restored = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                self.assertEqual(restored, start_head)
+                self.assertEqual(state["tasks"]["T001"]["status"], "result_reported")
+                self.assertFalse((hloop.merge_git_dir(repo) / "sequencer").exists())
+                status_lines = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=repo,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.splitlines()
+                self.assertEqual(
+                    [line for line in status_lines if not line.endswith(" .ai/")],
+                    [],
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_cherry_pick_recovery_rejects_sequencer_tampering(self):
+        previous = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("test-cherry-pick-tamper")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repo, state, _, _, _ = self.make_cherry_pick_recovery_fixture(Path(directory))
+                todo_path = hloop.merge_git_dir(repo) / "sequencer" / "todo"
+                todo_lines = todo_path.read_text(encoding="utf-8").splitlines()
+                self.assertGreaterEqual(len(todo_lines), 2)
+                todo_path.write_text("\n".join(reversed(todo_lines)) + "\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(hloop.HLoopError, "expected source suffix"):
+                    hloop.preflight_merge_transaction(repo, state["active_merge"], "continue")
+        finally:
+            hloop.configure_loop_namespace(previous)
+
     def test_message_envelopes_are_bound_to_each_role_without_undefined_names(self):
         state = {
             "run_id": "run-1",
