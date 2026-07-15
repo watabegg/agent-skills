@@ -146,6 +146,7 @@ def scenario_config_migration(ctx: dict[str, Any]) -> dict[str, Any]:
 [defaults]
 max_workers = 2
 session_cleanup = "archive"
+specification_scout = "always"
 
 [defaults.worker]
 provider = "codex"
@@ -200,6 +201,7 @@ probes_per_provider = 4
     require(state["schema_revision"] == 1, "init did not create revision 1")
     require(state["skill_version"] == ctx["runtime_version"], "state version mismatch")
     require(state["resolved_config"]["max_workers"] == 2, "config snapshot missing")
+    require(state["specification_scout"] == "always", "Scout policy missing")
 
     config_text = config_path.read_text(encoding="utf-8").replace(
         "max_workers = 2", "max_workers = 4"
@@ -709,20 +711,56 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
     )
     state = json.loads(path.read_text(encoding="utf-8"))
     require(secret not in json.dumps(state), "raw credential leaked into STATE")
+    input_file = root / "synthetic-user-input.txt"
+    input_file.write_text("preserve compatibility in the public API\n", encoding="utf-8")
     run(
         hloop_command(
             repo,
             namespace,
-            "requirement",
-            "new",
-            "--id",
-            "REQ-001",
-            "--source-input",
+            "input",
+            "record",
+            "--source",
+            "synthetic-file",
+            "--file",
+            str(input_file),
+        ),
+        cwd=root,
+        env=env,
+    )
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "requirements",
+            "extract",
+            "--input",
             "U0001",
+            "--input",
+            "U0002",
             "--acceptance",
             "structured release evidence exists",
             "--priority",
             "P1",
+        ),
+        cwd=root,
+        env=env,
+    )
+    draft_state = json.loads(path.read_text(encoding="utf-8"))
+    require(not draft_state.get("requirements"), "draft silently entered accepted ledger")
+    require(
+        draft_state["requirement_drafts"]["DRQ-001"]["confirmation_required"],
+        "draft confirmation boundary missing",
+    )
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "requirements",
+            "accept",
+            "--draft",
+            "DRQ-001",
+            "--id",
+            "REQ-001",
         ),
         cwd=root,
         env=env,
@@ -792,6 +830,53 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
     question_path = path.parent / "decisions" / "D001" / "QUESTION.md"
     require(question_path.is_file(), "decision question artifact missing")
     require("# 判断のお願い" in question_path.read_text(encoding="utf-8"), "liaison question is not plain Japanese")
+    no_herdr_env = dict(env)
+    no_herdr_env.pop("HERDR_ENV", None)
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "specification-scout",
+            "start",
+            "--force",
+        ),
+        cwd=root,
+        env=no_herdr_env,
+    )
+    fallback_state = json.loads(path.read_text(encoding="utf-8"))
+    require(
+        fallback_state["specification_scout_run"]["mode"] == "manager-fallback",
+        "Scout fallback missing",
+    )
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "specification-scout",
+            "close",
+            "--verdict",
+            "no-decision",
+            "--reason",
+            "synthetic Manager review found no extra decision",
+        ),
+        cwd=root,
+        env=env,
+    )
+    liaison = run(
+        hloop_command(
+            repo,
+            namespace,
+            "decision",
+            "liaison",
+            "start",
+            "--id",
+            "D001",
+        ),
+        cwd=root,
+        env=no_herdr_env,
+    )
+    require("# 判断のお願い" in liaison.stdout, "Liaison fallback did not present question")
+    require("T004" not in liaison.stdout, "Liaison user text leaked an internal task id")
     run(
         hloop_command(
             repo,
@@ -840,8 +925,12 @@ def scenario_requirements_decisions(ctx: dict[str, Any]) -> dict[str, Any]:
     require(all(item.is_file() for item in artifact_paths), "requirement/context/progress/decision artifact missing")
     return {
         "input_redacted_from_state": True,
+        "input_file_and_text": True,
+        "confirmation_boundary": True,
         "requirement_status": projected["progress"]["status"],
         "decision_status": final_state["decisions"]["D001"]["status"],
+        "scout_status": final_state["specification_scout_run"]["status"],
+        "liaison_mode": final_state["decision_liaisons"]["D001"]["mode"],
     }
 
 
@@ -961,7 +1050,30 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
         "T999": {
             "status": "merged",
             "branch": "synthetic/already-merged",
+            "title": "Synthetic confirmed fix",
             "cleanup_done": True,
+        }
+    }
+    worker_result = path.parent / "results" / "T999" / "result.md"
+    worker_result.parent.mkdir(parents=True, exist_ok=True)
+    worker_result.write_text("# Synthetic Worker Result\n", encoding="utf-8")
+    state["tasks"]["T999"]["result_path"] = str(worker_result)
+    state["tasks"]["T999"]["harvested_at"] = now()
+    review_path = path.parent / "reviews" / "R999.md"
+    review_path.parent.mkdir(parents=True, exist_ok=True)
+    review_path.write_text("# Synthetic confirmed review\n", encoding="utf-8")
+    state["reviews"] = {
+        "R999": {
+            "status": "triaged",
+            "gate_status": "triaged",
+            "head_sha": target,
+            "closed_head_sha": target,
+            "review_path": str(review_path),
+            "confirmed_finding_fingerprints": ["sha256:" + "f" * 64],
+            "created_fix_tasks": ["T999"],
+            "verdict": "accepted-risk",
+            "triage_reason": "synthetic residual compatibility risk",
+            "harvested_at": now(),
         }
     }
     state["batches"] = {"B001": {"status": "closed", "title": "synthetic batch"}}
@@ -995,7 +1107,11 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     require(finished["phase"] == "done", "finish did not reach done")
     require(finished["final_target_sha"] == target, "finish target mismatch")
     require(report_path.is_file(), "finish report missing")
-    require("# Final Outcome" in report_path.read_text(encoding="utf-8"), "FINAL is not OutcomeReport-rendered")
+    report_text = report_path.read_text(encoding="utf-8")
+    require("# Final Outcome" in report_text, "FINAL is not OutcomeReport-rendered")
+    require("sha256:" + "f" * 64 in report_text, "confirmed finding missing from FINAL")
+    require("T999" in report_text, "confirmed fix missing from FINAL")
+    require("synthetic residual compatibility risk" in report_text, "accepted risk missing from FINAL")
     return {
         "phase": finished["phase"],
         "target_sha": target,

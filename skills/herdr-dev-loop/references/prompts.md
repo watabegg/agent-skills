@@ -1,6 +1,14 @@
 # Prompt Templates
 
-`scripts/hloop` renders concrete prompts from these contracts. Keep prompts short and force agents back to `.ai/herdr-dev-loop/loops/<namespace>` files. Worker, Gap Auditor, Reviewer, and explicit Advisor prompts are usually sent into interactive role-agent TUI panes. Codex is the default provider, but Manager may select Claude or a specific model per role. Use non-interactive exec runners only for bounded automation where Manager does not need live TUI inspection.
+`scripts/hloop` renders concrete prompts from these contracts. Keep prompts short and force agents back to `.ai/herdr-dev-loop/loops/<namespace>` files. Worker, Gap Auditor, Reviewer, Specification Scout, Decision Liaison, and explicit Advisor prompts are usually sent into interactive role-agent TUI panes. Codex is the default provider, but Manager may select Claude or a specific model per role. Use non-interactive exec runners only for bounded automation where Manager does not need live TUI inspection.
+
+## Specification Scout Prompt Shape
+
+The dedicated `S001` Scout runs before implementation dispatch when its policy requires it. Its prompt pins the integration HEAD, lists the automatic trigger reasons, and directs the role to inspect MISSION, PLAN, PROFILE, DECISIONS, accepted requirements, queued tasks, and repository evidence. It must not edit product code or decide user-visible behavior. Its sole output is `decisions/SCOUT.md`, containing unresolved questions, affected work, two or three options, tradeoffs and rollback cost, a repository-supported recommendation, safe work that may continue, and delay cost. A no-decision result must be explicit.
+
+## Decision Liaison Prompt Shape
+
+The dedicated Liaison receives exactly one unresolved user decision and writes only `decisions/<decision-id>/RESPONSE.md`. The prompt requires plain Japanese and forbids decision IDs, task IDs, state-machine terms, and logical expressions in user-facing text. It must present two or three choices, benefits and drawbacks, the recommendation and rationale, work that can safely continue, and a free-text response route. The Liaison records the response but never resolves the decision; Manager validates and resolves it separately. If a pane cannot start, HLoop prints this plain-language question as the Manager fallback.
 
 ## Worker Prompt Shape
 
