@@ -4213,6 +4213,16 @@ def collect_worker_inventory(
                     f"hloop worker harvest {task_id}",
                 )
             )
+        elif artifact["readiness_reason"] == "seal-required":
+            issues.append(
+                make_issue(
+                    "P1",
+                    "worker-seal-required",
+                    f"worker:{task_id}",
+                    f"Worker {task_id} left a valid uncommitted handoff awaiting Manager seal.",
+                    f"hloop worker seal {task_id}",
+                )
+            )
         else:
             pane_issue = pane_issue_for_running("worker", task_id, pane)
             if pane_issue:
@@ -9272,6 +9282,28 @@ def run_seal_validation_command(worktree: Path, command: str) -> tuple[bool, str
     return proc.returncode == 0, proc.stdout or ""
 
 
+def rollback_validation_command_side_effects(worktree: Path, pre_validation_scope: set[str]) -> None:
+    """Undo whatever a failing Manager validation command left behind.
+
+    A validation command run during `hloop worker seal` may mutate the
+    worktree (formatters, generated files, partial build output) even when
+    it exits non-zero. Left in place, those paths would not match the
+    handoff's declared `changed_files`, so every retried seal would fail
+    closed forever on "stale handoff artifact" with no way to recover short
+    of a human deleting files by hand. Restore the worktree to exactly its
+    pre-validation dirty state instead: delete any newly introduced
+    untracked path and restore any newly modified or deleted tracked path
+    from `HEAD`.
+    """
+
+    current = set(porcelain_paths_no_renames(worktree))
+    new_paths = sorted(current - pre_validation_scope)
+    if not new_paths:
+        return
+    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "clean", "-f", "--", *new_paths], check=False)
+    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "checkout", "HEAD", "--", *new_paths], check=False)
+
+
 def read_worker_handoff_artifact(
     result_path: Path,
     result_rel: Path,
@@ -9301,16 +9333,95 @@ def read_worker_handoff_artifact(
         raise HLoopError(
             f"stale or mismatched Worker handoff artifact: {identity_error}: {result_rel.as_posix()}"
         )
+    # An empty/missing `attempt_id` must fail closed exactly like a mismatched
+    # one -- it must never be silently treated as belonging to the active
+    # attempt.
     reported_attempt = str(handoff_meta.get("attempt_id") or "")
-    if reported_attempt and reported_attempt != expected_attempt:
+    if reported_attempt != expected_attempt:
         raise HLoopError(
             f"handoff attempt_id mismatch: expected active attempt {expected_attempt}, "
-            f"got {reported_attempt}"
+            f"got {reported_attempt or '(empty)'}"
         )
     status = str(handoff_meta.get("status") or "")
     if status not in TASK_STATUSES_FINAL:
         raise HLoopError(f"invalid handoff status in {result_rel.as_posix()}: {status}")
     return handoff_meta
+
+
+def resume_staged_seal_transaction(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    worktree: Path,
+    expected_attempt: str,
+    result_rel: Path,
+    pre_staged: list[str],
+) -> int | None:
+    """Finish a seal that staged its commit and then crashed before committing.
+
+    `cmd_worker_seal` records a `seal_transaction` marker in Worker state --
+    the attempt, result path, exact staged paths, and commit message -- right
+    before `git add -A`, and clears it right after the commit lands. If the
+    Manager process dies in between, the next `hloop worker seal` invocation
+    finds the index already staged; if that staged content exactly matches
+    the recorded transaction, this completes the commit directly, without
+    losing work, without manual Git repair, and without re-running Manager
+    validation commands that already ran and were recorded before the crash.
+    Returns the seal exit code if this was a recognized, matching, and safely
+    resumable transaction; returns ``None`` if the staged index cannot be
+    attributed to a recorded transaction (including a partial `git add -A`
+    that never finished) so the caller fails closed as before.
+    """
+
+    transaction = task_state.get("seal_transaction")
+    if not isinstance(transaction, dict):
+        return None
+    if str(transaction.get("attempt_id") or "") != expected_attempt:
+        return None
+    if str(transaction.get("result_rel") or "") != result_rel.as_posix():
+        return None
+    expected_scope = normalize_list(transaction.get("staged_paths"))
+    commit_message = str(transaction.get("commit_message") or "")
+    if not expected_scope or not commit_message:
+        return None
+    if set(pre_staged) != set(expected_scope):
+        return None
+
+    # `pre_staged` already matches the recorded scope exactly, so the prior
+    # `git add -A` ran to completion before the crash -- restaging is
+    # unnecessary and, for a path whose only change was a deletion, would
+    # fail outright (a fully staged deletion no longer matches any pathspec
+    # in the index or worktree). Only the TOCTOU recheck below is needed
+    # before completing the commit.
+    remaining_dirty = porcelain_paths_no_renames(worktree)
+    cached_files = cached_diff_paths_no_renames(worktree)
+    if remaining_dirty or set(cached_files) != set(expected_scope):
+        run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "reset"], check=False)
+        task_state.pop("seal_transaction", None)
+        save_state(repo, state)
+        raise HLoopError(
+            f"seal resume aborted for {task_id}: worktree changed since the crashed seal "
+            f"attempt staged this transaction (remaining dirty: {remaining_dirty}; staged "
+            f"{sorted(cached_files)} != expected {sorted(expected_scope)}); inspect the "
+            "worktree before retrying"
+        )
+
+    run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(worktree), "commit", "-m", commit_message],
+        check=True,
+        capture=False,
+    )
+    head_sha = git(worktree, ["rev-parse", "HEAD"])
+    task_state.pop("seal_transaction", None)
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Resumed and sealed Worker handoff for `{task_id}` at attempt `{expected_attempt}` "
+        f"after a crash left the seal transaction staged ({head_sha}).",
+    )
+    print(f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha} (resumed after crash)")
+    return 0
 
 
 def cmd_worker_seal(args: argparse.Namespace) -> int:
@@ -9356,8 +9467,16 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     if expected_branch and branch != expected_branch:
         raise HLoopError(f"Worker branch mismatch: expected {expected_branch}, got {branch}")
 
+    result_rel = LOOP_DIR / "results" / task_id / "result.md"
+    result_path = worktree / result_rel
+
     pre_staged = cached_diff_paths_no_renames(worktree)
     if pre_staged:
+        resumed = resume_staged_seal_transaction(
+            repo, state, task_id, task_state, worktree, expected_attempt, result_rel, pre_staged
+        )
+        if resumed is not None:
+            return resumed
         raise HLoopError(
             f"cannot seal {task_id}: worktree index already has staged changes, which a "
             f"durable handoff must never produce: {sorted(pre_staged)}"
@@ -9366,9 +9485,6 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     meta = read_frontmatter(task_file(repo, task_id))
     if str(meta.get("id") or "") != task_id:
         raise HLoopError(f"task file mismatch for {task_id}")
-
-    result_rel = LOOP_DIR / "results" / task_id / "result.md"
-    result_path = worktree / result_rel
 
     # Read-only precheck: confirm there is a genuinely complete, well-formed
     # handoff before doing anything that could disrupt a Worker that has not
@@ -9449,10 +9565,19 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 f"cannot seal {task_id} as status done without at least one Manager "
                 "--validation-command"
             )
+        pre_validation_scope = set(full_scope)
         for command in manager_validation_commands:
             passed, output = run_seal_validation_command(worktree, command)
             manager_validation_results.append("passed" if passed else "failed")
             if not passed:
+                # A failing validation command may still have mutated the
+                # worktree (formatters, generated files, partial builds).
+                # Roll those side effects back to the pre-validation dirty
+                # state so the worktree matches the handoff's declared
+                # `changed_files` again -- otherwise a retried seal would
+                # fail closed forever on "stale handoff artifact" with no
+                # way to recover short of manual cleanup.
+                rollback_validation_command_side_effects(worktree, pre_validation_scope)
                 raise HLoopError(
                     f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
                     + output
@@ -9475,6 +9600,27 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 )
         full_scope = post_scope
         dirty = post_dirty
+        validation_recorded = bool(manager_validation_commands)
+        validation_commands = manager_validation_commands
+        validation_results = manager_validation_results
+        validation_summary = args.validation_summary or handoff_meta.get("validation_summary") or ""
+    else:
+        # Manager does not re-run validation for a `partial`/`blocked`/
+        # `failed` handoff -- there is nothing to measure. Preserve the
+        # Worker's own declared validation evidence exactly as reported,
+        # after verifying it is internally consistent, rather than
+        # overwriting it with an empty record and discarding whatever the
+        # Worker actually ran.
+        worker_validation_issue = worker_validation_error(handoff_meta)
+        if worker_validation_issue:
+            raise HLoopError(
+                f"cannot seal {task_id}: Worker-reported validation is inconsistent: "
+                f"{worker_validation_issue}"
+            )
+        validation_recorded = normalize_bool(handoff_meta.get("validation_recorded"))
+        validation_commands = normalize_list(handoff_meta.get("validation_commands"))
+        validation_results = normalize_list(handoff_meta.get("validation_results"))
+        validation_summary = args.validation_summary or handoff_meta.get("validation_summary") or ""
 
     merge_ready = status == "done" and bool(manager_validation_commands) and not blocking_questions and all(
         result == "passed" for result in manager_validation_results
@@ -9483,15 +9629,30 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         result_path,
         {
             "changed_files": full_scope,
-            "validation_recorded": bool(manager_validation_commands),
-            "validation_commands": manager_validation_commands,
-            "validation_results": manager_validation_results,
-            "validation_summary": args.validation_summary or handoff_meta.get("validation_summary") or "",
+            "validation_recorded": validation_recorded,
+            "validation_commands": validation_commands,
+            "validation_results": validation_results,
+            "validation_summary": validation_summary,
             "merge_ready": merge_ready,
         },
     )
     if result_rel.as_posix() not in dirty:
         dirty = [*dirty, result_rel.as_posix()]
+
+    commit_message = f"ai-loop({task_id}): seal worker handoff ({expected_attempt})"
+
+    # Record this transaction before staging so a crash between `git add -A`
+    # and `git commit` leaves a recoverable trail: the next `hloop worker
+    # seal` invocation recognizes and resumes exactly this staged state via
+    # `resume_staged_seal_transaction` instead of failing closed and
+    # requiring manual Git repair.
+    task_state["seal_transaction"] = {
+        "attempt_id": expected_attempt,
+        "result_rel": result_rel.as_posix(),
+        "staged_paths": dirty,
+        "commit_message": commit_message,
+    }
+    save_state(repo, state)
 
     run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "add", "-A", "--", *dirty], check=True)
 
@@ -9502,6 +9663,8 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     cached_files = cached_diff_paths_no_renames(worktree)
     if remaining_dirty or set(cached_files) != set(dirty):
         run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "reset"], check=False)
+        task_state.pop("seal_transaction", None)
+        save_state(repo, state)
         raise HLoopError(
             f"seal aborted for {task_id}: worktree changed while staging (remaining dirty: "
             f"{remaining_dirty}; staged {sorted(cached_files)} != expected {sorted(dirty)})"
@@ -9514,12 +9677,14 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
             str(worktree),
             "commit",
             "-m",
-            f"ai-loop({task_id}): seal worker handoff ({expected_attempt})",
+            commit_message,
         ],
         check=True,
         capture=False,
     )
     head_sha = git(worktree, ["rev-parse", "HEAD"])
+    task_state.pop("seal_transaction", None)
+    save_state(repo, state)
     journal(repo, f"Sealed Worker handoff for `{task_id}` at attempt `{expected_attempt}` ({head_sha}).")
     print(f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha}")
     return 0
@@ -10179,6 +10344,16 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     identity_error = artifact_identity_error(state, task_id, "worker", task_state, meta)
     if identity_error:
         raise HLoopError(f"stale or mismatched Worker artifact: {identity_error}: {result}")
+    expected_attempt = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or "")
+    reported_attempt = str(meta.get("attempt_id") or "")
+    if expected_attempt and reported_attempt != expected_attempt:
+        # An empty/missing `attempt_id` on the artifact must fail closed here
+        # too, exactly like a mismatched one -- a stale result left over from
+        # a superseded attempt must never be silently harvested as current.
+        raise HLoopError(
+            f"result attempt_id mismatch: expected active attempt {expected_attempt}, "
+            f"got {reported_attempt or '(empty)'}: {result}"
+        )
     status = str(meta.get("status", ""))
     if status not in TASK_STATUSES_FINAL:
         raise HLoopError(f"invalid result status in {result}: {status}")
@@ -13485,9 +13660,21 @@ def cmd_tick(args: argparse.Namespace) -> int:
         if task.get("status") == "running"
     ]
     if running_workers:
+        seal_required_workers = []
+        for task_id in running_workers:
+            task = state["tasks"][task_id]
+            worktree = Path(task.get("worktree") or default_worktree(repo, task_id, state))
+            result = result_file(worktree, task_id)
+            if artifact_readiness(repo, state, task_id, "worker", task, result)[1] == "seal-required":
+                seal_required_workers.append(task_id)
         if not args.dry_run:
             state["phase"] = "waiting_worker"
             save_state(repo, state)
+        if seal_required_workers:
+            print(
+                "seal required: "
+                + ", ".join(f"hloop worker seal {task_id}" for task_id in seal_required_workers)
+            )
         print("waiting for worker result: " + ", ".join(running_workers))
         return 0
 
@@ -15406,6 +15593,16 @@ def artifact_readiness(
                 worktree, agent_id, str(meta.get("head_sha") or "HEAD")
             )
             if commit_state != "committed":
+                if commit_state == "not-committed" and normalize_bool(meta.get("handoff")):
+                    # A well-formed, correctly identified, non-stale handoff
+                    # that simply has not been committed yet is not a broken
+                    # or missing artifact -- it is exactly the durable
+                    # `hloop worker finalize --handoff` shape awaiting
+                    # `hloop worker seal`. Report that distinctly so callers
+                    # (wait, dashboard/status, tick, pump) can surface an
+                    # actionable seal transition instead of treating it as a
+                    # terminal agent with no artifact.
+                    return False, "seal-required"
                 return False, commit_state
     elif role == "reviewer" and str(meta.get("status") or "") not in REVIEW_ARTIFACT_STATUSES:
         return False, "invalid-status"
@@ -15439,6 +15636,7 @@ def agent_wait_status(repo: Path, state: dict[str, Any], agent_id: str) -> dict[
             pane_status = "missing-or-closed"
     status = agent_gate_status(agent) if role in {"reviewer", "gap", "advisor"} else str(agent.get("status") or "")
     ready, readiness_reason = artifact_readiness(repo, state, agent_id, role, agent, path)
+    seal_required = readiness_reason == "seal-required"
     return {
         "id": agent_id,
         "role": role,
@@ -15446,7 +15644,11 @@ def agent_wait_status(repo: Path, state: dict[str, Any], agent_id: str) -> dict[
         "pane_id": pane_id,
         "pane_status": pane_status,
         "terminal_status": terminal_status,
-        "terminal_without_artifact": bool(terminal_status and not ready),
+        # A valid uncommitted handoff (seal-required) is not a terminal agent
+        # missing its artifact -- it has one, and simply needs `hloop worker
+        # seal` before it can be harvested. Never route it into abort/requeue.
+        "terminal_without_artifact": bool(terminal_status and not ready and not seal_required),
+        "seal_required": seal_required,
         "artifact_path": path,
         "artifact_ready": ready,
         "readiness_reason": readiness_reason,
@@ -15485,6 +15687,14 @@ def cmd_wait(args: argparse.Namespace) -> int:
                     return cmd_harvest(harvest_args)
             print(f"harvest with: hloop harvest {item['id']}")
             return 0
+        seal_required = [item for item in last_statuses if item.get("seal_required")]
+        if seal_required:
+            item = seal_required[0]
+            print(
+                f"seal required: {item['id']} ({item['role']}) has a valid uncommitted "
+                f"handoff; run `hloop worker seal {item['id']}` to validate and commit it"
+            )
+            return 3
         terminal = [item for item in last_statuses if item.get("terminal_without_artifact")]
         if terminal:
             item = terminal[0]

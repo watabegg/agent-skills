@@ -267,26 +267,33 @@ Prefer `hloop worker finalize <task-id> --validation-command ... --validation-re
 
 ### Durable handoff and Manager seal
 
-A Codex `workspace-write` Worker may not be able to run `git add`/`git commit` at all. `hloop worker finalize <task-id> --handoff` supports this: it tolerates dirty product paths that are already inside `write_allow`, writes `result.md` with `handoff: true`, and never invokes Git. Nothing is staged or committed; the Worker's product edits and `result.md` remain plain uncommitted files in the worktree.
+A Codex `workspace-write` Worker may not be able to run `git add`/`git commit` at all. `hloop worker finalize <task-id> --handoff` supports this: it tolerates dirty product paths that are already inside `write_allow`, writes `result.md` with `handoff: true`, and performs no Git metadata writes. Nothing is staged or committed; the Worker's product edits and `result.md` remain plain uncommitted files in the worktree.
 
 Manager (not the Worker) then runs `hloop worker seal <task-id> [--attempt-id <id>] [--validation-command <command>...] [--validation-summary <text>]` from the Manager checkout to turn that handoff into a normal committed Worker result. Seal fails closed, before staging or committing anything, if any of the following hold:
 
 - the task has no running attempt, or `--attempt-id` does not match the Manager's recorded active attempt
 - the semantic ACK barrier is not approved
 - the Worker's pane cannot be confirmed quiesced and closed first (see below)
-- the worktree's current branch does not match the task's recorded branch, or the index already has staged changes
+- the worktree's current branch does not match the task's recorded branch, or the index already has staged changes that do not exactly match a seal transaction this same command previously recorded and crashed before committing (see crash recovery below)
 - `result.md` is missing, has no frontmatter, or does not record `handoff: true`
 - the artifact's `task_id`, `run_id`, `skill_version`, or `attempt_id` does not match the active attempt
 - the handoff's declared `changed_files` does not exactly match the measured write scope (stale artifact)
 - the combined write scope -- everything already committed on top of `base_sha` plus every currently dirty (tracked, untracked, or deleted) path, with rename detection off so a rename's source cannot hide behind its destination -- has any file outside `write_allow` or inside `write_deny`
 - for `status: done`, Manager did not supply at least one `--validation-command`, one of them fails when actually run in the Worker's worktree, or it introduces an out-of-scope change
+- for `partial`/`blocked`/`failed`, the Worker's own declared validation fields are internally inconsistent (mismatched command/result counts, an unsupported result value, or evidence present while `validation_recorded` is false)
 - the worktree changes underneath seal while it is staging (a re-check after `git add` requires no unstaged/untracked path remains and the staged diff matches exactly what was scanned)
 
 Before touching Git or running any validation, seal confirms the Worker's `pane_id` is quiesced (not busy, no pending trust prompt) and closes it, refusing to proceed if there is no pane record to close, the pane is the current Manager pane, or the close itself fails -- so nothing can still be mutating the worktree while seal reads or commits it.
 
-For `status: done`, seal executes the Manager-supplied validation commands for real and overwrites `result.md`'s `validation_recorded`, `validation_commands`, `validation_results`, `validation_summary`, `merge_ready`, and `changed_files` with what it actually measured; this is the one sanctioned exception to "Manager must not edit a Worker result artifact" below, because seal is the only path by which an unwitnessed handoff becomes a trusted result. Other statuses keep the Worker's own declared validation fields (merge readiness is always false for them regardless).
+For `status: done`, seal executes the Manager-supplied validation commands for real and overwrites `result.md`'s `validation_recorded`, `validation_commands`, `validation_results`, `validation_summary`, `merge_ready`, and `changed_files` with what it actually measured; this is the one sanctioned exception to "Manager must not edit a Worker result artifact" below, because seal is the only path by which an unwitnessed handoff becomes a trusted result. Other statuses keep the Worker's own declared validation fields byte-for-byte (after the consistency check above), rather than overwriting them with an empty record; merge readiness is always false for them regardless.
+
+If a Manager `--validation-command` fails, seal rolls the worktree back to its pre-validation dirty state -- deleting any newly created untracked path and restoring any newly modified or deleted tracked path from `HEAD` -- before raising. A validation command that mutates the tree on failure therefore never leaves the worktree unable to match the handoff's declared `changed_files`, so a retried `hloop worker seal <task-id>` is not stuck on a permanent "stale handoff artifact" error.
 
 Only after every check passes does seal stage the dirty paths (`git add -A`) and create one commit, `ai-loop(<task-id>): seal worker handoff (<attempt-id>)`, in the Worker's own worktree. The result is indistinguishable from a Worker that committed its own result: `hloop worker harvest` and `hloop merge` require no changes to consume it.
+
+Before staging, seal records the exact attempt, result path, staged paths, and commit message it is about to produce in Worker state. If the Manager process dies after `git add -A` lands but before `git commit`, the next `hloop worker seal <task-id>` recognizes that the staged index exactly matches this recorded transaction and completes the same commit directly -- no re-run of Manager validation commands, no lost work, and no manual `git reset`/`git add` repair. A staged index that does not exactly match a recorded transaction (foreign staged changes, a stale transaction for a different attempt, or a `git add -A` that only partially completed) still fails closed with the "already has staged changes" error above.
+
+A handoff that is well-formed, correctly identified, and not stale, but simply not yet committed, reports readiness `seal-required` rather than the generic `not-committed`. `wait`, `dashboard`/`status`, `tick`, and `pump` treat `seal-required` as an actionable prompt to run `hloop worker seal <task-id>` -- never as `terminal_without_artifact`, and never as a reason to abort or requeue the task.
 
 Every task and role artifact records `skill_version`. Reviewer, Gap Auditor, and Advisor artifacts must also record the current `run_id` and exact audited `head_sha`. Harvest rejects artifacts produced by a different skill version, an older loop run, or a different integration head. Loops migrated from before version tracking use `unversioned` until a role is started with a versioned runtime.
 
