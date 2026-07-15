@@ -205,6 +205,83 @@ class ExactGitPathTests(unittest.TestCase):
                 "rename payload\n",
             )
 
+    def test_read_only_role_scope_rejects_staged_rename_from_product_to_artifact(self):
+        namespace = "role-rename-scope"
+        hloop.configure_loop_namespace(namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            source = "product-secret.txt"
+            (repo / source).write_text("secret\n", encoding="utf-8")
+            subprocess.run(["git", "add", source], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "seed product"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            cases = (
+                (
+                    "reviewer",
+                    hloop.LOOP_DIR / "reviews" / "R001.md",
+                    lambda: hloop.validate_reviewer_worktree_scope(
+                        "R001", {"baseline_dirty_files": []}, repo
+                    ),
+                ),
+                (
+                    "gap",
+                    hloop.LOOP_DIR / "gaps" / "G001.md",
+                    lambda: hloop.validate_gap_worktree_scope(
+                        "G001", {"baseline_dirty_files": []}, repo
+                    ),
+                ),
+                (
+                    "advisor",
+                    hloop.LOOP_DIR / "advice" / "A001-P1.md",
+                    lambda: hloop.validate_advisor_worktree_scope(
+                        "A001",
+                        {"participant_id": "P1", "baseline_dirty_files": []},
+                        repo,
+                    ),
+                ),
+                (
+                    "specification-scout",
+                    hloop.LOOP_DIR / "decisions" / "SCOUT.md",
+                    lambda: hloop.validate_decision_role_scope(
+                        repo,
+                        {"baseline_dirty_files": []},
+                        allowed={
+                            (hloop.LOOP_DIR / "decisions" / "SCOUT.md").as_posix()
+                        },
+                    ),
+                ),
+                (
+                    "decision-liaison",
+                    hloop.LOOP_DIR / "decisions" / "D001-QUESTION.md",
+                    lambda: hloop.validate_decision_role_scope(
+                        repo,
+                        {"baseline_dirty_files": []},
+                        allowed={
+                            (
+                                hloop.LOOP_DIR / "decisions" / "D001-QUESTION.md"
+                            ).as_posix()
+                        },
+                    ),
+                ),
+            )
+            for role, destination, validate in cases:
+                with self.subTest(role=role):
+                    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=repo, check=True)
+                    (repo / destination).parent.mkdir(parents=True, exist_ok=True)
+                    (repo / source).rename(repo / destination)
+                    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+
+                    self.assertEqual(
+                        set(hloop.role_scope_paths(repo)),
+                        {source, destination.as_posix()},
+                    )
+                    self.assertEqual(validate(), [source])
+
 
 if __name__ == "__main__":
     unittest.main()
