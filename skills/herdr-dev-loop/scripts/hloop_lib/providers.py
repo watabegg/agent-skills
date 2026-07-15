@@ -340,16 +340,23 @@ class ReviewCapacityResult:
     provider: str
     required: int
     ceiling: int
+    capacity_probe: CapabilityStatus = "unknown"
+    capacity_probe_reason: str = "no capacity probe supplied"
 
     @property
     def ok(self) -> bool:
-        return self.required <= self.ceiling
+        return self.required <= self.ceiling and self.capacity_probe in {
+            "supported",
+            "unknown",
+        }
 
     def as_record(self) -> dict[str, Any]:
         return {
             "provider": self.provider,
             "required": self.required,
             "ceiling": self.ceiling,
+            "capacity_probe": self.capacity_probe,
+            "capacity_probe_reason": self.capacity_probe_reason,
             "ok": self.ok,
         }
 
@@ -360,21 +367,91 @@ def review_capacity_ceiling(provider: str, *, limits: Mapping[str, int] | None =
     return DEFAULT_REVIEW_CAPACITY.get(provider, 8)
 
 
+def probe_provider_review_capacity(
+    provider: str,
+    *,
+    executable_finder: Callable[[str], str | None] = shutil.which,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout_seconds: float = 10.0,
+) -> tuple[CapabilityStatus, str]:
+    """Best-effort, side-effect-free evidence for a swarm concurrency ceiling.
+
+    Codex hosts review sub-agents via process-local ``-c agents.max_threads=N``
+    / ``-c agents.max_depth=1`` overrides; Claude Code hosts them via
+    session-local sub-agent (Task tool) support. Neither can be safely probed
+    by actually spawning agents before a Coordinator pane exists, so this only
+    inspects ``--help`` text for the documented control surface: a provider
+    that is installed but does not document it stays ``unknown`` (explicit,
+    unverified evidence), never an implicit ``supported`` fallback.
+    """
+
+    provider = _choice(provider, "provider", PROVIDERS)
+    executable = executable_finder(provider)
+    if executable is None:
+        return "unavailable", f"{provider} command not found"
+    try:
+        completed = command_runner(
+            [executable, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "unavailable", f"provider help probe failed: {type(exc).__name__}: {exc}"
+    if completed.returncode != 0:
+        return "unavailable", "provider help probe returned non-zero"
+    help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if provider == "codex":
+        if "-c" in help_text or "--config" in help_text:
+            return (
+                "supported",
+                "codex documents -c for process-local agents.max_threads/agents.max_depth overrides",
+            )
+        return (
+            "unknown",
+            "codex --help does not document a config override flag; swarm concurrency ceiling is unverified",
+        )
+    if "agent" in help_text.lower():
+        return "supported", "claude documents sub-agent (Task tool) support"
+    return (
+        "unknown",
+        "claude --help does not document sub-agent capacity controls; swarm concurrency ceiling is unverified",
+    )
+
+
 def check_review_capacity(
-    required: Mapping[str, int], *, limits: Mapping[str, int] | None = None
+    required: Mapping[str, int],
+    *,
+    limits: Mapping[str, int] | None = None,
+    capability: Mapping[str, tuple[CapabilityStatus, str]] | None = None,
 ) -> list[ReviewCapacityResult]:
     """Evaluate every provider's required-vs-ceiling capacity.
 
     Callers must check ``.ok`` before creating a Coordinator pane: a plan that
-    requests more concurrent sub-agents than the provider is trusted to host
-    must fail closed, not spawn a partially-staffed swarm.
+    requests more concurrent sub-agents than the provider is trusted to host,
+    or whose swarm concurrency controls a verifiable probe reports as
+    ``unsupported``/``unavailable``, must fail closed rather than spawn a
+    partially-staffed swarm. ``capability`` should carry real
+    ``probe_provider_review_capacity`` evidence per provider; providers absent
+    from it stay ``unknown`` (unverified, not blocking) rather than an
+    implicit pass.
     """
 
+    capability = capability or {}
     results = [
         ReviewCapacityResult(
             provider=provider,
             required=count,
             ceiling=review_capacity_ceiling(provider, limits=limits),
+            **(
+                {
+                    "capacity_probe": capability[provider][0],
+                    "capacity_probe_reason": capability[provider][1],
+                }
+                if provider in capability
+                else {}
+            ),
         )
         for provider, count in required.items()
     ]
@@ -382,6 +459,8 @@ def check_review_capacity(
     if exceeded:
         detail = "; ".join(
             f"{result.provider}: requires {result.required}, ceiling is {result.ceiling}"
+            if result.required > result.ceiling
+            else f"{result.provider}: capacity probe is {result.capacity_probe} ({result.capacity_probe_reason})"
             for result in exceeded
         )
         raise ProviderError(f"review swarm capacity exceeded: {detail}")
