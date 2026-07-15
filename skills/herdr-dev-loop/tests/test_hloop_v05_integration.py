@@ -4041,6 +4041,227 @@ effort = "medium"
         ), mock.patch.object(hloop, "manager_message_submitted", return_value=True):
             hloop.send_agent_tui_message("codex", "p1", "already enveloped", 1, 0, 1, 1)
 
+    def make_worker_seal_ignored_result_only_fixture(self, root: Path, *, namespace: str):
+        """Build a worktree where the loop namespace is git-excluded, the
+        product change is already committed by the Worker, and only
+        `result.md` is pending -- exactly what is left behind when a
+        workspace-write Worker self-commits its product change, its own
+        result commit fails, and it falls back to `worker finalize
+        --handoff`. `git status` never reports an ignored path even when it
+        genuinely differs from HEAD, so this reproduces the scenario where a
+        naive dirty-worktree check misreports `nothing to seal`.
+        """
+
+        hloop.configure_loop_namespace(namespace)
+        repo = self.make_repo(root)
+        (repo / ".gitignore").write_text(".ai/\n", encoding="utf-8")
+        (repo / "keep.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore", "keep.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed files"], cwd=repo, check=True, capture_output=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        worktree = root / "worker"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "worker-seal-ignored", str(worktree), "master"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        run_id = f"run-{namespace}"
+        task_meta = {
+            "id": "T001",
+            "run_id": run_id,
+            "kind": "fix",
+            "status": "running",
+            "branch": "worker-seal-ignored",
+            "base_ref": "master",
+            "base_sha": base_sha,
+            "write_allow": ["keep.txt"],
+            "write_deny": [],
+            "acceptance": ["handoff seals cleanly even when the namespace is gitignored"],
+        }
+        hloop.write_text(hloop.task_file(repo, "T001"), hloop.frontmatter(task_meta) + "\n\n# Task T001\n")
+
+        # Simulate the result-only handoff shape: the product change is
+        # already self-committed by the Worker, the result commit failed,
+        # and `worker finalize --handoff` wrote a fresh (uncommitted)
+        # result.md.
+        (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "keep.txt"], cwd=worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "worker product change"], cwd=worktree, check=True, capture_output=True
+        )
+        expected_parent = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+        ).stdout.strip()
+
+        # An arbitrary, unrelated ignored path under the same gitignored
+        # namespace -- e.g. Worker scratch state. It must never be swept
+        # into the seal commit; only the exact active-attempt result.md path
+        # may ever be force-added.
+        extra_ignored_rel = hloop.LOOP_DIR / "scratch" / "not-the-result.txt"
+        hloop.write_text(worktree / extra_ignored_rel, "unrelated scratch state\n")
+
+        result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
+        result_meta = {
+            "task_id": "T001",
+            "run_id": run_id,
+            "skill_version": hloop.SKILL_VERSION,
+            "attempt_id": "T001-A001",
+            "status": "done",
+            "merge_ready": False,
+            "branch": "worker-seal-ignored",
+            "head_sha": "HEAD",
+            "base_sha": base_sha,
+            "changed_files": ["keep.txt", result_rel.as_posix()],
+            "validation_recorded": False,
+            "validation_commands": [],
+            "validation_results": [],
+            "validation_summary": "",
+            "blocking_questions": [],
+            "handoff": True,
+        }
+        hloop.write_text(
+            worktree / result_rel,
+            hloop.frontmatter(result_meta) + "\n\n# Worker Result T001\n",
+        )
+        task_state = {
+            **task_meta,
+            "worktree": str(worktree),
+            "attempt_id": "T001-A001",
+            "active_attempt_id": "T001-A001",
+            "worker_base_sha": base_sha,
+            "skill_version": hloop.SKILL_VERSION,
+            "semantic_ack_barrier": {"status": "approved"},
+            "pane_closed_at": "2026-01-01T00:00:00+00:00",
+        }
+        state = {
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "namespace": hloop.LOOP_NAMESPACE,
+            "run_id": run_id,
+            "skill_version": hloop.SKILL_VERSION,
+            "phase": "running",
+            "integration_branch": "master",
+            "merge_mode": "squash",
+            "persistence": "local-only",
+            "tasks": {"T001": task_state},
+        }
+        return repo, worktree, state, result_rel, extra_ignored_rel, expected_parent
+
+    def test_worker_seal_detects_and_commits_ignored_result_only_handoff(self):
+        """A result-only handoff (product already committed, only
+        `result.md` pending) must be detected and sealed even when the loop
+        namespace is gitignored in the target repo, instead of being
+        misreported as `nothing to seal`."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (
+                    repo,
+                    worktree,
+                    state,
+                    result_rel,
+                    extra_ignored_rel,
+                    expected_parent,
+                ) = self.make_worker_seal_ignored_result_only_fixture(
+                    root, namespace="worker-seal-ignored-result-only"
+                )
+                # Confirm the fixture actually reproduces the reported bug:
+                # `git status` must not see the pending result artifact at
+                # all once the loop namespace is gitignored.
+                self.assertEqual(hloop.porcelain_paths_no_renames(worktree), [])
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=["exit 0"], validation_summary="ok")
+                        )
+                self.assertEqual(code, 0)
+
+                head_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True
+                ).stdout.strip()
+                self.assertNotEqual(head_sha, expected_parent)
+                head_message = subprocess.run(
+                    ["git", "log", "-1", "--format=%s"],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                self.assertIn("seal worker handoff", head_message)
+                self.assertIn("T001-A001", head_message)
+
+                committed_result = subprocess.run(
+                    ["git", "show", f"HEAD:{result_rel.as_posix()}"],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout
+                self.assertIn("merge_ready: true", committed_result)
+
+                # The unrelated ignored path must never have been swept into
+                # the seal commit -- only the exact active-attempt result.md
+                # path may ever be force-added.
+                extra_in_head = subprocess.run(
+                    ["git", "cat-file", "-e", f"HEAD:{extra_ignored_rel.as_posix()}"],
+                    cwd=worktree,
+                )
+                self.assertNotEqual(extra_in_head.returncode, 0)
+                self.assertTrue((worktree / extra_ignored_rel).exists())
+        finally:
+            hloop.configure_loop_namespace(previous)
+
+    def test_worker_seal_does_not_force_add_arbitrary_ignored_paths(self):
+        """Seal's force-add must stay scoped to the single active
+        task/attempt result artifact path -- an arbitrary ignored file must
+        never be picked up even though it sits under the same gitignored
+        namespace and passes a completely clean `git status`."""
+
+        previous = hloop.LOOP_NAMESPACE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (
+                    repo,
+                    worktree,
+                    state,
+                    result_rel,
+                    extra_ignored_rel,
+                    expected_parent,
+                ) = self.make_worker_seal_ignored_result_only_fixture(
+                    root, namespace="worker-seal-ignored-scope"
+                )
+
+                with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = hloop.cmd_worker_seal(
+                            self.seal_args(repo, validation_command=["exit 0"], validation_summary="ok")
+                        )
+                self.assertEqual(code, 0)
+
+                cached_after = subprocess.run(
+                    ["git", "log", "-1", "--name-only", "--format="],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.splitlines()
+                self.assertIn(result_rel.as_posix(), cached_after)
+                self.assertNotIn(extra_ignored_rel.as_posix(), cached_after)
+                self.assertTrue((worktree / extra_ignored_rel).exists())
+                self.assertEqual(
+                    (worktree / extra_ignored_rel).read_text(encoding="utf-8"),
+                    "unrelated scratch state\n",
+                )
+        finally:
+            hloop.configure_loop_namespace(previous)
+
 
 if __name__ == "__main__":
     unittest.main()
