@@ -34,6 +34,7 @@ Report protocol:
 - after read-only investigation, submit `hloop agent report --type ack` with understood goal, scope, acceptance, and approach before material edits
 - stop at the initial semantic ACK barrier until Manager approval; reject or timeout requires a corrected new ACK
 - include the rendered run, role, attempt, contract digest, and report token identity on every report
+- generate a new `--invocation-id` for each logical report and reuse it for every retry of that report before sending a newer report
 - send `milestone` only for a meaningful state change
 - send `attention` when Manager action is required
 - send `completion` with artifact, head SHA, validation references, residual risks, and handoff before the terminal sentinel
