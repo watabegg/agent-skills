@@ -307,6 +307,23 @@ def run_cmd(
     )
 
 
+def run_cmd_bytes(
+    cmd: list[str],
+    cwd: Path | None = None,
+    check: bool = True,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run a command without decoding output that may contain Git path bytes."""
+
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=check,
+    )
+
+
 # The absolute path of the git executable this process has verified (or
 # bootstrapped) against STATE.json's recorded identity.  `main()` resolves this
 # once, before any other code path can execute a PATH `git`, and every git
@@ -322,6 +339,15 @@ def git(repo: Path, args: list[str], check: bool = True) -> str:
     if proc.returncode != 0 and check:
         raise HLoopError(proc.stderr.strip())
     return (proc.stdout or "").strip()
+
+
+def git_bytes(repo: Path, args: list[str], check: bool = True) -> bytes:
+    """Return raw Git stdout for protocols whose records are byte-delimited."""
+
+    proc = run_cmd_bytes([TRUSTED_GIT_PATH, "-C", str(repo), *args], check=False)
+    if proc.returncode != 0 and check:
+        raise HLoopError(os.fsdecode(proc.stderr or b"").strip())
+    return proc.stdout or b""
 
 
 def resolve_git_binary_fingerprint() -> dict[str, Any]:
@@ -1620,9 +1646,15 @@ def parse_scalar(raw: str, key: str | None = None) -> Any:
         if key in STRICT_MULTILINE_LIST_FIELDS:
             raise HLoopError(f"{key}: inline list unsupported; use multiline list")
         return [parse_scalar(part.strip()) for part in inner.split(",")]
-    if (value.startswith('"') and value.endswith('"')) or (
-        value.startswith("'") and value.endswith("'")
-    ):
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise HLoopError(f"invalid JSON-quoted frontmatter scalar: {value}") from exc
+        if not isinstance(decoded, str):
+            raise HLoopError(f"quoted frontmatter scalar is not a string: {value}")
+        return decoded
+    if value.startswith("'") and value.endswith("'"):
         return value[1:-1]
     return value
 
@@ -1689,7 +1721,11 @@ def yaml_scalar(value: Any) -> str:
     # through `parse_scalar`'s case-insensitive boolean recognition -- quote
     # it like any other syntactically ambiguous scalar so readers get back
     # the exact string that was written.
-    if text == "" or text.lower() in {"true", "false"} or re.search(r"[:#\[\]{}]|^\s|\s$", text):
+    if (
+        text == ""
+        or text.lower() in {"true", "false"}
+        or re.search(r"[:#\[\]{}]|^\s|\s$|[\x00-\x1f\x7f]", text)
+    ):
         return json.dumps(text, ensure_ascii=False)
     return text
 
@@ -3247,15 +3283,75 @@ def parse_changed_files_name_status(text: str) -> list[str]:
     return list(dict.fromkeys(normalize_match_path(path) for path in paths if path.strip()))
 
 
+def split_nul_records(data: bytes, *, command: str) -> list[bytes]:
+    """Split one complete Git ``-z`` stream without losing path characters."""
+
+    if not data:
+        return []
+    if not data.endswith(b"\0"):
+        raise HLoopError(f"{command} returned an incomplete NUL-delimited record")
+    return data[:-1].split(b"\0")
+
+
+def git_path_from_bytes(value: bytes) -> str:
+    """Decode a Git path with the platform filesystem's surrogateescape rules."""
+
+    return normalize_match_path(os.fsdecode(value))
+
+
+def parse_name_status_z_records(
+    data: bytes,
+    *,
+    command: str = "git diff --name-status -z",
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Parse Git's NUL-delimited name-status protocol exactly."""
+
+    fields = split_nul_records(data, command=command)
+    records: list[tuple[str, tuple[str, ...]]] = []
+    index = 0
+    while index < len(fields):
+        try:
+            status = fields[index].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HLoopError(f"{command} returned a non-ASCII status") from exc
+        index += 1
+        path_count = 2 if status.startswith(("R", "C")) else 1
+        if not status or index + path_count > len(fields):
+            raise HLoopError(f"{command} returned a malformed NUL-delimited record")
+        paths = tuple(git_path_from_bytes(value) for value in fields[index : index + path_count])
+        if any(not path for path in paths):
+            raise HLoopError(f"{command} returned an empty path")
+        records.append((status, paths))
+        index += path_count
+    return records
+
+
+def parse_changed_files_name_status_z(data: bytes) -> list[str]:
+    paths = [
+        path
+        for _, record_paths in parse_name_status_z_records(data)
+        for path in record_paths
+    ]
+    return list(dict.fromkeys(paths))
+
+
+def parse_name_only_z(data: bytes, *, command: str) -> list[str]:
+    return [git_path_from_bytes(value) for value in split_nul_records(data, command=command)]
+
+
+def git_name_only_z(repo: Path, args: list[str], *, command: str) -> list[str]:
+    return parse_name_only_z(git_bytes(repo, [*args, "-z"]), command=command)
+
+
 def changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
     if not base_sha or not head_sha:
         return []
-    out = git(
+    out = git_bytes(
         repo,
-        ["diff", "--name-status", "--find-renames", f"{base_sha}..{head_sha}"],
-        check=False,
+        ["diff", "--name-status", "-z", "--find-renames", f"{base_sha}..{head_sha}"],
+        check=True,
     )
-    return parse_changed_files_name_status(out)
+    return parse_changed_files_name_status_z(out)
 
 
 def git_worktree_paths(repo: Path) -> list[Path]:
@@ -3442,7 +3538,9 @@ def escape_literal_brackets(pattern: str) -> str:
 
 
 def normalize_match_path(value: str) -> str:
-    value = str(value).replace("\\", "/")
+    value = str(value)
+    if os.sep == "\\":
+        value = value.replace("\\", "/")
     if value.startswith("./"):
         return value[2:]
     return value
@@ -3479,11 +3577,12 @@ def validate_change_scope(task_id: str, task_meta: dict[str, Any], files: list[s
 
 
 def porcelain_paths(repo: Path) -> list[str]:
-    proc = run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
-        check=False,
+    out = git_bytes(
+        repo,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        check=True,
     )
-    return parse_porcelain_paths(proc.stdout or "")
+    return [paths[0] for _, paths in parse_porcelain_v1_z_records(out)]
 
 
 def parse_porcelain_paths(text: str) -> list[str]:
@@ -3499,6 +3598,33 @@ def parse_porcelain_paths(text: str) -> list[str]:
     return paths
 
 
+def parse_porcelain_v1_z_records(data: bytes) -> list[tuple[str, tuple[str, ...]]]:
+    """Parse ``git status --porcelain=v1 -z`` without C-style path quoting."""
+
+    fields = split_nul_records(data, command="git status --porcelain=v1 -z")
+    records: list[tuple[str, tuple[str, ...]]] = []
+    index = 0
+    while index < len(fields):
+        primary = fields[index]
+        index += 1
+        if len(primary) < 4 or primary[2:3] != b" ":
+            raise HLoopError("git status --porcelain=v1 -z returned a malformed record")
+        try:
+            status = primary[:2].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HLoopError("git status --porcelain=v1 -z returned a non-ASCII status") from exc
+        paths = [git_path_from_bytes(primary[3:])]
+        if "R" in status or "C" in status:
+            if index >= len(fields):
+                raise HLoopError("git status --porcelain=v1 -z omitted a rename source")
+            paths.append(git_path_from_bytes(fields[index]))
+            index += 1
+        if any(not path for path in paths):
+            raise HLoopError("git status --porcelain=v1 -z returned an empty path")
+        records.append((status, tuple(paths)))
+    return records
+
+
 def porcelain_paths_no_renames(repo: Path) -> list[str]:
     """Unstaged/untracked paths (tracked modified/deleted, untracked) with rename detection off.
 
@@ -3512,36 +3638,45 @@ def porcelain_paths_no_renames(repo: Path) -> list[str]:
     `cached_diff_paths_no_renames` instead.
     """
 
-    proc = run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(repo), "status", "--porcelain", "--untracked-files=all", "--no-renames"],
-        check=False,
+    out = git_bytes(
+        repo,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+        check=True,
     )
-    paths = []
-    for line in (proc.stdout or "").splitlines():
-        if len(line) > 1 and line[1] != " ":
-            path = line[3:] if len(line) > 3 else ""
-            if path:
-                paths.append(path)
-    return paths
+    return [paths[0] for status, paths in parse_porcelain_v1_z_records(out) if status[1] != " "]
+
+
+def porcelain_paths_all_no_renames(repo: Path) -> list[str]:
+    """All staged, unstaged, and untracked paths with both rename sides visible."""
+
+    out = git_bytes(
+        repo,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+        check=True,
+    )
+    return [paths[0] for _, paths in parse_porcelain_v1_z_records(out)]
 
 
 def cached_diff_paths_no_renames(repo: Path) -> list[str]:
-    out = git(repo, ["diff", "--cached", "--no-renames", "--name-status"], check=False)
-    return parse_changed_files_name_status(out)
+    out = git_bytes(
+        repo,
+        ["diff", "--cached", "--no-renames", "--name-status", "-z"],
+        check=True,
+    )
+    return parse_changed_files_name_status_z(out)
 
 
 def porcelain_paths_for(repo: Path, pathspec: str) -> list[str]:
-    proc = run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(repo), "status", "--porcelain", "--untracked-files=all", "--", pathspec],
-        check=False,
+    out = git_bytes(
+        repo,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", pathspec],
+        check=True,
     )
-    if proc.returncode != 0:
-        raise HLoopError((proc.stderr or proc.stdout or "").strip())
-    return parse_porcelain_paths(proc.stdout or "")
+    return [paths[0] for _, paths in parse_porcelain_v1_z_records(out)]
 
 
 def unsafe_dirty_paths(repo: Path, *, allow_loop_dirty: bool = True) -> list[str]:
-    paths = porcelain_paths(repo)
+    paths = porcelain_paths_all_no_renames(repo)
     if not allow_loop_dirty:
         return paths
     loop_home = LOOP_HOME.as_posix()
@@ -9880,14 +10015,14 @@ def remove_snapshot_remotes(snapshot_repo: Path) -> None:
 
 
 def index_object_ids(worktree: Path) -> list[str]:
-    output = git(worktree, ["ls-files", "--stage", "-z"], check=False)
+    output = git_bytes(worktree, ["ls-files", "--stage", "-z"])
     object_ids: list[str] = []
-    for record in output.split("\0"):
-        match = re.match(r"^([0-7]{6}) ([0-9a-f]{40,64}) [0-3]\t", record)
-        if match and match.group(1) != "160000":
+    for record in split_nul_records(output, command="git ls-files --stage -z"):
+        match = re.match(rb"^([0-7]{6}) ([0-9a-f]{40,64}) [0-3]\t", record)
+        if match and match.group(1) != b"160000":
             # A gitlink records a commit owned by the nested repository, not
             # necessarily by this superproject's object store.
-            object_ids.append(match.group(2))
+            object_ids.append(match.group(2).decode("ascii"))
     return list(dict.fromkeys(object_ids))
 
 
@@ -11961,6 +12096,62 @@ def merge_git_dir(repo: Path) -> Path:
     return Path(git(repo, ["rev-parse", "--path-format=absolute", "--git-dir"])).resolve()
 
 
+def commit_parent_shas(repo: Path, commit_sha: str) -> tuple[str, ...]:
+    fields = git(repo, ["rev-list", "--parents", "-n", "1", commit_sha]).split()
+    if not fields or fields[0] != commit_sha:
+        raise HLoopError(f"cannot read commit parents for {commit_sha}")
+    return tuple(fields[1:])
+
+
+def commit_author_message(repo: Path, commit_sha: str) -> tuple[bytes, bytes]:
+    raw = git_bytes(repo, ["cat-file", "commit", commit_sha])
+    headers, separator, message = raw.partition(b"\n\n")
+    if not separator:
+        raise HLoopError(f"commit object is malformed: {commit_sha}")
+    author = next(
+        (line.removeprefix(b"author ") for line in headers.splitlines() if line.startswith(b"author ")),
+        b"",
+    )
+    if not author:
+        raise HLoopError(f"commit object has no author: {commit_sha}")
+    return author, message
+
+
+def expected_cherry_pick_tree(
+    repo: Path,
+    landed_parent: str,
+    source_parent: str,
+    source_commit: str,
+) -> str:
+    """Compute the exact clean cherry-pick result without touching index/worktree."""
+
+    proc = run_cmd(
+        [
+            TRUSTED_GIT_PATH,
+            "-C",
+            str(repo),
+            "merge-tree",
+            "--write-tree",
+            "--merge-base",
+            source_parent,
+            landed_parent,
+            source_commit,
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: recorded source does not replay cleanly "
+            f"from landed parent {landed_parent}"
+        )
+    tree_sha = (proc.stdout or "").splitlines()[0] if (proc.stdout or "").splitlines() else ""
+    if not re.fullmatch(r"[0-9a-f]{40,64}", tree_sha):
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: git merge-tree returned no exact tree identity"
+        )
+    return tree_sha
+
+
 def cherry_pick_todo_commits(repo: Path, todo_path: Path) -> tuple[str, ...]:
     commits: list[str] = []
     for raw_line in read_text(todo_path).splitlines():
@@ -12215,6 +12406,145 @@ def reconcile_completed_squash_merge(
     return True
 
 
+def reconcile_completed_cherry_pick(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+) -> bool:
+    """Finish bookkeeping after every recorded cherry-pick commit landed.
+
+    A missing sequencer is not itself success evidence.  Recovery accepts only
+    the exact recorded source sequence reproduced as the clean, single-parent
+    first-parent suffix of the recorded pre-merge HEAD.
+    """
+
+    active = state.get("active_merge") or {}
+    if str(active.get("task_id") or "") != task_id:
+        return False
+    try:
+        transaction = MergeTransaction.from_record(active)
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
+    if transaction.mode != "cherry-pick" or transaction.status not in {
+        MERGE_ACTIVE,
+        MERGE_CONTENT_CONFLICT,
+    }:
+        return False
+
+    git_dir = merge_git_dir(repo)
+    if (git_dir / "sequencer").is_dir() or (git_dir / "CHERRY_PICK_HEAD").exists():
+        return False
+    current_head = git(repo, ["rev-parse", "HEAD"])
+    if current_head == transaction.pre_merge_head:
+        return False
+    if not is_ancestor(repo, transaction.pre_merge_head, current_head):
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: HEAD is not descended from the recorded pre-merge HEAD"
+        )
+
+    integration_head = git(repo, ["rev-parse", str(state["integration_branch"])])
+    if integration_head != current_head:
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: integration branch does not point at HEAD"
+        )
+    if not branch_exists(repo, transaction.branch):
+        raise HLoopError("completed cherry-pick recovery rejected: Worker branch is missing")
+    if git(repo, ["rev-parse", transaction.branch]) != transaction.worker_head:
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: Worker branch no longer matches the transaction"
+        )
+
+    worker_base = str(active.get("worker_base_sha") or "")
+    if not worker_base:
+        raise HLoopError("completed cherry-pick recovery rejected: Worker base is missing")
+    recorded_sources = tuple(
+        git(repo, ["rev-list", "--reverse", f"{worker_base}..{transaction.worker_head}"]).splitlines()
+    )
+    if recorded_sources != transaction.source_commits:
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: recorded source sequence no longer matches the Worker range"
+        )
+
+    index_clean = run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--quiet", "HEAD", "--"],
+        check=False,
+    )
+    if index_clean.returncode != 0:
+        raise HLoopError("completed cherry-pick recovery rejected: index is not clean at HEAD")
+    dirty_product = unsafe_dirty_paths(repo, allow_loop_dirty=True)
+    if dirty_product:
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: product worktree is dirty: "
+            + ", ".join(dirty_product)
+        )
+
+    landed_commits = tuple(
+        git(
+            repo,
+            [
+                "rev-list",
+                "--reverse",
+                "--first-parent",
+                f"{transaction.pre_merge_head}..{current_head}",
+            ],
+        ).splitlines()
+    )
+    if len(landed_commits) != len(transaction.source_commits):
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: first-parent suffix length does not match the recorded source sequence"
+        )
+
+    expected_parent = transaction.pre_merge_head
+    for source_commit, landed_commit in zip(transaction.source_commits, landed_commits):
+        source_parents = commit_parent_shas(repo, source_commit)
+        landed_parents = commit_parent_shas(repo, landed_commit)
+        if len(source_parents) != 1:
+            raise HLoopError(
+                f"completed cherry-pick recovery rejected: source commit is not single-parent: {source_commit}"
+            )
+        if landed_parents != (expected_parent,):
+            raise HLoopError(
+                "completed cherry-pick recovery rejected: landed commits are not the exact first-parent suffix"
+            )
+        expected_tree = expected_cherry_pick_tree(
+            repo,
+            expected_parent,
+            source_parents[0],
+            source_commit,
+        )
+        if merge_transaction_index_state(repo, landed_commit) != expected_tree:
+            raise HLoopError(
+                "completed cherry-pick recovery rejected: landed tree does not exactly replay recorded source "
+                f"{source_commit}"
+            )
+        if commit_author_message(repo, source_commit) != commit_author_message(repo, landed_commit):
+            raise HLoopError(
+                "completed cherry-pick recovery rejected: landed author/message does not match recorded source "
+                f"{source_commit}"
+            )
+        expected_parent = landed_commit
+    if expected_parent != current_head:
+        raise HLoopError(
+            "completed cherry-pick recovery rejected: first-parent suffix does not end at HEAD"
+        )
+
+    observed = dataclass_replace(
+        transaction,
+        applied_commits=transaction.source_commits,
+        applied_head=current_head,
+    )
+    transition_merge_transaction(
+        repo,
+        state,
+        transaction,
+        MERGE_COMPLETED,
+        observed=observed,
+    )
+    complete_merge_state(repo, state, task_id, "cherry-pick")
+    journal(repo, f"Reconciled completed cherry-pick `{current_head}` for Worker `{task_id}`.")
+    return True
+
+
 def cmd_merge_abort(repo: Path, state: dict[str, Any], task_id: str) -> int:
     active = state.get("active_merge") or {}
     if str(active.get("task_id") or "") != task_id:
@@ -12242,10 +12572,18 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
     if str(active.get("task_id") or "") != task_id:
         raise HLoopError(f"no active merge transaction for {task_id}")
     prior = preflight_merge_transaction(repo, active, "continue")
-    unmerged = git(repo, ["diff", "--name-only", "--diff-filter=U"])
-    if unmerged.strip():
-        raise HLoopError("merge still has unresolved paths: " + ", ".join(unmerged.splitlines()))
-    staged = git(repo, ["diff", "--cached", "--name-only"]).splitlines()
+    unmerged = git_name_only_z(
+        repo,
+        ["diff", "--name-only", "--diff-filter=U"],
+        command="git diff --name-only --diff-filter=U -z",
+    )
+    if unmerged:
+        raise HLoopError("merge still has unresolved paths: " + ", ".join(unmerged))
+    staged = git_name_only_z(
+        repo,
+        ["diff", "--cached", "--no-renames", "--name-only"],
+        command="git diff --cached --no-renames --name-only -z",
+    )
     violations = validate_change_scope(task_id, state["tasks"][task_id], staged)
     if violations:
         raise HLoopError("write-scope violations after conflict resolution: " + "; ".join(violations))
@@ -12305,6 +12643,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
         require_integration_branch=True,
         skip_dirty_check=recovering_active_transaction,
     )
+    if reconcile_completed_cherry_pick(repo, state, task_id):
+        print(f"reconciled merge {task_id}")
+        return 0
     if reconcile_completed_squash_merge(repo, state, task_id):
         print(f"reconciled merge {task_id}")
         return 0
@@ -17142,34 +17483,28 @@ def checkpoint_paths(repo: Path, args: argparse.Namespace) -> list[str]:
 
 
 def ignored_untracked_paths_for(repo: Path, pathspec: str) -> list[str]:
-    proc = run_cmd(
+    out = git_bytes(
+        repo,
         [
-            TRUSTED_GIT_PATH,
-            "-C",
-            str(repo),
             "ls-files",
             "--others",
             "--ignored",
             "--exclude-standard",
+            "-z",
             "--",
             pathspec,
         ],
-        check=False,
+        check=True,
     )
-    if proc.returncode != 0:
-        raise HLoopError((proc.stderr or proc.stdout or "git ls-files failed").strip())
-    return [
-        normalize_match_path(line)
-        for line in (proc.stdout or "").splitlines()
-        if line.strip()
-    ]
+    return parse_name_only_z(out, command="git ls-files --others --ignored -z")
 
 
 def staged_paths(repo: Path) -> list[str]:
-    proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--name-only"], check=False)
-    if proc.returncode != 0:
-        raise HLoopError((proc.stderr or proc.stdout or "git diff --cached failed").strip())
-    return [normalize_match_path(line) for line in (proc.stdout or "").splitlines() if line.strip()]
+    return git_name_only_z(
+        repo,
+        ["diff", "--cached", "--no-renames", "--name-only"],
+        command="git diff --cached --no-renames --name-only -z",
+    )
 
 
 def ensure_checkpoint_staged_scope(staged: list[str], allowed_paths: list[str]) -> None:
@@ -17215,13 +17550,19 @@ def head_reachable_from_upstream(repo: Path) -> bool:
 
 
 def head_changed_paths(repo: Path) -> list[str]:
-    proc = run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(repo), "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        check=False,
+    return git_name_only_z(
+        repo,
+        [
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--no-renames",
+            "--name-only",
+            "-r",
+            "HEAD",
+        ],
+        command="git diff-tree --no-renames --name-only -z HEAD",
     )
-    if proc.returncode != 0:
-        raise HLoopError((proc.stderr or proc.stdout or "git diff-tree failed").strip())
-    return [normalize_match_path(line) for line in (proc.stdout or "").splitlines() if line.strip()]
 
 
 def checkpoint_amend_blocker(repo: Path, batch_id: str) -> str:
