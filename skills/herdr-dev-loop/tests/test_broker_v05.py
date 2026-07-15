@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import sqlite3
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +44,50 @@ class BrokerStorageBoundaryTests(unittest.TestCase):
             with self.assertRaises(broker.BrokerUnavailableError):
                 with self.store.transaction():
                     self.fail("transaction body must not run")
+
+    def test_connect_initialization_failure_closes_real_connection_without_warning(self):
+        created_connections = []
+        real_connect = sqlite3.connect
+
+        class FailingInitializationConnection(sqlite3.Connection):
+            close_called = False
+
+            def execute(self, sql, parameters=(), /):
+                if sql == "PRAGMA journal_mode = DELETE":
+                    raise sqlite3.OperationalError("simulated PRAGMA failure")
+                return super().execute(sql, parameters)
+
+            def close(self):
+                self.close_called = True
+                return super().close()
+
+        def connect_with_fault(*args, **kwargs):
+            connection = real_connect(
+                *args, **kwargs, factory=FailingInitializationConnection
+            )
+            created_connections.append(connection)
+            return connection
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            with mock.patch.object(
+                broker.sqlite3, "connect", side_effect=connect_with_fault
+            ):
+                with self.assertRaisesRegex(
+                    broker.BrokerUnavailableError, "simulated PRAGMA failure"
+                ):
+                    broker.BrokerStore(self.root / "failing-broker")
+
+            self.assertEqual(len(created_connections), 1)
+            close_called = created_connections[0].close_called
+            created_connections.clear()
+            gc.collect()
+
+        self.assertTrue(close_called)
+        self.assertEqual(
+            [warning for warning in caught if warning.category is ResourceWarning],
+            [],
+        )
 
     def test_integrity_error_is_permanent_storage_semantics(self):
         connection = mock.Mock()

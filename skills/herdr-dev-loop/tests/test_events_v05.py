@@ -109,6 +109,16 @@ def report_authentication(event: dict[str, object], token: str = "report-token")
 
 
 class ReportValidationTests(unittest.TestCase):
+    def test_invocation_id_accepts_visible_ascii_and_rejects_unsafe_keys(self):
+        self.assertEqual(
+            events.normalize_invocation_id("T003-A001:report/0001"),
+            "T003-A001:report/0001",
+        )
+        for invalid in ("", "two words", "line\nbreak", "tab\tkey", "非ASCII"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(events.ReportValidationError):
+                    events.normalize_invocation_id(invalid)
+
     def test_client_assigns_uuid_and_digest_while_sequence_is_broker_only(self):
         prepared = events.prepare_client_event(
             report(), event_id="b06cb72e-504a-44c8-b86c-28c25f2e9b3a"
@@ -962,6 +972,39 @@ class RoleOutboxTests(unittest.TestCase):
             self.outbox_path, payload_digest="0" * 64
         )
         self.assertNotEqual(recreated, first_event_id)
+
+    def test_invocation_entries_obey_max_entries_retention(self):
+        first = broker.role_outbox_client_event(
+            self.outbox_path,
+            report=report(summary="first"),
+            invocation_id="report-1",
+            max_entries=2,
+        )
+        broker.role_outbox_client_event(
+            self.outbox_path,
+            report=report(summary="second"),
+            invocation_id="report-2",
+            max_entries=2,
+        )
+        broker.role_outbox_client_event(
+            self.outbox_path,
+            report=report(summary="third"),
+            invocation_id="report-3",
+            max_entries=2,
+        )
+
+        stored = json.loads(self.outbox_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [entry["invocation_id"] for entry in stored["entries"]],
+            ["report-2", "report-3"],
+        )
+        recreated = broker.role_outbox_client_event(
+            self.outbox_path,
+            report=report(summary="first"),
+            invocation_id="report-1",
+            max_entries=2,
+        )
+        self.assertNotEqual(recreated["event_id"], first["event_id"])
 
 
 if __name__ == "__main__":

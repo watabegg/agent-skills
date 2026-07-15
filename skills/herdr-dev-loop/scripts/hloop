@@ -5740,8 +5740,12 @@ Reporting: send ack, milestone, attention, and completion reports as your unders
 python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent report \\
   --role-id {role_id} --attempt-id {attempt_id} --run-id {run_id} \\
   --task-contract-digest {task_contract_digest} --report-credential-file {credential_ref} \\
+  --invocation-id <new-stable-key-for-this-logical-report> \\
   --type ack --stage <stage> --summary '<summary>' --next '<next action>' ...
 ```
+Generate a new visible-ASCII, whitespace-free invocation ID for each logical
+report. Reuse that exact ID for every retry of the same report, and finish its
+retry before sending a newer logical report.
 After the initial read-only investigation, send the semantic `ack` and stop before material work. Resume only after the Manager explicitly approves that ACK and sends the approval notice. A reject or timeout requires a corrected, new ACK event.
 """
 
@@ -6881,6 +6885,18 @@ validation_commands: ["npm test -- --grep foo,bar"]
     check(
         f"herdr-dev-loop {SKILL_VERSION} / namespace {LOOP_NAMESPACE} / Worker T001" in worker_prompt,
         "worker prompt omitted first-message version identity",
+    )
+    report_contract = report_contract_text(
+        "T001",
+        "T001-A001",
+        {"run_id": "run-selftest"},
+        report_credential_file="/tmp/hloop-report-credential.json",
+        task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+    )
+    check(
+        "--invocation-id <new-stable-key-for-this-logical-report>"
+        in report_contract,
+        "report contract omitted caller-stable invocation ID",
     )
     review_override_prompt = render_reviewer_prompt(
         "R999",
@@ -17081,11 +17097,20 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
         normalized = hloop_events.validate_report(report)
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid report: {exc}") from exc
-    requested_event_id = None
     raw_event_id = getattr(args, "event_id", None)
-    if raw_event_id:
+    raw_invocation_id = getattr(args, "invocation_id", None)
+    if raw_event_id is not None and raw_invocation_id is not None:
+        raise HLoopError("use only one of --event-id or --invocation-id")
+    requested_event_id = None
+    if raw_event_id is not None:
         try:
             requested_event_id = hloop_events.normalize_event_id(raw_event_id)
+        except hloop_events.ReportValidationError as exc:
+            raise HLoopError(f"invalid report: {exc}") from exc
+    invocation_id = None
+    if raw_invocation_id is not None:
+        try:
+            invocation_id = hloop_events.normalize_invocation_id(raw_invocation_id)
         except hloop_events.ReportValidationError as exc:
             raise HLoopError(f"invalid report: {exc}") from exc
     outbox_path = role_report_outbox_path(
@@ -17099,6 +17124,7 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             outbox_path,
             report=normalized,
             requested_event_id=requested_event_id,
+            invocation_id=invocation_id,
         )
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid report: {exc}") from exc
@@ -19395,7 +19421,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_report.add_argument("--attempt-id")
     agent_report.add_argument("--run-id")
-    agent_report.add_argument("--event-id")
+    report_idempotency = agent_report.add_mutually_exclusive_group()
+    report_idempotency.add_argument(
+        "--event-id",
+        help="explicit event UUID retained for compatibility retries",
+    )
+    report_idempotency.add_argument(
+        "--invocation-id",
+        help="caller-stable visible-ASCII key reused for one logical report retry",
+    )
     agent_report.add_argument("--task-contract-digest")
     report_credential = agent_report.add_mutually_exclusive_group()
     report_credential.add_argument(

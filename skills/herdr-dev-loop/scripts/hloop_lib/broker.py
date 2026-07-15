@@ -26,6 +26,7 @@ from .events import (
     assign_broker_sequence,
     canonical_json,
     new_event_id,
+    normalize_invocation_id,
     parse_rfc3339,
     payload_digest,
     prepare_client_event,
@@ -283,11 +284,20 @@ class BrokerStore:
             timeout=self.timeout_seconds,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = DELETE")
+            connection.execute("PRAGMA synchronous = FULL")
+            return connection
+        except BaseException:
+            try:
+                connection.close()
+            except BaseException:
+                # Initialization already failed. Preserve that original
+                # exception instead of replacing it with a cleanup failure.
+                pass
+            raise
 
     def _initialize(self) -> None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1316,19 +1326,27 @@ def role_outbox_client_event(
     *,
     report: Mapping[str, Any],
     requested_event_id: str | None = None,
+    invocation_id: str | None = None,
     max_entries: int = 64,
 ) -> dict[str, Any]:
-    """Persist and reuse a pending client event for one semantic report.
+    """Persist and reuse a client event for one logical report invocation.
 
     ``created_at`` is transport metadata, not part of the caller's semantic
-    report identity. A retry therefore looks up the normalized report without
-    ``created_at`` and returns the exact previously persisted *pending* event,
-    including its original timestamp, payload digest, and event ID. Once the
-    caller confirms broker or spool persistence, a later implicit invocation
-    creates a distinct event even when its semantic report fields are equal;
-    an explicit retained event ID still selects its exact original envelope.
+    report identity. A caller-stable ``invocation_id`` selects the first exact
+    retained envelope regardless of pending/confirmed delivery state. Without
+    either explicit ID, legacy implicit retry continues to reuse only a pending
+    semantic match. Retention is bounded by ``max_entries``.
     """
 
+    if requested_event_id is not None and invocation_id is not None:
+        raise ReportValidationError(
+            "event_id and invocation_id are mutually exclusive"
+        )
+    normalized_invocation_id = (
+        normalize_invocation_id(invocation_id)
+        if invocation_id is not None
+        else None
+    )
     normalized = validate_report(report)
     semantic_payload = dict(normalized)
     semantic_payload.pop("created_at", None)
@@ -1368,12 +1386,19 @@ def role_outbox_client_event(
             retained: list[Any] = []
             existing_event: dict[str, Any] | None = None
             requested_event: tuple[str, dict[str, Any]] | None = None
+            invocation_event: tuple[str, dict[str, Any]] | None = None
             legacy_event_id: str | None = None
             for entry in raw_entries:
                 if isinstance(entry, Mapping):
                     if set(entry) not in (
                         {"semantic_digest", "event"},
                         {"semantic_digest", "event", "status"},
+                        {
+                            "semantic_digest",
+                            "event",
+                            "status",
+                            "invocation_id",
+                        },
                     ):
                         raise BrokerIntegrityError(
                             f"role report outbox entry has an invalid shape: {outbox_path}"
@@ -1381,6 +1406,11 @@ def role_outbox_client_event(
                     event = validate_client_event(entry["event"])
                     recorded_semantic_digest = str(entry["semantic_digest"])
                     status = str(entry.get("status", "pending"))
+                    recorded_invocation_id = (
+                        normalize_invocation_id(entry["invocation_id"])
+                        if "invocation_id" in entry
+                        else None
+                    )
                     if status not in {"pending", "confirmed"}:
                         raise BrokerIntegrityError(
                             f"role report outbox entry has an invalid status: {outbox_path}"
@@ -1397,13 +1427,14 @@ def role_outbox_client_event(
                         raise BrokerIntegrityError(
                             f"role report outbox semantic digest mismatch: {outbox_path}"
                         )
-                    retained.append(
-                        {
-                            "semantic_digest": recorded_semantic_digest,
-                            "event": event,
-                            "status": status,
-                        }
-                    )
+                    retained_entry = {
+                        "semantic_digest": recorded_semantic_digest,
+                        "event": event,
+                        "status": status,
+                    }
+                    if recorded_invocation_id is not None:
+                        retained_entry["invocation_id"] = recorded_invocation_id
+                    retained.append(retained_entry)
                     if (
                         recorded_semantic_digest == semantic_digest
                         and status == "pending"
@@ -1411,6 +1442,17 @@ def role_outbox_client_event(
                         existing_event = event
                     if event["event_id"] == requested_event_id:
                         requested_event = (recorded_semantic_digest, event)
+                    if (
+                        normalized_invocation_id is not None
+                        and recorded_invocation_id == normalized_invocation_id
+                    ):
+                        if recorded_semantic_digest != semantic_digest:
+                            raise IdempotencyConflict(
+                                f"invocation id {normalized_invocation_id} is retained "
+                                "for different semantic content"
+                            )
+                        if invocation_event is None:
+                            invocation_event = (recorded_semantic_digest, event)
                     continue
 
                 # Read the 0.5.0 pre-fix digest/event-id pair format so an
@@ -1439,7 +1481,14 @@ def role_outbox_client_event(
                     )
                 return event
 
-            if requested_event_id is None and existing_event is not None:
+            if invocation_event is not None:
+                return invocation_event[1]
+
+            if (
+                requested_event_id is None
+                and normalized_invocation_id is None
+                and existing_event is not None
+            ):
                 return existing_event
 
             event_id = requested_event_id or legacy_event_id or new_event_id()
@@ -1453,13 +1502,14 @@ def role_outbox_client_event(
                     and entry[0] == current_payload_digest
                 )
             ]
-            retained.append(
-                {
-                    "semantic_digest": semantic_digest,
-                    "event": client_event,
-                    "status": "pending",
-                }
-            )
+            retained_entry = {
+                "semantic_digest": semantic_digest,
+                "event": client_event,
+                "status": "pending",
+            }
+            if normalized_invocation_id is not None:
+                retained_entry["invocation_id"] = normalized_invocation_id
+            retained.append(retained_entry)
             if len(retained) > max_entries:
                 retained = retained[len(retained) - max_entries :]
             _atomic_write_json(outbox_path, {"entries": retained})
@@ -1509,12 +1559,23 @@ def confirm_role_outbox_delivery(
                     if set(entry) not in (
                         {"semantic_digest", "event"},
                         {"semantic_digest", "event", "status"},
+                        {
+                            "semantic_digest",
+                            "event",
+                            "status",
+                            "invocation_id",
+                        },
                     ):
                         raise BrokerIntegrityError(
                             f"role report outbox entry has an invalid shape: {outbox_path}"
                         )
                     event = validate_client_event(entry["event"])
                     status = str(entry.get("status", "pending"))
+                    recorded_invocation_id = (
+                        normalize_invocation_id(entry["invocation_id"])
+                        if "invocation_id" in entry
+                        else None
+                    )
                     if status not in {"pending", "confirmed"}:
                         raise BrokerIntegrityError(
                             f"role report outbox entry has an invalid status: {outbox_path}"
@@ -1541,13 +1602,14 @@ def confirm_role_outbox_delivery(
                         if status == "pending":
                             status = "confirmed"
                             changed = True
-                    entries.append(
-                        {
-                            "semantic_digest": recorded_semantic_digest,
-                            "event": event,
-                            "status": status,
-                        }
-                    )
+                    retained_entry = {
+                        "semantic_digest": recorded_semantic_digest,
+                        "event": event,
+                        "status": status,
+                    }
+                    if recorded_invocation_id is not None:
+                        retained_entry["invocation_id"] = recorded_invocation_id
+                    entries.append(retained_entry)
                     continue
                 if (
                     isinstance(entry, list)

@@ -449,6 +449,22 @@ def normalize_event_id(value: Any) -> str:
     return text
 
 
+def normalize_invocation_id(value: Any) -> str:
+    """Validate a caller-stable opaque invocation key."""
+
+    text = _text(
+        value,
+        field="invocation_id",
+        maximum=MAX_IDENTIFIER_LENGTH,
+        allow_newlines=False,
+    )
+    if any(ord(char) < 0x21 or ord(char) > 0x7E for char in text):
+        raise ReportValidationError(
+            "invocation_id must contain only visible ASCII without whitespace"
+        )
+    return text
+
+
 def prepare_client_event(
     report: Mapping[str, Any], *, event_id: str | None = None
 ) -> dict[str, Any]:

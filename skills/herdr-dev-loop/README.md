@@ -177,7 +177,7 @@ hloop decision new \
 
 ## Agent報告とevent-driven Manager
 
-0.5.0のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
+0.5.0のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
 
 Managerはpaneを巡回する前にdurable inboxを処理します。
 
