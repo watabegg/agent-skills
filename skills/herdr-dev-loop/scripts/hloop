@@ -9,7 +9,6 @@ repositories.
 from __future__ import annotations
 
 import argparse
-import errno
 import fnmatch
 import fcntl
 import hashlib
@@ -22,14 +21,15 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from pathlib import Path
+from typing import Any
 
 # HLoop is commonly executed from its source checkout.  Keep importing its
 # local modules from creating repository-local bytecode before validation even
@@ -9301,206 +9301,143 @@ def run_seal_validation_command(worktree: Path, command: str) -> tuple[bool, str
     return proc.returncode == 0, proc.stdout or ""
 
 
-def snapshot_worktree_paths(worktree: Path, paths: Iterable[str]) -> dict[str, dict[str, str]]:
-    """Capture exact byte-for-byte pre-validation state for each dirty path.
+def resolve_symlink_target(link_path: Path, target: str) -> str:
+    """Fully canonicalize `target` (as read from `link_path`) to a real path.
 
-    Records enough to restore each path exactly as it was before a Manager
-    validation command runs: file content (via a Git blob, so restoration is
-    byte-for-byte regardless of encoding), executable mode, symlink target,
-    or absence (an already-dirty tracked deletion). Covers every path in
-    `pre_validation_scope`, not just ones a validation command later
-    introduces -- a validation command may also further mutate content the
-    Worker had already changed (e.g. a formatter reformatting a file the
-    Worker edited), and that must roll back too.
+    `os.path.realpath` resolves every symlink along the way, not just the
+    textual `..` segments `os.path.normpath` alone would collapse. A target
+    string that lexically looks contained under the worktree can still
+    physically escape it if some directory component in the resolved path
+    -- of the worktree itself, or of the target -- is a symlink pointing
+    elsewhere (e.g. a symlinked temp-directory ancestor); canonicalizing
+    both sides with `realpath` before comparing is the only way to judge
+    containment correctly in either direction.
     """
 
-    snapshot: dict[str, dict[str, str]] = {}
-    for rel in paths:
-        full = worktree / rel
-        if full.is_symlink():
-            snapshot[rel] = {"kind": "symlink", "target": os.readlink(full)}
-        elif full.is_file():
-            mode = "100755" if os.access(full, os.X_OK) else "100644"
-            blob = git(worktree, ["hash-object", "-w", "--", rel])
-            snapshot[rel] = {"kind": "file", "mode": mode, "blob": blob}
-        else:
-            snapshot[rel] = {"kind": "absent"}
-    return snapshot
+    if os.path.isabs(target):
+        candidate = target
+    else:
+        candidate = os.path.join(str(link_path.parent), target)
+    return os.path.realpath(candidate)
 
 
-def snapshot_worktree_directories(worktree: Path) -> set[str]:
-    """Record every real directory that exists before Manager validation.
+def snapshot_symlink_target(worktree: Path, snapshot: Path, link_path: Path, target: str) -> str:
+    """Return the target a symlink must carry inside the isolated snapshot.
 
-    Rollback may remove directories created by a failing validation command,
-    but it must never infer that an ancestor is new merely because Git did not
-    report the directory itself. Git tracks files, not directories, so a clean
-    tracked sibling can make an existing directory invisible to the dirty-path
-    snapshot. Capture directory existence explicitly and prune only paths that
-    are absent from this set.
+    A symlink whose target resolves outside `worktree` could let a
+    validation command read or write arbitrary filesystem paths through it,
+    even from inside the disposable snapshot -- there is no way to isolate
+    that, so fail closed before running anything rather than silently copy
+    an escape hatch. A relative target that stays inside `worktree`
+    continues to resolve correctly once the directory layout is reproduced
+    structurally in the snapshot, so it is copied unchanged. An absolute
+    target that points inside `worktree` is rewritten to the equivalent
+    absolute path inside the snapshot, so following it lands on isolated
+    content instead of leaking back into the original worktree.
     """
 
-    directories: set[str] = set()
+    worktree_real = os.path.realpath(str(worktree))
+    resolved = resolve_symlink_target(link_path, target)
+    if resolved != worktree_real and not resolved.startswith(worktree_real + os.sep):
+        raise HLoopError(
+            "cannot build isolated validation snapshot: symlink "
+            f"{link_path.relative_to(worktree).as_posix()} targets {target!r}, which "
+            "resolves outside the worktree and cannot be safely isolated"
+        )
+    if os.path.isabs(target):
+        return str(snapshot) + resolved[len(worktree_real):]
+    return target
 
-    def raise_walk_error(error: OSError) -> None:
-        raise error
 
-    for root, dirnames, _filenames in os.walk(
-        worktree, topdown=True, followlinks=False, onerror=raise_walk_error
-    ):
-        root_path = Path(root)
-        if root_path == worktree and ".git" in dirnames:
-            dirnames.remove(".git")
-        for dirname in list(dirnames):
-            full = root_path / dirname
-            if full.is_symlink():
-                # A symlink is path content, not a directory rollback may
-                # later prune with rmdir(2).
-                dirnames.remove(dirname)
+def copy_worktree_tree_entry(worktree: Path, snapshot: Path, source: Path, destination: Path) -> None:
+    """Reproduce `source` at `destination` inside `snapshot`, recursing into directories."""
+
+    if source.is_symlink():
+        target = os.readlink(source)
+        os.symlink(snapshot_symlink_target(worktree, snapshot, source, target), destination)
+    elif source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        for entry in source.iterdir():
+            copy_worktree_tree_entry(worktree, snapshot, entry, destination / entry.name)
+        # Preserve directory mode/mtime too, once its content has finished
+        # copying -- otherwise a later write into it above would bump mtime
+        # again after copystat ran.
+        shutil.copystat(source, destination, follow_symlinks=False)
+    else:
+        shutil.copy2(source, destination)
+
+
+def build_validation_snapshot(worktree: Path) -> Path:
+    """Build a disposable, git-aware copy of `worktree` for isolated validation.
+
+    A Manager validation command (formatter, linter, build) may mutate
+    whatever it touches, but the only content seal may ever commit is the
+    exact tree recorded before validation ran. Running validation against a
+    full copy instead of `worktree` itself means those mutations can never
+    reach the original worktree at all -- there is nothing to roll back, and
+    a retried seal can never get stuck on a validation side effect.
+
+    The copy is byte-for-byte: every path under `worktree` except its own
+    `.git` (a link file, not a real repository, for a linked Worker
+    worktree) is reproduced exactly, including untracked and ignored files,
+    executable bits, deletions (nothing is copied for a path that is not
+    there), and empty directories. Symlinks are handled by
+    `copy_worktree_tree_entry`/`snapshot_symlink_target`: an internal
+    absolute symlink is rewritten to the snapshot's equivalent path so
+    following it never reaches the original worktree, an internal relative
+    symlink is copied unchanged (the reproduced layout keeps it resolving
+    correctly), and a symlink that escapes the worktree entirely fails
+    closed before any validation command runs. `git clone --local
+    --no-hardlinks --no-checkout` gives the copy its own real `.git`
+    (cloned from `worktree`'s current HEAD, with its own object files
+    rather than ones hardlinked back to the original repository) so
+    ordinary git-aware validation commands (`git status`, `git diff`, ...)
+    work inside it exactly as they would in `worktree`; an explicit `git
+    read-tree HEAD` guarantees the index reflects that HEAD tree rather
+    than relying on `--no-checkout`'s implicit behavior. Local clone with
+    `--no-hardlinks` still never requires a reflink-capable filesystem, so
+    this is portable across Linux and macOS. Content is copied with
+    `shutil`, not `cp --reflink`, for the same reason.
+    """
+
+    snapshot = Path(tempfile.mkdtemp(prefix="hloop-seal-validate-"))
+    clone = run_cmd(
+        [
+            TRUSTED_GIT_PATH,
+            "clone",
+            "--local",
+            "--no-hardlinks",
+            "--no-checkout",
+            "--quiet",
+            str(worktree),
+            str(snapshot),
+        ],
+        check=False,
+    )
+    if clone.returncode != 0:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise HLoopError(
+            "failed to build isolated validation snapshot: "
+            + (clone.stderr or clone.stdout or "git clone failed").strip()
+        )
+    read_tree = run_cmd(
+        [TRUSTED_GIT_PATH, "-C", str(snapshot), "read-tree", "HEAD"], check=False
+    )
+    if read_tree.returncode != 0:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise HLoopError(
+            "failed to build isolated validation snapshot: "
+            + (read_tree.stderr or read_tree.stdout or "git read-tree HEAD failed").strip()
+        )
+    try:
+        for entry in worktree.iterdir():
+            if entry.name == ".git":
                 continue
-            directories.add(full.relative_to(worktree).as_posix())
-    return directories
-
-
-def prune_empty_worktree_directories(worktree: Path, candidates: Iterable[str]) -> None:
-    """Prune candidate directories deepest-first without recursive deletion."""
-
-    for rel in sorted(
-        set(candidates),
-        key=lambda path: (path.count("/"), path),
-        reverse=True,
-    ):
-        full = worktree / rel
-        if full.is_symlink():
-            continue
-        try:
-            full.rmdir()
-        except FileNotFoundError:
-            pass
-        except NotADirectoryError:
-            pass
-        except OSError as exc:
-            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
-                raise
-
-
-def restore_worktree_paths_snapshot(worktree: Path, snapshot: dict[str, dict[str, str]]) -> None:
-    """Restore paths to the exact byte-for-byte state captured by `snapshot_worktree_paths`."""
-
-    for rel, entry in snapshot.items():
-        full = worktree / rel
-        # A validation command may have replaced a file or symlink with a
-        # directory (or vice versa). `Path.unlink()` raises `IsADirectoryError`
-        # on a real directory, so clear a directory with `shutil.rmtree`
-        # first -- otherwise restoring the recorded file/symlink/absent state
-        # underneath it would fail outright.
-        if full.is_symlink():
-            full.unlink()
-        elif full.is_dir():
-            shutil.rmtree(full)
-        elif full.exists():
-            full.unlink()
-        kind = entry.get("kind")
-        if kind == "absent":
-            continue
-        full.parent.mkdir(parents=True, exist_ok=True)
-        if kind == "symlink":
-            os.symlink(entry["target"], full)
-        elif kind == "file":
-            # Binary-safe: read the blob's raw bytes directly rather than
-            # through the text-mode `git()`/`run_cmd()` helpers, which decode
-            # stdout as text and would corrupt non-UTF-8 content.
-            proc = subprocess.run(
-                [TRUSTED_GIT_PATH, "-C", str(worktree), "cat-file", "blob", entry["blob"]],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            full.write_bytes(proc.stdout)
-            os.chmod(full, 0o755 if entry.get("mode") == "100755" else 0o644)
-
-
-def rollback_validation_command_side_effects(
-    worktree: Path,
-    pre_validation_scope: set[str],
-    pre_validation_snapshot: dict[str, dict[str, str]],
-    pre_validation_directories: set[str],
-) -> None:
-    """Undo whatever a failing Manager validation command left behind, byte for byte.
-
-    A validation command run during `hloop worker seal` may mutate the
-    worktree (formatters, generated files, partial build output) even when
-    it exits non-zero. Left in place, those paths would not match the
-    handoff's declared `changed_files`, so every retried seal would fail
-    closed forever on "stale handoff artifact" with no way to recover short
-    of a human deleting files by hand. Restore the worktree to exactly its
-    pre-validation dirty state instead: delete any newly introduced
-    untracked/modified path (restoring a previously-clean tracked path from
-    `HEAD`), and restore every already-dirty path from `pre_validation_snapshot`
-    exactly -- content, executable mode, symlink target, and deletion state
-    -- rather than trusting that only "new" paths need repair.
-    """
-
-    current = set(porcelain_paths_no_renames(worktree))
-    new_paths = sorted(current - pre_validation_scope)
-    current_directories = snapshot_worktree_directories(worktree)
-    candidate_directories = current_directories - pre_validation_directories
-    if new_paths:
-        # Split exact file paths against the index. `git ls-files -- <dir>`
-        # expands recursively, so intersect with the complete tracked-file
-        # list instead of treating a pathspec match as proof that the path
-        # itself was tracked.
-        tracked_paths = set(git(worktree, ["ls-files", "-z"]).split("\0"))
-        tracked_paths.discard("")
-        tracked_new_paths = sorted(set(new_paths) & tracked_paths)
-        untracked_new_paths = sorted(set(new_paths) - tracked_paths)
-
-        for rel in new_paths:
-            parent = PurePosixPath(rel).parent
-            while str(parent) not in {"", "."}:
-                candidate_directories.add(str(parent))
-                parent = parent.parent
-
-        # Remove only the newly reported leaf content. Never recursively
-        # delete a directory: it may have existed before validation and still
-        # contain a clean tracked sibling that Git status does not mention.
-        for rel in sorted(
-            untracked_new_paths,
-            key=lambda path: (path.count("/"), path),
-            reverse=True,
-        ):
-            full = worktree / rel
-            if full.is_symlink() or (full.exists() and not full.is_dir()):
-                full.unlink()
-            elif full.is_dir():
-                candidate_directories.add(rel)
-
-        # Paths that were clean tracked files before validation are restored
-        # from HEAD after newly created replacement directories are pruned.
-        if tracked_new_paths:
-            # A tracked file may have been replaced by a directory. Prune
-            # proven-new empty directories before checkout needs to recreate
-            # that file; the complete pass below handles all remaining
-            # candidates after leaf restoration.
-            prune_empty_worktree_directories(worktree, candidate_directories)
-            run_cmd(
-                [
-                    TRUSTED_GIT_PATH,
-                    "-C",
-                    str(worktree),
-                    "checkout",
-                    "HEAD",
-                    "--",
-                    *tracked_new_paths,
-                ],
-                check=True,
-            )
-
-    # Git porcelain omits empty untracked directories entirely. The explicit
-    # before/after directory snapshots make those paths candidates too. Prune
-    # deepest-first and only with rmdir(2), so non-empty or pre-existing
-    # directories (including ones with clean tracked siblings) survive.
-    prune_empty_worktree_directories(worktree, candidate_directories)
-    restore_worktree_paths_snapshot(worktree, pre_validation_snapshot)
+            copy_worktree_tree_entry(worktree, snapshot, entry, snapshot / entry.name)
+    except Exception:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+    return snapshot
 
 
 def worker_result_contract_error(
@@ -9694,6 +9631,45 @@ def validate_recorded_seal_commit(
         )
 
 
+def reconcile_seal_index(
+    worktree: Path,
+    task_id: str,
+    branch_ref: str,
+    commit_sha: str,
+) -> None:
+    """Reconcile the index to `commit_sha` without ever moving `branch_ref`.
+
+    The mutable index is only a staging/recovery aid; `branch_ref` was
+    already advanced to `commit_sha` by the compare-and-swap in
+    `commit_recorded_seal_tree`. `git reset --mixed <commit>` reconciles the
+    index too, but as a side effect it also *sets* the current branch ref to
+    `<commit>` -- harmless when the ref is already there, but if another
+    process advances the ref during this reconciliation window, a mixed
+    reset would silently move it back and discard that concurrent commit's
+    ref position. `git read-tree <commit>` only replaces the index, leaving
+    HEAD/`branch_ref` and the working tree untouched, so verify `branch_ref`
+    still equals the recorded `commit_sha` immediately before and after
+    reconciling instead of relying on a command that could move it.
+    """
+
+    pre_ref = git(worktree, ["rev-parse", "-q", "--verify", branch_ref], check=False)
+    if pre_ref != commit_sha:
+        raise HLoopError(
+            f"seal index reconciliation aborted for {task_id}: {branch_ref} is "
+            f"{pre_ref or '(missing)'}, not the recorded seal commit {commit_sha}; "
+            "preserving the concurrent ref movement and leaving the seal transaction "
+            "in place for inspection"
+        )
+    run_cmd([TRUSTED_GIT_PATH, "-C", str(worktree), "read-tree", commit_sha], check=True)
+    post_ref = git(worktree, ["rev-parse", "-q", "--verify", branch_ref], check=False)
+    if post_ref != commit_sha:
+        raise HLoopError(
+            f"seal index reconciliation aborted for {task_id}: {branch_ref} advanced to "
+            f"{post_ref or '(missing)'} during index reconciliation; preserving that "
+            "concurrent advance and leaving the seal transaction in place for inspection"
+        )
+
+
 def commit_recorded_seal_tree(
     repo: Path,
     state: dict[str, Any],
@@ -9707,8 +9683,10 @@ def commit_recorded_seal_tree(
     The mutable index is only a staging/recovery aid. The commit object is
     always constructed from the transaction's durable `staged_tree` and
     `expected_parent`, then installed with `git update-ref <new> <old>`.
-    Finally a mixed reset reconciles the index to the landed commit while
-    preserving any concurrent worktree content as ordinary unstaged changes.
+    Finally an index-only reconciliation (`reconcile_seal_index`) brings the
+    index in line with the landed commit while preserving any concurrent
+    worktree content as ordinary unstaged changes and never moving the
+    branch ref itself.
     """
 
     transaction = task_state.get("seal_transaction")
@@ -9787,12 +9765,13 @@ def commit_recorded_seal_tree(
             f"expected {commit_sha}, got {landed_head}"
         )
 
-    # Never use `reset --hard`: same-path content written or re-staged after
-    # `staged_tree` was recorded must survive as an unstaged worktree change.
-    run_cmd(
-        [TRUSTED_GIT_PATH, "-C", str(worktree), "reset", "--mixed", "--quiet", commit_sha],
-        check=True,
-    )
+    # Never use `reset --hard` or `reset --mixed`: same-path content written
+    # or re-staged after `staged_tree` was recorded must survive as an
+    # unstaged worktree change, and a mixed reset would also move
+    # `branch_ref` -- silently reverting it if another process advanced it
+    # during this window. Reconcile the index only, and fail closed without
+    # touching the ref if that has happened.
+    reconcile_seal_index(worktree, task_id, branch_ref, commit_sha)
     return commit_sha
 
 
@@ -10078,54 +10057,34 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 f"cannot seal {task_id} as status done without at least one Manager "
                 "--validation-command"
             )
-        pre_validation_scope = set(full_scope)
-        pre_validation_snapshot = snapshot_worktree_paths(worktree, pre_validation_scope)
-        pre_validation_directories = snapshot_worktree_directories(worktree)
-        for command in manager_validation_commands:
-            passed, output = run_seal_validation_command(worktree, command)
-            manager_validation_results.append("passed" if passed else "failed")
-            if not passed:
-                # A failing validation command may still have mutated the
-                # worktree (formatters, generated files, partial builds).
-                # Roll those side effects back to the pre-validation dirty
-                # state so the worktree matches the handoff's declared
-                # `changed_files` again -- otherwise a retried seal would
-                # fail closed forever on "stale handoff artifact" with no
-                # way to recover short of manual cleanup.
-                rollback_validation_command_side_effects(
-                    worktree,
-                    pre_validation_scope,
-                    pre_validation_snapshot,
-                    pre_validation_directories,
-                )
-                raise HLoopError(
-                    f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
-                    + output
-                )
+        # Run every Manager validation command inside a disposable, isolated
+        # copy of this worktree rather than in place: a validation command
+        # (formatter, linter, build) may mutate whatever it touches, and the
+        # only thing seal may ever commit is the exact content recorded
+        # before validation ran. Building and discarding the snapshot around
+        # the whole command sequence guarantees this worktree is never
+        # mutated by validation, so there is nothing to roll back and no
+        # post-validation rescan is needed -- `full_scope`/`dirty`, both
+        # already measured above, remain exactly what gets sealed.
+        snapshot = build_validation_snapshot(worktree)
+        try:
+            for command in manager_validation_commands:
+                passed, output = run_seal_validation_command(snapshot, command)
+                manager_validation_results.append("passed" if passed else "failed")
+                if not passed:
+                    raise HLoopError(
+                        f"Manager validation command failed, refusing to seal {task_id}: {command}\n"
+                        + output
+                    )
+        finally:
+            shutil.rmtree(snapshot, ignore_errors=True)
 
-        # The validation run itself may have mutated the tree (formatters,
-        # lockfiles, generated files). Re-scan and scope-check only the delta
-        # it introduced; nothing may be committed unless every changed path,
-        # old and new, is in scope.
-        post_dirty = porcelain_paths_no_renames(worktree)
         observed_parent = git(worktree, ["rev-parse", "HEAD"])
         if observed_parent != expected_parent:
             raise HLoopError(
                 f"Worker branch moved during Manager validation for {task_id}: "
                 f"expected {expected_parent}, got {observed_parent}"
             )
-        post_committed = changed_files(worktree, base_sha, expected_parent)
-        post_scope = list(dict.fromkeys([*post_committed, *post_dirty]))
-        new_paths = sorted(set(post_scope) - set(full_scope))
-        if new_paths:
-            new_violations = validate_change_scope(task_id, meta, new_paths)
-            if new_violations:
-                raise HLoopError(
-                    "write-scope violations introduced by Manager validation commands: "
-                    + "; ".join(new_violations)
-                )
-        full_scope = post_scope
-        dirty = post_dirty
         validation_recorded = bool(manager_validation_commands)
         validation_commands = manager_validation_commands
         validation_results = manager_validation_results
