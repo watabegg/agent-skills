@@ -668,12 +668,32 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
             "token": "synthetic-t002-token",
         },
     )
+    poison_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    (spool_dir / f"{poison_id}.json").write_text(
+        json.dumps({"not": "an event"}), encoding="utf-8"
+    )
     recovered = run(
         hloop_command(repo, namespace, "broker", "recover"),
         cwd=root,
         env=env,
     )
-    require("replayed 1 spooled report" in recovered.stdout, "spool recovery did not replay")
+    require(
+        "replayed 1 spooled report" in recovered.stdout,
+        "spool recovery did not replay the valid entry alongside a poison entry",
+    )
+    require(
+        "quarantined 1 poison entrie" in recovered.stdout,
+        "spool recovery did not report the quarantined poison entry",
+    )
+    quarantined_files = [
+        path
+        for path in (spool_dir / "quarantine").glob("*.json")
+        if not path.name.endswith(".audit.json")
+    ]
+    require(
+        [path.name for path in quarantined_files] == [f"{poison_id}.json"],
+        "poison spool entry was not quarantined by itself",
+    )
     broker_status = run(
         hloop_command(repo, namespace, "broker", "status"),
         cwd=root,
@@ -681,11 +701,13 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
     )
     status = json.loads(broker_status.stdout)
     require(status["spooled"] == 0, "recovered spool was not cleared")
+    require(status["spool_quarantined"] == 1, "quarantined spool count is stale")
     require(status["events"] == 2, "broker event count mismatch")
     return {
         "semantic_ack_event": event_id,
         "wake_consumed": True,
         "recovered_event": spooled_id,
+        "quarantined_event": poison_id,
         "broker_counts": status,
     }
 

@@ -517,7 +517,7 @@ class BrokerStorageTests(unittest.TestCase):
             self.assertEqual(replayed[0].event["sequence"], 1)
         self.assertEqual(list(spool.glob("*.json")), [])
 
-    def test_spool_replay_reauthenticates_unknown_role_and_stale_attempt(self):
+    def test_spool_replay_quarantines_unknown_role_and_stale_attempt_without_blocking_valid_entries(self):
         spool = self.root / "spool"
         unknown = client_event()
         unknown["role_id"] = "T999"
@@ -529,14 +529,26 @@ class BrokerStorageTests(unittest.TestCase):
             unknown,
             authentication=report_authentication(unknown, "unknown-token"),
         )
-        with self.assertRaisesRegex(
-            broker.ReportAuthenticationError, "does not match an active"
-        ):
-            with self.store.transaction() as transaction:
-                self.store.replay_spool(transaction, spool)
-        self.assertEqual(len(list(spool.glob("*.json"))), 1)
+        valid = client_event(event_id="00000000-0000-4000-8000-0000000000aa")
+        broker.spool_client_event(
+            spool, valid, authentication=report_authentication(valid, self.report_token)
+        )
 
-        for path in spool.glob("*.json"):
+        with self.store.transaction() as transaction:
+            replayed = self.store.replay_spool(transaction, spool)
+        self.assertEqual([item.event["event_id"] for item in replayed], [valid["event_id"]])
+        self.assertEqual(list(spool.glob("*.json")), [])
+        quarantine_dir = spool / "quarantine"
+        quarantined = [
+            path for path in quarantine_dir.glob("*.json") if not path.name.endswith(".audit.json")
+        ]
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].name, f"{unknown['event_id']}.json")
+        audit = json.loads((quarantine_dir / f"{unknown['event_id']}.json.audit.json").read_text())
+        self.assertEqual(audit["reason"], "stale-run")
+        self.assertEqual(audit["event_id"], unknown["event_id"])
+
+        for path in quarantine_dir.glob("*"):
             path.unlink()
         stale = client_event()
         with self.store.transaction() as transaction:
@@ -553,11 +565,15 @@ class BrokerStorageTests(unittest.TestCase):
             stale,
             authentication=report_authentication(stale, self.report_token),
         )
-        with self.assertRaisesRegex(
-            broker.ReportAuthenticationError, "T003/T003-A001"
-        ):
-            with self.store.transaction() as transaction:
-                self.store.replay_spool(transaction, spool)
+        with self.store.transaction() as transaction:
+            replayed = self.store.replay_spool(transaction, spool)
+        self.assertEqual(replayed, [])
+        self.assertEqual(list(spool.glob("*.json")), [])
+        audit = json.loads(
+            (quarantine_dir / f"{stale['event_id']}.json.audit.json").read_text()
+        )
+        self.assertEqual(audit["reason"], "revoked-attempt")
+        self.assertIn("T003/T003-A001", audit["detail"])
 
     def test_future_schema_is_rejected_without_ddl_mutation(self):
         future_root = self.root / "future-broker"
@@ -659,7 +675,7 @@ class BrokerStorageTests(unittest.TestCase):
         self.assertEqual(broker.read_owner_metadata(metadata_path), second)
         self.assertEqual(metadata_path.stat().st_mode & 0o777, 0o600)
 
-    def test_invalid_spool_entry_rolls_back_the_whole_replay_batch(self):
+    def test_invalid_spool_entry_is_quarantined_while_valid_entries_still_replay(self):
         spool = self.root / "spool"
         event = client_event()
         broker.spool_client_event(
@@ -668,12 +684,26 @@ class BrokerStorageTests(unittest.TestCase):
         invalid = spool / "ffffffff-ffff-4fff-8fff-ffffffffffff.json"
         invalid.write_text(json.dumps({"not": "an event"}), encoding="utf-8")
 
-        with self.assertRaisesRegex(broker.BrokerStorageError, "invalid spool entry"):
-            with self.store.transaction() as transaction:
-                self.store.replay_spool(transaction, spool)
+        with self.store.transaction() as transaction:
+            replayed = self.store.replay_spool(transaction, spool)
+        self.assertEqual([item.event["event_id"] for item in replayed], [event["event_id"]])
 
         with self.store.transaction() as transaction:
-            self.assertEqual(self.store.events(transaction), [])
+            self.assertEqual(
+                [item["event_id"] for item in self.store.events(transaction)],
+                [event["event_id"]],
+            )
+        self.assertEqual(list(spool.glob("*.json")), [])
+        quarantine_dir = spool / "quarantine"
+        quarantined = [
+            path for path in quarantine_dir.glob("*.json") if not path.name.endswith(".audit.json")
+        ]
+        self.assertEqual([path.name for path in quarantined], ["ffffffff-ffff-4fff-8fff-ffffffffffff.json"])
+        audit = json.loads(
+            (quarantine_dir / "ffffffff-ffff-4fff-8fff-ffffffffffff.json.audit.json").read_text()
+        )
+        self.assertEqual(audit["reason"], "invalid")
+        self.assertIn("invalid spool entry", audit["detail"])
 
 
 if __name__ == "__main__":

@@ -811,24 +811,42 @@ class BrokerStore:
     def replay_spool(
         self, transaction: BrokerTransaction, spool_directory: Path
     ) -> list[StoredEvent]:
-        """Replay a spool batch and remove files only after a successful commit."""
+        """Replay a spool batch and remove files only after a successful commit.
+
+        A poison entry (invalid content, stale-run, revoked-attempt, or a
+        digest/token mismatch) is quarantined with audit metadata instead of
+        aborting the whole batch, so later valid entries still replay in the
+        same recovery pass.
+        """
 
         transaction.require_active(self)
+        directory = Path(spool_directory)
+        valid_entries, poison_entries = _scan_spool_directory(directory)
         replayed: list[StoredEvent] = []
-        for path, event, authentication in _iter_spooled_entries(spool_directory):
-            if authentication is None or not self.authenticate_role_report(
-                transaction,
-                run_id=event["run_id"],
-                role_id=event["role_id"],
-                attempt_id=event["attempt_id"],
-                task_contract_digest=event["task_contract_digest"],
-                token=str(authentication.get("token") or ""),
-            ):
-                raise ReportAuthenticationError(
+        for path, reason, detail, event_id in poison_entries:
+            transaction.after_commit(
+                lambda path=path, reason=reason, detail=detail, event_id=event_id: _quarantine_spool_entry(
+                    path, directory, reason=reason, detail=detail, event_id=event_id
+                )
+            )
+        for _, path, event, authentication in valid_entries:
+            auth_failure = self._spool_authentication_failure_reason(
+                transaction, event=event, authentication=authentication
+            )
+            if auth_failure is not None:
+                detail = (
                     "spooled report does not match an active "
                     "run/role/attempt/digest/token identity: "
                     f"{event['role_id']}/{event['attempt_id']}"
                 )
+                transaction.after_commit(
+                    lambda path=path, reason=auth_failure, detail=detail, event_id=event[
+                        "event_id"
+                    ]: _quarantine_spool_entry(
+                        path, directory, reason=reason, detail=detail, event_id=event_id
+                    )
+                )
+                continue
             stored = self.accept_report(transaction, event)
             replayed.append(stored)
             expected_digest = event["payload_digest"]
@@ -838,6 +856,35 @@ class BrokerStore:
                 )
             )
         return replayed
+
+    def _spool_authentication_failure_reason(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        event: Mapping[str, Any],
+        authentication: Mapping[str, str] | None,
+    ) -> str | None:
+        """Classify why a spooled report cannot be authenticated, or None if it can."""
+
+        if authentication is None:
+            return "invalid"
+        current = self._latest_active_role(
+            transaction, run_id=event["run_id"], role_id=event["role_id"]
+        )
+        if current is None:
+            return "stale-run"
+        if not current["active"]:
+            return "revoked-attempt"
+        if current["attempt_id"] != event["attempt_id"]:
+            return "revoked-attempt"
+        if current["task_contract_digest"] != event["task_contract_digest"].lower():
+            return "digest-mismatch"
+        token_digest = hashlib.sha256(
+            str(authentication.get("token") or "").encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(current["token_digest"], token_digest):
+            return "token-mismatch"
+        return None
 
     def register_owner(
         self,
@@ -1235,51 +1282,159 @@ def _validate_spool_authentication(
     return normalized
 
 
-def _iter_spooled_entries(
+_SPOOL_QUARANTINE_DIRNAME = "quarantine"
+
+
+def _scan_spool_directory(
     spool_directory: Path,
-) -> Iterator[tuple[Path, dict[str, Any], dict[str, str] | None]]:
-    """Yield validated spool entries including the private auth envelope."""
+) -> tuple[
+    list[tuple[int | None, Path, dict[str, Any], dict[str, str] | None]],
+    list[tuple[Path, str, str, str | None]],
+]:
+    """Split a spool directory into valid entries and poison entries.
+
+    Poison entries never abort the scan: each unsafe path, unparseable file,
+    filename/event_id mismatch, or duplicate spool_sequence is recorded as
+    ``(path, reason, detail, event_id)`` instead of raising, so a single
+    corrupted file cannot block replay of the rest of the batch. Valid
+    entries are returned in durable enqueue order (by spool_sequence, then
+    filename for legacy unsequenced entries).
+    """
 
     directory = Path(spool_directory)
+    valid: list[tuple[int | None, Path, dict[str, Any], dict[str, str] | None]] = []
+    poison: list[tuple[Path, str, str, str | None]] = []
     if not directory.exists():
-        return
-    entries: list[
-        tuple[int | None, Path, dict[str, Any], dict[str, str] | None]
-    ] = []
+        return valid, poison
     seen_sequences: dict[int, Path] = {}
-    for path in directory.glob("*.json"):
+    for path in sorted(directory.glob("*.json"), key=lambda item: item.name):
         if path.is_symlink() or not path.is_file():
-            raise BrokerStorageError(f"unsafe spool entry: {path}")
-        sequence, event, authentication = _read_spool_entry(path)
+            poison.append((path, "invalid", f"unsafe spool entry: {path}", None))
+            continue
+        try:
+            sequence, event, authentication = _read_spool_entry(path)
+        except (BrokerStorageError, ReportAuthenticationError) as exc:
+            poison.append((path, "invalid", str(exc), _best_effort_event_id(path)))
+            continue
         if path.stem != event["event_id"]:
-            raise BrokerStorageError(
-                f"spool filename does not match event_id: {path.name}"
+            poison.append(
+                (
+                    path,
+                    "invalid",
+                    f"spool filename does not match event_id: {path.name}",
+                    event["event_id"],
+                )
             )
+            continue
         if sequence is not None and sequence in seen_sequences:
-            raise BrokerStorageError(
-                "duplicate spool_sequence "
-                f"{sequence}: {seen_sequences[sequence].name}, {path.name}"
+            poison.append(
+                (
+                    path,
+                    "invalid",
+                    "duplicate spool_sequence "
+                    f"{sequence}: {seen_sequences[sequence].name}, {path.name}",
+                    event["event_id"],
+                )
             )
+            continue
         if sequence is not None:
             seen_sequences[sequence] = path
-        entries.append((sequence, path, event, authentication))
-    entries.sort(
+        valid.append((sequence, path, event, authentication))
+    valid.sort(
         key=lambda item: (
             item[0] is not None,
             item[0] if item[0] is not None else 0,
             item[1].name,
         )
     )
-    for _, path, event, authentication in entries:
-        yield path, event, authentication
+    return valid, poison
+
+
+def _best_effort_event_id(path: Path) -> str | None:
+    """Try to recover an event_id from an otherwise-unparseable spool file."""
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(raw, Mapping):
+        candidate = raw.get("event", raw)
+        if isinstance(candidate, Mapping):
+            event_id = candidate.get("event_id")
+            if isinstance(event_id, str) and event_id:
+                return event_id
+    return None
+
+
+def _quarantine_spool_entry(
+    path: Path,
+    spool_directory: Path,
+    *,
+    reason: str,
+    detail: str,
+    event_id: str | None,
+) -> None:
+    """Atomically move a poison spool entry aside with audit metadata."""
+
+    if not path.exists():
+        return
+    quarantine_dir = Path(spool_directory) / _SPOOL_QUARANTINE_DIRNAME
+    quarantine_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        quarantine_dir.chmod(0o700)
+    except OSError:
+        pass
+    target = quarantine_dir / path.name
+    suffix = 0
+    while target.exists():
+        suffix += 1
+        target = quarantine_dir / f"{path.stem}.{suffix}{path.suffix}"
+    os.replace(path, target)
+    _atomic_write_json(
+        target.with_name(target.name + ".audit.json"),
+        {
+            "quarantined_at": utc_now(),
+            "reason": reason,
+            "detail": detail,
+            "original_filename": path.name,
+            "event_id": event_id or "",
+        },
+    )
+
+
+def spool_quarantine_count(spool_directory: Path) -> int:
+    """Return the number of poison entries currently quarantined."""
+
+    quarantine_dir = Path(spool_directory) / _SPOOL_QUARANTINE_DIRNAME
+    if not quarantine_dir.exists():
+        return 0
+    return sum(1 for path in quarantine_dir.glob("*.json") if not path.name.endswith(".audit.json"))
+
+
+def spool_has_entries(spool_directory: Path) -> bool:
+    """Return whether the spool directory holds any pending entry.
+
+    This is a lightweight existence check (no parsing) so a poison-only
+    spool still reports pending work and triggers a quarantining replay.
+    """
+
+    directory = Path(spool_directory)
+    if not directory.exists():
+        return False
+    return any(directory.glob("*.json"))
 
 
 def iter_spooled_events(
     spool_directory: Path,
 ) -> Iterator[tuple[Path, dict[str, Any]]]:
-    """Yield validated spool entries in durable enqueue order."""
+    """Yield valid spool entries in durable enqueue order.
 
-    for path, event, _ in _iter_spooled_entries(spool_directory):
+    Poison entries are silently skipped; use ``replay_spool`` to quarantine
+    them durably.
+    """
+
+    valid_entries, _ = _scan_spool_directory(spool_directory)
+    for _, path, event, _authentication in valid_entries:
         yield path, event
 
 
