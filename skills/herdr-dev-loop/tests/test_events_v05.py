@@ -337,6 +337,109 @@ class BrokerStorageTests(unittest.TestCase):
             ],
         )
 
+    def test_acknowledging_coalesced_milestone_drains_displayed_duplicates_without_changing_wakes(self):
+        milestone_first = events.prepare_client_event(
+            report(summary="進捗1", report_type="milestone"),
+            event_id=str(uuid.uuid4()),
+        )
+        milestone_displayed = events.prepare_client_event(
+            report(summary="進捗1", report_type="milestone"),
+            event_id=str(uuid.uuid4()),
+        )
+        attention = events.prepare_client_event(
+            report(summary="進捗1", report_type="attention"),
+            event_id=str(uuid.uuid4()),
+        )
+
+        with self.store.transaction() as transaction:
+            for candidate in (milestone_first, milestone_displayed, attention):
+                self.store.accept_report(transaction, candidate)
+            lease = self.store.register_wake_lease(
+                transaction,
+                run_id="run-001",
+                manager_session_id="session-1",
+                pane_id="wH:p1",
+                expires_at=EXPIRES_AT,
+                created_at=CREATED_AT,
+            )
+            wakes = self.store.enqueue_unacknowledged_for_lease(
+                transaction,
+                run_id="run-001",
+                lease_generation=lease["generation"],
+                manager_session_id="session-1",
+                pane_id="wH:p1",
+                report_types=frozenset({"ack", "attention", "completion"}),
+                created_at=CREATED_AT,
+            )
+
+            self.assertEqual(
+                [
+                    item["event_id"]
+                    for item in self.store.unconsumed_inbox(
+                        transaction, run_id="run-001"
+                    )
+                ],
+                [milestone_displayed["event_id"], attention["event_id"]],
+            )
+            self.assertEqual(
+                [item.wake["event_id"] for item in wakes],
+                [attention["event_id"]],
+            )
+
+            acknowledged = self.store.acknowledge_inbox(
+                transaction,
+                event_id=milestone_displayed["event_id"],
+                run_id="run-001",
+                acknowledged_at=CREATED_AT,
+            )
+
+            self.assertEqual(
+                acknowledged,
+                broker.InboxAcknowledgement(True, "acknowledged"),
+            )
+            self.assertEqual(
+                [
+                    item["event_id"]
+                    for item in self.store.unconsumed_inbox(
+                        transaction, run_id="run-001"
+                    )
+                ],
+                [attention["event_id"]],
+            )
+            self.assertEqual(
+                [
+                    item["event_id"]
+                    for item in self.store.pending_wakes(
+                        transaction, at=CREATED_AT
+                    )
+                ],
+                [attention["event_id"]],
+            )
+            acknowledgement_ids = transaction.connection.execute(
+                "SELECT event_id FROM inbox_acknowledgements ORDER BY acknowledgement_id"
+            ).fetchall()
+            self.assertEqual(
+                [row["event_id"] for row in acknowledgement_ids],
+                [milestone_first["event_id"], milestone_displayed["event_id"]],
+            )
+
+            milestone_later = events.prepare_client_event(
+                report(summary="進捗1", report_type="milestone"),
+                event_id=str(uuid.uuid4()),
+            )
+            self.store.accept_report(transaction, milestone_later)
+            self.assertEqual(
+                [
+                    item["event_id"]
+                    for item in self.store.unconsumed_inbox(
+                        transaction, run_id="run-001"
+                    )
+                ],
+                [attention["event_id"], milestone_later["event_id"]],
+            )
+            self.assertEqual(len(self.store.events(transaction)), 4)
+            self.assertEqual(len(self.store.inbox(transaction)), 4)
+
     def test_exception_rolls_back_event_and_inbox_together(self):
         with self.assertRaisesRegex(RuntimeError, "rollback"):
             with self.store.transaction() as transaction:
