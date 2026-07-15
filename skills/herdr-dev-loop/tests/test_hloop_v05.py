@@ -28,14 +28,37 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
     def tearDown(self):
         hloop.configure_loop_namespace(self.previous_namespace)
 
-    def make_repo(self, root: Path, *, commit_count: int):
+    def make_repo(
+        self,
+        root: Path,
+        *,
+        commit_count: int,
+        object_format: str = "sha1",
+        commit_encoding: str | None = None,
+    ):
         namespace = f"cherry-pick-crash-{commit_count}"
         hloop.configure_loop_namespace(namespace)
         repo = root / "repo"
         repo.mkdir()
-        subprocess.run(["git", "init", "--initial-branch=main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "init",
+                f"--object-format={object_format}",
+                "--initial-branch=main",
+            ],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
         subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        if commit_encoding:
+            subprocess.run(
+                ["git", "config", "i18n.commitEncoding", commit_encoding],
+                cwd=repo,
+                check=True,
+            )
         (repo / "README.md").write_text("base\n", encoding="utf-8")
         subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
@@ -48,12 +71,13 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
             changed_paths.append(path)
             (repo / path).write_text(f"feature {index}\n", encoding="utf-8")
             subprocess.run(["git", "add", path], cwd=repo, check=True)
-            subprocess.run(
-                ["git", "commit", "-m", f"feature {index}"],
-                cwd=repo,
-                check=True,
-                capture_output=True,
-            )
+            if commit_encoding:
+                message_path = root / f"message-{index}.txt"
+                message_path.write_bytes(f"caf\N{LATIN SMALL LETTER E WITH ACUTE} {index}\n".encode("latin-1"))
+                commit_args = ["git", "commit", "-F", str(message_path)]
+            else:
+                commit_args = ["git", "commit", "-m", f"feature {index}"]
+            subprocess.run(commit_args, cwd=repo, check=True, capture_output=True)
         worker_head = hloop.git(repo, ["rev-parse", "HEAD"])
         source_commits = tuple(
             hloop.git(repo, ["rev-list", "--reverse", f"{worker_base}..{worker_head}"]).splitlines()
@@ -94,13 +118,21 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                     "write_deny": [],
                 }
             },
-            "active_merge": {
-                **transaction.to_record(),
-                "worker_base_sha": worker_base,
-            },
+            "active_merge": hloop.build_active_merge_record(
+                transaction,
+                worker_base_sha=worker_base,
+            ),
         }
         hloop.save_state(repo, state)
         return repo, state, source_commits
+
+    def install_failing_prepare_commit_msg_hook(self, repo: Path):
+        hook = Path(hloop.git(repo, ["rev-parse", "--git-path", "hooks/prepare-commit-msg"]))
+        if not hook.is_absolute():
+            hook = repo / hook
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        hook.chmod(0o755)
 
     def merge_args(self, repo: Path):
         return argparse.Namespace(
@@ -111,6 +143,29 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
             retry=False,
             mode=None,
             dry_run=False,
+        )
+
+    def run_recorded_cherry_pick(
+        self,
+        repo: Path,
+        state: dict,
+        source_commits: tuple[str, ...],
+        *,
+        check: bool,
+    ):
+        transaction = hloop.MergeTransaction.from_record(state["active_merge"])
+        _, env = hloop.prepare_cherry_pick_evidence(
+            repo,
+            state,
+            transaction,
+            resolved_tree=None,
+        )
+        return subprocess.run(
+            ["git", *hloop.CHERRY_PICK_GIT_CONFIG, "cherry-pick", *source_commits],
+            cwd=repo,
+            check=check,
+            capture_output=True,
+            env=env,
         )
 
     def make_conflicted_repo(self, root: Path, *, commit_count: int):
@@ -194,17 +249,17 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                     "write_deny": [],
                 }
             },
-            "active_merge": {
-                **transaction.to_record(),
-                "worker_base_sha": worker_base,
-            },
+            "active_merge": hloop.build_active_merge_record(
+                transaction,
+                worker_base_sha=worker_base,
+            ),
         }
         hloop.save_state(repo, state)
-        cherry_pick = subprocess.run(
-            ["git", "cherry-pick", *source_commits],
-            cwd=repo,
-            text=True,
-            capture_output=True,
+        cherry_pick = self.run_recorded_cherry_pick(
+            repo,
+            state,
+            source_commits,
+            check=False,
         )
         self.assertNotEqual(cherry_pick.returncode, 0)
         observed = hloop.observed_merge_transaction(repo, transaction)
@@ -233,17 +288,212 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                 hloop.cmd_merge_continue(repo, state, "T001")
         return hloop.load_state(repo)
 
+    def test_new_transaction_evidence_policy_cannot_be_downgraded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state, source_commits = self.make_repo(Path(directory), commit_count=1)
+            active = state["active_merge"]
+            self.assertEqual(
+                active["cherry_pick_transaction_version"],
+                hloop.CHERRY_PICK_TRANSACTION_VERSION,
+            )
+            self.assertEqual(
+                active["cherry_pick_evidence_policy"],
+                hloop.CHERRY_PICK_EVIDENCE_POLICY,
+            )
+            self.assertEqual(
+                active["cherry_pick_evidence_version"],
+                hloop.CHERRY_PICK_EVIDENCE_VERSION,
+            )
+            self.assertEqual(active["cherry_pick_evidence_legacy_prefix_count"], 0)
+            self.assertEqual(active["cherry_pick_evidence"], [])
+
+            transaction = hloop.MergeTransaction.from_record(active)
+            initial_head = hloop.git(repo, ["rev-parse", "HEAD"])
+            initial_mutations = {
+                "missing-policy": lambda candidate: candidate.pop(
+                    "cherry_pick_evidence_policy"
+                ),
+                "rewritten-policy": lambda candidate: candidate.update(
+                    {
+                        "cherry_pick_evidence_policy": (
+                            hloop.CHERRY_PICK_EVIDENCE_LEGACY_POLICY
+                        ),
+                        "cherry_pick_evidence_legacy_migration_digest": (
+                            hloop.legacy_cherry_pick_migration_digest(transaction, 0)
+                        ),
+                    }
+                ),
+                "missing-transaction-version": lambda candidate: candidate.pop(
+                    "cherry_pick_transaction_version"
+                ),
+                "missing-version": lambda candidate: candidate.pop(
+                    "cherry_pick_evidence_version"
+                ),
+                "missing-evidence": lambda candidate: candidate.pop(
+                    "cherry_pick_evidence"
+                ),
+            }
+            for name, mutation in initial_mutations.items():
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(active)
+                    mutation(candidate)
+                    with self.assertRaisesRegex(
+                        hloop.HLoopError, "evidence|transaction"
+                    ):
+                        hloop.validate_cherry_pick_evidence(
+                            repo,
+                            candidate,
+                            transaction,
+                            applied_head=initial_head,
+                            applied_count=0,
+                        )
+
+            self.run_recorded_cherry_pick(
+                repo,
+                state,
+                source_commits,
+                check=True,
+            )
+            landed_head = hloop.git(repo, ["rev-parse", "HEAD"])
+            applied_transaction = hloop.MergeTransaction.from_record(
+                state["active_merge"]
+            )
+            applied_mutations = {
+                "legacy-prefix": lambda candidate: candidate.__setitem__(
+                    "cherry_pick_evidence_legacy_prefix_count", 1
+                ),
+                "deleted-records": lambda candidate: candidate.__setitem__(
+                    "cherry_pick_evidence", []
+                ),
+            }
+            for name, mutation in applied_mutations.items():
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(state["active_merge"])
+                    mutation(candidate)
+                    with self.assertRaisesRegex(hloop.HLoopError, "evidence|legacy"):
+                        hloop.validate_cherry_pick_evidence(
+                            repo,
+                            candidate,
+                            applied_transaction,
+                            applied_head=landed_head,
+                            applied_count=1,
+                        )
+
+    def test_only_source_less_legacy_transaction_enters_explicit_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state, _ = self.make_conflicted_repo(Path(directory), commit_count=1)
+            versioned = copy.deepcopy(state["active_merge"])
+            versioned.pop("source_commits")
+            with self.assertRaisesRegex(hloop.HLoopError, "versioned cherry-pick"):
+                hloop.cherry_pick_transaction_from_active(repo, versioned)
+
+            legacy = copy.deepcopy(state["active_merge"])
+            legacy.pop("source_commits")
+            for field in (
+                "cherry_pick_transaction_version",
+                "cherry_pick_evidence_policy",
+                "cherry_pick_evidence_version",
+                "cherry_pick_evidence_legacy_prefix_count",
+                "cherry_pick_evidence",
+            ):
+                legacy.pop(field)
+            hloop.preflight_merge_transaction(repo, legacy, "continue")
+            self.assertEqual(
+                legacy["cherry_pick_evidence_policy"],
+                hloop.CHERRY_PICK_EVIDENCE_LEGACY_POLICY,
+            )
+            self.assertEqual(
+                legacy["cherry_pick_evidence_version"],
+                hloop.CHERRY_PICK_EVIDENCE_VERSION,
+            )
+            self.assertEqual(legacy["cherry_pick_evidence_legacy_prefix_count"], 0)
+            self.assertTrue(legacy["cherry_pick_evidence_legacy_migration_digest"])
+
+    def test_git_native_prediction_matches_sha1_sha256_encoding_and_hook_config(self):
+        for object_format, hash_length in (("sha1", 40), ("sha256", 64)):
+            for commit_count in (1, 3):
+                with self.subTest(
+                    object_format=object_format,
+                    commit_count=commit_count,
+                ), tempfile.TemporaryDirectory() as directory:
+                    repo, state, source_commits = self.make_repo(
+                        Path(directory),
+                        commit_count=commit_count,
+                        object_format=object_format,
+                        commit_encoding="ISO-8859-1",
+                    )
+                    self.install_failing_prepare_commit_msg_hook(repo)
+                    subprocess.run(
+                        ["git", "config", "commit.gpgSign", "true"],
+                        cwd=repo,
+                        check=True,
+                    )
+                    self.run_recorded_cherry_pick(
+                        repo,
+                        state,
+                        source_commits,
+                        check=True,
+                    )
+                    landed_head = hloop.git(repo, ["rev-parse", "HEAD"])
+                    evidence = state["active_merge"]["cherry_pick_evidence"]
+                    expected_landed = tuple(
+                        commit
+                        for record in evidence
+                        for commit in record["expected_landed_commits"]
+                    )
+                    landed = tuple(
+                        hloop.git(
+                            repo,
+                            [
+                                "rev-list",
+                                "--reverse",
+                                "--first-parent",
+                                f"{state['active_merge']['pre_merge_head']}..{landed_head}",
+                            ],
+                        ).splitlines()
+                    )
+                    self.assertEqual(expected_landed, landed)
+                    self.assertTrue(all(len(commit) == hash_length for commit in landed))
+                    for source_commit, landed_commit in zip(source_commits, landed):
+                        self.assertEqual(
+                            hloop.commit_author_message(repo, source_commit),
+                            hloop.commit_author_message(repo, landed_commit),
+                        )
+                        raw = hloop.git_bytes(repo, ["cat-file", "commit", landed_commit])
+                        self.assertIn(b"\nencoding ISO-8859-1\n", raw)
+                    self.assertTrue(
+                        hloop.reconcile_completed_cherry_pick(repo, state, "T001")
+                    )
+
+    def test_conflict_continue_disables_prepare_hook_and_automatic_signing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state, _ = self.make_conflicted_repo(Path(directory), commit_count=3)
+            self.install_failing_prepare_commit_msg_hook(repo)
+            subprocess.run(
+                ["git", "config", "commit.gpgSign", "true"],
+                cwd=repo,
+                check=True,
+            )
+            recovered = self.continue_then_crash_before_state_completion(repo, state)
+            landed_head = hloop.git(repo, ["rev-parse", "HEAD"])
+            self.assertEqual(
+                recovered["active_merge"]["cherry_pick_evidence"][0][
+                    "expected_landed_commits"
+                ][-1],
+                landed_head,
+            )
+
     def test_single_and_multi_commit_crash_after_git_completion_reconcile_once(self):
         for commit_count in (1, 3):
             with self.subTest(commit_count=commit_count), tempfile.TemporaryDirectory() as directory:
                 repo, state, source_commits = self.make_repo(
                     Path(directory), commit_count=commit_count
                 )
-                subprocess.run(
-                    ["git", "cherry-pick", *source_commits],
-                    cwd=repo,
+                self.run_recorded_cherry_pick(
+                    repo,
+                    state,
+                    source_commits,
                     check=True,
-                    capture_output=True,
                 )
                 landed_head = hloop.git(repo, ["rev-parse", "HEAD"])
                 landed_count = hloop.git(repo, ["rev-list", "--count", "HEAD"])
@@ -262,11 +512,11 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
     def test_completed_recovery_rejects_extra_first_parent_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state, source_commits = self.make_repo(Path(directory), commit_count=1)
-            subprocess.run(
-                ["git", "cherry-pick", *source_commits],
-                cwd=repo,
+            self.run_recorded_cherry_pick(
+                repo,
+                state,
+                source_commits,
                 check=True,
-                capture_output=True,
             )
             (repo / "foreign.txt").write_text("foreign\n", encoding="utf-8")
             subprocess.run(["git", "add", "foreign.txt"], cwd=repo, check=True)
@@ -279,11 +529,11 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
     def test_completed_recovery_rejects_whitespace_only_tree_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state, source_commits = self.make_repo(Path(directory), commit_count=1)
-            subprocess.run(
-                ["git", "cherry-pick", *source_commits],
-                cwd=repo,
+            self.run_recorded_cherry_pick(
+                repo,
+                state,
+                source_commits,
                 check=True,
-                capture_output=True,
             )
             (repo / "feature-0.txt").write_text("feature  0\n", encoding="utf-8")
             subprocess.run(["git", "add", "feature-0.txt"], cwd=repo, check=True)
@@ -294,7 +544,7 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                 capture_output=True,
             )
 
-            with self.assertRaisesRegex(hloop.HLoopError, "landed tree"):
+            with self.assertRaisesRegex(hloop.HLoopError, "landed commit identity"):
                 hloop.reconcile_completed_cherry_pick(repo, state, "T001")
             self.assertIn("active_merge", state)
 
@@ -368,7 +618,7 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
-            with self.assertRaisesRegex(hloop.HLoopError, "does not replay cleanly"):
+            with self.assertRaisesRegex(hloop.HLoopError, "missing an applied sequence"):
                 hloop.reconcile_completed_cherry_pick(repo, state, "T001")
 
         with tempfile.TemporaryDirectory() as directory:

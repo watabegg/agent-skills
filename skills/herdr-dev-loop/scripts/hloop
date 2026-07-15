@@ -108,6 +108,16 @@ DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_REVIEWERS = 1
 DEFAULT_MAX_GAP_AUDITORS = 1
 DEFAULT_REVIEW_AFTER_MERGES = 1
+CHERRY_PICK_EVIDENCE_POLICY = "exact-landed-commit"
+CHERRY_PICK_EVIDENCE_LEGACY_POLICY = "legacy-prefix"
+CHERRY_PICK_EVIDENCE_VERSION = 1
+CHERRY_PICK_TRANSACTION_VERSION = 1
+CHERRY_PICK_GIT_CONFIG = (
+    "-c",
+    "commit.gpgSign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
 DEFAULT_GAP_AFTER_MERGES = 3
 DEFAULT_BRANCH_STRATEGY = "integration"
 DEFAULT_WORKER_QA_PROFILE = "repo-default"
@@ -12134,6 +12144,26 @@ def build_merge_transaction(
     )
 
 
+def build_active_merge_record(
+    transaction: MergeTransaction,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Return the first durable record for a new merge transaction."""
+
+    record = {**transaction.to_record(), **extra}
+    if transaction.mode == "cherry-pick":
+        record.update(
+            {
+                "cherry_pick_transaction_version": CHERRY_PICK_TRANSACTION_VERSION,
+                "cherry_pick_evidence_policy": CHERRY_PICK_EVIDENCE_POLICY,
+                "cherry_pick_evidence_version": CHERRY_PICK_EVIDENCE_VERSION,
+                "cherry_pick_evidence_legacy_prefix_count": 0,
+                "cherry_pick_evidence": [],
+            }
+        )
+    return record
+
+
 def merge_git_dir(repo: Path) -> Path:
     return Path(git(repo, ["rev-parse", "--path-format=absolute", "--git-dir"])).resolve()
 
@@ -12157,6 +12187,19 @@ def commit_author_message(repo: Path, commit_sha: str) -> tuple[bytes, bytes]:
     if not author:
         raise HLoopError(f"commit object has no author: {commit_sha}")
     return author, message
+
+
+def git_ident_environment(prefix: str, ident: bytes) -> dict[str, str]:
+    """Convert a raw commit ident into Git's byte-preserving identity environment."""
+
+    match = re.fullmatch(rb"(.*) <([^<>]*)> (\d+ [+-]\d{4})", ident)
+    if match is None:
+        raise HLoopError(f"git commit has an invalid {prefix.lower()} identity")
+    return {
+        f"GIT_{prefix}_NAME": os.fsdecode(match.group(1)),
+        f"GIT_{prefix}_EMAIL": os.fsdecode(match.group(2)),
+        f"GIT_{prefix}_DATE": os.fsdecode(match.group(3)),
+    }
 
 
 def expected_cherry_pick_tree(
@@ -12267,31 +12310,26 @@ def predicted_cherry_pick_commit(
     source_commit: str,
     landed_parent: str,
     landed_tree: str,
-    committer_ident: str,
+    committer_env: dict[str, str],
 ) -> str:
-    """Write and return the exact commit object HLoop expects Git to land."""
+    """Use Git's native commit writer for the exact object HLoop expects to land."""
 
     author, message = commit_author_message(repo, source_commit)
-    payload = b"\n".join(
-        (
-            f"tree {landed_tree}".encode("ascii"),
-            f"parent {landed_parent}".encode("ascii"),
-            b"author " + author,
-            b"committer " + committer_ident.encode("utf-8"),
-        )
-    ) + b"\n\n" + message
+    env = dict(committer_env)
+    env.update(git_ident_environment("AUTHOR", author))
     proc = run_cmd_bytes(
         [
             TRUSTED_GIT_PATH,
             "-C",
             str(repo),
-            "hash-object",
-            "-t",
-            "commit",
-            "-w",
-            "--stdin",
+            *CHERRY_PICK_GIT_CONFIG,
+            "commit-tree",
+            landed_tree,
+            "-p",
+            landed_parent,
         ],
-        input_data=payload,
+        input_data=message,
+        env=env,
         check=False,
     )
     if proc.returncode != 0:
@@ -12300,7 +12338,7 @@ def predicted_cherry_pick_commit(
         )
     commit_sha = os.fsdecode(proc.stdout or b"").strip()
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
-        raise HLoopError("git hash-object returned no predicted cherry-pick commit identity")
+        raise HLoopError("git commit-tree returned no predicted cherry-pick commit identity")
     return commit_sha
 
 
@@ -12343,7 +12381,7 @@ def build_cherry_pick_evidence(
             source_commit=source_commit,
             landed_parent=parent,
             landed_tree=tree_sha,
-            committer_ident=identity["committer_ident"],
+            committer_env=env,
         )
         sources.append(source_commit)
         trees.append(tree_sha)
@@ -12368,10 +12406,96 @@ def build_cherry_pick_evidence(
 
 
 def cherry_pick_evidence_records(active: dict[str, Any]) -> list[dict[str, Any]]:
-    raw = active.get("cherry_pick_evidence") or []
+    if "cherry_pick_evidence" not in active:
+        raise HLoopError("cherry-pick transaction evidence field is missing")
+    raw = active.get("cherry_pick_evidence")
     if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
         raise HLoopError("cherry-pick transaction evidence is malformed")
     return [dict(item) for item in raw]
+
+
+def legacy_cherry_pick_migration_digest(
+    transaction: MergeTransaction,
+    legacy_prefix_count: int,
+) -> str:
+    material = {
+        "transaction_id": transaction.transaction_id,
+        "task_id": transaction.task_id,
+        "attempt_id": transaction.attempt_id,
+        "branch": transaction.branch,
+        "pre_merge_head": transaction.pre_merge_head,
+        "worker_head": transaction.worker_head,
+        "result_head": transaction.result_head,
+        "index_state": transaction.index_state,
+        "changed_paths": list(transaction.changed_paths),
+        "mode": transaction.mode,
+        "source_commits": list(transaction.source_commits),
+        "legacy_prefix_count": legacy_prefix_count,
+    }
+    payload = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def cherry_pick_transaction_from_active(
+    repo: Path,
+    active: dict[str, Any],
+) -> tuple[MergeTransaction, bool]:
+    """Parse a current transaction or identify the one explicit legacy shape."""
+
+    record = dict(active)
+    is_cherry_pick = str(record.get("mode") or "squash") == "cherry-pick"
+    if is_cherry_pick and not record.get("source_commits"):
+        policy_fields = {
+            "cherry_pick_transaction_version",
+            "cherry_pick_evidence_policy",
+            "cherry_pick_evidence_version",
+            "cherry_pick_evidence_legacy_prefix_count",
+            "cherry_pick_evidence",
+            "cherry_pick_evidence_legacy_migration_digest",
+        }
+        if any(field in record for field in policy_fields):
+            raise HLoopError(
+                "versioned cherry-pick transaction is missing its source sequence"
+            )
+        worker_base = str(record.get("worker_base_sha") or "")
+        worker_head = str(record.get("worker_head") or "")
+        if not worker_base or not worker_head:
+            raise HLoopError(
+                "legacy cherry-pick transaction is missing Worker base/head identity"
+            )
+        record["source_commits"] = git(
+            repo, ["rev-list", "--reverse", f"{worker_base}..{worker_head}"]
+        ).splitlines()
+        try:
+            return MergeTransaction.from_record(record), True
+        except (TypeError, ValueError) as exc:
+            raise HLoopError(f"legacy merge transaction record is invalid: {exc}") from exc
+    try:
+        return MergeTransaction.from_record(record), False
+    except (TypeError, ValueError) as exc:
+        raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
+
+
+def migrate_legacy_cherry_pick_evidence(
+    active: dict[str, Any],
+    transaction: MergeTransaction,
+    *,
+    legacy_prefix_count: int,
+) -> None:
+    """Upgrade only the source-less legacy shape to a transaction-bound prefix."""
+
+    active.update(transaction.to_record())
+    active.update(
+        {
+            "cherry_pick_evidence_policy": CHERRY_PICK_EVIDENCE_LEGACY_POLICY,
+            "cherry_pick_evidence_version": CHERRY_PICK_EVIDENCE_VERSION,
+            "cherry_pick_evidence_legacy_prefix_count": legacy_prefix_count,
+            "cherry_pick_evidence": [],
+            "cherry_pick_evidence_legacy_migration_digest": (
+                legacy_cherry_pick_migration_digest(transaction, legacy_prefix_count)
+            ),
+        }
+    )
 
 
 def validate_cherry_pick_evidence(
@@ -12385,17 +12509,50 @@ def validate_cherry_pick_evidence(
     """Validate durable evidence and bind every landed evidence slot to a SHA/tree."""
 
     records = cherry_pick_evidence_records(active)
+    transaction_version = active.get("cherry_pick_transaction_version")
+    evidence_policy = active.get("cherry_pick_evidence_policy")
     evidence_version = active.get("cherry_pick_evidence_version")
-    if evidence_version is None and not records:
-        return {}
-    if evidence_version != 1:
+    if (
+        type(evidence_version) is not int
+        or evidence_version != CHERRY_PICK_EVIDENCE_VERSION
+    ):
         raise HLoopError("cherry-pick transaction evidence marker is invalid")
-    try:
-        legacy_prefix_count = int(active.get("cherry_pick_evidence_legacy_prefix_count"))
-    except (TypeError, ValueError) as exc:
-        raise HLoopError("cherry-pick transaction evidence legacy prefix is invalid") from exc
+    legacy_prefix_count = active.get("cherry_pick_evidence_legacy_prefix_count")
+    if type(legacy_prefix_count) is not int:
+        raise HLoopError("cherry-pick transaction evidence legacy prefix is invalid")
     if not 0 <= legacy_prefix_count <= applied_count:
         raise HLoopError("cherry-pick transaction evidence legacy prefix is out of range")
+    migration_digest = str(
+        active.get("cherry_pick_evidence_legacy_migration_digest") or ""
+    )
+    if evidence_policy == CHERRY_PICK_EVIDENCE_POLICY:
+        if (
+            type(transaction_version) is not int
+            or transaction_version != CHERRY_PICK_TRANSACTION_VERSION
+        ):
+            raise HLoopError("versioned cherry-pick transaction marker is invalid")
+        if legacy_prefix_count != 0:
+            raise HLoopError(
+                "versioned cherry-pick transaction cannot acquire a legacy evidence prefix"
+            )
+        if migration_digest:
+            raise HLoopError(
+                "versioned cherry-pick transaction has unexpected legacy migration evidence"
+            )
+    elif evidence_policy == CHERRY_PICK_EVIDENCE_LEGACY_POLICY:
+        if transaction_version is not None:
+            raise HLoopError(
+                "versioned cherry-pick transaction cannot use the legacy evidence policy"
+            )
+        expected_digest = legacy_cherry_pick_migration_digest(
+            transaction, legacy_prefix_count
+        )
+        if not migration_digest or not secrets.compare_digest(
+            migration_digest, expected_digest
+        ):
+            raise HLoopError("legacy cherry-pick evidence migration marker is invalid")
+    else:
+        raise HLoopError("cherry-pick transaction evidence policy is invalid")
     landed_commits = tuple(
         git(
             repo,
@@ -12450,7 +12607,7 @@ def validate_cherry_pick_evidence(
         elif record.get("resolved_tree"):
             raise HLoopError("clean cherry-pick evidence unexpectedly records a resolution tree")
 
-        _, identity = fixed_cherry_pick_committer(repo, record)
+        committer_env, _ = fixed_cherry_pick_committer(repo, record)
         parent = expected_parent
         for offset, (source_commit, tree_sha, expected_commit) in enumerate(
             zip(sources, trees, landed)
@@ -12478,7 +12635,7 @@ def validate_cherry_pick_evidence(
                 source_commit=source_commit,
                 landed_parent=parent,
                 landed_tree=tree_sha,
-                committer_ident=identity["committer_ident"],
+                committer_env=committer_env,
             )
             if recomputed != expected_commit:
                 raise HLoopError("cherry-pick transaction evidence landed identity mismatch")
@@ -12621,27 +12778,7 @@ def preflight_merge_transaction(repo: Path, active: dict[str, Any], op: str) -> 
     observations no longer match the recorded transaction identity.
     """
 
-    record = dict(active)
-    if str(record.get("mode") or "squash") == "cherry-pick" and not record.get(
-        "source_commits"
-    ):
-        # A pre-0.5 transaction already stored the immutable Worker base and
-        # head but not the source sequence.  Reconstruct that sequence before
-        # validating live progress so an in-flight recovery can be upgraded
-        # without weakening the prefix/sequencer checks.
-        worker_base = str(record.get("worker_base_sha") or "")
-        worker_head = str(record.get("worker_head") or "")
-        if not worker_base or not worker_head:
-            raise HLoopError(
-                "legacy cherry-pick transaction is missing Worker base/head identity"
-            )
-        record["source_commits"] = git(
-            repo, ["rev-list", "--reverse", f"{worker_base}..{worker_head}"]
-        ).splitlines()
-    try:
-        prior = MergeTransaction.from_record(record)
-    except (TypeError, ValueError) as exc:
-        raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
+    prior, legacy_migration = cherry_pick_transaction_from_active(repo, active)
     allowed = allowed_merge_operations(prior.status)
     if op not in allowed:
         raise HLoopError(
@@ -12656,6 +12793,12 @@ def preflight_merge_transaction(repo: Path, active: dict[str, Any], op: str) -> 
             + "; ".join(issue.message for issue in drift.issues)
         )
     if prior.mode == "cherry-pick":
+        if legacy_migration:
+            migrate_legacy_cherry_pick_evidence(
+                active,
+                observed,
+                legacy_prefix_count=len(observed.applied_commits),
+            )
         validate_cherry_pick_evidence(
             repo,
             active,
@@ -12712,10 +12855,6 @@ def prepare_cherry_pick_evidence(
         applied_count=len(current.applied_commits),
     )
     start = len(current.applied_commits)
-    if "cherry_pick_evidence_version" not in active:
-        active["cherry_pick_evidence_version"] = 1
-        active["cherry_pick_evidence_legacy_prefix_count"] = start
-        state["active_merge"] = active
     existing = next(
         (
             record
@@ -12850,10 +12989,7 @@ def reconcile_completed_cherry_pick(
     active = state.get("active_merge") or {}
     if str(active.get("task_id") or "") != task_id:
         return False
-    try:
-        transaction = MergeTransaction.from_record(active)
-    except (TypeError, ValueError) as exc:
-        raise HLoopError(f"merge transaction record is invalid: {exc}") from exc
+    transaction, legacy_migration = cherry_pick_transaction_from_active(repo, active)
     if transaction.mode != "cherry-pick" or transaction.status not in {
         MERGE_ACTIVE,
         MERGE_CONTENT_CONFLICT,
@@ -12923,6 +13059,16 @@ def reconcile_completed_cherry_pick(
             "completed cherry-pick recovery rejected: first-parent suffix length does not match the recorded source sequence"
         )
 
+    if legacy_migration:
+        migrate_legacy_cherry_pick_evidence(
+            active,
+            dataclass_replace(
+                transaction,
+                applied_commits=transaction.source_commits,
+                applied_head=current_head,
+            ),
+            legacy_prefix_count=len(landed_commits),
+        )
     expected_by_sequence = validate_cherry_pick_evidence(
         repo,
         active,
@@ -13051,7 +13197,7 @@ def cmd_merge_continue(repo: Path, state: dict[str, Any], task_id: str) -> int:
         try:
             git(
                 repo,
-                ["-c", "commit.gpgSign=false", "cherry-pick", "--continue"],
+                [*CHERRY_PICK_GIT_CONFIG, "cherry-pick", "--continue"],
                 env=cherry_pick_env,
             )
         except subprocess.CalledProcessError as exc:
@@ -13227,12 +13373,12 @@ def cmd_merge(args: argparse.Namespace) -> int:
         mode=mode,
         source_commits=commits,
     )
-    state["active_merge"] = {
-        **transaction.to_record(),
-        "worker_base_sha": base_sha,
-        "mode": mode,
-        "started_at": now_iso(),
-    }
+    state["active_merge"] = build_active_merge_record(
+        transaction,
+        worker_base_sha=base_sha,
+        mode=mode,
+        started_at=now_iso(),
+    )
     save_state(repo, state)
     try:
         staged = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--cached", "--quiet"], check=False)
@@ -13260,7 +13406,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             )
             git(
                 repo,
-                ["-c", "commit.gpgSign=false", "cherry-pick", *commits],
+                [*CHERRY_PICK_GIT_CONFIG, "cherry-pick", *commits],
                 env=cherry_pick_env,
             )
     except subprocess.CalledProcessError as exc:

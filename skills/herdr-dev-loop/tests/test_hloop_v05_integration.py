@@ -3887,17 +3887,24 @@ effort = "medium"
                     "write_deny": [],
                 }
             },
-            "active_merge": {
-                **transaction.to_record(),
-                "worker_base_sha": base,
-            },
+            "active_merge": hloop.build_active_merge_record(
+                transaction,
+                worker_base_sha=base,
+            ),
         }
         hloop.save_state(repo, state)
+        _, cherry_pick_env = hloop.prepare_cherry_pick_evidence(
+            repo,
+            state,
+            transaction,
+            resolved_tree=None,
+        )
         cherry_pick = subprocess.run(
-            ["git", "cherry-pick", *source_commits],
+            ["git", *hloop.CHERRY_PICK_GIT_CONFIG, "cherry-pick", *source_commits],
             cwd=repo,
             text=True,
             capture_output=True,
+            env=cherry_pick_env,
         )
         self.assertNotEqual(cherry_pick.returncode, 0)
         observed = hloop.observed_merge_transaction(repo, transaction)
@@ -3923,6 +3930,14 @@ effort = "medium"
                 legacy_active = dict(state["active_merge"])
                 for field in ("source_commits", "applied_commits", "applied_head"):
                     legacy_active.pop(field, None)
+                for field in (
+                    "cherry_pick_transaction_version",
+                    "cherry_pick_evidence_policy",
+                    "cherry_pick_evidence_version",
+                    "cherry_pick_evidence_legacy_prefix_count",
+                    "cherry_pick_evidence",
+                ):
+                    legacy_active.pop(field)
                 legacy_observed = hloop.preflight_merge_transaction(
                     repo, legacy_active, "continue"
                 )
