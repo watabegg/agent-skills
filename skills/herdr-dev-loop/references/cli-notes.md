@@ -27,7 +27,7 @@ Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revi
 
 Use `config path`, `config validate`, `config explain`, and `config init` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; 0.5.0 has no in-place `config apply` subcommand.
 
-Mutating helper commands take the repo-local Git lock from `git rev-parse --git-path hloop.lock` and write files atomically. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
+Mutating helper commands take `/tmp/herdr-dev-loop-<uid>/locks/<sha256>.lock` and write files atomically. The digest is derived from the canonical Git common directory and namespace. The fixed `/tmp` root does not follow `HLOOP_RUNTIME_DIR`, `XDG_RUNTIME_DIR`, or `TMPDIR`; its UID directory is secured to mode `0700`, lock files are mode `0600` and opened without following symlinks where the platform supports `O_NOFOLLOW`, and all lock state remains outside Git metadata. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
 ## Herdr
 

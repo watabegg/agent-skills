@@ -2,11 +2,11 @@
 
 Use a bounded state machine. Do not let Manager, Worker, Gap Auditor, Reviewer, or Advisor coordinate through freeform chat when an artifact can represent the state. Use `PROFILE.md` for product-specific branch, review, QA, and agent backend strategy.
 
-Each state machine is selected by `--namespace` and lives only below `.ai/herdr-dev-loop/loops/<namespace>`. Legacy `.ai/loop` is never a fallback source. Multiple namespaces may coexist, while the repo-local Git lock serializes their mutations.
+Each state machine is selected by `--namespace` and lives only below `.ai/herdr-dev-loop/loops/<namespace>`. Legacy `.ai/loop` is never a fallback source. Multiple namespaces may coexist, while the repository-and-namespace runtime lock serializes their mutations.
 
 At session entry, Manager prints `hloop version` and identifies the runtime version, loop-pinned version, and `run_id` in the first progress message. Each started role likewise identifies its version and role ID before investigation. `skill_version` in state and artifacts is part of the durable state-machine identity, not merely display metadata.
 
-Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with a repo-local Git lock (`git rev-parse --git-path hloop.lock`); Manager should not update `STATE.json`, start Worker/Reviewer/Gap/Advisor sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
+Run all loop mutations through `hloop` using the absolute helper path when needed. The helper serializes mutations with `/tmp/herdr-dev-loop-<uid>/locks/<sha256>.lock`, where the digest identifies the canonical Git common directory and namespace. This fixed POSIX location is independent of `HLOOP_RUNTIME_DIR`, `XDG_RUNTIME_DIR`, and `TMPDIR`, is private to the UID, and remains outside Git metadata. Manager should not update `STATE.json`, start Worker/Reviewer/Gap/Advisor sessions, merge Worker branches, or rewrite result artifacts by hand to bypass a helper failure.
 
 Use `hloop status`, `hloop dashboard`, `hloop conductor`, and `hloop doctor --sessions` as read-only state inspection surfaces. They do not advance the state machine; they help Manager decide which bounded transition to run next. `conductor` also audits trust signals left in `STATE.json` and pane output, including unsafe sandbox values, dangerous Codex launch markers, non-hloop prompt paths, unharvested artifact states, untrusted Worker head markers such as `manager-working-tree` or `pending_code_commit`, Manager-owned Worker result paths, and manual integration traces.
 
