@@ -15946,7 +15946,6 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
         normalized = hloop_events.validate_report(report)
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid report: {exc}") from exc
-    digest = hloop_events.payload_digest(normalized)
     requested_event_id = None
     raw_event_id = getattr(args, "event_id", None)
     if raw_event_id:
@@ -15960,15 +15959,16 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
         role_id=str(report["role_id"]),
         attempt_id=str(report["attempt_id"]),
     )
-    resolved_event_id = hloop_broker.role_outbox_event_id(
-        outbox_path,
-        payload_digest=digest,
-        requested_event_id=requested_event_id,
-    )
     try:
-        client_event = hloop_events.prepare_client_event(report, event_id=resolved_event_id)
+        client_event = hloop_broker.role_outbox_client_event(
+            outbox_path,
+            report=normalized,
+            requested_event_id=requested_event_id,
+        )
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid report: {exc}") from exc
+    except (hloop_broker.BrokerStorageError, OSError) as exc:
+        raise HLoopError(f"cannot persist report outbox: {exc}") from exc
 
     class _Unauthenticated(RuntimeError):
         pass
@@ -16007,18 +16007,37 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             )
     except _Unauthenticated as exc:
         raise HLoopError(str(exc)) from exc
-    except (hloop_broker.BrokerStorageError, OSError) as exc:
-        spool_path = hloop_broker.spool_client_event(
-            broker_spool_dir(repo),
-            client_event,
-            authentication={
-                "run_id": client_event["run_id"],
-                "role_id": client_event["role_id"],
-                "attempt_id": client_event["attempt_id"],
-                "task_contract_digest": client_event["task_contract_digest"],
-                "token": report_token,
-            },
-        )
+    except hloop_broker.BrokerUnavailableError as exc:
+        try:
+            hloop_broker.spool_client_event(
+                broker_spool_dir(repo),
+                client_event,
+                authentication={
+                    "run_id": client_event["run_id"],
+                    "role_id": client_event["role_id"],
+                    "attempt_id": client_event["attempt_id"],
+                    "task_contract_digest": client_event["task_contract_digest"],
+                    "token": report_token,
+                },
+            )
+        except (hloop_broker.BrokerStorageError, OSError) as spool_exc:
+            raise HLoopError(
+                f"cannot spool unavailable broker report: {spool_exc}"
+            ) from spool_exc
+        try:
+            hloop_broker.confirm_role_outbox_delivery(
+                outbox_path,
+                event_id=client_event["event_id"],
+                payload_digest_value=client_event["payload_digest"],
+            )
+        except (
+            hloop_events.ReportValidationError,
+            hloop_broker.BrokerStorageError,
+            OSError,
+        ) as confirm_exc:
+            raise HLoopError(
+                f"cannot confirm spooled report delivery: {confirm_exc}"
+            ) from confirm_exc
         try:
             hloop_supervisor.signal_supervisor(
                 hloop_broker.derive_runtime_socket_path(
@@ -16029,6 +16048,24 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             pass
         print(f"spooled {client_event['event_id']} (broker unavailable: {exc})")
         return 0
+    except hloop_broker.BrokerStorageError as exc:
+        raise HLoopError(f"report rejected by broker: {exc}") from exc
+    except OSError as exc:
+        raise HLoopError(f"cannot access report broker: {exc}") from exc
+    try:
+        hloop_broker.confirm_role_outbox_delivery(
+            outbox_path,
+            event_id=client_event["event_id"],
+            payload_digest_value=client_event["payload_digest"],
+        )
+    except (
+        hloop_events.ReportValidationError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+    ) as confirm_exc:
+        raise HLoopError(
+            f"cannot confirm broker report delivery: {confirm_exc}"
+        ) from confirm_exc
     if owner is not None and stored.event["type"] in REPORT_WAKE_TYPES:
         try:
             hloop_supervisor.signal_supervisor(Path(owner["socket_path"]))
@@ -16120,7 +16157,7 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
         timeout_seconds=float(args.ttl_seconds),
         fallback_watches=fallback_watches,
     )
-    state["broker_lease"] = {
+    broker_lease = {
         "run_id": run_id,
         "generation": result.lease_generation,
         "manager_session_id": manager_session_id,
@@ -16129,7 +16166,7 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
         "reason": result.reason,
         "returned_at": now_iso(),
     }
-    state["last_manager_sleep"] = {
+    last_manager_sleep = {
         "reason": result.reason,
         "event_ids": list(result.event_ids),
         "drained_reports": result.drained_reports,
@@ -16143,12 +16180,27 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
             else None
         ),
     }
-    save_state(repo, state)
-    journal(
-        repo,
-        f"Manager sleep returned `{result.reason}` at lease generation "
-        f"{result.lease_generation}; events={','.join(result.event_ids) or 'none'}.",
-    )
+    # `manager sleep` deliberately does not hold the repository transaction
+    # lock while blocked. Re-read STATE only after reacquiring that lock and
+    # merge the two sleep-owned fields, so task/decision/harvest/migration
+    # updates committed by another process during the wait remain intact.
+    with loop_lock(repo):
+        assert_mutating_state_schema_compatible(repo)
+        latest_state = load_state(repo)
+        latest_run_id = str(latest_state.get("run_id") or "local")
+        if latest_run_id != run_id:
+            raise HLoopError(
+                "Manager sleep result belongs to stale run "
+                f"{run_id}; current run is {latest_run_id}"
+            )
+        latest_state["broker_lease"] = broker_lease
+        latest_state["last_manager_sleep"] = last_manager_sleep
+        save_state(repo, latest_state)
+        journal(
+            repo,
+            f"Manager sleep returned `{result.reason}` at lease generation "
+            f"{result.lease_generation}; events={','.join(result.event_ids) or 'none'}.",
+        )
     print(f"manager sleep returned: {result.reason}")
     print(f"lease generation: {result.lease_generation}")
     for event_id in result.event_ids:

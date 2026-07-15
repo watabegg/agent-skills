@@ -204,7 +204,6 @@ class ManagerSleepSupervisor:
     def acquire(self) -> dict[str, Any]:
         if self.acquired:
             raise SupervisorError("supervisor is already acquired")
-        self.owner_lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _private_directory(self.owner_lock_path.parent)
         descriptor = os.open(
             self.owner_lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
@@ -511,7 +510,6 @@ class ManagerSleepSupervisor:
                 self._cancel_lease_in_transaction(transaction, timestamp)
 
     def _prepare_socket_path(self) -> None:
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _private_directory(self.socket_path.parent)
         if not os.path.lexists(self.socket_path):
             return
@@ -614,10 +612,67 @@ def _unseen_inbox(
 
 
 def _private_directory(path: Path) -> None:
+    """Create/repair one private directory without following its final link."""
+
     try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise UnsafeSocketError(
+            f"cannot create private directory {path}: {exc}"
+        ) from exc
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise UnsafeSocketError(
+            f"private directory must be a real directory, not a symlink: {path}: {exc}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise UnsafeSocketError(f"private path is not a directory: {path}")
+        expected_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if metadata.st_uid != expected_uid:
+            raise UnsafeSocketError(
+                f"private directory is not owned by the current user: {path}"
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            try:
+                os.fchmod(descriptor, 0o700)
+            except OSError as exc:
+                raise UnsafeSocketError(
+                    f"cannot secure private directory {path}: {exc}"
+                ) from exc
+            metadata = os.fstat(descriptor)
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise UnsafeSocketError(
+                f"private directory must have mode 0700: {path}"
+            )
+
+        # Compare the opened directory with the pathname after securing it.
+        # This detects replacement even on platforms without O_NOFOLLOW.
+        try:
+            path_metadata = os.lstat(path)
+        except OSError as exc:
+            raise UnsafeSocketError(
+                f"cannot verify private directory {path}: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or not stat.S_ISDIR(path_metadata.st_mode)
+            or (path_metadata.st_dev, path_metadata.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise UnsafeSocketError(
+                f"private directory changed or is a symlink: {path}"
+            )
+    finally:
+        os.close(descriptor)
 
 
 def _utc_now() -> str:
