@@ -197,6 +197,22 @@ class ReleaseScopeTests(unittest.TestCase):
         )
         self.assertEqual(updated.apply_amendment(second).scope_revision, 3)
 
+    def test_scope_change_rejects_input_missing_from_captured_inventory(self):
+        scope = locked_scope()
+        with self.assertRaisesRegex(AmendmentValidationError, "captured input inventory"):
+            create_amendment(
+                scope,
+                amendment_id="A001",
+                kind="scope-change",
+                new_source_contents={
+                    "MISSION.md": "expanded\n",
+                    "PLAN.md": SOURCES["PLAN.md"],
+                },
+                reason="Reject an authorization that was never captured.",
+                user_input_id="U0002",
+                captured_input_ids={"U0001": {"source": "manager-chat"}},
+            )
+
     def test_amendment_cannot_start_from_another_lock_or_be_reapplied(self):
         scope = locked_scope()
         amendment = create_amendment(
@@ -344,6 +360,40 @@ class TaskAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskAuthorizationError, "latest locked input"):
             authorize_task_creation(
                 {**task, "authorization_input_id": "U0003"}, amended_scope
+            )
+
+    def test_user_amendment_task_rejects_input_missing_from_captured_inventory(self):
+        scope = locked_scope()
+        amendment = create_amendment(
+            scope,
+            amendment_id="A001",
+            kind="scope-change",
+            new_source_contents={"MISSION.md": "expanded\n", "PLAN.md": SOURCES["PLAN.md"]},
+            reason="User-authorized scope addition.",
+            user_input_id="U0002",
+            captured_input_ids={"U0002": {"source": "manager-chat"}},
+        )
+        amended_scope = scope.apply_amendment(amendment)
+        task = planned_task(
+            task_origin="user-amendment",
+            release_scope_revision=2,
+            plan_item_refs=[],
+            authorization_input_id="U0002",
+            scope_refs=["A001"],
+        )
+        self.assertEqual(
+            authorize_task_creation(
+                task,
+                amended_scope,
+                captured_input_ids={"U0002": {"source": "manager-chat"}},
+            ).authorization_input_id,
+            "U0002",
+        )
+        with self.assertRaisesRegex(TaskAuthorizationError, "captured input inventory"):
+            authorize_task_creation(
+                task,
+                amended_scope,
+                captured_input_ids={"U0001": {"source": "manager-chat"}},
             )
 
     def test_editorial_and_clarification_amendments_clear_scope_authorization(self):

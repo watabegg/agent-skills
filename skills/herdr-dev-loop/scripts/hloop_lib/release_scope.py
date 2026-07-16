@@ -135,6 +135,25 @@ def _optional_input_id(value: Any, field_name: str) -> str:
     return _input_id(value, field_name)
 
 
+def is_captured_input_id(
+    input_id: Any, inputs_index: Mapping[str, Any] | None
+) -> bool:
+    """Return whether an authorization ID belongs to the captured input inventory.
+
+    ``None`` means the caller is using the pure compatibility API without a
+    state inventory.  CLI callers pass the state mapping when the loop has a
+    captured-input inventory, while older states without that field retain
+    their legacy authorization behavior.
+    """
+
+    if inputs_index is None:
+        return True
+    if not isinstance(inputs_index, Mapping):
+        return False
+    candidate = input_id.strip() if isinstance(input_id, str) else input_id
+    return isinstance(candidate, str) and candidate in inputs_index
+
+
 def _digest(value: Any, field_name: str) -> str:
     text = _required_text(value, field_name).lower()
     if not _DIGEST_RE.fullmatch(text):
@@ -720,7 +739,12 @@ ReleaseScopeAmendment = ScopeAmendment
 AmendmentRecord = ScopeAmendment
 
 
-def validate_amendment(scope: ReleaseScope, amendment: ScopeAmendment) -> None:
+def validate_amendment(
+    scope: ReleaseScope,
+    amendment: ScopeAmendment,
+    *,
+    captured_input_ids: Mapping[str, Any] | None = None,
+) -> None:
     """Validate that an immutable amendment starts at exactly ``scope``."""
 
     if not isinstance(scope, ReleaseScope):
@@ -754,6 +778,13 @@ def validate_amendment(scope: ReleaseScope, amendment: ScopeAmendment) -> None:
         raise AmendmentValidationError(
             f"{amendment.kind} amendment cannot use a scope-change authorization input"
         )
+    if amendment.kind == "scope-change" and not is_captured_input_id(
+        amendment.user_input_id, captured_input_ids
+    ):
+        raise AmendmentValidationError(
+            "scope-change user_input_id is not present in the captured input inventory: "
+            + amendment.user_input_id
+        )
 
 
 def create_amendment(
@@ -769,6 +800,7 @@ def create_amendment(
     affected_task_ids: Sequence[str] = (),
     created_at: str = "",
     semantic_equivalence: bool | None = None,
+    captured_input_ids: Mapping[str, Any] | None = None,
 ) -> ScopeAmendment:
     """Build an amendment whose ``previous_*`` fields come from ``scope``."""
 
@@ -785,7 +817,7 @@ def create_amendment(
         raise AmendmentValidationError("new source digests or contents are required")
     if semantic_equivalence is None:
         semantic_equivalence = kind != "scope-change"
-    return ScopeAmendment(
+    amendment = ScopeAmendment(
         amendment_id=amendment_id,
         kind=kind,
         previous_scope_revision=scope.scope_revision,
@@ -802,6 +834,14 @@ def create_amendment(
         previous_scope_digest=scope.scope_digest,
         semantic_equivalence=semantic_equivalence,
     )
+    if amendment.kind == "scope-change" and not is_captured_input_id(
+        amendment.user_input_id, captured_input_ids
+    ):
+        raise AmendmentValidationError(
+            "scope-change user_input_id is not present in the captured input inventory: "
+            + amendment.user_input_id
+        )
+    return amendment
 
 
 def amend_scope(*args: Any, **kwargs: Any) -> tuple[ReleaseScope, ScopeAmendment]:
@@ -1083,6 +1123,7 @@ def validate_task_provenance(
     plan_item_refs: Sequence[str] | None = None,
     requirement_refs: Sequence[str] | None = None,
     finding_ids: Sequence[str] | None = None,
+    captured_input_ids: Mapping[str, Any] | None = None,
     legacy_mode: bool = False,
     allow_legacy_unclassified: bool = False,
     **_: Any,
@@ -1184,6 +1225,13 @@ def validate_task_provenance(
         if not provenance.authorization_input_id:
             raise TaskAuthorizationError(
                 "user-amendment task requires authorization_input_id"
+            )
+        if not is_captured_input_id(
+            provenance.authorization_input_id, captured_input_ids
+        ):
+            raise TaskAuthorizationError(
+                "user-amendment authorization_input_id is not present in the captured input inventory: "
+                + provenance.authorization_input_id
             )
         if normalized_scope.last_user_input_id != provenance.authorization_input_id:
             raise TaskAuthorizationError(
@@ -1426,6 +1474,7 @@ __all__ = [
     "create_amendment",
     "digest_text",
     "detect_source_drift",
+    "is_captured_input_id",
     "is_task_creation_authorized",
     "make_task_provenance",
     "scope_digest",

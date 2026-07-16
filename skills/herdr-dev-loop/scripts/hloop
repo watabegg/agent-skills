@@ -3187,6 +3187,7 @@ def authorize_task_record(
             locked_plan_item_refs=scope.plan_item_refs,
             locked_requirement_refs=scope.requirement_refs,
             locked_finding_ids=finding_inventory_ids(state, confirmed_only=True),
+            captured_input_ids=state.get("inputs_index"),
             legacy_mode=scope.status == "legacy-unlocked",
             allow_legacy_unclassified=scope.status == "legacy-unlocked",
         )
@@ -3249,6 +3250,7 @@ def validate_task_update_provenance(
             locked_plan_item_refs=scope.plan_item_refs,
             locked_requirement_refs=scope.requirement_refs,
             locked_finding_ids=finding_inventory_ids(state, confirmed_only=True),
+            captured_input_ids=state.get("inputs_index"),
             legacy_mode=scope.status == "legacy-unlocked",
             allow_legacy_unclassified=scope.status == "legacy-unlocked",
         )
@@ -8012,6 +8014,7 @@ def _review_reopen_scope_amendment(
             user_input_id=amendment_user_input,
             affected_task_ids=_arg_list(args, "scope_affected_task_id"),
             created_at=now_iso(),
+            captured_input_ids=state.get("inputs_index"),
         )
     except hloop_release_scope.ReleaseScopeError as exc:
         raise HLoopError(f"cannot create review-reopen amendment: {exc}") from exc
@@ -11196,6 +11199,7 @@ def cmd_release_scope_amend(args: argparse.Namespace) -> int:
             ),
             affected_task_ids=_arg_list(args, "affected_task_id"),
             created_at=now_iso(),
+            captured_input_ids=state.get("inputs_index"),
         )
         updated_scope = scope.apply_amendment(amendment)
     except hloop_release_scope.ReleaseScopeError as exc:
