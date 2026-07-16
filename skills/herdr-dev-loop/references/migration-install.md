@@ -1,6 +1,6 @@
 # Migration And Install Parity
 
-herdr-dev-loop 0.5.1 uses `state_format_version: 3` and `schema_revision: 1`. The runtime reads format 2 and earlier format 3 revision 0 for migration, but mutating commands reject a future format or revision.
+herdr-dev-loop 0.5.2 uses `state_format_version: 3` and `schema_revision: 2`. The runtime reads format 1/2 and format 3 revision 0/1 for migration, but mutating commands reject a future format or revision.
 
 ## Migrating an existing namespace
 
@@ -14,7 +14,7 @@ $HLOOP status --raw-state
 $HLOOP doctor
 ```
 
-The dry run does not change the state. Apply creates a versioned backup below the namespace migration directory, preserves `run_id`, executes every declared revision in order, and updates the loop skill version. Migration refuses to run while a role or merge transaction is active or a role worktree is dirty. An unknown future revision remains readable through explicit inspection surfaces but cannot be mutated or downgraded.
+The dry run does not change the state. Apply creates a versioned backup below the namespace migration directory, preserves `run_id`, executes every declared revision in order, and updates the loop skill version. Migration refuses to run while a role or merge transaction is active or a role worktree is dirty. An unknown future revision remains readable through explicit inspection surfaces but cannot be mutated or downgraded. A migrated legacy loop keeps its stored merge-count cadence, marks pre-existing tasks `legacy-unclassified`, and does not acquire the new manual-final requirement implicitly.
 
 Legacy `.ai/loop` is a different artifact family and remains ignored. Do not copy it into the namespaced format by hand.
 
@@ -59,7 +59,7 @@ python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
 python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
 ```
 
-For an ordinary distribution, start fresh Codex and Claude sessions after synchronization if an existing session cached skill discovery, then confirm that both clients report 0.5.1. For this 0.5.1 candidate gate, only fresh Codex discovery is executed. Fresh Claude discovery is a separate live-provider check; because it is not executed in this release run, do not infer success from file parity or Python selftest.
+For an ordinary distribution, start fresh Codex and Claude sessions after synchronization if an existing session cached skill discovery, then confirm that both clients report 0.5.2. Fresh provider discovery is a separate live-provider check; do not infer success from file parity or Python selftest. The 0.5.2 repository task does not synchronize installed copies; perform that step only in the later distribution/release operation after the candidate SHA is fixed.
 
 ## Rollback
 

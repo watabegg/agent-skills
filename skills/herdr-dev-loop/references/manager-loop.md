@@ -64,13 +64,46 @@ Use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` for 
 
 ## Default Cadence
 
-Keep the loop active by default:
+For new 0.5.2 loops, keep implementation work bounded by task batches:
 
 - dispatch up to `max_workers: 3` Workers when write scopes do not overlap
-- open the review gate after each validated integration merge (`review_after_merges: 1`)
-- open the gap gate less often (`gap_after_merges: 3`) and before final completion
-- allow Gap Auditor and Reviewer to run while Workers continue on isolated branches
-- do not merge Worker branches while Gap Auditor or Reviewer is reading the integration branch
+- close the current batch before opening ordinary review work (`review_policy.cadence: batch`)
+- run fixed-target convergence explicitly with `hloop review readiness` and `hloop review convergence prepare|record`
+- prepare a complete manual final certification after convergence, rather than treating a zero finding count as sufficient
+- preserve `review_after_merges`/`gap_after_merges` for explicitly configured `merge-count` and migrated legacy loops
+- allow Gap Auditor and Reviewer to run while Workers continue on isolated branches, but do not merge the branch they are reading
+
+The scheduler does not silently replace a prepared convergence or manual-final plan with an ordinary Reviewer. A dispatch freeze may stop new task and role starts while validation, harvest, merge, follow-up recording, and final evidence continue.
+
+## Release Scope And Task Authorization
+
+Before dispatching a new release, lock the source snapshot:
+
+```bash
+hloop release-scope lock --source MISSION.md --source PLAN.md \
+  --plan-item-ref P001 --requirement-ref R001 --scope-ref release-scope-contract
+hloop release-scope status --json
+```
+
+The lock stores source digests, `scope_revision`, `source_snapshot_revision`, and stable plan/requirement references. Use `release-scope amend` for an editorial correction, a clarification, or an explicitly authorized scope change. An unrecorded source drift blocks review readiness and final certification.
+
+After the lock, every task must carry `task_origin` and a matching authorization: `planned` references a plan item or requirement, `finding` references a confirmed in-scope finding and why it is fixed now, `user-amendment` references the input and new scope revision, and `operational` records a non-product reason. `hloop task new`, triage, pump, and conductor all use the shared preflight. A review candidate alone is not permission to create a remediation task.
+
+## Bounded Convergence And Manual Final
+
+At a stable batch boundary:
+
+```bash
+hloop review readiness --json
+hloop review convergence prepare --mode swarm --json
+hloop review convergence record --fix-round 0 --json
+hloop final-review prepare --mode swarm --json
+hloop final-review record --json
+```
+
+`convergence prepare` fixes base and target SHA and writes a plan; it does not start a Reviewer. `convergence record` recomputes manifest completeness and verified actionable findings. New loops allow at most two automatic fix rounds. `final-review record` recomputes lane completion, independent verification, shortfalls, plan/manifest identity, scope snapshot, report presence, and the zero-actionable-finding condition. A follow-up can remain open only when its disposition is non-blocking and current acceptance is satisfied.
+
+When convergence is exhausted or manual final is failed/incomplete, `hloop review reopen --action ... --user-input-id Uxxxx` is the only transition that may reopen task creation. The transition is atomic with respect to dispatch freeze, certification invalidation, scope amendments, and authorized extra rounds; do not reset `STATE.json` by hand.
 
 ## Event-Driven Progress
 
@@ -179,17 +212,19 @@ For each running Reviewer:
 
 ## Triage Rules
 
-P0/P1 findings normally create a fix task. If rejected as false positive, record the code evidence in `JOURNAL.md`.
+Classify each candidate on independent axes before choosing an action: `fact_status` (`confirmed`, `refuted`, `insufficient_evidence`), `severity` (`P0`–`P3`), `origin` (`introduced`, `diff-expanded-pre-existing`, `unrelated-pre-existing`, `unknown`), `contract_relation` (`in_scope`, `outside_release`, `ambiguous`), `decision_requirement` (`none`, `spec`, `user`), `disposition`, and `release_effect` (`blocking`, `non_blocking`). Do not infer release disposition from severity alone.
 
-P2 findings create a fix task, accepted risk, or follow-up depending on whether they affect `MISSION.md` done criteria.
+An introduced or diff-expanded in-scope regression cannot be deferred as a follow-up. An in-scope P0/P1 requires `fix_now`, `disable_feature`, or `user_decision`; confirmed outside-release work normally becomes `defer_follow_up` or `discard`; an accepted risk requires explicit authorization. A refuted candidate is discarded. Insufficient evidence that prevents current acceptance or safety requires a user decision; insufficient evidence outside the release may remain a non-blocking follow-up.
 
-P3 findings should not block completion unless the mission explicitly requires them.
+P0/P1 findings normally create a provenance-linked fix task only after Manager verifies the trigger and contract relation. P2 findings create a fix task, accepted risk, or follow-up depending on whether they affect `MISSION.md` done criteria. P3 findings should not block completion unless the mission explicitly requires them. If rejected as false positive or unrelated pre-existing, record the code evidence and classification in the Manager-owned triage/journal artifacts.
 
 `hloop triage` separates valid and rejected Fix Task Candidates. Rejected candidates are written to the triage draft with reasons such as missing `write_allow`, `acceptance`, `rationale`, or invalid priority. Do not rerun with `--create-tasks` expecting rejected candidates to become tasks; either fix the source artifact/candidate block, create a task manually, or record why the finding is not actionable.
 
 Do not mark the loop done only because a review artifact exists. Manager must close the review gate after triage.
 
 Gap findings are not generic review findings. `missing`, `partial`, and `needs-decision` items that affect `MISSION.md` done criteria normally create a fix task or a decision. `obsolete-spec` items should update or explicitly retire the stale plan/spec source before closing the gap gate.
+
+For non-blocking candidates, use `hloop follow-up add` rather than creating a task directly. The CLI requires a review fingerprint, evidence, affected path or symbol, deferral reason, and reconsider condition, then deduplicates by the stable semantic issue key (`fu:v1:sha256:<digest>`). Follow-up issue keys intentionally exclude target SHA, severity, title, and proposed fix so repeated reviews update one follow-up.
 
 Do not mark the loop done only because a gap artifact exists. Manager must close the gap gate after triage.
 
@@ -200,6 +235,8 @@ Specification choices that cannot be resolved from the original plan/spec belong
 Worker QA is task-local. Manager final QA is a separate combined-implementation gate controlled by `manager_qa_profile`.
 
 When `manager_qa_profile` is `none`, no separate final QA gate is required.
+
+This setting is separate from 0.5.2 manual final certification. Even when `manager_qa_profile: none`, a new loop must complete the fixed-target convergence and `final-review` evidence required by `review_policy.final_required`. Manual final is the review certification gate; Manager QA is product-environment QA.
 
 When `manager_qa_profile` is `local`, `preview`, `staging`, `repo-default`, or `custom`:
 
@@ -226,6 +263,9 @@ When done, generate `reports/FINAL.md` with:
 - role agent providers/models
 - gap status
 - review status
+- release-scope lock status, scope/source revisions, and amendments
+- convergence target/fix rounds and manual-final certification status
+- finding dispositions, accepted risks, and first-class follow-up issue keys
 - advice status when Advisor was used
 - accepted risks
 - remaining follow-ups

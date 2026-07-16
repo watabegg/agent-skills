@@ -16,7 +16,7 @@ For `persistence: local-only`, committed snapshot checks are replaced by copying
 
 An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again with a new attempt id. The original attempt base is immutable; an unmerged branch with commits is archived instead of silently reused or deleted. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
 
-State format 3 revision 1 is required by herdr-dev-loop 0.5.1. For format 2 or format 3 revision 0, first run `hloop migrate --dry-run`, inspect the complete revision path, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
+State format 3 revision 2 is required by herdr-dev-loop 0.5.2. The migration path is format 1 -> 2 -> 3.0 -> 3.1 -> 3.2; first run `hloop migrate --dry-run`, inspect the complete revision path, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist. Legacy migrated loops retain their merge-count cadence and are marked so manual-final certification is not required for that historical run. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
 
 ## Phases
 
@@ -30,6 +30,13 @@ State format 3 revision 1 is required by herdr-dev-loop 0.5.1. For format 2 or f
 - `validating`: Manager is running integration validation.
 - `gap_checking`: Gap Auditor is running or its artifact is being triaged.
 - `reviewing`: Reviewer is running or its artifact is being triaged.
+- `review_readiness`: the current batch is closed and the fixed-target review prerequisites are being checked.
+- `review_convergence`: a fixed-target convergence plan or manifest is pending, or a bounded remediation round is required.
+- `review_convergence_exhausted`: the convergence round limit was reached with verified actionable findings; only an explicit reopen can select the next action.
+- `awaiting_manual_final_review`: convergence is complete and the separate manual-final certification is prepared or awaiting its evidence.
+- `manual_final_review_passed`: the fixed-target manual-final evidence is complete and has zero verified actionable findings.
+- `manual_final_review_incomplete`: manual-final evidence is missing lanes, verification, report, or other required completeness data.
+- `manual_final_review_failed`: manual-final evidence is stale, inconsistent, or contains a verified actionable finding.
 - `advising`: explicit Advisor consultation is requested, running, or awaiting Manager review.
 - `manager_qa`: Manager final QA is required before completion.
 - `waiting_worker`: Workers are still running and no result artifact is ready.
@@ -73,6 +80,20 @@ Then run, at most, one material transition:
 
 Prefer a small number of obvious transitions over attempting to finish a goal in one tick.
 
+For a new 0.5.2 loop, the review transition is itself bounded and artifact-driven:
+
+1. close the current task batch and verify the release-scope snapshot, current validation, clean Manager checkout, and no active role or merge;
+2. enter `review_readiness`, then prepare `reviews/convergence/PLAN.json` and an intentionally incomplete `MANIFEST.json` at one base/target SHA;
+3. collect fixed-target lane and verification evidence and record the manifest; if actionable findings remain, keep dispatch frozen while the Manager performs at most two automatic fix rounds;
+4. when convergence records zero verified actionable findings, prepare `reviews/final/PLAN.json`, `MANIFEST.json`, and `REPORT.md`, then record the independent manual-final certification;
+5. permit `hloop review reopen` only for an exhausted, failed, or incomplete review state, with explicit user-input provenance and the selected remediation, scope amendment, feature action, retry, or abort policy.
+
+The convergence and manual-final artifacts are not interchangeable. A new task,
+scope amendment, target SHA drift, or source snapshot drift invalidates the
+affected fixed-target evidence and returns the state to dispatching or a
+reopen-required phase. Do not reset `STATE.json`, reuse a stale manifest, or
+turn a non-blocking follow-up into a new in-scope task without authorization.
+
 `pump` repeats this bounded tick order up to `--max-transitions` and sleeps briefly between ticks by default so waiting phases can be polled instead of consuming the whole transition budget immediately. It must stop when:
 
 - a Gap Auditor or Reviewer artifact needs Manager triage
@@ -85,13 +106,18 @@ Do not let `pump` turn review/gap findings directly into queued tasks without Ma
 
 ## Default Cadence
 
-Defaults are intentionally active:
+Defaults are intentionally active for the scheduler, while review cadence is
+policy-driven:
 
 - `max_workers: 3`
 - `max_reviewers: 1`
 - `max_gap_auditors: 1`
-- `review_after_merges: 1`
-- `gap_after_merges: 3`
+- `review_policy.cadence: batch` for new 0.5.2 loops
+- `review_policy.pre_final_protocol: codex-review-multi-v2`
+- `review_policy.manual_final_protocol: codex-review-multi-v2`
+- `review_policy.max_fix_rounds: 2`
+- `review_policy.final_required: complete_zero_verified_actionable_findings`
+- `review_after_merges: 1` and `gap_after_merges: 3` remain legacy/merge-count knobs
 - `branch_strategy: integration`
 - `worker_protocol: native`
 - `review_protocol: native`
@@ -99,7 +125,10 @@ Defaults are intentionally active:
 - `worker_qa_profile: repo-default`
 - `manager_qa_profile: none`
 
-Reviewer should normally run after each validated integration advance. Gap Auditor is lower frequency and should run every three validated merges, or before final completion if no fresh gap audit covers the latest integration state.
+For new loops, ordinary review waits for a closed batch and the Manager explicitly
+prepares fixed-target convergence; it is not restarted after every incremental
+commit. Gap Auditor cadence remains product/profile-driven. Migrated or explicitly
+configured `merge-count` loops retain the historical review and gap thresholds.
 
 Advisor has no default cadence. Manager may explicitly create an Advisor request when review/gap findings require another model's reasoning but do not require user input.
 
@@ -133,12 +162,15 @@ Set a blocked or failed phase and stop when:
 - `HERDR_ENV=1` is absent.
 - required CLI tools are missing.
 - `STATE.json` is unreadable or contradicts the current branch.
+- the release-scope lock is absent, stale, or source digests no longer match.
+- a new task or role is requested while dispatch freeze is active.
 - every remaining safe task is dependency-blocked by an unresolved `blocking-user` decision.
 - a Worker result is missing required fields.
 - a Worker result reports `partial`, `blocked`, `failed`, `abandoned`, `merge_ready: false`, blocking questions, or missing validation.
 - a Worker changed files outside its allowed scope.
 - a merge conflict appears.
 - validation fails.
+- convergence is incomplete or exhausted, or manual-final certification is incomplete or failed.
 - Manager final QA fails or is blocked when required.
 - Gap Auditor reports a missing, partial, or needs-decision item that affects mission done criteria.
 - Reviewer reports a P0/P1 finding that cannot be fixed without a user decision.

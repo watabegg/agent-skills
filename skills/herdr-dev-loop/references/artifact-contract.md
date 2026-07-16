@@ -19,7 +19,12 @@ All loop coordination is file-backed under `.ai/herdr-dev-loop/loops/<namespace>
   results/
   gaps/
   reviews/
+    convergence/
+    final/
   advice/
+  release-scope/
+    amendments/
+  follow-ups/
   prompts/
   triage/
   validation/
@@ -85,9 +90,23 @@ Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pa
 
 `namespace` and `loop_path` must match the Manager command's explicit `--namespace`. A command never searches another namespace or legacy `.ai/loop` when the selected `STATE.json` is missing.
 
-Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r1 state.
+Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r2 state.
 
-The current 0.5.1 contract is `state_format_version: 3` and `schema_revision: 1`. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned backup, and applies every declared revision rather than rebinding old evidence to the new schema.
+The current 0.5.2 contract is `state_format_version: 3` and `schema_revision: 2`. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned backup, and applies every declared revision rather than rebinding old evidence to the new schema. The runtime chain accepts format 1/2 and format 3 revision 0/1, then reaches format 3 revision 2.
+
+### 0.5.2 policy blocks
+
+New state includes the following policy and evidence blocks:
+
+- `review_policy`: new-loop batch cadence, pre-final/manual-final protocol, maximum two automatic fix rounds, scope-expansion action, complete-zero final requirement, and lane count.
+- `release_scope`: lock status, source refs and digests, semantic `scope_revision`, editorial `source_snapshot_revision`, plan/requirement refs, and amendment refs.
+- `dispatch_freeze`: whether new task/role starts are frozen, why, the authorizing input, and the running roles allowed to finish.
+- `review_convergence`: fixed base/target SHA, prepared plan, current fix round, extra-round authorizations, manifest completeness, and verified actionable finding count.
+- `manual_final_review`: certification id, PLAN/MANIFEST/report paths and digest, fixed target SHA, completeness, verified actionable finding count, and attempt history.
+- `follow_ups`: first-class artifact refs, open count, stable issue keys, aliases, and exported report paths.
+- `manager_invocation` and `execution_metrics`: Manager provider/model/reasoning effort plus task-origin, disposition, remediation-round, stale/aborted-review, and parallelism metrics.
+
+Legacy migration initializes these blocks with legacy-safe statuses. In particular, a migrated legacy loop keeps its stored merge-count cadence, marks existing tasks `legacy-unclassified`, and uses `not-required-for-legacy-run` for manual final certification.
 
 `persistence: local-only` copies the namespace snapshot to role worktrees and excludes loop artifacts from integration commits. `persistence: branch-history` requires Manager-owned inputs to be committed at the audited ref. `worktree_setup_commands` contains the ordered repository-specific bootstrap contract applied before role launch; run outcomes are stored separately under `.ai/herdr-dev-loop/experience/worktree-setup.json`.
 
@@ -96,8 +115,8 @@ Recommended optional fields:
 - `session_cleanup`: `archive`, `none`, or `delete`; default to `archive`
 - `review_wait_ms`: bounded wait for a running Reviewer before returning control
 - `gap_wait_ms`: bounded wait for a running Gap Auditor before returning control
-- `review_after_merges`: validated integration merge count that opens the review gate; default `1`
-- `gap_after_merges`: validated integration merge count that opens the gap gate; default `3`
+- `review_after_merges`: legacy/explicit `merge-count` validated integration merge count that opens the review gate; default `1`
+- `gap_after_merges`: legacy/explicit `merge-count` validated integration merge count that opens the gap gate; default `3`
 - `unreviewed_merge_count`: integration merges not yet covered by a closed review gate
 - `ungapped_merge_count`: integration merges not yet covered by a closed gap gate
 - `spec_sources`: original repo plan/spec files or directories the Gap Auditor should compare against implementation
@@ -130,7 +149,7 @@ Recommended optional fields:
 
 Raw or redacted input bodies, inbox events, broker databases, sockets, spooled reports, and provider credentials are never checkpoint-eligible. `STATE.json` may retain safe digests, IDs, counts, and resolved non-secret configuration, but not the underlying prompt or transport secret.
 
-Accepted requirements, their progress, and machine-readable decision records currently live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. The 0.5.1 CLI does not create separate `requirements/`, `progress/`, `context/`, or `decisions/` directories.
+Accepted requirements, their progress, and machine-readable decision records currently live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. The 0.5.2 CLI does not create separate `requirements/`, `progress/`, `context/`, or `decisions/` directories; release scope, convergence, manual final, and follow-up records use the namespaced paths described below.
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 
@@ -191,6 +210,19 @@ worker_agent_model: auto
 `write_allow` is mandatory and non-empty for implementation and fix tasks unless Manager explicitly uses `--allow-no-write` for an exceptional no-edit task. Use `kind: research` for ordinary no-edit investigation tasks. `write_deny` is optional but should be used for migrations, generated files, or unrelated subsystems. `validation_minimum` may be a single level such as `L1` or a multiline list when the task needs multiple explicit validation requirements.
 
 `worker_agent_provider` and `worker_agent_model` optionally override the default Worker backend from `PROFILE.md` for a single task.
+
+### Task provenance after release-scope lock
+
+Once `STATE.json.release_scope.status` is `locked`, every new task records immutable authorization metadata in addition to `kind`:
+
+- `task_origin`: `planned`, `finding`, `user-amendment`, or `operational`; migrated legacy tasks use `legacy-unclassified` and cannot be used as the origin for a new task.
+- `release_scope_revision`: the locked scope revision at task creation.
+- `plan_item_refs`, `requirement_refs`, and `scope_refs`: references required for a `planned` task.
+- `source_finding`, `why_fix_now`, `origin`, `contract_relation`, `release_effect`, `fact_status`, `disposition`, and `remediation_round`: evidence required for a `finding` task.
+- `authorization_input_id`: required for a `user-amendment` task together with the updated scope revision.
+- `operational_reason`: required for an `operational` task; it cannot authorize a product or release-artifact behavior change.
+
+`hloop task new`, review/gap triage, and other task-creation paths use one authorization preflight. `task update` may add details but cannot erase provenance or change the task origin. A new origin requires closing the old task and creating another task from the new evidence.
 
 ## Batch File
 
@@ -377,6 +409,40 @@ rationale: The reviewed code path can fail when ...
 ```
 
 `hloop triage review R001` reads this section and writes `.ai/herdr-dev-loop/loops/<namespace>/triage/R001.fix-task-draft.md`, including rejected candidates and reasons when candidate blocks are incomplete. It creates queued tasks only from valid candidates when Manager reruns with `--create-tasks`.
+
+## Fixed-target convergence artifacts
+
+The 0.5.2 pre-final convergence commands write fixed-target JSON artifacts below:
+
+```text
+reviews/convergence/PLAN.json
+reviews/convergence/MANIFEST.json
+```
+
+`PLAN.json` records `base_ref`, `base_sha`, `target_ref`, `target_sha`, `fix_round`, `max_fix_rounds`, the review plan, readiness checks, protocol, and preparation time. `MANIFEST.json` records the same review-plan identity, lane results, normalized findings, verifier assignments/results, completeness issues, and the recomputed verified actionable finding count. The prepared target SHA and plan must match exactly when the manifest is recorded. An incomplete manifest or a nonzero actionable count keeps convergence open or exhausted; the Manager must not substitute a plain review artifact for these fixed-target records.
+
+Public validation entry points are:
+
+- `schemas/final-review-plan.schema.json`
+- `schemas/final-review-manifest.schema.json`
+
+They reference the canonical definitions in `references/schemas/` and are intended for offline JSON-schema validation.
+
+## Manual final review artifacts
+
+`hloop final-review prepare` writes the manual certification bundle below:
+
+```text
+reviews/final/PLAN.json
+reviews/final/MANIFEST.json
+reviews/final/REPORT.md
+```
+
+The plan fixes certification id, base/target SHA, base/target ref, scope source and digest, scope revisions, protocol, lane plan, and verification policy. The manifest must include lane completion, verification completeness, all normalized findings and evidence, `manifest_complete`, `verified_actionable_findings`, and `patch_verdict`. The report must be non-empty. `hloop final-review record` recomputes completeness and invalidates the certification when target SHA or plan identity drifts. `finish` accepts only a `passed` certification whose evidence is complete and whose verified actionable finding count is zero. A follow-up may remain open without failing this gate when it is non-blocking and the current contract is satisfied.
+
+## First-class follow-up artifact
+
+Each follow-up is stored as `follow-ups/FNNN.md` and indexed from `STATE.json.follow_ups`. Its issue key has the form `fu:v1:sha256:<64 hex>` and is computed only from normalized `component`, `trigger_class`, `product_impact`, and optional `root_cause`. Review fingerprint, target SHA, severity, title, affected line, and proposed fix are evidence fields and do not create a second issue. Re-adding the same semantic issue updates the existing artifact and returns `deduplicated` instead of allocating another `FNNN`.
 
 ## Gap Artifact
 
