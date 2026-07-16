@@ -1781,6 +1781,47 @@ def _write_final_manifest(
         json.dumps(manifest.to_record(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    inventory = hloop._changed_file_inventory(fixture["repo"], plan.base_sha, plan.target_sha)
+    report = {
+        "protocol": plan.protocol,
+        "certification_id": plan.certification_id,
+        "prepared_plan_digest": plan.digest,
+        "base_sha": plan.base_sha,
+        "target_sha": plan.target_sha,
+        "scope_revision": plan.scope_revision,
+        "source_snapshot_revision": plan.source_snapshot_revision,
+        "source_digest": plan.source_digest,
+        "lane_count": len(plan.lane_plan),
+        "lane_names": [
+            f"{lane.provider}:{lane.lane_id}" for lane in plan.lane_plan
+        ],
+        "lane_outcomes": [
+            f"{result.provider}:{result.lane_id}:{result.status}"
+            for result in lane_results
+        ],
+        "coordinator_session_id": "synthetic-coordinator",
+        "diff_inventory": inventory or ["(no changed files)"],
+        "verification_records": [
+            record.fingerprint for record in verifications
+        ],
+        "verification_shortfall": len(
+            review_manifest.verification_plan.shortfalls
+        ),
+        "incomplete_findings": list(manifest.completeness.incomplete_findings),
+        "manifest_complete": manifest.manifest_complete,
+        "verified_actionable_findings": manifest.recomputed_verified_actionable_count,
+        "findings": [
+            finding.fingerprint for finding in review_manifest.findings
+        ],
+        "residual_risks": [],
+        "follow_up_refs": [],
+        "patch_verdict": manifest.patch_verdict,
+        "completed_at": now(),
+    }
+    (loop / "reviews" / "final" / "FINAL.md").write_text(
+        hloop.frontmatter(report) + "\n# Synthetic Manual Final Review\n",
+        encoding="utf-8",
+    )
     return manifest
 
 
@@ -2304,13 +2345,73 @@ def scenario_review_budget(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
-    root: Path = ctx["root"]
-    repo: Path = ctx["repo"]
-    env: dict[str, str] = ctx["env"]
-    namespace: str = ctx["namespace"]
+    fixture = _new_synthetic_fixture(ctx, "final-gate-and-finish")
+    root: Path = fixture["root"]
+    repo: Path = fixture["repo"]
+    env: dict[str, str] = fixture["env"]
+    namespace: str = fixture["namespace"]
     path = state_path(repo, namespace)
     state = json.loads(path.read_text(encoding="utf-8"))
     target = git(repo, "rev-parse", "master").stdout.strip()
+    final_plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, final_plan)
+    require(
+        _record_convergence(fixture, 0)["status"] == "converged",
+        "finish fixture did not converge",
+    )
+    _prepare_final_review(fixture)
+    _write_final_manifest(fixture)
+    require(
+        _record_final_review(fixture)["status"] == "passed",
+        "finish fixture final certification did not pass",
+    )
+    captured_input = run(
+        hloop_command(
+            repo,
+            namespace,
+            "input",
+            "record",
+            "--source",
+            "synthetic-final-gate",
+            "--text",
+            "the synthetic final-gate requirement",
+        ),
+        cwd=root,
+        env=env,
+    )
+    source_input = captured_input.stdout.strip().split()[-1]
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "requirement",
+            "new",
+            "--id",
+            "REQ-001",
+            "--source-input",
+            source_input,
+            "--acceptance",
+            "synthetic final-gate evidence is recorded",
+            "--priority",
+            "P1",
+        ),
+        cwd=root,
+        env=env,
+    )
+    run(
+        hloop_command(
+            repo,
+            namespace,
+            "progress",
+            "record",
+            "--requirement-id",
+            "REQ-001",
+            "--status",
+            "in_progress",
+        ),
+        cwd=root,
+        env=env,
+    )
     run(
         hloop_command(
             repo,
@@ -2367,6 +2468,8 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
             "status": "merged",
             "branch": "synthetic/already-merged",
             "title": "Synthetic confirmed fix",
+            "task_origin": "planned",
+            "release_scope_revision": 1,
             "cleanup_done": True,
         }
     }
@@ -2428,11 +2531,21 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     require("sha256:" + "f" * 64 in report_text, "confirmed finding missing from FINAL")
     require("T999" in report_text, "confirmed fix missing from FINAL")
     require("synthetic residual compatibility risk" in report_text, "accepted risk missing from FINAL")
+    require("Manager invocation unavailable reason:" in report_text, "manager invocation projection missing from FINAL")
+    require("Task origins:" in report_text, "task metrics projection missing from FINAL")
+    require("Timings (seconds):" in report_text, "timing metrics projection missing from FINAL")
+    finished_metrics = finished.get("execution_metrics") or {}
+    require(
+        finished_metrics.get("remediation_task_count") == 0
+        and finished_metrics.get("planned_task_count") == 1,
+        "finish did not refresh task-origin metrics",
+    )
     return {
         "phase": finished["phase"],
         "target_sha": target,
         "final_gate_generation": finished["final_gate"]["generation"],
         "report": str(report_path.relative_to(repo)),
+        "metrics_projected": True,
         "fixture_note": "prepared an already-merged task and passing validation before invoking real final-gates and finish commands",
     }
 

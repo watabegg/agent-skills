@@ -79,6 +79,16 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
     def save_state(self, state: dict) -> None:
         self.state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
+    def test_new_loop_initializes_manager_invocation_and_execution_metrics(self):
+        state = self.state()
+        self.assertIn("manager_invocation", state)
+        self.assertIn("execution_metrics", state)
+        invocation = state["manager_invocation"]
+        if not any(invocation.get(field) for field in ("provider", "model", "reasoning_effort")):
+            self.assertTrue(invocation["unavailable_reason"])
+        self.assertIsNone(state["execution_metrics"]["effective_parallelism"])
+        self.assertEqual(state["execution_metrics"]["planned_task_count"], 0)
+
     def _make_ready_state(self) -> None:
         state = self.state()
         target = subprocess.check_output(
@@ -116,6 +126,54 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         )
         (loop / "reviews" / "convergence" / "MANIFEST.json").write_text(
             json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8"
+        )
+
+    def write_complete_final_report(
+        self, plan: CertificationPlan, evidence: FinalReviewManifest
+    ) -> None:
+        loop = self.state_path.parent
+        inventory = hloop._changed_file_inventory(self.repo, plan.base_sha, plan.target_sha)
+        report = {
+            "protocol": plan.protocol,
+            "certification_id": plan.certification_id,
+            "prepared_plan_digest": plan.digest,
+            "base_sha": plan.base_sha,
+            "target_sha": plan.target_sha,
+            "scope_revision": plan.scope_revision,
+            "source_snapshot_revision": plan.source_snapshot_revision,
+            "source_digest": plan.source_digest,
+            "lane_count": len(plan.lane_plan),
+            "lane_names": [
+                f"{lane.provider}:{lane.lane_id}" for lane in plan.lane_plan
+            ],
+            "lane_outcomes": [
+                f"{result.provider}:{result.lane_id}:{result.status}"
+                for result in evidence.review_manifest.lane_results
+            ],
+            "coordinator_session_id": "fixture-coordinator",
+            "diff_inventory": inventory or ["(no changed files)"],
+            "verification_records": [
+                record.fingerprint
+                for record in evidence.review_manifest.verifications
+            ],
+            "verification_shortfall": len(
+                evidence.review_manifest.verification_plan.shortfalls
+            ),
+            "incomplete_findings": list(evidence.completeness.incomplete_findings),
+            "manifest_complete": evidence.manifest_complete,
+            "verified_actionable_findings": evidence.recomputed_verified_actionable_count,
+            "findings": [
+                finding.fingerprint
+                for finding in evidence.review_manifest.findings
+            ],
+            "residual_risks": [],
+            "follow_up_refs": [],
+            "patch_verdict": evidence.patch_verdict,
+            "completed_at": hloop.now_iso(),
+        }
+        (loop / "reviews" / "final" / "FINAL.md").write_text(
+            hloop.frontmatter(report) + "\n# Fixture Manual Final Review\n",
+            encoding="utf-8",
         )
 
     def write_policy_manifest(self, *, outside_release: bool) -> None:
@@ -192,6 +250,80 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(payload["verified_actionable_findings"], 0)
         self.assertEqual(payload["release_blocking_findings"], 0)
 
+    def test_readiness_fails_closed_without_changed_file_and_special_verification(self):
+        target = self.state()["integration_head_sha"]
+        state = self.state()
+        state.pop("changed_file_validation", None)
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=["README.md"]):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (2, ""), out)
+        blocked = json.loads(out)
+        self.assertIn("changed-file validation evidence mapping is missing", blocked["errors"])
+        self.assertIn("special verification evidence is missing: public-docs", blocked["errors"])
+
+        state = self.state()
+        state["changed_file_validation"] = {
+            "status": "passed",
+            "target_sha": target,
+            "paths": ["README.md"],
+            "mapping": {"README.md": ["validation.log"]},
+        }
+        state["special_verification_evidence"] = {
+            "public-docs": {
+                "status": "passed",
+                "target_sha": target,
+                "references": ["docs-review.log"],
+            }
+        }
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=["README.md"]):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        ready = json.loads(out)
+        self.assertEqual(ready["checks"]["changed_file_validation"]["status"], "passed")
+        self.assertEqual(ready["checks"]["special_verification"]["status"], "passed")
+
+    def test_readiness_requires_first_class_follow_up_for_deferred_candidate(self):
+        fingerprint = "sha256:" + "d" * 64
+        state = self.state()
+        state["defer_follow_up_fingerprints"] = [fingerprint]
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=[]):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (2, ""), out)
+        blocked = json.loads(out)
+        self.assertTrue(
+            any("first-class follow-up artifacts" in item for item in blocked["errors"])
+        )
+
+        loop = self.state_path.parent
+        follow_up_path = loop / "follow-ups" / "F001.md"
+        follow_up_path.parent.mkdir(parents=True, exist_ok=True)
+        follow_up_path.write_text(
+            hloop.frontmatter(
+                {
+                    "id": "F001",
+                    "source_review_fingerprints": [fingerprint],
+                    "status": "deferred",
+                }
+            )
+            + "\n# Follow-up\n",
+            encoding="utf-8",
+        )
+        state = self.state()
+        state["follow_ups"]["artifact_refs"] = [
+            str(follow_up_path.relative_to(self.repo))
+        ]
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=[]):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(
+            json.loads(out)["checks"]["follow_up_completeness"]["status"],
+            "passed",
+        )
+
     def test_convergence_retains_confirmed_in_scope_blocking_finding(self):
         self.prepare_convergence()
         self.write_policy_manifest(outside_release=False)
@@ -219,6 +351,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(err, "")
         result = json.loads(out)
         self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(any(item.startswith("report-") for item in result["issues"]))
         state = self.state()
         self.assertEqual(state["manual_final_review"]["status"], "incomplete")
         self.assertEqual(state["phase"], "manual_final_review_incomplete")
@@ -247,6 +380,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         )
         manifest = FinalReviewManifest.from_review_manifest(plan, review)
         manifest_path.write_text(json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8")
+        self.write_complete_final_report(plan, manifest)
         code, out, err = self.run_cli("final-review", "record", "--json")
         self.assertEqual((code, err), (0, ""), out)
         self.assertEqual(json.loads(out)["status"], "passed")
