@@ -3,10 +3,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import importlib.machinery
 import importlib.util
@@ -743,6 +745,117 @@ class PolicyCliV052Tests(unittest.TestCase):
             self.assertEqual(after["manual_final_review"]["status"], "pending")
             self.assertEqual(after["phase"], "dispatching")
             self.assertEqual(after["review_convergence"]["target_sha"], target)
+
+    def test_operational_task_authorization_uses_complete_write_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "unsafe operational task",
+                "--id",
+                "T050",
+                "--kind",
+                "research",
+                "--write-allow",
+                "src/product.py",
+                "--task-origin",
+                "operational",
+                "--operational-reason",
+                "record operational evidence",
+            )
+            self.assertNotEqual(result, 0, output)
+            self.assertIn("product or release", output)
+            self.assertFalse((loop / "tasks" / "T050.md").exists())
+
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "evidence-only operational task",
+                "--id",
+                "T050",
+                "--kind",
+                "research",
+                "--allow-no-write",
+                "--task-origin",
+                "operational",
+                "--operational-reason",
+                "record operational evidence",
+            )
+            self.assertEqual(result, 0, output)
+            before = (loop / "tasks" / "T050.md").read_bytes()
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "update",
+                "T050",
+                "--add-write-allow",
+                "src/product.py",
+            )
+            self.assertNotEqual(result, 0, output)
+            self.assertIn("product or release", output)
+            self.assertEqual(before, (loop / "tasks" / "T050.md").read_bytes())
+
+            state = hloop.load_state(repo)
+            task_meta = hloop.read_frontmatter(loop / "tasks" / "T050.md")
+            task_meta["write_allow"] = ["src/product.py"]
+            with self.assertRaisesRegex(hloop.HLoopError, "product or release"):
+                hloop.dispatch_start_preflight(
+                    repo,
+                    state,
+                    role_id="T050",
+                    role_kind="worker",
+                    task_meta=task_meta,
+                )
+
+    def test_config_apply_updates_review_policy_and_invalidates_policy_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            target = subprocess.check_output(
+                ["git", "rev-parse", "main"], cwd=repo, text=True
+            ).strip()
+            state.update(
+                {
+                    "phase": "awaiting_manual_final_review",
+                    "review_readiness": {"status": "ready", "target_sha": target},
+                    "review_convergence": {
+                        "status": "converged",
+                        "target_sha": target,
+                        "verified_actionable_findings": 0,
+                        "artifact_refs": ["reviews/convergence/MANIFEST.json"],
+                    },
+                    "manual_final_review": {
+                        "status": "passed",
+                        "target_sha": target,
+                        "manifest_complete": True,
+                        "verified_actionable_findings": 0,
+                        "release_blocking_findings": 0,
+                    },
+                }
+            )
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            config_home = Path(directory) / "config"
+            config_home.mkdir()
+            (config_home / "config.toml").write_text(
+                "version = 1\n\n[defaults.review]\ncadence = \"merge-count\"\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HLOOP_CONFIG_HOME": str(config_home)}):
+                result, output = self.run_cli(repo, "config", "apply", "--apply")
+            self.assertEqual(result, 0, output)
+            after = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(after["review_policy"]["cadence"], "merge-count")
+            self.assertTrue(json.loads(output)["review_policy_changed"])
+            self.assertEqual(after["review_convergence"]["status"], "pending")
+            self.assertEqual(after["manual_final_review"]["status"], "pending")
+            self.assertEqual(after["review_readiness"]["status"], "pending")
 
     def test_review_failure_phases_reject_ordinary_dispatch_unfreeze(self) -> None:
         for phase in (

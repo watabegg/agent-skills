@@ -1316,6 +1316,11 @@ def apply_resolved_config_to_state(
     state["specification_scout"] = str(
         resolved.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT
     )
+    review_policy = dict(hloop_config.REVIEW_POLICY_DEFAULTS)
+    configured_review_policy = resolved.get("review")
+    if isinstance(configured_review_policy, dict):
+        review_policy.update(configured_review_policy)
+    state["review_policy"] = review_policy
     for role in ("worker", "reviewer"):
         role_config = resolved.get(role) or {}
         state[f"{role}_agent_provider"] = normalize_agent_provider(
@@ -1347,6 +1352,14 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
 
     resolved = resolution.as_dict()
     changes = config_apply_changes(state.get("resolved_config") or {}, resolved)
+    previous_review_policy = review_policy_record(state)
+    next_review_policy = dict(hloop_config.REVIEW_POLICY_DEFAULTS)
+    configured_review_policy = resolved.get("review")
+    if isinstance(configured_review_policy, dict):
+        next_review_policy.update(configured_review_policy)
+    review_policy_changed = _canonical_digest(previous_review_policy) != _canonical_digest(
+        next_review_policy
+    )
     next_source = {
         "kind": candidate.source if candidate else "built-in-default",
         "path": str(candidate.path) if candidate else "",
@@ -1358,7 +1371,8 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
         "config_source": candidate.source if candidate else "built-in-default",
         "changes": changes,
         "source_changed": source_changed,
-        "changed": bool(changes) or source_changed,
+        "review_policy_changed": review_policy_changed,
+        "changed": bool(changes) or source_changed or review_policy_changed,
     }
     if not args.apply:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1373,8 +1387,18 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
         raise HLoopError("cannot apply config while a merge transaction is active")
     if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
         raise HLoopError(f"cannot apply config to a terminal run: {state.get('phase')}")
-    if changes or source_changed:
+    if changes or source_changed or review_policy_changed:
         apply_resolved_config_to_state(state, resolved, candidate)
+        if review_policy_changed:
+            # Review plans, convergence manifests, and manual-final
+            # certification are all identified by the active policy.  A
+            # policy change must invalidate those dependent artifacts before
+            # the new snapshot becomes observable.
+            invalidate_review_gates_for_change(
+                state,
+                reason="review-policy-config-change",
+                target_sha=current_integration_target(repo, state),
+            )
         state["config_applied_at"] = now_iso()
         save_state(repo, state)
         journal(
@@ -1382,7 +1406,7 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
             "Applied resolved config snapshot: "
             + (", ".join(item["key"] for item in changes) or "config_source"),
         )
-    payload["applied"] = bool(changes) or source_changed
+    payload["applied"] = bool(changes) or source_changed or review_policy_changed
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -1916,8 +1940,11 @@ def _validation_identity_matches(
             "commands": record.get("commands"),
             "dependency_identity": record.get("dependency_identity"),
         }
-    stored_commands = sorted(str(item) for item in normalize_list(stored.get("commands")))
-    current_commands = sorted(str(item) for item in normalize_list(identity.get("commands")))
+    # Validation commands are an ordered execution contract.  Comparing a
+    # sorted command set would allow a different sequence (and therefore a
+    # different validation pipeline) to reuse old evidence.
+    stored_commands = [str(item) for item in normalize_list(stored.get("commands"))]
+    current_commands = [str(item) for item in normalize_list(identity.get("commands"))]
     return (
         str(stored.get("target_sha") or "") == str(identity.get("target_sha") or "")
         and stored_commands == current_commands
@@ -3236,6 +3263,23 @@ def provenance_record_from_args(
         or candidate.get("decision_requirement")
         or ("none" if source_finding else "")
     )
+    # Operational authorization is evaluated against the complete task
+    # record, not only the immutable provenance projection.  Preserve the
+    # path-bearing fields on this validation-only record so the shared
+    # fail-closed validator can reject product/release writes before the task
+    # artifact is persisted.
+    for field_name in (
+        "write_allow",
+        "write_deny",
+        "changed_files",
+        "product_paths",
+        "release_artifact_paths",
+    ):
+        supplied = getattr(args, field_name, None) if args is not None else None
+        if supplied is not None:
+            record[field_name] = normalize_list(supplied)
+        elif field_name in candidate:
+            record[field_name] = normalize_list(candidate.get(field_name))
     return record
 
 
@@ -3298,6 +3342,18 @@ def task_provenance_record(meta: dict[str, Any]) -> dict[str, Any] | None:
             record[key] = int(value)
     if "severity" not in record and meta.get("priority"):
         record["severity"] = str(meta.get("priority"))
+    # Dispatch and update preflights must authorize operational tasks with
+    # their current write scope.  These fields remain validation-only; the
+    # normalized TaskProvenance artifact is unchanged.
+    for field_name in (
+        "write_allow",
+        "write_deny",
+        "changed_files",
+        "product_paths",
+        "release_artifact_paths",
+    ):
+        if field_name in meta:
+            record[field_name] = normalize_list(meta.get(field_name))
     return record | ({"scope_expanding": True} if meta.get("scope_expanding") else {})
 
 
@@ -3334,6 +3390,11 @@ def validate_task_update_provenance(
         )
     except hloop_release_scope.ReleaseScopeError as exc:
         raise HLoopError(f"task provenance update rejected: {exc}") from exc
+    # Provenance mutation checks intentionally normalize away task metadata.
+    # Re-run the shared authorization against the complete updated record so
+    # operational updates cannot introduce product or release writes through
+    # write_allow (or its equivalent path-bearing fields).
+    authorize_task_record(repo, state, task_provenance_record(next_meta) or {})
 
 
 def dispatch_start_preflight(
@@ -6755,6 +6816,15 @@ def review_policy_record(state: dict[str, Any]) -> dict[str, Any]:
         raise HLoopError("review max_fix_rounds must be an integer") from exc
     if max_fix_rounds < 0 or max_fix_rounds > 2:
         raise HLoopError("review max_fix_rounds must be between 0 and 2")
+    manual_final_protocol = str(
+        policy.get("manual_final_protocol")
+        or hloop_certification.MANUAL_FINAL_PROTOCOL
+    )
+    if manual_final_protocol != hloop_certification.MANUAL_FINAL_PROTOCOL:
+        raise HLoopError(
+            "unsupported manual-final protocol: " + manual_final_protocol
+        )
+    policy["manual_final_protocol"] = manual_final_protocol
     policy["cadence"] = cadence
     policy["max_fix_rounds"] = max_fix_rounds
     return policy
@@ -6958,7 +7028,17 @@ def _validation_mapping_for_paths(
             missing.append(path)
         else:
             mapping[path] = refs
-    return mapping, [f"changed file lacks validation evidence: {path}" for path in missing]
+    errors = [f"changed file lacks validation evidence: {path}" for path in missing]
+    expected_paths = {str(path) for path in paths}
+    extra_paths = sorted(
+        str(path) for path in raw_mapping if str(path) not in expected_paths
+    )
+    if extra_paths:
+        errors.append(
+            "changed-file validation evidence has unexpected paths: "
+            + ", ".join(extra_paths)
+        )
+    return mapping, errors
 
 
 def _special_verification_domains(paths: Sequence[str]) -> dict[str, list[str]]:
@@ -7017,16 +7097,22 @@ def _special_verification_errors(
     errors: list[str] = []
     for domain in sorted(domains):
         value = raw.get(domain)
-        if isinstance(value, Mapping):
-            if str(value.get("target_sha") or target) != target:
-                errors.append(f"special verification evidence is stale: {domain}")
-                continue
-            if str(value.get("status") or "") not in {"passed", "verified"}:
-                errors.append(f"special verification evidence is not passed: {domain}")
-                continue
-            refs = normalize_list(value.get("references") or value.get("evidence"))
-        else:
-            refs = normalize_list(value)
+        if not isinstance(value, Mapping):
+            # Pre-0.5.2 list-shaped evidence has no trustworthy target
+            # identity.  It must not satisfy a current-head readiness gate.
+            errors.append(f"special verification evidence identity is missing: {domain}")
+            continue
+        recorded_target = value.get("target_sha")
+        if not isinstance(recorded_target, str) or not recorded_target.strip():
+            errors.append(f"special verification evidence identity is missing: {domain}")
+            continue
+        if recorded_target != target:
+            errors.append(f"special verification evidence is stale: {domain}")
+            continue
+        if str(value.get("status") or "") not in {"passed", "verified"}:
+            errors.append(f"special verification evidence is not passed: {domain}")
+            continue
+        refs = normalize_list(value.get("references") or value.get("evidence"))
         if not refs:
             errors.append(f"special verification evidence is missing: {domain}")
         else:
@@ -7385,6 +7471,15 @@ def _final_certification_plan(
     probe_count: int | None = None,
     probes_per_provider: int | None = None,
 ) -> tuple[hloop_certification.CertificationPlan, hloop_review.ReviewGroupPlan]:
+    review_policy = review_policy_record(state)
+    manual_final_protocol = str(review_policy.get("manual_final_protocol") or "")
+    if manual_final_protocol != hloop_certification.MANUAL_FINAL_PROTOCOL:
+        # Do not silently substitute the one implemented protocol when a
+        # persisted/configured policy names an unsupported manual-final
+        # implementation.
+        raise HLoopError(
+            "unsupported manual-final protocol: " + (manual_final_protocol or "missing")
+        )
     group = _review_plan_for_target(
         state,
         target,
@@ -7419,7 +7514,7 @@ def _final_certification_plan(
         scope_revision=scope_revision,
         source_snapshot_revision=snapshot_revision,
         source_digest=source_digest,
-        protocol=hloop_certification.MANUAL_FINAL_PROTOCOL,
+        protocol=manual_final_protocol,
         lane_plan=lanes,
         verification_policy=policy,
     )
@@ -8204,6 +8299,23 @@ def cmd_review_reopen(args: argparse.Namespace) -> int:
             manual["invalidated_status"] = "invalidated"
             manual["status"] = "pending"
         if amendment_record is not None and amendment_path is not None:
+            # ``certification.reopen_review`` clears the certification model,
+            # while the CLI owns the broader readiness projection.  Reuse the
+            # same invalidation boundary as ``release-scope amend`` so a
+            # scope-changing reopen cannot retain a stale target, convergence
+            # identity, or manual-final evidence.  Preserve the command's
+            # explicit next phase after the shared reset.
+            amendment_id = str(amendment_record.get("amendment_id") or "scope")
+            invalidate_review_gates_for_change(
+                candidate,
+                reason=f"review-reopen-scope-amendment:{amendment_id}",
+                target_sha=current_integration_target(repo, candidate),
+            )
+            candidate["phase"] = (
+                "review_readiness"
+                if args.action == "scope-amend"
+                else "review_convergence"
+            )
             _persist_review_reopen(repo, candidate, amendment_record, amendment_path)
         else:
             save_state(repo, candidate)
@@ -23662,6 +23774,98 @@ def manual_final_gate_errors(repo: Path, state: dict[str, Any], target: str) -> 
     return errors
 
 
+def _finish_accepted_risk_errors(
+    repo: Path, state: Mapping[str, Any], target: str
+) -> list[str]:
+    """Revalidate persisted accepted-risk evidence at the finish boundary."""
+
+    manual = state.get("manual_final_review")
+    manifest_ref = (
+        manual.get("manifest") if isinstance(manual, Mapping) else None
+    )
+    # A manual-final run that has not prepared a manifest is still covered by
+    # the ordinary manual-final gate.  Once a manifest exists, however, its
+    # accepted-risk findings are authoritative evidence and must be checked
+    # even when the derived state projection is absent.
+    if not manifest_ref:
+        return []
+
+    raw_authorizations = state.get("accepted_risk_authorizations")
+    if raw_authorizations is None:
+        if isinstance(manual, Mapping):
+            raw_authorizations = manual.get("accepted_risk_authorizations")
+
+    if raw_authorizations in (None, {}, []):
+        authorization_items: list[tuple[str, Any]] = []
+    elif isinstance(raw_authorizations, Mapping):
+        authorization_items = list(raw_authorizations.items())
+    elif isinstance(raw_authorizations, Sequence) and not isinstance(
+        raw_authorizations, (str, bytes)
+    ):
+        authorization_items = [
+            (str(index), value) for index, value in enumerate(raw_authorizations)
+        ]
+    else:
+        return ["accepted-risk authorization projection is malformed"]
+
+    projection_findings: list[dict[str, Any]] = []
+    for key, raw in authorization_items:
+        if not isinstance(raw, Mapping):
+            return [f"accepted-risk authorization projection is malformed: {key}"]
+        fingerprint = str(
+            raw.get("finding_fingerprint") or raw.get("fingerprint") or key
+        ).strip()
+        projection_findings.append(
+            {
+                "fingerprint": fingerprint,
+                "head_sha": raw.get("target_sha") or raw.get("head_sha") or "",
+                "disposition": "accepted_risk",
+                "accepted_risk_decision_id": raw.get("decision_id") or "",
+            }
+        )
+
+    try:
+        manifest_path = safe_repo_path(repo, str(manifest_ref))
+        evidence = hloop_certification.FinalReviewManifest.from_record(
+            json.loads(read_text(manifest_path))
+        )
+        manifest_findings = evidence.review_manifest.findings
+    except (
+        HLoopError,
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        KeyError,
+        hloop_certification.CertificationModelError,
+    ) as exc:
+        return [f"accepted-risk authorization evidence is invalid: {exc}"]
+
+    decisions = state.get("decisions") or {}
+    now = datetime.now(timezone.utc)
+    try:
+        manifest_resolved = hloop_decisions.resolve_accepted_risk_authorizations(
+            decisions,
+            manifest_findings,
+            target_sha=target,
+            now=now,
+        )
+        projection_resolved = hloop_decisions.resolve_accepted_risk_authorizations(
+            decisions,
+            projection_findings,
+            target_sha=target,
+            now=now,
+        )
+    except hloop_decisions.DecisionAuthorizationError as exc:
+        return [f"accepted-risk authorization revalidation failed: {exc}"]
+
+    if set(manifest_resolved) != set(projection_resolved):
+        return [
+            "accepted-risk authorization projection does not match final-review findings"
+        ]
+    return []
+
+
 def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     target = git(repo, ["rev-parse", str(state["integration_branch"])])
@@ -23675,6 +23879,7 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("Manager checkout has non-loop dirty files")
     if not last_validation_passed(state):
         errors.append("current completion target lacks passing validation")
+    errors.extend(_finish_accepted_risk_errors(repo, state, target))
     if not review_gate_passed(state):
         errors.append("current completion target lacks a closed review gate")
     errors.extend(manual_final_gate_errors(repo, state, target))
