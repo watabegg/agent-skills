@@ -1609,6 +1609,10 @@ def _candidate_for_lane(
     finding_id: str,
     severity: str,
     title: str,
+    origin: str = "introduced",
+    contract_relation: str = "in_scope",
+    disposition: str = "fix_now",
+    release_effect: str = "blocking",
 ) -> FindingCandidate:
     return FindingCandidate(
         finding_id=finding_id,
@@ -1623,9 +1627,14 @@ def _candidate_for_lane(
         symbol="synthetic_gate",
         trigger="synthetic bounded-convergence trigger",
         product_impact="the synthetic release gate must account for this finding",
-        origin="introduced",
+        origin=origin,
         proposed_fix="apply the bounded synthetic remediation",
         requires_spec_decision=False,
+        fact_status="confirmed",
+        contract_relation=contract_relation,
+        decision_requirement="none",
+        disposition=disposition,
+        release_effect=release_effect,
     )
 
 
@@ -1976,8 +1985,8 @@ def scenario_remediation_convergence(ctx: dict[str, Any]) -> dict[str, Any]:
         title="synthetic remediation finding",
     )
     _write_review_manifest(fixture, plan, candidates=(candidate,))
-    exhausted = _record_convergence(fixture, 2)
-    require(exhausted["status"] == "exhausted", "two-round convergence did not exhaust")
+    first_round = _record_convergence(fixture, 0)
+    require(first_round["status"] == "pending", "first remediation round did not remain pending")
     reopened = _fixture_cli(
         fixture,
         "review",
@@ -1986,13 +1995,9 @@ def scenario_remediation_convergence(ctx: dict[str, Any]) -> dict[str, Any]:
         "remediate",
         "--user-input-id",
         "U0001",
-        "--authorized-extra-rounds",
-        "1",
-        "--authorization-input-id",
-        "U0001",
         "--json",
     )
-    require(json.loads(reopened.stdout)["accepted"], "authorized remediation reopen was rejected")
+    require(json.loads(reopened.stdout)["accepted"], "remediation reopen was rejected")
     reopened_state = _fixture_state(fixture)
     require(reopened_state["review_convergence"]["fix_round"] == 1, "authorized remediation did not start a fresh bounded round")
     _create_finding_task(
@@ -2037,6 +2042,9 @@ def scenario_scope_expansion_follow_up(ctx: dict[str, Any]) -> dict[str, Any]:
         finding_id="F001",
         severity="P2",
         title="synthetic scope expansion",
+        contract_relation="outside_release",
+        disposition="defer_follow_up",
+        release_effect="non_blocking",
     )
     _write_review_manifest(
         fixture,
@@ -2125,8 +2133,39 @@ def scenario_two_round_exhaustion(ctx: dict[str, Any]) -> dict[str, Any]:
         title="synthetic exhausting finding",
     )
     _write_review_manifest(fixture, plan, candidates=(candidate,))
+    first = _record_convergence(fixture, 0)
+    require(first["status"] == "pending", "round zero did not remain pending")
+    reopened_one = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "remediate",
+        "--user-input-id",
+        "U0001",
+        "--json",
+    )
+    require(json.loads(reopened_one.stdout)["accepted"], "round-one remediation reopen was rejected")
+    plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, plan, candidates=(candidate,))
+    second = _record_convergence(fixture, 1)
+    require(second["status"] == "pending", "round one did not remain pending")
+    reopened_two = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "remediate",
+        "--user-input-id",
+        "U0002",
+        "--json",
+    )
+    require(json.loads(reopened_two.stdout)["accepted"], "round-two remediation reopen was rejected")
+    plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, plan, candidates=(candidate,))
     exhausted = _record_convergence(fixture, 2)
     require(exhausted["status"] == "exhausted", "convergence did not stop at two rounds")
+    exhausted_state = _fixture_state(fixture)
     third = _fixture_cli(
         fixture,
         "review",
@@ -2136,13 +2175,44 @@ def scenario_two_round_exhaustion(ctx: dict[str, Any]) -> dict[str, Any]:
         expected=2,
     )
     require("exhausted" in (third.stdout + third.stderr).lower(), "third automatic round was not rejected")
+    unauthorized = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "remediate",
+        "--user-input-id",
+        "U0003",
+        "--json",
+        expected=2,
+    )
+    require(
+        "authorized-extra-rounds-required" in unauthorized.stdout,
+        "exhausted remediation reopened without extra-round authorization",
+    )
+    authorized = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "remediate",
+        "--user-input-id",
+        "U0003",
+        "--authorized-extra-rounds",
+        "1",
+        "--authorization-input-id",
+        "U0003",
+        "--json",
+    )
+    require(json.loads(authorized.stdout)["accepted"], "authorized extra remediation reopen was rejected")
     state = _fixture_state(fixture)
-    require(state["review_convergence"]["fix_round"] == 0, "failed automatic prepare changed round state")
+    require(state["review_convergence"]["fix_round"] == 3, "authorized reopen did not advance canonical round")
     return {
         "configured_max_fix_rounds": exhausted["max_fix_rounds"],
         "recorded_fix_round": exhausted["fix_round"],
         "automatic_third_round": False,
-        "dispatch_frozen": state["dispatch_freeze"]["status"] == "active",
+        "dispatch_frozen": exhausted_state["dispatch_freeze"]["status"] == "active",
+        "canonical_fix_round_after_authorized_reopen": state["review_convergence"]["fix_round"],
         "phase": state["phase"],
     }
 

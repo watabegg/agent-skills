@@ -55,6 +55,7 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
         self.assertEqual(evidence["recorded_fix_round"], 2)
         self.assertFalse(evidence["automatic_third_round"])
         self.assertTrue(evidence["dispatch_frozen"])
+        self.assertEqual(evidence["canonical_fix_round_after_authorized_reopen"], 3)
 
     def test_user_stop_freezes_new_dispatch_but_allows_safe_harvest(self):
         evidence = self.run_scenario("user-stop-freeze")

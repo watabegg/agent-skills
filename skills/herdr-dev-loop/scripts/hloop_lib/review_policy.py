@@ -64,9 +64,52 @@ NON_BLOCKING_DISPOSITIONS = frozenset(
 )
 _REGRESSION_ORIGINS = frozenset({"introduced", "diff-expanded-pre-existing"})
 
+# A P0 is safety-critical by definition.  P1 findings are safety-critical
+# when their evidence describes a security or data-integrity boundary.  Keep
+# this detector deliberately conservative: it is only used to reject an
+# unsafe non-blocking disposition at the convergence gate, so a false
+# positive leaves the Manager an explicit blocking disposition to resolve.
+_SAFETY_CRITICAL_MARKERS = (
+    re.compile(r"\bsecurity\b", re.IGNORECASE),
+    re.compile(r"\bdata[ -](?:loss|leak(?:age)?|exposure|corruption)\b", re.IGNORECASE),
+    re.compile(r"\bcredential(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bauth(?:entication|orization)?\s+bypass\b", re.IGNORECASE),
+    re.compile(r"\b(?:privacy|tenant)[ -](?:breach|escape|isolation)\b", re.IGNORECASE),
+    re.compile(r"\bcross[ -]tenant\b", re.IGNORECASE),
+    re.compile(r"\bsecret(?:s)?\b", re.IGNORECASE),
+)
+
 
 class ReviewPolicyError(ValueError):
     """Raised when a finding classification or follow-up relation is invalid."""
+
+
+def is_safety_critical_finding(
+    *,
+    severity: str,
+    title: str = "",
+    trigger: str = "",
+    product_impact: str = "",
+    proposed_fix: str = "",
+) -> bool:
+    """Return whether finding evidence requires the security/data-loss gate.
+
+    The policy model intentionally keeps this as evidence-derived metadata
+    rather than adding another serialized classification axis.  P0 is always
+    critical; for P1, matching any security or data-integrity marker is enough
+    to require a blocking disposition.
+    """
+
+    if severity == "P0":
+        return True
+    if severity != "P1":
+        return False
+    evidence = " ".join(
+        value.strip()
+        for value in (title, trigger, product_impact, proposed_fix)
+        if isinstance(value, str) and value.strip()
+    )
+    return any(marker.search(evidence) for marker in _SAFETY_CRITICAL_MARKERS)
 
 
 def _required_text(value: Any, field_name: str) -> str:
@@ -774,6 +817,7 @@ __all__ = [
     "enforce_disposition_policy",
     "follow_up_issue_key",
     "follow_up_relation",
+    "is_safety_critical_finding",
     "issue_key_components",
     "same_follow_up_issue",
     "resolve_issue_key_alias",
