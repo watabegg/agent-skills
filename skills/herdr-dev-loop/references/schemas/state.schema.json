@@ -270,7 +270,7 @@
       "properties": {
         "cadence": {"type": "string", "enum": ["batch", "merge-count"]},
         "pre_final_protocol": {"type": "string", "enum": ["native", "codex-review-multi-v2"]},
-        "manual_final_protocol": {"type": "string", "enum": ["native", "codex-review-multi-v2"]},
+        "manual_final_protocol": {"type": "string", "enum": ["codex-review-multi-v2"]},
         "max_fix_rounds": {"type": "integer", "minimum": 0, "maximum": 2},
         "scope_expansion_action": {
           "type": "string",

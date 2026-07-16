@@ -380,6 +380,50 @@ class OutcomeSchemaTests(unittest.TestCase):
         self.assertEqual(list(validator.iter_errors(legacy)), [])
         self.assertEqual(list(validator.iter_errors(projected)), [])
 
+    def test_schema_accepts_runtime_worker_and_batch_metrics(self):
+        outcome_path = SCHEMAS / "outcome.schema.json"
+        progress_path = SCHEMAS / "progress.schema.json"
+        schema = json.loads(outcome_path.read_text())
+        registry = Registry()
+        for schema_path in (progress_path, outcome_path):
+            registry = registry.with_resource(
+                schema_path.resolve().as_uri(),
+                Resource.from_contents(json.loads(schema_path.read_text())),
+            )
+        validator = jsonschema.Draft202012Validator(
+            {"$schema": schema["$schema"], "$ref": outcome_path.resolve().as_uri()},
+            registry=registry,
+        )
+        batch = BatchPerformance(
+            batch_id="B008",
+            worker_count=2,
+            wall_time_seconds=10.0,
+            worker_runtime_seconds=12.0,
+            effective_parallelism=1.2,
+            longest_worker_seconds=8.0,
+            validation_time_seconds=3.0,
+            review_wait_time_seconds=4.0,
+            warnings=("effective-parallelism-low: 1.2 with 2 workers",),
+            replan_required=True,
+            conflict_graph_digest="d" * 64,
+        )
+        projected = draft_outcome(
+            run_id="run-001",
+            goal="runtime metrics",
+            generated_at=NOW,
+            requirement_progress=(RequirementProgress("REQ-001"),),
+            gates=(OutcomeGate(name="validation", status="pending"),),
+            integration_target_sha="",
+            current_branch_sha="",
+            execution_metrics=ExecutionMetrics(
+                worker_runtime_seconds=12.0,
+                batch_id="B008",
+                batch_metrics=(batch,),
+            ),
+        ).to_record()
+
+        self.assertEqual(list(validator.iter_errors(projected)), [])
+
 
 if __name__ == "__main__":
     unittest.main()

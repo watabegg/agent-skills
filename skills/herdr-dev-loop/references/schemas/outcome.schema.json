@@ -25,6 +25,45 @@
       "type": "object",
       "additionalProperties": {"type": "integer", "minimum": 0}
     },
+    "batchPerformanceRecord": {
+      "type": "object",
+      "required": [
+        "batch_id",
+        "worker_count",
+        "wall_time_seconds",
+        "worker_runtime_seconds",
+        "effective_parallelism",
+        "longest_worker_seconds",
+        "validation_time_seconds",
+        "review_wait_time_seconds",
+        "warnings",
+        "replan_required",
+        "conflict_graph_digest"
+      ],
+      "properties": {
+        "batch_id": {"type": "string"},
+        "worker_count": {"type": "integer", "minimum": 0},
+        "wall_time_seconds": {"type": "number", "minimum": 0},
+        "worker_runtime_seconds": {"type": "number", "minimum": 0},
+        "effective_parallelism": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "number", "minimum": 0}
+          ]
+        },
+        "longest_worker_seconds": {"type": "number", "minimum": 0},
+        "validation_time_seconds": {"type": "number", "minimum": 0},
+        "review_wait_time_seconds": {"type": "number", "minimum": 0},
+        "warnings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "replan_required": {"type": "boolean"},
+        "conflict_graph_digest": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
     "manager_invocation": {
       "type": "object",
       "required": [
@@ -118,7 +157,13 @@
         "phase_wall_time_seconds": {"type": "number", "minimum": 0},
         "validation_time_seconds": {"type": "number", "minimum": 0},
         "review_wait_time_seconds": {"type": "number", "minimum": 0},
-        "longest_worker_seconds": {"type": "number", "minimum": 0}
+        "longest_worker_seconds": {"type": "number", "minimum": 0},
+        "worker_runtime_seconds": {"type": "number", "minimum": 0},
+        "batch_id": {"type": "string"},
+        "batch_metrics": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/batchPerformanceRecord"}
+        }
       },
       "additionalProperties": false
     },
