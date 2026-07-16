@@ -93,6 +93,8 @@ def finding_task(**overrides):
         "remediation_round": 1,
         "fact_status": "confirmed",
         "disposition": "fix_now",
+        "severity": "P1",
+        "decision_requirement": "none",
     }
     values.update(overrides)
     return values
@@ -285,6 +287,68 @@ class TaskAuthorizationTests(unittest.TestCase):
                 candidate = finding_task(**mutation)
                 with self.assertRaisesRegex(TaskAuthorizationError, message):
                     authorize_task_creation(candidate, scope, locked_finding_ids=("FND-001",))
+
+    def test_authoritative_finding_record_rejects_stale_or_mutated_task_axes(self):
+        scope = locked_scope()
+        fingerprint = "sha256:" + "f" * 64
+        record = {
+            "fingerprint": fingerprint,
+            "target_sha": "target-current",
+            "scope_revision": scope.scope_revision,
+            "confirmed": True,
+            "policy_axes_explicit": True,
+            "policy_axes": {
+                "fact_status": "confirmed",
+                "severity": "P1",
+                "origin": "introduced",
+                "contract_relation": "in_scope",
+                "decision_requirement": "none",
+                "disposition": "fix_now",
+                "release_effect": "blocking",
+            },
+            "requirement_refs": ["REQ-001"],
+            "scope_refs": [],
+        }
+        task = finding_task(source_finding=fingerprint)
+        self.assertEqual(
+            authorize_task_creation(
+                task,
+                scope,
+                finding_records={fingerprint: record},
+                current_target_sha="target-current",
+            ).source_finding,
+            fingerprint,
+        )
+
+        for mutation in (
+            {"severity": "P2"},
+            {"contract_relation": "outside_release"},
+            {"disposition": "defer_follow_up"},
+            {"fact_status": "refuted"},
+            {"decision_requirement": "user"},
+            {"requirement_refs": ["REQ-999"]},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(TaskAuthorizationError):
+                    authorize_task_creation(
+                        {**task, **mutation},
+                        scope,
+                        finding_records={fingerprint: record},
+                        current_target_sha="target-current",
+                    )
+
+        for inventory_mutation in (
+            {"confirmed": False},
+            {"target_sha": "stale-target"},
+        ):
+            with self.subTest(inventory_mutation=inventory_mutation):
+                with self.assertRaises(TaskAuthorizationError):
+                    authorize_task_creation(
+                        task,
+                        scope,
+                        finding_records={fingerprint: {**record, **inventory_mutation}},
+                        current_target_sha="target-current",
+                    )
 
     def test_finding_task_can_repair_confirmed_requirement_or_safety_invariant_violation(self):
         scope = locked_scope()
