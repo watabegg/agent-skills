@@ -3005,6 +3005,39 @@ def finding_inventory_ids(
     return tuple(sorted(values))
 
 
+def finding_inventory_records(
+    state: Mapping[str, Any], *, confirmed_only: bool = False
+) -> dict[str, dict[str, Any]]:
+    """Return finding records keyed by fingerprint and persisted finding IDs."""
+
+    raw_inventory = state.get("finding_inventory")
+    if not isinstance(raw_inventory, Mapping):
+        return {}
+    raw_records = raw_inventory.get("records")
+    if not isinstance(raw_records, Mapping):
+        return {}
+    records: dict[str, dict[str, Any]] = {}
+    for fingerprint, raw_record in raw_records.items():
+        if not isinstance(raw_record, Mapping):
+            continue
+        if confirmed_only and raw_record.get("confirmed") is not True:
+            continue
+        record = dict(raw_record)
+        aliases = {
+            str(fingerprint).strip(),
+            str(record.get("fingerprint") or "").strip(),
+            *(
+                str(item).strip()
+                for item in normalize_list(record.get("finding_ids"))
+                if str(item).strip()
+            ),
+        }
+        for alias in aliases:
+            if alias:
+                records[alias] = record
+    return records
+
+
 def persist_finding_inventory(
     state: dict[str, Any],
     manifest: hloop_review.ReviewManifest,
@@ -3022,6 +3055,7 @@ def persist_finding_inventory(
     records = inventory.setdefault("records", {})
     if not isinstance(records, dict):
         raise HLoopError("STATE.json finding_inventory.records must be an object")
+    scope = release_scope_from_state(state)
     confirmed = set(manifest.confirmed_fingerprints)
     for finding in manifest.findings:
         fingerprint = str(finding.fingerprint).strip()
@@ -3051,9 +3085,31 @@ def persist_finding_inventory(
             "finding_ids": sorted(
                 set(normalize_list(previous.get("finding_ids"))) | set(candidate_ids)
             ),
+            "target_sha": str(finding.head_sha),
             "head_sha": str(finding.head_sha),
+            "scope_revision": scope.scope_revision,
             "source_refs": source_refs,
-            "confirmed": bool(previous.get("confirmed")) or fingerprint in confirmed,
+            "confirmed": fingerprint in confirmed,
+            "policy_axes_explicit": bool(finding.policy_axes_explicit),
+            "policy_axes": {
+                "fact_status": str(finding.fact_status or ""),
+                "severity": str(finding.severity or ""),
+                "origin": str(finding.origin or ""),
+                "contract_relation": str(finding.contract_relation or ""),
+                "decision_requirement": str(finding.decision_requirement or ""),
+                "disposition": str(finding.disposition or ""),
+                "release_effect": str(finding.release_effect or ""),
+            },
+            "fact_status": str(finding.fact_status or ""),
+            "severity": str(finding.severity or ""),
+            "origin": str(finding.origin or ""),
+            "contract_relation": str(finding.contract_relation or ""),
+            "decision_requirement": str(finding.decision_requirement or ""),
+            "disposition": str(finding.disposition or ""),
+            "release_effect": str(finding.release_effect or ""),
+            "requirement_refs": list(finding.requirement_refs),
+            "scope_refs": list(scope.release_scope_refs),
+            "why_fix_now": str(finding.why_fix_now or ""),
         }
     inventory["records"] = records
     inventory["fingerprints"] = sorted(str(item) for item in records)
@@ -3168,6 +3224,18 @@ def provenance_record_from_args(
     scope_expanding = bool(get("scope_expanding") or candidate.get("scope_expanding", False))
     if scope_expanding:
         record["scope_expanding"] = True
+    record["severity"] = str(
+        get("severity")
+        or get("priority")
+        or candidate.get("severity")
+        or candidate.get("priority")
+        or ""
+    )
+    record["decision_requirement"] = str(
+        get("decision_requirement")
+        or candidate.get("decision_requirement")
+        or ("none" if source_finding else "")
+    )
     return record
 
 
@@ -3179,6 +3247,7 @@ def authorize_task_record(
     existing_task: dict[str, Any] | None = None,
 ) -> hloop_release_scope.TaskProvenance:
     scope = assert_release_scope_snapshot(repo, state)
+    inventory_records = finding_inventory_records(state)
     try:
         return hloop_release_scope.authorize_task_creation(
             record,
@@ -3187,6 +3256,8 @@ def authorize_task_record(
             locked_plan_item_refs=scope.plan_item_refs,
             locked_requirement_refs=scope.requirement_refs,
             locked_finding_ids=finding_inventory_ids(state, confirmed_only=True),
+            finding_records=inventory_records or None,
+            current_target_sha=current_integration_target(repo, state),
             captured_input_ids=state.get("inputs_index"),
             legacy_mode=scope.status == "legacy-unlocked",
             allow_legacy_unclassified=scope.status == "legacy-unlocked",
@@ -3216,6 +3287,8 @@ def task_provenance_record(meta: dict[str, Any]) -> dict[str, Any] | None:
             "remediation_round",
             "fact_status",
             "disposition",
+            "severity",
+            "decision_requirement",
         )
         if key in meta
     }
@@ -3223,6 +3296,8 @@ def task_provenance_record(meta: dict[str, Any]) -> dict[str, Any] | None:
         value = record.get(key)
         if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
             record[key] = int(value)
+    if "severity" not in record and meta.get("priority"):
+        record["severity"] = str(meta.get("priority"))
     return record | ({"scope_expanding": True} if meta.get("scope_expanding") else {})
 
 
@@ -3242,6 +3317,7 @@ def validate_task_update_provenance(
     if bool(current_meta.get("scope_expanding")) != bool(next_meta.get("scope_expanding")):
         raise HLoopError("task provenance update rejected: scope_expanding is immutable")
     scope = assert_release_scope_snapshot(repo, state)
+    inventory_records = finding_inventory_records(state)
     try:
         hloop_release_scope.validate_provenance_update(
             old_record,
@@ -3250,6 +3326,8 @@ def validate_task_update_provenance(
             locked_plan_item_refs=scope.plan_item_refs,
             locked_requirement_refs=scope.requirement_refs,
             locked_finding_ids=finding_inventory_ids(state, confirmed_only=True),
+            finding_records=inventory_records or None,
+            current_target_sha=current_integration_target(repo, state),
             captured_input_ids=state.get("inputs_index"),
             legacy_mode=scope.status == "legacy-unlocked",
             allow_legacy_unclassified=scope.status == "legacy-unlocked",
@@ -24771,6 +24849,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_new.add_argument("--operational-reason")
     task_new.add_argument("--origin", choices=sorted(hloop_release_scope.FINDING_ORIGINS))
     task_new.add_argument("--contract-relation", choices=sorted(hloop_release_scope.CONTRACT_RELATIONS))
+    task_new.add_argument(
+        "--decision-requirement",
+        choices=sorted(hloop_release_scope.DECISION_REQUIREMENTS),
+    )
     task_new.add_argument("--release-effect", choices=sorted(hloop_release_scope.RELEASE_EFFECTS))
     task_new.add_argument("--remediation-round", type=int)
     task_new.add_argument("--fact-status", choices=sorted(hloop_release_scope.FACT_STATUSES))

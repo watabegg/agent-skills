@@ -207,9 +207,35 @@
             "properties": {
               "fingerprint": {"type": "string"},
               "finding_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+              "target_sha": {"type": "string", "minLength": 1},
               "head_sha": {"type": "string"},
+              "scope_revision": {"type": "integer", "minimum": 0},
               "source_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-              "confirmed": {"type": "boolean"}
+              "confirmed": {"type": "boolean"},
+              "policy_axes_explicit": {"type": "boolean"},
+              "policy_axes": {
+                "type": "object",
+                "properties": {
+                  "fact_status": {"enum": ["confirmed", "refuted", "insufficient_evidence"]},
+                  "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+                  "origin": {"enum": ["introduced", "diff-expanded-pre-existing", "unrelated-pre-existing", "unknown"]},
+                  "contract_relation": {"enum": ["in_scope", "outside_release", "ambiguous"]},
+                  "decision_requirement": {"enum": ["none", "spec", "user"]},
+                  "disposition": {"enum": ["fix_now", "defer_follow_up", "disable_feature", "mark_experimental", "user_decision", "accepted_risk", "discard"]},
+                  "release_effect": {"enum": ["blocking", "non_blocking"]}
+                },
+                "additionalProperties": false
+              },
+              "fact_status": {"enum": ["confirmed", "refuted", "insufficient_evidence"]},
+              "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+              "origin": {"enum": ["introduced", "diff-expanded-pre-existing", "unrelated-pre-existing", "unknown"]},
+              "contract_relation": {"enum": ["in_scope", "outside_release", "ambiguous"]},
+              "decision_requirement": {"enum": ["none", "spec", "user"]},
+              "disposition": {"enum": ["fix_now", "defer_follow_up", "disable_feature", "mark_experimental", "user_decision", "accepted_risk", "discard"]},
+              "release_effect": {"enum": ["blocking", "non_blocking"]},
+              "requirement_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+              "scope_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+              "why_fix_now": {"type": "string"}
             },
             "additionalProperties": true
           }

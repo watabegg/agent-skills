@@ -33,6 +33,8 @@ FINDING_ORIGINS = frozenset(
 CONTRACT_RELATIONS = frozenset({"in_scope", "outside_release", "ambiguous"})
 RELEASE_EFFECTS = frozenset({"blocking", "non_blocking"})
 FACT_STATUSES = frozenset({"confirmed", "refuted", "insufficient_evidence"})
+SEVERITIES = frozenset({"P0", "P1", "P2", "P3"})
+DECISION_REQUIREMENTS = frozenset({"none", "spec", "user"})
 TASK_DISPOSITIONS = frozenset(
     {
         "fix_now",
@@ -908,6 +910,8 @@ class TaskProvenance:
     remediation_round: int = 0
     fact_status: str = ""
     disposition: str = ""
+    severity: str = ""
+    decision_requirement: str = ""
 
     def __post_init__(self) -> None:
         if self.task_origin not in TASK_ORIGINS:
@@ -952,6 +956,18 @@ class TaskProvenance:
         disposition = self.disposition.strip() if isinstance(self.disposition, str) else ""
         if disposition and disposition not in TASK_DISPOSITIONS:
             raise TaskAuthorizationError(f"unknown disposition: {disposition}")
+        severity = self.severity.strip() if isinstance(self.severity, str) else ""
+        if severity and severity not in SEVERITIES:
+            raise TaskAuthorizationError(f"unknown severity: {severity}")
+        decision_requirement = (
+            self.decision_requirement.strip()
+            if isinstance(self.decision_requirement, str)
+            else ""
+        )
+        if decision_requirement and decision_requirement not in DECISION_REQUIREMENTS:
+            raise TaskAuthorizationError(
+                f"unknown decision_requirement: {decision_requirement}"
+            )
 
         object.__setattr__(self, "release_scope_revision", scope_revision)
         object.__setattr__(self, "plan_item_refs", plan_item_refs)
@@ -967,6 +983,8 @@ class TaskProvenance:
         object.__setattr__(self, "remediation_round", remediation_round)
         object.__setattr__(self, "fact_status", fact_status)
         object.__setattr__(self, "disposition", disposition)
+        object.__setattr__(self, "severity", severity)
+        object.__setattr__(self, "decision_requirement", decision_requirement)
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "TaskProvenance":
@@ -1002,6 +1020,8 @@ class TaskProvenance:
             remediation_round=value.get("remediation_round", 0),
             fact_status=str(value.get("fact_status") or ""),
             disposition=str(value.get("disposition") or ""),
+            severity=str(value.get("severity") or value.get("priority") or ""),
+            decision_requirement=str(value.get("decision_requirement") or ""),
         )
 
     def to_record(self) -> dict[str, Any]:
@@ -1021,6 +1041,8 @@ class TaskProvenance:
             "remediation_round": self.remediation_round,
             "fact_status": self.fact_status,
             "disposition": self.disposition,
+            "severity": self.severity,
+            "decision_requirement": self.decision_requirement,
         }
 
 
@@ -1123,6 +1145,8 @@ def validate_task_provenance(
     plan_item_refs: Sequence[str] | None = None,
     requirement_refs: Sequence[str] | None = None,
     finding_ids: Sequence[str] | None = None,
+    finding_records: Mapping[str, Mapping[str, Any]] | None = None,
+    current_target_sha: str = "",
     captured_input_ids: Mapping[str, Any] | None = None,
     legacy_mode: bool = False,
     allow_legacy_unclassified: bool = False,
@@ -1196,15 +1220,33 @@ def validate_task_provenance(
                 f"missing locked requirement reference: {reference}"
             )
     if provenance.source_finding:
-        if not available_findings:
-            raise TaskAuthorizationError(
-                "missing locked finding reference: "
-                f"{provenance.source_finding} (finding inventory is empty)"
+        if finding_records is not None:
+            finding_record = finding_records.get(provenance.source_finding)
+            if not isinstance(finding_record, Mapping):
+                if not finding_records:
+                    raise TaskAuthorizationError(
+                        "missing locked finding reference: "
+                        f"{provenance.source_finding} (finding inventory is empty)"
+                    )
+                raise TaskAuthorizationError(
+                    f"missing locked finding reference: {provenance.source_finding}"
+                )
+            _validate_finding_inventory_record(
+                provenance,
+                finding_record,
+                normalized_scope,
+                current_target_sha=current_target_sha,
             )
-        if provenance.source_finding not in available_findings:
-            raise TaskAuthorizationError(
-                f"missing locked finding reference: {provenance.source_finding}"
-            )
+        else:
+            if not available_findings:
+                raise TaskAuthorizationError(
+                    "missing locked finding reference: "
+                    f"{provenance.source_finding} (finding inventory is empty)"
+                )
+            if provenance.source_finding not in available_findings:
+                raise TaskAuthorizationError(
+                    f"missing locked finding reference: {provenance.source_finding}"
+                )
 
     if provenance.task_origin == "planned":
         if not provenance.plan_item_refs and not provenance.requirement_refs:
@@ -1284,6 +1326,137 @@ def _scope_expansion_requested(record: Mapping[str, Any]) -> bool:
             raise TaskAuthorizationError(f"{name} must be boolean")
     relation = record.get("contract_relation")
     return relation == "outside_release" or record.get("release_effect") == "scope_expanding"
+
+
+_FINDING_POLICY_AXES = (
+    "fact_status",
+    "severity",
+    "origin",
+    "contract_relation",
+    "decision_requirement",
+    "disposition",
+    "release_effect",
+)
+
+
+def _finding_inventory_axis(
+    finding_record: Mapping[str, Any], policy_axes: Mapping[str, Any] | None, field_name: str
+) -> Any:
+    if policy_axes is not None and field_name in policy_axes:
+        return policy_axes[field_name]
+    return finding_record.get(field_name)
+
+
+def _finding_inventory_refs(
+    finding_record: Mapping[str, Any], field_name: str
+) -> set[str] | None:
+    if field_name not in finding_record:
+        return None
+    value = finding_record.get(field_name)
+    if value is None:
+        return set()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TaskAuthorizationError(f"finding inventory {field_name} must be an array")
+    return set(_unique_texts(tuple(value), f"finding inventory {field_name}"))
+
+
+def _validate_finding_inventory_record(
+    provenance: TaskProvenance,
+    finding_record: Mapping[str, Any],
+    scope: ReleaseScope,
+    *,
+    current_target_sha: str,
+) -> None:
+    """Require a finding task to match the persisted review evidence exactly."""
+
+    if finding_record.get("confirmed") is not True:
+        raise TaskAuthorizationError("missing locked finding reference (finding inventory is empty)")
+
+    target_sha = str(finding_record.get("target_sha") or "").strip()
+    authoritative = bool(
+        target_sha
+        or "scope_revision" in finding_record
+        or "policy_axes" in finding_record
+        or "requirement_refs" in finding_record
+        or "scope_refs" in finding_record
+    )
+    if target_sha:
+        current_target = str(current_target_sha or "").strip()
+        if not current_target:
+            raise TaskAuthorizationError(
+                "finding task authorization requires the current integration target SHA"
+            )
+        if target_sha != current_target:
+            raise TaskAuthorizationError(
+                "finding target SHA is stale: "
+                f"inventory={target_sha}, current={current_target}"
+            )
+    elif authoritative:
+        raise TaskAuthorizationError(
+            "finding inventory record is missing authoritative target_sha"
+        )
+
+    if "scope_revision" in finding_record:
+        recorded_revision = _revision(
+            finding_record.get("scope_revision"), "finding inventory scope_revision"
+        )
+        if recorded_revision != scope.scope_revision:
+            raise TaskAuthorizationError(
+                "finding scope revision is stale: "
+                f"inventory={recorded_revision}, current={scope.scope_revision}"
+            )
+
+    policy_axes = finding_record.get("policy_axes")
+    if policy_axes is not None and not isinstance(policy_axes, Mapping):
+        raise TaskAuthorizationError("finding inventory policy_axes must be an object")
+    if authoritative:
+        if finding_record.get("policy_axes_explicit") is False:
+            raise TaskAuthorizationError(
+                "finding inventory record does not contain explicit policy axes"
+            )
+        for field_name in _FINDING_POLICY_AXES:
+            expected = _finding_inventory_axis(finding_record, policy_axes, field_name)
+            if expected in (None, ""):
+                raise TaskAuthorizationError(
+                    "finding inventory record is missing policy axis: " + field_name
+                )
+            actual = getattr(provenance, field_name)
+            if actual != str(expected):
+                raise TaskAuthorizationError(
+                    f"finding task {field_name} does not match persisted finding record: "
+                    f"expected {expected}, got {actual}"
+                )
+
+    persisted_requirement_refs = _finding_inventory_refs(
+        finding_record, "requirement_refs"
+    )
+    persisted_scope_refs = _finding_inventory_refs(finding_record, "scope_refs")
+    if persisted_requirement_refs is not None or persisted_scope_refs is not None:
+        supplied_requirement_refs = set(provenance.requirement_refs)
+        supplied_scope_refs = set(provenance.scope_refs)
+        if persisted_requirement_refs is not None and not supplied_requirement_refs.issubset(
+            persisted_requirement_refs
+        ):
+            raise TaskAuthorizationError(
+                "finding task requirement_refs do not match persisted finding record"
+            )
+        if persisted_scope_refs is not None and not supplied_scope_refs.issubset(
+            persisted_scope_refs
+        ):
+            raise TaskAuthorizationError(
+                "finding task scope_refs do not match persisted finding record"
+            )
+        matching_requirement = bool(
+            persisted_requirement_refs
+            and supplied_requirement_refs.intersection(persisted_requirement_refs)
+        )
+        matching_scope = bool(
+            persisted_scope_refs and supplied_scope_refs.intersection(persisted_scope_refs)
+        )
+        if not matching_requirement and not matching_scope:
+            raise TaskAuthorizationError(
+                "finding task does not reference persisted finding requirement or scope refs"
+            )
 
 
 def _validate_finding_task(
@@ -1444,11 +1617,15 @@ __all__ = [
     "AmendmentRecord",
     "AmendmentValidationError",
     "CONTRACT_RELATIONS",
+    "DECISION_REQUIREMENTS",
+    "FACT_STATUSES",
     "FINDING_ORIGINS",
     "ReleaseScope",
     "ReleaseScopeAmendment",
     "ReleaseScopeError",
     "ReleaseScopeLock",
+    "RELEASE_EFFECTS",
+    "SEVERITIES",
     "ScopeAmendment",
     "ScopeDriftError",
     "ScopeLock",

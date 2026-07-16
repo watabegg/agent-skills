@@ -403,6 +403,13 @@ class PolicyCliV052Tests(unittest.TestCase):
 
             state_path = loop / "STATE.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            current_target = subprocess.run(
+                ["git", "rev-parse", "main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             state["finding_inventory"] = {
                 "fingerprints": [fingerprint],
                 "finding_ids": ["FND-RECOVERY"],
@@ -410,9 +417,23 @@ class PolicyCliV052Tests(unittest.TestCase):
                     fingerprint: {
                         "fingerprint": fingerprint,
                         "finding_ids": ["FND-RECOVERY"],
-                        "head_sha": "a" * 40,
+                        "target_sha": current_target,
+                        "head_sha": current_target,
+                        "scope_revision": 1,
                         "source_refs": ["reviews/R001/MANIFEST.json"],
                         "confirmed": True,
+                        "policy_axes_explicit": True,
+                        "policy_axes": {
+                            "fact_status": "confirmed",
+                            "severity": "P1",
+                            "origin": "unrelated-pre-existing",
+                            "contract_relation": "in_scope",
+                            "decision_requirement": "none",
+                            "disposition": "fix_now",
+                            "release_effect": "non_blocking",
+                        },
+                        "requirement_refs": ["REQ-007"],
+                        "scope_refs": ["release-contract"],
                     }
                 },
                 "updated_at": "2026-07-16T00:00:00+00:00",
@@ -427,6 +448,28 @@ class PolicyCliV052Tests(unittest.TestCase):
             state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
             result, output = self.run_cli(repo, *finding_args)
             self.assertEqual(result, 0, output)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            mismatched_axes = [*finding_args, "--priority", "P2"]
+            result, output = self.run_cli(repo, *mismatched_axes)
+            self.assertNotEqual(result, 0)
+            self.assertIn("severity", output)
+
+            state["finding_inventory"]["records"][fingerprint]["target_sha"] = "stale-target"
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("stale", output)
+
+            state["finding_inventory"]["records"][fingerprint]["target_sha"] = current_target
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = False
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("finding inventory is empty", output)
+
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = True
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
             outside_args = list(finding_args)
             outside_args[outside_args.index("in_scope")] = "outside_release"

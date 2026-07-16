@@ -98,6 +98,18 @@
           "discard"
         ]}
       ]
+    },
+    "severity": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["P0", "P1", "P2", "P3"]}
+      ]
+    },
+    "decision_requirement": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["none", "spec", "user"]}
+      ]
     }
   },
   "allOf": [

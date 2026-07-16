@@ -628,6 +628,26 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(state["review_convergence"]["status"], "converged")
         self.assertEqual(state["review_convergence"]["target_sha"], target)
         self.assertIn(fingerprint, state["finding_inventory"]["fingerprints"])
+        finding_record = state["finding_inventory"]["records"][fingerprint]
+        self.assertEqual(finding_record["target_sha"], target)
+        self.assertEqual(
+            finding_record["scope_revision"],
+            state["release_scope"]["scope_revision"],
+        )
+        self.assertEqual(
+            set(finding_record["policy_axes"]),
+            {
+                "fact_status",
+                "severity",
+                "origin",
+                "contract_relation",
+                "decision_requirement",
+                "disposition",
+                "release_effect",
+            },
+        )
+        self.assertIn("requirement_refs", finding_record)
+        self.assertIn("scope_refs", finding_record)
         self.assertEqual(state["defer_follow_up_fingerprints"], [fingerprint])
 
         follow_up_path = self.state_path.parent / "follow-ups" / "F001.md"
