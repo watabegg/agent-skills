@@ -215,6 +215,11 @@ STRUCTURED_JSON_FIELDS = (
     "relations",
     "history",
 )
+FOLLOW_UP_INPUT_JSON_FIELDS = (
+    "decision_summary",
+    "verification_evidence",
+    "implementation_constraints",
+)
 INTEGER_FRONTMATTER_FIELDS = frozenset({"issue_key_version"})
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 DANGEROUS_AGENT_MARKERS = (
@@ -11854,7 +11859,7 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
         previous_relations = []
     structured_values = {
         name: _follow_up_structured_value(args, name)
-        for name in STRUCTURED_JSON_FIELDS
+        for name in FOLLOW_UP_INPUT_JSON_FIELDS
     }
 
     if canonical_key == issue_key:

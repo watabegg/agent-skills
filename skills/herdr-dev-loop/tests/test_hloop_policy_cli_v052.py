@@ -75,6 +75,24 @@ class PolicyCliV052Tests(unittest.TestCase):
         validator = jsonschema.Draft202012Validator(schema)
         self.assertEqual(list(validator.iter_errors(record)), [], record)
 
+    def assert_follow_up_projections(
+        self, repo: Path, loop: Path, payload: dict
+    ) -> dict:
+        record = payload["follow_up"]
+        artifact_path = loop / "follow-ups" / f"{record['id']}.md"
+        artifact = hloop.read_frontmatter(artifact_path)
+        result, output = self.run_cli(
+            repo, "follow-up", "show", record["id"], "--json"
+        )
+        self.assertEqual(result, 0, output)
+        shown = json.loads(output)
+        for projection in (record, artifact, shown):
+            self.assert_follow_up_schema(projection)
+        for field in ("history", "relations", "duplicate_relation"):
+            self.assertEqual(record.get(field), artifact.get(field), field)
+            self.assertEqual(record.get(field), shown.get(field), field)
+        return shown
+
     def init_and_lock(self, repo: Path) -> Path:
         result, output = self.run_cli(
             repo,
@@ -979,8 +997,11 @@ class PolicyCliV052Tests(unittest.TestCase):
             provisional = add_follow_up()
             provisional_key = provisional["follow_up"]["issue_key"]
             self.assertTrue(provisional["follow_up"]["provisional"])
-            self.assert_follow_up_schema(provisional["follow_up"])
-            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
+            provisional_shown = self.assert_follow_up_projections(repo, loop, provisional)
+            self.assertEqual(
+                [event["action"] for event in provisional_shown["history"]],
+                ["create"],
+            )
 
             final = add_follow_up(
                 "--root-cause",
@@ -1006,9 +1027,15 @@ class PolicyCliV052Tests(unittest.TestCase):
                 final_record["evidence"],
                 ["review evidence one", "review evidence two"],
             )
-            self.assertTrue(final_record["history"])
-            self.assert_follow_up_schema(final_record)
-            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
+            final_shown = self.assert_follow_up_projections(repo, loop, final)
+            self.assertEqual(
+                [event["action"] for event in final_shown["history"]],
+                ["create", "promote_provisional"],
+            )
+            self.assertEqual(
+                final_shown["duplicate_relation"]["relation"], "alias_of"
+            )
+            self.assertEqual(final_shown["duplicate_relation"], final["relation"])
             state = hloop.load_state(repo)
             self.assertEqual(state["follow_ups"]["issue_keys"], {final_key: "F001"})
             self.assertEqual(
@@ -1033,8 +1060,21 @@ class PolicyCliV052Tests(unittest.TestCase):
                 hloop.load_state(repo)["follow_ups"]["issue_key_aliases"][duplicate_key],
                 final_key,
             )
-            self.assert_follow_up_schema(duplicate["follow_up"])
-            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
+            duplicate_shown = self.assert_follow_up_projections(repo, loop, duplicate)
+            self.assertEqual(
+                [event["action"] for event in duplicate_shown["history"]],
+                ["create", "promote_provisional", "duplicate_of"],
+            )
+            self.assertEqual(
+                duplicate_shown["duplicate_relation"]["relation"], "duplicate_of"
+            )
+            self.assertEqual(
+                duplicate_shown["duplicate_relation"], duplicate["relation"]
+            )
+            self.assertEqual(
+                [relation["relation"] for relation in duplicate_shown["relations"]],
+                ["alias_of", "duplicate_of"],
+            )
 
             superseding = add_follow_up(
                 "--component",
@@ -1055,9 +1095,38 @@ class PolicyCliV052Tests(unittest.TestCase):
                 hloop.read_frontmatter(loop / "follow-ups" / "F001.md")["status"],
                 "superseded",
             )
-            self.assert_follow_up_schema(superseding["follow_up"])
-            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
-            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F002.md"))
+            superseding_shown = self.assert_follow_up_projections(
+                repo, loop, superseding
+            )
+            self.assertEqual(
+                [event["action"] for event in superseding_shown["history"]],
+                ["supersedes"],
+            )
+            self.assertEqual(
+                superseding_shown["duplicate_relation"]["relation"], "supersedes"
+            )
+            self.assertEqual(
+                superseding_shown["duplicate_relation"], superseding["relation"]
+            )
+            superseded = hloop.read_frontmatter(loop / "follow-ups" / "F001.md")
+            result, output = self.run_cli(
+                repo, "follow-up", "show", "F001", "--json"
+            )
+            self.assertEqual(result, 0, output)
+            superseded_shown = json.loads(output)
+            self.assert_follow_up_schema(superseded)
+            self.assert_follow_up_schema(superseded_shown)
+            self.assertEqual(
+                [event["action"] for event in superseded["history"]],
+                ["create", "promote_provisional", "duplicate_of", "superseded"],
+            )
+            self.assertEqual(superseded["history"], superseded_shown["history"])
+            self.assertEqual(
+                superseded["duplicate_relation"]["relation"], "supersedes"
+            )
+            self.assertEqual(
+                superseded["duplicate_relation"], superseding["relation"]
+            )
             result, output = self.run_cli(
                 repo, "follow-up", "show", provisional_key, "--json"
             )
