@@ -579,11 +579,14 @@ def _decision_items(
         try:
             record = _decision(value)
         except (DecisionValidationError, TypeError, ValueError) as exc:
-            if str(key):
-                raise DecisionAuthorizationError(
-                    f"invalid decision record {key}: {exc}"
-                ) from exc
-            continue
+            label = str(key) if str(key) else "sequence item"
+            raise DecisionAuthorizationError(
+                f"invalid decision record {label}: {exc}"
+            ) from exc
+        if str(key) and str(key) != record.decision_id:
+            raise DecisionAuthorizationError(
+                f"decision mapping key {key!r} does not match {record.decision_id}"
+            )
         normalized.append((record.decision_id, record))
     return tuple(normalized)
 
@@ -620,7 +623,11 @@ def resolve_accepted_risk_authorization(
         authorization = record.accepted_risk_authorization
         if authorization is None:
             continue
-        linked = authorization.finding_fingerprint == fingerprint or fingerprint in record.source_findings
+        linked = bool(
+            (requested_id and current_id == requested_id)
+            or authorization.finding_fingerprint == fingerprint
+            or fingerprint in record.source_findings
+        )
         if not linked:
             continue
         if authorization.finding_fingerprint != fingerprint:
@@ -654,6 +661,8 @@ def resolve_accepted_risk_authorization(
             f"decision {current_id} has no accepted resolution"
         )
     reference_now = now or datetime.now(timezone.utc)
+    if reference_now.tzinfo is None or reference_now.utcoffset() is None:
+        raise DecisionAuthorizationError("now must include a timezone")
     if authorization.expires_at:
         expires_text = authorization.expires_at
         candidate = expires_text[:-1] + "+00:00" if expires_text.endswith("Z") else expires_text
@@ -665,6 +674,82 @@ def resolve_accepted_risk_authorization(
         status=record.status,
         authorization=authorization,
     )
+
+
+def resolve_accepted_risk_authorizations(
+    decisions: Mapping[str, DecisionRecord | Mapping[str, Any]] | Sequence[Any],
+    findings: Mapping[str, Any] | Sequence[Any] | Any,
+    *,
+    target_sha: str = "",
+    now: datetime | None = None,
+) -> dict[str, ResolvedAcceptedRiskAuthorization]:
+    """Revalidate every accepted-risk finding against canonical decisions.
+
+    This is the finish-time boundary for accepted-risk evidence.  Callers pass
+    the current decision records and the current normalized findings rather
+    than a previously persisted authorization projection.  Each accepted-risk
+    finding is therefore checked again for its decision status, exact finding
+    fingerprint, target SHA, and expiration at the supplied (or current) time.
+    """
+
+    if hasattr(findings, "findings") and not isinstance(findings, Mapping):
+        findings = getattr(findings, "findings")
+    if isinstance(findings, Mapping):
+        if "findings" in findings and "fingerprint" not in findings:
+            findings = findings["findings"]
+        elif "fingerprint" in findings:
+            findings = (findings,)
+        else:
+            findings = tuple(findings.values())
+    if isinstance(findings, (str, bytes)) or not isinstance(findings, Sequence):
+        raise DecisionAuthorizationError("findings must be a sequence of normalized findings")
+
+    expected_target = _optional_text(target_sha)
+    if expected_target:
+        expected_target = _required_text(expected_target, "target_sha")
+    resolved: dict[str, ResolvedAcceptedRiskAuthorization] = {}
+    for finding in findings:
+        if isinstance(finding, Mapping):
+            disposition = finding.get("disposition")
+            fingerprint = finding.get("fingerprint", "")
+            finding_target = finding.get("head_sha", finding.get("target_sha", ""))
+            decision_id = finding.get(
+                "accepted_risk_decision_id", finding.get("decision_id", "")
+            )
+        else:
+            disposition = getattr(finding, "disposition", None)
+            fingerprint = getattr(finding, "fingerprint", "")
+            finding_target = getattr(
+                finding, "head_sha", getattr(finding, "target_sha", "")
+            )
+            decision_id = getattr(
+                finding, "accepted_risk_decision_id", getattr(finding, "decision_id", "")
+            )
+        if disposition != "accepted_risk":
+            continue
+        fingerprint = _required_text(fingerprint, "finding_fingerprint")
+        finding_target = _required_text(finding_target, "target_sha")
+        if expected_target and finding_target != expected_target:
+            raise DecisionAuthorizationError(
+                f"accepted_risk finding {fingerprint} targets a different SHA"
+            )
+        if fingerprint in resolved:
+            raise DecisionAuthorizationError(
+                f"accepted_risk authorization is ambiguous for {fingerprint}"
+            )
+        resolved[fingerprint] = resolve_accepted_risk_authorization(
+            decisions,
+            finding_fingerprint=fingerprint,
+            target_sha=expected_target or finding_target,
+            decision_id=str(decision_id or ""),
+            now=now,
+        )
+    return resolved
+
+
+# The explicit name is useful to finish/certification callers and keeps the
+# single-finding primitive available for existing convergence call sites.
+revalidate_accepted_risk_authorizations = resolve_accepted_risk_authorizations
 
 
 def reclassify_decision(

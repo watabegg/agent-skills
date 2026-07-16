@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
@@ -20,6 +21,7 @@ SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
 sys.path.insert(0, str(SCRIPTS))
 
+from hloop_lib import decisions as hloop_decisions  # noqa: E402
 from hloop_lib import release_scope as hloop_release_scope  # noqa: E402
 from hloop_lib.certification import (  # noqa: E402
     MANUAL_FINAL_PROTOCOL,
@@ -405,6 +407,130 @@ class FinalManifestCompletenessTests(unittest.TestCase):
         current_drift = validate_final_review(plan, manifest, current_target_sha="new-target")
         self.assertIn("target-sha-drift", current_drift.issues)
 
+    def test_scope_identity_change_rejects_the_old_manifest(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        manifest = final_manifest(plan, group)
+        amended_plan = replace(
+            plan,
+            scope_revision=2,
+            source_snapshot_revision=2,
+            source_digest="b" * 64,
+        )
+
+        result = validate_final_review(amended_plan, manifest)
+
+        self.assertFalse(result.passed)
+        self.assertIn("identity-mismatch:prepared-plan-digest", result.issues)
+        self.assertIn("identity-mismatch:scope-revision", result.issues)
+        self.assertIn(
+            "identity-mismatch:source-snapshot-revision", result.issues
+        )
+        self.assertIn("identity-mismatch:source-digest", result.issues)
+
+    def test_explicit_verification_consensus_must_match_normalized_fact(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        normalized = normalize_findings((candidate(),))
+        verification = plan_verification(group, normalized)
+        refuted_records = tuple(
+            VerificationRecord.from_assignment(
+                assignment,
+                fact_status="refuted",
+                ignore_status="no_action",
+                decision_status="none",
+                progress_without_decision="yes",
+                severity="P2",
+                recommended_action="discard",
+            )
+            for assignment in verification.assignments
+        )
+        manifest = final_manifest(
+            plan,
+            group,
+            findings=normalized,
+            verifications=refuted_records,
+        )
+
+        self.assertFalse(manifest.completeness.complete)
+        self.assertIn(
+            f"verification-consensus-mismatch:{normalized[0].fingerprint}",
+            manifest.completeness.issues,
+        )
+        result = validate_final_review(plan, manifest)
+        self.assertFalse(result.passed)
+
+    def test_finish_time_accepted_risk_revalidation_checks_identity_and_expiry(self):
+        fingerprint = "sha256:" + "a" * 64
+        target = "target-sha"
+        decision = {
+            "id": "D001",
+            "class": "advisory",
+            "status": "accepted",
+            "question": "Accept the fixed-target residual risk?",
+            "options": [
+                {
+                    "id": "accept",
+                    "label": "Accept",
+                    "tradeoffs": ["The residual risk remains documented."],
+                },
+                {
+                    "id": "fix",
+                    "label": "Fix",
+                    "tradeoffs": ["The release remains blocked until fixed."],
+                },
+            ],
+            "recommendation": {
+                "option_id": "accept",
+                "rationale": "The approved contract accepts this risk.",
+            },
+            "resolution": {
+                "outcome": "accepted",
+                "rationale": "Accepted for the fixed target.",
+                "resolved_by": "release-owner",
+                "resolved_at": "2026-07-16T00:00:00Z",
+                "selected_option": "accept",
+            },
+            "accepted_risk_authorization": {
+                "finding_fingerprint": fingerprint,
+                "target_sha": target,
+                "authorized_by": "release-owner",
+                "risk": "A residual compatibility behavior remains.",
+                "reason": "The approved contract accepts this risk.",
+                "expires_at": "2026-07-20T00:00:00Z",
+            },
+        }
+        finding = {
+            "fingerprint": fingerprint,
+            "head_sha": target,
+            "disposition": "accepted_risk",
+            "accepted_risk_decision_id": "D001",
+        }
+
+        resolved = hloop_decisions.resolve_accepted_risk_authorizations(
+            {"D001": decision},
+            (finding,),
+            now=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
+        self.assertEqual(resolved[fingerprint].decision_id, "D001")
+
+        for field, value, message in (
+            ("finding_fingerprint", "sha256:" + "b" * 64, "different finding"),
+            ("target_sha", "other-target", "different SHA"),
+            ("expires_at", "2026-07-16T00:00:00Z", "expired"),
+        ):
+            with self.subTest(field=field):
+                invalid = json.loads(json.dumps(decision))
+                invalid["accepted_risk_authorization"][field] = value
+                with self.assertRaisesRegex(
+                    hloop_decisions.DecisionAuthorizationError, message
+                ):
+                    hloop_decisions.resolve_accepted_risk_authorizations(
+                        {"D001": invalid},
+                        (finding,),
+                        now=datetime(2026, 7, 17, tzinfo=timezone.utc),
+                    )
+
 
 def reopen_state(*, phase: str, finding_count: int = 1, fix_round: int = 0):
     status = {
@@ -500,6 +626,22 @@ class ReopenTransitionTests(unittest.TestCase):
 
     def test_scope_amend_updates_scope_and_returns_to_readiness(self):
         state = reopen_state(phase="manual_final_review_failed", finding_count=1)
+        state["review_convergence"].update(
+            {
+                "status": "converged",
+                "review_plan": {"head_sha": "old-target"},
+                "recorded_round": 1,
+                "recorded_manifest_digest": "sha256:" + "c" * 64,
+                "recorded_status": "converged",
+                "accepted_risk_authorizations": {"old": {"decision_id": "D001"}},
+            }
+        )
+        state["accepted_risk_authorizations"] = {
+            "old": {"decision_id": "D001"}
+        }
+        state["manual_final_review"]["accepted_risk_authorizations"] = {
+            "old": {"decision_id": "D001"}
+        }
         scope = hloop_release_scope.ReleaseScope.from_record(state["release_scope"])
         amendment = hloop_release_scope.create_amendment(
             scope,
@@ -523,6 +665,17 @@ class ReopenTransitionTests(unittest.TestCase):
         self.assertEqual(result.state["release_scope"]["scope_revision"], 2)
         self.assertEqual(result.state["release_scope"]["source_snapshot_revision"], 2)
         self.assertEqual(result.state["release_scope"]["last_user_input_id"], "U0001")
+        convergence = result.state["review_convergence"]
+        self.assertEqual(convergence["status"], "pending")
+        self.assertEqual(convergence["artifact_refs"], [])
+        self.assertNotIn("review_plan", convergence)
+        self.assertNotIn("recorded_manifest_digest", convergence)
+        self.assertNotIn("recorded_round", convergence)
+        self.assertNotIn("accepted_risk_authorizations", convergence)
+        self.assertNotIn("accepted_risk_authorizations", result.state)
+        self.assertNotIn(
+            "accepted_risk_authorizations", result.state["manual_final_review"]
+        )
 
     def test_non_scope_reopen_amendments_do_not_record_outer_user_input(self):
         for kind, basis_refs in (("editorial", ()), ("clarification", ("REQ-005",))):
