@@ -67,6 +67,14 @@
       "uniqueItems": true,
       "items": {"type": "string", "pattern": "^fu:v[1-9][0-9]*:sha256:[0-9a-f]{64}$"}
     },
+    "relations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/relation"}
+    },
+    "history": {
+      "type": "array",
+      "items": {"type": "object", "minProperties": 1}
+    },
     "discovered_head": {"type": "string", "minLength": 1},
     "evidence": {
       "type": "array",
@@ -97,6 +105,17 @@
       "enum": ["in_scope", "outside_release", "ambiguous"]
     },
     "decision_requirement": {"enum": ["none", "spec", "user"]},
+    "disposition": {
+      "enum": [
+        "fix_now",
+        "defer_follow_up",
+        "disable_feature",
+        "mark_experimental",
+        "user_decision",
+        "accepted_risk",
+        "discard"
+      ]
+    },
     "release_effect": {"enum": ["blocking", "non_blocking"]},
     "requirement_refs": {
       "type": "array",

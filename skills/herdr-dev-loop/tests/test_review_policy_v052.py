@@ -15,6 +15,7 @@ SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
 sys.path.insert(0, str(SCRIPTS))
 
+from hloop_lib.review import FindingCandidate, NormalizedFinding, normalize_findings  # noqa: E402
 from hloop_lib.review_policy import (  # noqa: E402
     FindingDisposition,
     FollowUpIssueKey,
@@ -177,6 +178,70 @@ class FindingDispositionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReviewPolicyError, "security or data-loss"):
             validate_disposition(candidate, safety_critical=True)
+
+
+class RuntimeFindingAxisTests(unittest.TestCase):
+    def candidate(self, **overrides) -> FindingCandidate:
+        values = {
+            "finding_id": "FND-001",
+            "provider": "codex",
+            "head_sha": "a" * 40,
+            "discovering_agent": "codex-discovery-01",
+            "severity": "P2",
+            "confidence": 0.9,
+            "title": "runtime finding",
+            "file_path": "src/runtime.py",
+            "line": 10,
+            "symbol": "run",
+            "trigger": "runtime trigger",
+            "product_impact": "runtime impact",
+            "origin": "unrelated-pre-existing",
+            "proposed_fix": "runtime fix",
+            "fact_status": "confirmed",
+            "contract_relation": "outside_release",
+            "decision_requirement": "spec",
+            "disposition": "defer_follow_up",
+            "release_effect": "non_blocking",
+            "requirement_refs": ("REQ-001",),
+            "why_fix_now": "",
+        }
+        values.update(overrides)
+        return FindingCandidate(**values)
+
+    def test_candidate_and_normalized_finding_round_trip_all_policy_axes(self):
+        candidate = self.candidate()
+        restored_candidate = FindingCandidate.from_record(
+            json.loads(json.dumps(candidate.to_record()))
+        )
+        self.assertEqual(restored_candidate, candidate)
+        normalized = normalize_findings((candidate,))[0]
+        restored = NormalizedFinding.from_record(
+            json.loads(json.dumps(normalized.to_record()))
+        )
+        self.assertEqual(restored, normalized)
+        for record in (candidate.to_record(), normalized.to_record()):
+            self.assertEqual(record["fact_status"], "confirmed")
+            self.assertEqual(record["origin"], "unrelated-pre-existing")
+            self.assertEqual(record["contract_relation"], "outside_release")
+            self.assertEqual(record["decision_requirement"], "spec")
+            self.assertEqual(record["disposition"], "defer_follow_up")
+            self.assertEqual(record["release_effect"], "non_blocking")
+        self.assertFalse(normalized.is_actionable)
+        self.assertFalse(normalized.is_release_blocking)
+
+    def test_normalized_axes_keep_confirmed_in_scope_blocking_actionable(self):
+        normalized = normalize_findings(
+            (
+                self.candidate(
+                    contract_relation="in_scope",
+                    decision_requirement="none",
+                    disposition="fix_now",
+                    release_effect="blocking",
+                ),
+            )
+        )[0]
+        self.assertTrue(normalized.is_actionable)
+        self.assertTrue(normalized.is_release_blocking)
 
 
 class FollowUpIssueKeyTests(unittest.TestCase):

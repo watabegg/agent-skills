@@ -5745,6 +5745,7 @@ def invalidate_review_gates_for_change(
             "status": "pending",
             "target_sha": target_sha,
             "verified_actionable_findings": None,
+            "release_blocking_findings": None,
             "artifact_refs": [],
             "invalidated_at": now_iso(),
             "invalidated_reason": reason,
@@ -5927,23 +5928,52 @@ def _review_manifest_from_path(path: Path) -> hloop_review.ReviewManifest:
         raise HLoopError(f"invalid review manifest {path}: {exc}") from exc
 
 
-def _review_manifest_actionable_count(manifest: hloop_review.ReviewManifest) -> int:
+def _review_manifest_policy_counts(
+    manifest: hloop_review.ReviewManifest,
+) -> tuple[int, int]:
+    """Count verified findings from the Manager's policy axes.
+
+    A pre-0.5.2 manifest has no policy axes.  Its recommendation fields are
+    retained as an explicit compatibility fallback; every new manifest takes
+    the axis path and therefore cannot turn an outside-release follow-up into
+    fix-now work merely because a verifier suggested a task.
+    """
+
     incomplete = set(manifest.completeness.incomplete_findings)
     by_fingerprint: dict[str, list[Any]] = {}
     for record in manifest.verifications:
         by_fingerprint.setdefault(record.fingerprint, []).append(record)
-    return len({
-        finding.fingerprint
-        for finding in manifest.findings
-        if finding.fingerprint not in incomplete
-        and by_fingerprint.get(finding.fingerprint)
-        and all(record.fact_status == "confirmed" for record in by_fingerprint[finding.fingerprint])
-        and any(
+    actionable: set[str] = set()
+    release_blocking: set[str] = set()
+    for finding in manifest.findings:
+        if finding.fingerprint in incomplete:
+            continue
+        records = by_fingerprint.get(finding.fingerprint, [])
+        if not records or any(record.fact_status != "confirmed" for record in records):
+            continue
+        if finding.policy_axes_explicit:
+            if finding.is_actionable:
+                actionable.add(finding.fingerprint)
+            if finding.is_release_blocking:
+                release_blocking.add(finding.fingerprint)
+            continue
+
+        # Legacy review manifests predate the independent disposition axes.
+        # Keep their old verifier recommendation semantics while making this
+        # branch explicit and isolated from the 0.5.2 path.
+        if any(
             record.recommended_action in {"fix_task", "ask_user"}
             and record.ignore_status == "must_not_ignore"
-            for record in by_fingerprint[finding.fingerprint]
-        )
-    })
+            for record in records
+        ):
+            actionable.add(finding.fingerprint)
+            if finding.severity in hloop_review.CRITICAL_SEVERITIES:
+                release_blocking.add(finding.fingerprint)
+    return len(actionable), len(release_blocking)
+
+
+def _review_manifest_actionable_count(manifest: hloop_review.ReviewManifest) -> int:
+    return _review_manifest_policy_counts(manifest)[0]
 
 
 def _final_paths(repo: Path) -> dict[str, Path]:
@@ -6184,7 +6214,7 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
     if isinstance(expected_plan, dict) and manifest.plan.to_record() != expected_plan:
         raise HLoopError("review convergence manifest does not match the prepared plan")
     completeness = manifest.completeness
-    actionable = _review_manifest_actionable_count(manifest)
+    actionable, release_blocking = _review_manifest_policy_counts(manifest)
     max_rounds = review_max_fix_rounds(state, convergence)
     current_round = normalize_int(convergence.get("fix_round"), 0)
     requested_round = getattr(args, "fix_round", None)
@@ -6194,6 +6224,7 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
     if not args.dry_run:
         convergence["artifact_refs"] = [str(manifest_path.relative_to(repo))]
         convergence["verified_actionable_findings"] = actionable
+        convergence["release_blocking_findings"] = release_blocking
         convergence["manifest_completeness"] = completeness.to_record()
         convergence["recorded_at"] = now_iso()
         convergence["recorded_round"] = round_number
@@ -6228,6 +6259,7 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
         "manifest_complete": completeness.complete,
         "manifest_issues": list(completeness.issues),
         "verified_actionable_findings": actionable,
+        "release_blocking_findings": release_blocking,
         "fix_round": round_number,
         "max_fix_rounds": max_rounds,
         "automatic_reviewer_started": False,
@@ -8999,6 +9031,7 @@ None.
             "authorized_extra_rounds": 0,
             "extra_round_authorization_refs": [],
             "verified_actionable_findings": None,
+            "release_blocking_findings": None,
             "artifact_refs": [],
             "attempt_history": [],
         },
@@ -9462,6 +9495,118 @@ def _refresh_follow_up_count(state: dict[str, Any]) -> None:
     state.pop("_follow_up_records_cache", None)
 
 
+def _follow_up_issue_key_maps(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    follow_ups = _follow_up_state(state)
+    issue_keys = follow_ups.get("issue_keys")
+    aliases = follow_ups.get("issue_key_aliases")
+    if not isinstance(issue_keys, dict):
+        raise HLoopError("STATE.json follow_ups.issue_keys must be an object")
+    if not isinstance(aliases, dict):
+        raise HLoopError("STATE.json follow_ups.issue_key_aliases must be an object")
+    return issue_keys, aliases
+
+
+def _follow_up_record_for_id(
+    repo: Path, state: dict[str, Any], follow_up_id: str
+) -> dict[str, Any] | None:
+    for record in _follow_up_records(repo, state):
+        if str(record.get("id") or "") == follow_up_id:
+            return record
+    return None
+
+
+def _follow_up_key_for_id(
+    repo: Path, state: dict[str, Any], follow_up_id: str
+) -> str:
+    record = _follow_up_record_for_id(repo, state, follow_up_id)
+    if record and record.get("issue_key"):
+        return str(record["issue_key"])
+    issue_keys, _aliases = _follow_up_issue_key_maps(state)
+    for issue_key, value in issue_keys.items():
+        if str(value) == follow_up_id:
+            return str(issue_key)
+    raise HLoopError(f"follow-up has no issue key: {follow_up_id}")
+
+
+def _follow_up_known_issue_keys(
+    repo: Path, state: dict[str, Any]
+) -> tuple[str, ...]:
+    issue_keys, aliases = _follow_up_issue_key_maps(state)
+    values = set(str(key) for key in issue_keys)
+    values.update(str(key) for key in aliases)
+    values.update(str(value) for value in aliases.values())
+    values.update(
+        str(record.get("issue_key"))
+        for record in _follow_up_records(repo, state)
+        if record.get("issue_key")
+    )
+    return tuple(sorted(values))
+
+
+def _follow_up_target_key(
+    repo: Path, state: dict[str, Any], raw_target: str
+) -> str:
+    value = str(raw_target or "").strip()
+    if re.fullmatch(r"F[0-9]{3}", value):
+        value = _follow_up_key_for_id(repo, state, value)
+    try:
+        return hloop_review_policy.resolve_issue_key_alias(
+            value, _follow_up_issue_key_maps(state)[1]
+        )
+    except hloop_review_policy.ReviewPolicyError as exc:
+        raise HLoopError(f"invalid follow-up relation target: {exc}") from exc
+
+
+def _follow_up_relation_request(args: argparse.Namespace) -> tuple[str, str] | None:
+    requested: list[tuple[str, str]] = []
+    for relation, name in (
+        ("alias_of", "alias_of"),
+        ("duplicate_of", "duplicate_of"),
+        ("supersedes", "supersedes"),
+    ):
+        value = str(getattr(args, name, None) or "").strip()
+        if value:
+            requested.append((relation, value))
+    explicit_relation = str(getattr(args, "relation", None) or "").strip()
+    explicit_target = str(getattr(args, "target_issue_key", None) or "").strip()
+    if explicit_relation:
+        if not explicit_target:
+            raise HLoopError("--relation requires --target-issue-key")
+        requested.append((explicit_relation, explicit_target))
+    elif explicit_target:
+        raise HLoopError("--target-issue-key requires --relation")
+    if len(requested) > 1:
+        raise HLoopError("follow-up relation options are mutually exclusive")
+    return requested[0] if requested else None
+
+
+def _follow_up_set_alias(
+    aliases: dict[str, Any], source_key: str, target_key: str
+) -> None:
+    source = str(source_key).strip()
+    target = str(target_key).strip()
+    if source == target:
+        raise HLoopError("follow-up issue-key alias cannot target itself")
+    try:
+        canonical_target = hloop_review_policy.resolve_issue_key_alias(target, aliases)
+        aliases[source] = canonical_target
+        hloop_review_policy.resolve_issue_key_alias(source, aliases)
+    except hloop_review_policy.ReviewPolicyError as exc:
+        aliases.pop(source, None)
+        raise HLoopError(f"invalid follow-up issue-key alias: {exc}") from exc
+
+
+def _merge_follow_up_values(*values: Any) -> list[str]:
+    merged: list[str] = []
+    for value in values:
+        for item in normalize_list(value):
+            if item and item not in merged:
+                merged.append(item)
+    return merged
+
+
 def cmd_follow_up_add(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     ensure_loop_dirs(repo)
@@ -9513,44 +9658,192 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
         if value not in fingerprints:
             fingerprints.append(value)
     issue_key = key.key
-    issue_keys = follow_ups["issue_keys"]
-    if not isinstance(issue_keys, dict):
-        raise HLoopError("STATE.json follow_ups.issue_keys must be an object")
-    existing_id = str(issue_keys.get(issue_key) or "")
+    issue_keys, aliases = _follow_up_issue_key_maps(state)
+    relation_request = _follow_up_relation_request(args)
+    relation: hloop_review_policy.FollowUpRelation | None = None
+    target_key = ""
+    target_id = ""
+    if relation_request:
+        relation_kind, raw_target = relation_request
+        target_key = _follow_up_target_key(repo, state, raw_target)
+        relation = hloop_review_policy.FollowUpRelation(
+            relation=relation_kind,
+            target_issue_key=target_key,
+            source_issue_key=issue_key,
+        )
+        try:
+            hloop_review_policy.validate_follow_up_relation(
+                relation,
+                known_issue_keys=_follow_up_known_issue_keys(repo, state),
+                aliases=aliases,
+            )
+        except hloop_review_policy.ReviewPolicyError as exc:
+            raise HLoopError(f"follow-up relation rejected: {exc}") from exc
+        target_id = str(issue_keys.get(target_key) or "")
+        if not target_id:
+            target_record = _follow_up_record_for_id(repo, state, raw_target)
+            if target_record:
+                target_id = str(target_record.get("id") or "")
+        if not target_id:
+            raise HLoopError(f"follow-up relation target is not recorded: {target_key}")
+
+    canonical_key = hloop_review_policy.resolve_issue_key_alias(issue_key, aliases)
+    existing_id = str(issue_keys.get(canonical_key) or issue_keys.get(issue_key) or "")
+    promoted = False
     duplicate = bool(existing_id)
-    follow_up_id = existing_id or next_id("F", {
-        ref: True for ref in normalize_list(follow_ups.get("artifact_refs"))
-    })
+    relation_kind = relation.relation if relation else ""
+
+    if relation_kind in {"alias_of", "duplicate_of"}:
+        target_record = _follow_up_record_for_id(repo, state, target_id)
+        target_record_key = (
+            str(target_record.get("issue_key") or target_key)
+            if target_record
+            else target_key
+        )
+        if relation_kind == "alias_of" and not key.provisional and target_record:
+            # A resolved root cause promotes the provisional artifact instead
+            # of creating F002.  All old aliases are rewired to the final key
+            # so every spelling resolves to one canonical FNNN.
+            if bool(target_record.get("provisional")):
+                promoted = True
+                existing_id = target_id
+                duplicate = True
+                for alias_key, mapped_key in list(aliases.items()):
+                    try:
+                        mapped_canonical = hloop_review_policy.resolve_issue_key_alias(
+                            str(mapped_key), aliases
+                        )
+                    except hloop_review_policy.ReviewPolicyError as exc:
+                        raise HLoopError(f"invalid stored follow-up alias: {exc}") from exc
+                    if alias_key == target_record_key or mapped_canonical == target_record_key:
+                        aliases[alias_key] = issue_key
+                aliases[target_record_key] = issue_key
+                issue_keys.pop(target_record_key, None)
+                issue_keys[issue_key] = existing_id
+                canonical_key = issue_key
+            else:
+                _follow_up_set_alias(aliases, issue_key, target_key)
+                canonical_key = target_key
+                existing_id = target_id
+                duplicate = True
+                issue_keys.pop(issue_key, None)
+        else:
+            _follow_up_set_alias(aliases, issue_key, target_key)
+            canonical_key = target_key
+            existing_id = target_id
+            duplicate = True
+            issue_keys.pop(issue_key, None)
+    elif relation_kind == "supersedes":
+        _follow_up_set_alias(aliases, target_key, issue_key)
+        canonical_key = issue_key
+        issue_keys.pop(target_key, None)
+        issue_keys[issue_key] = existing_id
+        duplicate = bool(existing_id)
+
+    existing_follow_up_ids = {
+        str(record.get("id"))
+        for record in _follow_up_records(repo, state)
+        if re.fullmatch(r"F[0-9]{3}", str(record.get("id") or ""))
+    }
+    if existing_id:
+        follow_up_id = existing_id
+    else:
+        candidate_number = max(normalize_int(follow_ups.get("next_id"), 1), 1)
+        while f"F{candidate_number:03d}" in existing_follow_up_ids:
+            candidate_number += 1
+        follow_up_id = f"F{candidate_number:03d}"
+    if not existing_id:
+        issue_keys[canonical_key] = follow_up_id
     path = _follow_up_artifact(repo, follow_up_id)
     previous = read_frontmatter(path) if path.exists() else {}
     created_at = str(previous.get("created_at") or now_iso())
     previous_fingerprints = normalize_list(previous.get("source_review_fingerprints"))
     previous_evidence = normalize_list(previous.get("evidence"))
-    key_record = key.to_record()
+    previous_aliases = normalize_list(previous.get("aliases"))
+    previous_history = previous.get("history")
+    if not isinstance(previous_history, list):
+        previous_history = []
+    previous_relations = previous.get("relations")
+    if not isinstance(previous_relations, list):
+        previous_relations = []
+
+    if canonical_key == issue_key:
+        key_record = key.to_record()
+    else:
+        try:
+            key_record = hloop_review_policy.FollowUpIssueKey.from_record(previous).to_record()
+        except hloop_review_policy.ReviewPolicyError:
+            key_record = key.to_record()
     if key_record.get("root_cause") is None:
         key_record["root_cause"] = ""
+
+    relation_record = relation.to_record() if relation else None
+    if relation_record:
+        relation_record["target_issue_key"] = target_key
+    recorded_aliases = list(previous_aliases)
+    if relation_kind in {"alias_of", "duplicate_of"} and issue_key != canonical_key:
+        if issue_key not in recorded_aliases:
+            recorded_aliases.append(issue_key)
+    if promoted and target_key not in recorded_aliases:
+        recorded_aliases.append(target_key)
+    if relation_kind == "supersedes" and target_key not in recorded_aliases:
+        recorded_aliases.append(target_key)
+
+    event_action = (
+        "promote_provisional"
+        if promoted
+        else relation_kind or ("update" if previous else "create")
+    )
+    history_event: dict[str, Any] = {
+        "at": now_iso(),
+        "action": event_action,
+        "issue_key": issue_key,
+        "canonical_issue_key": canonical_key,
+        "source_review_fingerprints": fingerprints,
+        "evidence": list(args.evidence),
+    }
+    if relation_record:
+        history_event["relation"] = relation_record
+        previous_relations.append(relation_record)
+
+    requirement_refs = _merge_follow_up_values(
+        previous.get("requirement_refs"), _arg_list(args, "requirement_ref")
+    )
     record: dict[str, Any] = {
         "id": follow_up_id,
-        "title": args.title,
+        "title": args.title or str(previous.get("title") or "Follow-up"),
         "status": str(previous.get("status") or args.status),
         **key_record,
-        "source_review_fingerprints": list(dict.fromkeys([*previous_fingerprints, *fingerprints])),
-        "discovered_head": args.discovered_head or git(repo, ["rev-parse", state["integration_branch"]]),
-        "evidence": list(dict.fromkeys([*previous_evidence, *args.evidence])),
-        "impact": args.impact,
+        "aliases": recorded_aliases,
+        "source_review_fingerprints": _merge_follow_up_values(
+            previous_fingerprints, fingerprints
+        ),
+        "discovered_head": args.discovered_head
+        or str(previous.get("discovered_head") or "")
+        or git(repo, ["rev-parse", state["integration_branch"]]),
+        "evidence": _merge_follow_up_values(previous_evidence, args.evidence),
+        "impact": args.impact or str(previous.get("impact") or ""),
         "fact_status": args.fact_status,
         "severity": args.severity,
         "origin": args.origin,
         "contract_relation": args.contract_relation,
         "decision_requirement": args.decision_requirement,
+        "disposition": args.disposition,
         "release_effect": args.release_effect,
-        "requirement_refs": _arg_list(args, "requirement_ref"),
+        "requirement_refs": requirement_refs,
         "recommended_action": args.recommended_action,
         "deferred_reason": args.deferred_reason,
         "reconsider_condition": args.reconsider_condition,
         "created_at": created_at,
         "updated_at": now_iso(),
+        "history": [*previous_history, history_event],
+        "relations": list(dict.fromkeys(json.dumps(item, sort_keys=True) for item in previous_relations)),
     }
+    record["relations"] = [json.loads(item) for item in record["relations"]]
+    if relation_record:
+        record["duplicate_relation"] = relation_record
+    elif previous.get("duplicate_relation"):
+        record["duplicate_relation"] = previous["duplicate_relation"]
     for name in (
         "source_review",
         "source_gap",
@@ -9561,10 +9854,42 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
         "target_version",
         "milestone",
     ):
-        value = getattr(args, name, None)
+        value = getattr(args, name, None) or previous.get(name)
         if value:
             record[name] = value
-    write_text(path, frontmatter(record) + f"\n# {args.title}\n\n{args.impact}\n")
+
+    write_text(
+        path,
+        frontmatter(record)
+        + f"\n# {record['title']}\n\n{record['impact']}\n",
+    )
+
+    if relation_kind == "supersedes" and target_id:
+        target_path = _follow_up_artifact(repo, target_id)
+        target_record = read_frontmatter(target_path)
+        target_record["status"] = "superseded"
+        target_record["updated_at"] = now_iso()
+        target_record["duplicate_relation"] = relation_record
+        target_history = target_record.get("history")
+        if not isinstance(target_history, list):
+            target_history = []
+        target_history.append(
+            {
+                "at": now_iso(),
+                "action": "superseded",
+                "issue_key": target_key,
+                "canonical_issue_key": issue_key,
+                "relation": relation_record,
+            }
+        )
+        target_record["history"] = target_history
+        write_text(
+            target_path,
+            frontmatter(target_record)
+            + f"\n# {target_record.get('title') or target_id}\n\n"
+            + f"{target_record.get('impact') or ''}\n",
+        )
+
     artifact_ref = str(path.relative_to(repo))
     refs = normalize_list(follow_ups.get("artifact_refs"))
     if artifact_ref not in refs:
@@ -9575,13 +9900,40 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
             normalize_int(follow_ups.get("next_id"), 1),
             int(follow_up_id[1:]) + 1,
         )
-    issue_keys[issue_key] = follow_up_id
+    # Keep only canonical keys in issue_keys.  Historical spellings are
+    # resolved through issue_key_aliases and remain auditable in the artifact.
+    issue_keys[canonical_key] = follow_up_id
+    for alias_key in list(issue_keys):
+        if alias_key != canonical_key:
+            try:
+                if hloop_review_policy.resolve_issue_key_alias(alias_key, aliases) != alias_key:
+                    issue_keys.pop(alias_key, None)
+            except hloop_review_policy.ReviewPolicyError as exc:
+                raise HLoopError(f"invalid stored follow-up alias: {exc}") from exc
+    for alias_key in list(aliases):
+        try:
+            hloop_review_policy.resolve_issue_key_alias(alias_key, aliases)
+        except hloop_review_policy.ReviewPolicyError as exc:
+            raise HLoopError(f"invalid stored follow-up alias: {exc}") from exc
     state["_follow_up_records_cache"] = _follow_up_records(repo, state)
     _refresh_follow_up_count(state)
     save_state(repo, state)
-    journal(repo, f"{'Updated' if duplicate else 'Recorded'} follow-up `{follow_up_id}` ({issue_key}).")
-    payload = {"status": "deduplicated" if duplicate else "created", "follow_up": record, "artifact": str(path)}
-    print_policy_payload(payload, as_json=bool(getattr(args, "json", False)), label=f"follow-up {'updated' if duplicate else 'created'}: {follow_up_id}")
+    journal(
+        repo,
+        f"{'Updated' if duplicate else 'Recorded'} follow-up `{follow_up_id}` ({canonical_key}).",
+    )
+    payload = {
+        "status": "deduplicated" if duplicate else "created",
+        "follow_up": record,
+        "artifact": str(path),
+        "canonical_issue_key": canonical_key,
+        "relation": relation_record,
+    }
+    print_policy_payload(
+        payload,
+        as_json=bool(getattr(args, "json", False)),
+        label=f"follow-up {'updated' if duplicate else 'created'}: {follow_up_id}",
+    )
     return 0
 
 
@@ -9589,8 +9941,14 @@ def resolve_follow_up_id(state: dict[str, Any], raw_id: str) -> str:
     value = str(raw_id or "").strip()
     if re.fullmatch(r"F[0-9]{3}", value):
         return value
-    issue_keys = _follow_up_state(state).get("issue_keys", {})
-    if isinstance(issue_keys, dict) and value in issue_keys:
+    issue_keys, aliases = _follow_up_issue_key_maps(state)
+    try:
+        canonical = hloop_review_policy.resolve_issue_key_alias(value, aliases)
+    except hloop_review_policy.ReviewPolicyError as exc:
+        raise HLoopError(f"unknown follow-up: {value}: {exc}") from exc
+    if canonical in issue_keys:
+        return str(issue_keys[canonical])
+    if value in issue_keys:
         return str(issue_keys[value])
     raise HLoopError(f"unknown follow-up: {value}")
 
@@ -21731,6 +22089,11 @@ def build_parser() -> argparse.ArgumentParser:
     follow_up_add.add_argument("--reconsider-condition", required=True)
     follow_up_add.add_argument("--target-version")
     follow_up_add.add_argument("--milestone")
+    follow_up_add.add_argument("--relation", choices=sorted(hloop_review_policy.RELATION_TYPES))
+    follow_up_add.add_argument("--target-issue-key", "--relation-target", dest="target_issue_key")
+    follow_up_add.add_argument("--alias-of", dest="alias_of")
+    follow_up_add.add_argument("--duplicate-of", dest="duplicate_of")
+    follow_up_add.add_argument("--supersedes", dest="supersedes")
     follow_up_add.add_argument("--acceptance-can-be-met-without-decision", action="store_true")
     follow_up_add.add_argument("--safety-critical", action="store_true")
     follow_up_add.add_argument("--scope-change-authorized", action="store_true")

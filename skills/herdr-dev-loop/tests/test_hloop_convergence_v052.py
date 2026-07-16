@@ -118,6 +118,93 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8"
         )
 
+    def write_policy_manifest(self, *, outside_release: bool) -> None:
+        loop = self.state_path.parent
+        plan = json.loads(
+            (loop / "reviews" / "convergence" / "PLAN.json").read_text(encoding="utf-8")
+        )
+        group = hloop_review.ReviewGroupPlan.from_record(plan["review_plan"])
+        candidate = FindingCandidate(
+            finding_id="FND-001",
+            provider="codex",
+            head_sha=plan["target_sha"],
+            discovering_agent="codex-reviewer",
+            severity="P2",
+            confidence=0.95,
+            title="axis-derived finding",
+            file_path="src/example.py",
+            line=1,
+            symbol="run",
+            trigger="the policy trigger",
+            product_impact="the policy impact",
+            origin="unrelated-pre-existing" if outside_release else "introduced",
+            proposed_fix="repair the policy path",
+            fact_status="confirmed",
+            contract_relation="outside_release" if outside_release else "in_scope",
+            decision_requirement="none",
+            disposition="defer_follow_up" if outside_release else "fix_now",
+            release_effect="non_blocking" if outside_release else "blocking",
+        )
+        finding = hloop_review.normalize_findings((candidate,))[0]
+        verification_plan = hloop_review.plan_verification(group, (finding,))
+        verifications = tuple(
+            hloop_review.VerificationRecord.from_assignment(
+                assignment,
+                fact_status="confirmed",
+                ignore_status="must_not_ignore",
+                decision_status="none",
+                progress_without_decision="yes",
+                severity="P2",
+                # Deliberately disagree with the old recommendation.  New
+                # runtime records must use the disposition axes instead.
+                recommended_action="fix_task",
+            )
+            for assignment in verification_plan.assignments
+        )
+        manifest = hloop_review.ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=tuple(
+                lane.result(
+                    finding_count=sum(
+                        1
+                        for item in finding.candidates
+                        if item.discovering_agent == lane.agent_label
+                    )
+                )
+                for lane in group.expected_lanes
+            ),
+            findings=(finding,),
+            verification_plan=verification_plan,
+            verifications=verifications,
+        )
+        (loop / "reviews" / "convergence" / "MANIFEST.json").write_text(
+            json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8"
+        )
+
+    def test_convergence_counts_use_axes_not_legacy_recommendation(self):
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=True)
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "converged")
+        self.assertEqual(payload["verified_actionable_findings"], 0)
+        self.assertEqual(payload["release_blocking_findings"], 0)
+
+    def test_convergence_retains_confirmed_in_scope_blocking_finding(self):
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=False)
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--fix-round", "0", "--json"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "pending")
+        self.assertEqual(payload["verified_actionable_findings"], 1)
+        self.assertEqual(payload["release_blocking_findings"], 1)
+
     def test_incomplete_zero_finding_final_review_does_not_pass(self):
         self.prepare_convergence()
         self.complete_convergence_manifest()
