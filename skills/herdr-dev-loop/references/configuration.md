@@ -52,7 +52,7 @@ final_required = "complete_zero_verified_actionable_findings"
 lane_count = "auto"
 ```
 
-`cadence = "batch"` defers ordinary review-gate opening until the current task batch is closed; it does not start a fixed-target Reviewer by itself. `merge-count` remains supported for explicitly configured or migrated legacy loops. `max_fix_rounds` is bounded from 0 through 2. Scope expansion may be routed to a follow-up, disable a feature, mark it experimental, or require a user decision; it cannot silently create a new in-scope fix task. `final_required` requires complete lanes, required independent verification, complete PLAN/MANIFEST evidence, and zero verified actionable findings for manual final certification.
+`cadence = "batch"` defers ordinary review-gate opening until the current task batch is closed; it does not start a fixed-target Reviewer by itself. `merge-count` remains supported for explicitly configured or migrated legacy loops. `max_fix_rounds` is bounded from 0 through 2. Scope expansion may be routed to a follow-up, disable a feature, mark it experimental, or require a user decision; it cannot silently create a new in-scope fix task. `final_required` requires complete lanes, required independent verification, complete PLAN/MANIFEST evidence, and zero verified actionable findings for manual final certification. `manual_final_protocol` is intentionally narrower than the ordinary review protocol and currently accepts only the implemented `codex-review-multi-v2`; `native` is invalid for manual-final configuration and is never silently substituted.
 
 ## Review modes
 

@@ -125,6 +125,11 @@ policy-driven:
 - `worker_qa_profile: repo-default`
 - `manager_qa_profile: none`
 
+The manual-final policy is fail-closed: its schema accepts only the implemented
+`codex-review-multi-v2` protocol. The ordinary `review_protocol: native` setting
+describes the Worker/Reviewer contract and does not make `native` valid for
+manual-final certification.
+
 For new loops, ordinary review waits for a closed batch and the Manager explicitly
 prepares fixed-target convergence; it is not restarted after every incremental
 commit. Gap Auditor cadence remains product/profile-driven. Migrated or explicitly

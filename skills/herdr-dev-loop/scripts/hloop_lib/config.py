@@ -29,6 +29,10 @@ SUPPORTED_REVIEW_MODES = ("single", "swarm", "dual", "dual-swarm")
 SUPPORTED_SPECIFICATION_SCOUT_MODES = ("auto", "always", "off")
 SUPPORTED_REVIEW_CADENCES = ("batch", "merge-count")
 SUPPORTED_REVIEW_PROTOCOLS = ("native", "codex-review-multi-v2")
+# The manual-final command currently has only one implemented protocol. Keep
+# this separate from the ordinary review protocol set so an unsupported
+# ``native`` value cannot be accepted and silently routed elsewhere.
+SUPPORTED_MANUAL_FINAL_PROTOCOLS = ("codex-review-multi-v2",)
 SUPPORTED_SCOPE_EXPANSION_ACTIONS = (
     "follow_up",
     "disable_feature",
@@ -308,9 +312,22 @@ def _validate_review_policy_table(desc: str, table: Any, errors: list[str]) -> N
 
     if "cadence" in table:
         _validate_enum(desc, "cadence", table["cadence"], SUPPORTED_REVIEW_CADENCES, errors)
-    for key in ("pre_final_protocol", "manual_final_protocol"):
-        if key in table:
-            _validate_enum(desc, key, table[key], SUPPORTED_REVIEW_PROTOCOLS, errors)
+    if "pre_final_protocol" in table:
+        _validate_enum(
+            desc,
+            "pre_final_protocol",
+            table["pre_final_protocol"],
+            SUPPORTED_REVIEW_PROTOCOLS,
+            errors,
+        )
+    if "manual_final_protocol" in table:
+        _validate_enum(
+            desc,
+            "manual_final_protocol",
+            table["manual_final_protocol"],
+            SUPPORTED_MANUAL_FINAL_PROTOCOLS,
+            errors,
+        )
     if "max_fix_rounds" in table:
         _validate_int_range(
             desc,

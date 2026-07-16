@@ -24,6 +24,7 @@ probe_count = 6
 [defaults.review]
 cadence = "batch"
 pre_final_protocol = "codex-review-multi-v2"
+# Manual-final certification currently has no native implementation.
 manual_final_protocol = "codex-review-multi-v2"
 max_fix_rounds = 2
 scope_expansion_action = "follow_up"

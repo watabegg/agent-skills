@@ -55,7 +55,7 @@ hloop config explain --repo <repo> --json
 
 `[defaults]`にWorkerとReviewerのprovider、model、effort、同時Worker数、session cleanupを設定できます。`[[scope]]`は既定でcanonicalなrepository rootに一致し、同じrepository内のsubdirectoryから起動しても結果が変わりません。起動directory固有の設定だけ`match = "cwd"`を明示します。設定例は[`examples/config.toml`](examples/config.toml)にあります。
 
-新規loopの`[defaults.review]`は、`cadence = "batch"`、`pre_final_protocol = "codex-review-multi-v2"`、`manual_final_protocol = "codex-review-multi-v2"`、`max_fix_rounds = 2`、`scope_expansion_action = "follow_up"`、`final_required = "complete_zero_verified_actionable_findings"`、`lane_count = "auto"`です。legacy loopをmigrationしても、保存済みのmerge-count cadenceや既存のfinish semanticsは暗黙に変更されません。
+新規loopの`[defaults.review]`は、`cadence = "batch"`、`pre_final_protocol = "codex-review-multi-v2"`、`manual_final_protocol = "codex-review-multi-v2"`、`max_fix_rounds = 2`、`scope_expansion_action = "follow_up"`、`final_required = "complete_zero_verified_actionable_findings"`、`lane_count = "auto"`です。manual-finalは実装済みの`codex-review-multi-v2`だけを受理し、`native`は黙って置換せず拒否します。legacy loopをmigrationしても、保存済みのmerge-count cadenceや既存のfinish semanticsは暗黙に変更されません。
 
 解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、task override、role start overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
 
@@ -392,8 +392,18 @@ hloop --repo <repo> init \
 ### 3. batchとtaskを作る
 
 ```bash
+hloop --repo <repo> input record --source manager-chat --text '<利用者の指示>'
+hloop --repo <repo> requirement new \
+  --source-input U0001 \
+  --acceptance '<観測可能な完了条件>' \
+  --priority P1
+hloop --repo <repo> release-scope lock \
+  --source MISSION.md --source PLAN.md \
+  --plan-item-ref P001 --requirement-ref REQ-001 \
+  --scope-ref release-scope-contract
 hloop --repo <repo> batch start "Initial implementation batch"
 hloop --repo <repo> task new "<担当範囲の実装>" \
+  --plan-item-ref P001 --requirement-ref REQ-001 \
   --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 ```
 
