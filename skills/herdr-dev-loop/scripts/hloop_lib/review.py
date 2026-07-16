@@ -36,7 +36,51 @@ RECOMMENDED_ACTIONS = frozenset(
     {"fix_task", "ask_user", "accepted_risk_candidate", "discard"}
 )
 FINDING_ORIGINS = frozenset(
-    {"introduced", "diff-expanded-pre-existing", "unrelated-pre-existing"}
+    {
+        "introduced",
+        "diff-expanded-pre-existing",
+        "unrelated-pre-existing",
+        "unknown",
+    }
+)
+
+# These are the Manager's seven independent disposition axes.  The older
+# verification model below intentionally keeps its ``FACT_STATUSES`` and
+# ``DECISION_STATUSES`` values (for example ``needs_spec``) for legacy review
+# manifests.  New finding records use this separate vocabulary and are
+# required to serialize every axis.
+POLICY_FACT_STATUSES = frozenset(
+    {"confirmed", "refuted", "insufficient_evidence"}
+)
+POLICY_CONTRACT_RELATIONS = frozenset(
+    {"in_scope", "outside_release", "ambiguous"}
+)
+POLICY_DECISION_REQUIREMENTS = frozenset({"none", "spec", "user"})
+POLICY_DISPOSITIONS = frozenset(
+    {
+        "fix_now",
+        "defer_follow_up",
+        "disable_feature",
+        "mark_experimental",
+        "user_decision",
+        "accepted_risk",
+        "discard",
+    }
+)
+POLICY_RELEASE_EFFECTS = frozenset({"blocking", "non_blocking"})
+POLICY_BLOCKING_DISPOSITIONS = frozenset(
+    {"fix_now", "disable_feature", "mark_experimental", "user_decision"}
+)
+POLICY_NON_BLOCKING_DISPOSITIONS = frozenset(
+    {"defer_follow_up", "accepted_risk", "discard"}
+)
+POLICY_AXES = (
+    "fact_status",
+    "origin",
+    "contract_relation",
+    "decision_requirement",
+    "disposition",
+    "release_effect",
 )
 
 DEFAULT_DISCOVERY_LANES = (
@@ -108,6 +152,98 @@ def _require_record_fields(
         raise ReviewModelError(
             f"{field_name} is missing required fields: {', '.join(missing)}"
         )
+
+
+def _policy_axis(
+    value: Any, field_name: str, allowed: Sequence[str] | set[str]
+) -> str:
+    if value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ReviewModelError(
+            f"unsupported {field_name}: {value!r}; expected {choices}"
+        )
+    return str(value)
+
+
+def _policy_axes_present(record: Mapping[str, Any]) -> tuple[bool, bool]:
+    """Return ``(has_any, has_all)`` for the new finding axes.
+
+    A format-3 manifest created before 0.5.2 may omit all policy axes.  It is
+    still readable so that legacy cadence and review evidence remain usable.
+    A partially upgraded record is never accepted: it would otherwise make a
+    missing axis look like a deliberate Manager decision.
+    """
+
+    # ``origin`` existed on the pre-0.5.2 candidate record, so it cannot by
+    # itself signal that a new policy record is present.
+    new_axis_fields = tuple(
+        field_name for field_name in POLICY_AXES if field_name != "origin"
+    )
+    has_new_axis = any(field_name in record for field_name in new_axis_fields)
+    present = [field_name in record for field_name in POLICY_AXES]
+    return has_new_axis, all(present)
+
+
+def _legacy_policy_axes(*, requires_spec_decision: bool) -> dict[str, str]:
+    """Provide a compatibility projection for pre-0.5.2 candidates.
+
+    The projection is intentionally marked as legacy by the caller.  Runtime
+    convergence uses the old verification recommendation for those records;
+    the values here only make the serialized shape schema-complete.
+    """
+
+    return {
+        "fact_status": "confirmed",
+        "contract_relation": "in_scope",
+        "decision_requirement": "user" if requires_spec_decision else "none",
+        "disposition": "fix_now",
+        "release_effect": "blocking",
+    }
+
+
+def _policy_axes_from_record(
+    record: Mapping[str, Any],
+    *,
+    requires_spec_decision: bool,
+    field_name: str,
+) -> tuple[dict[str, str], bool]:
+    has_any, has_all = _policy_axes_present(record)
+    if has_any and not has_all:
+        missing = [name for name in POLICY_AXES if name not in record]
+        raise ReviewModelError(
+            f"{field_name} is missing policy axes: {', '.join(missing)}"
+        )
+    if not has_all:
+        return _legacy_policy_axes(requires_spec_decision=requires_spec_decision), False
+
+    axes = {
+        "fact_status": _policy_axis(
+            record["fact_status"], "fact_status", POLICY_FACT_STATUSES
+        ),
+        "origin": _policy_axis(record["origin"], "origin", FINDING_ORIGINS),
+        "contract_relation": _policy_axis(
+            record["contract_relation"],
+            "contract_relation",
+            POLICY_CONTRACT_RELATIONS,
+        ),
+        "decision_requirement": _policy_axis(
+            record["decision_requirement"],
+            "decision_requirement",
+            POLICY_DECISION_REQUIREMENTS,
+        ),
+        "disposition": _policy_axis(
+            record["disposition"], "disposition", POLICY_DISPOSITIONS
+        ),
+        "release_effect": _policy_axis(
+            record["release_effect"],
+            "release_effect",
+            POLICY_RELEASE_EFFECTS,
+        ),
+    }
+    explicit = record.get("policy_axes_explicit", True)
+    if not isinstance(explicit, bool):
+        raise ReviewModelError(f"{field_name}.policy_axes_explicit must be boolean")
+    return axes, explicit
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,6 +780,14 @@ class FindingCandidate:
     origin: str
     proposed_fix: str
     requires_spec_decision: bool = False
+    fact_status: str | None = None
+    contract_relation: str | None = None
+    decision_requirement: str | None = None
+    disposition: str | None = None
+    release_effect: str | None = None
+    requirement_refs: tuple[str, ...] = ()
+    why_fix_now: str = ""
+    policy_axes_explicit: bool | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -676,6 +820,39 @@ class FindingCandidate:
         if not isinstance(self.requires_spec_decision, bool):
             raise ReviewModelError("requires_spec_decision must be boolean")
 
+        axes, inferred_explicit = _policy_axes_from_record(
+            {
+                "origin": self.origin,
+                **{
+                    name: getattr(self, name)
+                    for name in POLICY_AXES
+                    if name != "origin" and getattr(self, name) is not None
+                },
+            },
+            requires_spec_decision=self.requires_spec_decision,
+            field_name="finding candidate",
+        )
+        explicit = inferred_explicit
+        if self.policy_axes_explicit is not None:
+            if not isinstance(self.policy_axes_explicit, bool):
+                raise ReviewModelError("policy_axes_explicit must be boolean")
+            explicit = self.policy_axes_explicit
+        if explicit and not inferred_explicit:
+            raise ReviewModelError(
+                "policy_axes_explicit cannot be true without all policy axes"
+            )
+        for field_name, value in axes.items():
+            object.__setattr__(self, field_name, value)
+        object.__setattr__(
+            self,
+            "requirement_refs",
+            _text_tuple(self.requirement_refs, "requirement_refs"),
+        )
+        if not isinstance(self.why_fix_now, str):
+            raise ReviewModelError("why_fix_now must be a string")
+        object.__setattr__(self, "why_fix_now", self.why_fix_now.strip())
+        object.__setattr__(self, "policy_axes_explicit", explicit)
+
     @property
     def fingerprint(self) -> str:
         return finding_fingerprint(
@@ -704,6 +881,14 @@ class FindingCandidate:
             "origin": self.origin,
             "proposed_fix": self.proposed_fix,
             "requires_spec_decision": self.requires_spec_decision,
+            "fact_status": self.fact_status,
+            "contract_relation": self.contract_relation,
+            "decision_requirement": self.decision_requirement,
+            "disposition": self.disposition,
+            "release_effect": self.release_effect,
+            "requirement_refs": list(self.requirement_refs),
+            "why_fix_now": self.why_fix_now,
+            "policy_axes_explicit": self.policy_axes_explicit,
         }
 
     @classmethod
@@ -731,6 +916,12 @@ class FindingCandidate:
                 "requires_spec_decision",
             ),
         )
+        axes, explicit = _policy_axes_from_record(
+            record,
+            requires_spec_decision=record["requires_spec_decision"],
+            field_name="finding candidate",
+        )
+        axes.pop("origin", None)
         candidate = cls(
             finding_id=record["finding_id"],
             provider=record["provider"],
@@ -747,6 +938,10 @@ class FindingCandidate:
             origin=record["origin"],
             proposed_fix=record["proposed_fix"],
             requires_spec_decision=record["requires_spec_decision"],
+            **axes,
+            requirement_refs=record.get("requirement_refs", ()),
+            why_fix_now=record.get("why_fix_now", ""),
+            policy_axes_explicit=record.get("policy_axes_explicit", explicit),
         )
         if record["fingerprint"] != candidate.fingerprint:
             raise ReviewModelError("finding candidate fingerprint does not match its evidence")
@@ -758,6 +953,15 @@ class NormalizedFinding:
     fingerprint: str
     head_sha: str
     candidates: tuple[FindingCandidate, ...]
+    fact_status: str | None = None
+    origin: str | None = None
+    contract_relation: str | None = None
+    decision_requirement: str | None = None
+    disposition: str | None = None
+    release_effect: str | None = None
+    requirement_refs: tuple[str, ...] = ()
+    why_fix_now: str = ""
+    policy_axes_explicit: bool | None = None
 
     def __post_init__(self) -> None:
         fingerprint = _required_text(self.fingerprint, "fingerprint")
@@ -774,6 +978,73 @@ class NormalizedFinding:
         object.__setattr__(self, "fingerprint", fingerprint)
         object.__setattr__(self, "head_sha", head_sha)
         object.__setattr__(self, "candidates", candidates)
+
+        candidate_axes = [
+            candidate
+            for candidate in candidates
+            if candidate.policy_axes_explicit
+        ]
+        inferred_explicit = bool(candidate_axes)
+        if all(value is None for value in (
+            self.fact_status,
+            self.origin,
+            self.contract_relation,
+            self.decision_requirement,
+            self.disposition,
+            self.release_effect,
+        )):
+            if candidate_axes:
+                source = candidate_axes[0]
+                axes = {
+                    field_name: getattr(source, field_name)
+                    for field_name in POLICY_AXES
+                }
+                requirement_refs = source.requirement_refs
+                why_fix_now = source.why_fix_now
+            else:
+                source = candidates[0]
+                axes = _legacy_policy_axes(
+                    requires_spec_decision=source.requires_spec_decision
+                )
+                axes["origin"] = source.origin
+                requirement_refs = ()
+                why_fix_now = ""
+        else:
+            axes, explicit_from_record = _policy_axes_from_record(
+                {
+                    "origin": self.origin,
+                    "fact_status": self.fact_status,
+                    "contract_relation": self.contract_relation,
+                    "decision_requirement": self.decision_requirement,
+                    "disposition": self.disposition,
+                    "release_effect": self.release_effect,
+                },
+                requires_spec_decision=candidates[0].requires_spec_decision,
+                field_name="normalized finding",
+            )
+            inferred_explicit = explicit_from_record
+            requirement_refs = self.requirement_refs
+            why_fix_now = self.why_fix_now
+        explicit = inferred_explicit
+        if self.policy_axes_explicit is not None:
+            if not isinstance(self.policy_axes_explicit, bool):
+                raise ReviewModelError("policy_axes_explicit must be boolean")
+            explicit = self.policy_axes_explicit
+        if explicit and not inferred_explicit:
+            raise ReviewModelError(
+                "policy_axes_explicit cannot be true without all policy axes"
+            )
+        for field_name, value in axes.items():
+            object.__setattr__(self, field_name, value)
+        object.__setattr__(
+            self,
+            "requirement_refs",
+            _text_tuple(requirement_refs, "requirement_refs"),
+        )
+        if not isinstance(why_fix_now, str):
+            raise ReviewModelError("why_fix_now must be a string")
+        object.__setattr__(self, "why_fix_now", why_fix_now.strip())
+        object.__setattr__(self, "policy_axes_explicit", explicit)
 
     @property
     def providers(self) -> tuple[str, ...]:
@@ -803,6 +1074,30 @@ class NormalizedFinding:
     def cross_model_consensus(self) -> bool:
         return self.classification == "consensus"
 
+    @property
+    def is_actionable(self) -> bool:
+        """Whether the approved axes require in-scope release action."""
+
+        return bool(
+            self.policy_axes_explicit
+            and self.fact_status == "confirmed"
+            and self.contract_relation == "in_scope"
+            and self.disposition in POLICY_BLOCKING_DISPOSITIONS
+            and self.release_effect == "blocking"
+        )
+
+    @property
+    def is_release_blocking(self) -> bool:
+        """Whether this verified finding blocks the current release."""
+
+        return bool(
+            self.policy_axes_explicit
+            and self.fact_status == "confirmed"
+            and self.contract_relation == "in_scope"
+            and self.release_effect == "blocking"
+            and self.disposition not in POLICY_NON_BLOCKING_DISPOSITIONS
+        )
+
     def to_record(self) -> dict[str, Any]:
         return {
             "fingerprint": self.fingerprint,
@@ -817,6 +1112,15 @@ class NormalizedFinding:
                 for candidate in self.candidates
             ],
             "discovering_agents": list(self.discovering_agents),
+            "fact_status": self.fact_status,
+            "origin": self.origin,
+            "contract_relation": self.contract_relation,
+            "decision_requirement": self.decision_requirement,
+            "disposition": self.disposition,
+            "release_effect": self.release_effect,
+            "requirement_refs": list(self.requirement_refs),
+            "why_fix_now": self.why_fix_now,
+            "policy_axes_explicit": self.policy_axes_explicit,
             "candidates": [candidate.to_record() for candidate in self.candidates],
         }
 
@@ -839,13 +1143,28 @@ class NormalizedFinding:
                 "candidates",
             ),
         )
+        candidate_records = tuple(
+            FindingCandidate.from_record(item)
+            for item in _record_items(record["candidates"], "finding candidates")
+        )
+        axes, explicit = _policy_axes_from_record(
+            record,
+            requires_spec_decision=bool(record.get("requires_spec_decision", False)),
+            field_name="normalized finding",
+        )
+        # The normalized record is authoritative when present.  Candidate
+        # records remain available for each provider's independent evidence.
+        if not explicit:
+            axes = dict(axes)
+            axes["origin"] = str(record.get("origin") or candidate_records[0].origin)
         finding = cls(
             fingerprint=record["fingerprint"],
             head_sha=record["head_sha"],
-            candidates=tuple(
-                FindingCandidate.from_record(item)
-                for item in _record_items(record["candidates"], "finding candidates")
-            ),
+            candidates=candidate_records,
+            **axes,
+            requirement_refs=record.get("requirement_refs", ()),
+            why_fix_now=record.get("why_fix_now", ""),
+            policy_axes_explicit=record.get("policy_axes_explicit", explicit),
         )
         declared = {
             "severity": record["severity"],
@@ -859,6 +1178,15 @@ class NormalizedFinding:
             "discovering_agents": list(
                 _record_items(record["discovering_agents"], "finding discovering_agents")
             ),
+            "fact_status": finding.fact_status,
+            "origin": finding.origin,
+            "contract_relation": finding.contract_relation,
+            "decision_requirement": finding.decision_requirement,
+            "disposition": finding.disposition,
+            "release_effect": finding.release_effect,
+            "requirement_refs": list(finding.requirement_refs),
+            "why_fix_now": finding.why_fix_now,
+            "policy_axes_explicit": finding.policy_axes_explicit,
         }
         actual = finding.to_record()
         if any(actual[key] != value for key, value in declared.items()):
@@ -1384,6 +1712,46 @@ class ReviewManifest:
                 for record in by_fingerprint[finding.fingerprint]
             )
         )
+
+    def _verified_fingerprints_for_policy(
+        self, *, blocking_only: bool = False
+    ) -> tuple[str, ...]:
+        """Return fully verified findings classified by the new policy axes.
+
+        Legacy manifests do not carry the policy axes and are intentionally
+        excluded here; the CLI applies its pre-0.5.2 recommendation fallback
+        for those records.  This keeps the compatibility path explicit rather
+        than silently mixing old and new semantics.
+        """
+
+        incomplete = set(self.completeness.incomplete_findings)
+        by_fingerprint: dict[str, list[VerificationRecord]] = {}
+        for record in self.verifications:
+            by_fingerprint.setdefault(record.fingerprint, []).append(record)
+        result: list[str] = []
+        for finding in self.findings:
+            if not finding.policy_axes_explicit:
+                continue
+            if finding.fingerprint in incomplete:
+                continue
+            records = by_fingerprint.get(finding.fingerprint, [])
+            if not records or any(record.fact_status != "confirmed" for record in records):
+                continue
+            if blocking_only:
+                eligible = finding.is_release_blocking
+            else:
+                eligible = finding.is_actionable
+            if eligible:
+                result.append(finding.fingerprint)
+        return tuple(sorted(set(result)))
+
+    @property
+    def verified_actionable_fingerprints(self) -> tuple[str, ...]:
+        return self._verified_fingerprints_for_policy()
+
+    @property
+    def verified_release_blocking_fingerprints(self) -> tuple[str, ...]:
+        return self._verified_fingerprints_for_policy(blocking_only=True)
 
     @classmethod
     def from_record(cls, value: Any) -> "ReviewManifest":
