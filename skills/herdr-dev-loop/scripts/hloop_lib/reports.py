@@ -755,6 +755,8 @@ class ManualFinalReviewProjection:
     lane_completed_count: int = 0
     lane_count: int = 0
     incomplete_attempt_count: int = 0
+    residual_risks: tuple[str, ...] = ()
+    follow_up_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _required_text(self.status, "manual final status"))
@@ -792,6 +794,10 @@ class ManualFinalReviewProjection:
             )
         if self.lane_completed_count > self.lane_count and self.lane_count:
             raise OutcomeModelError("lane_completed_count cannot exceed lane_count")
+        for field_name in ("residual_risks", "follow_up_refs"):
+            object.__setattr__(
+                self, field_name, _unique_texts(getattr(self, field_name), field_name)
+            )
 
     @property
     def complete(self) -> bool:
@@ -823,6 +829,8 @@ class ManualFinalReviewProjection:
             "lane_completed_count": self.lane_completed_count,
             "lane_count": self.lane_count,
             "incomplete_attempt_count": self.incomplete_attempt_count,
+            "residual_risks": list(self.residual_risks),
+            "follow_up_refs": list(self.follow_up_refs),
         }
 
     @classmethod
@@ -842,6 +850,8 @@ class ManualFinalReviewProjection:
             lane_completed_count=record.get("lane_completed_count", 0),
             lane_count=record.get("lane_count", 0),
             incomplete_attempt_count=record.get("incomplete_attempt_count", 0),
+            residual_risks=record.get("residual_risks", ()),
+            follow_up_refs=record.get("follow_up_refs", ()),
         )
 
 
@@ -996,6 +1006,7 @@ class OutcomeReport:
     review_findings: tuple[str, ...] = ()
     review_fixes: tuple[str, ...] = ()
     accepted_risks: tuple[str, ...] = ()
+    residual_risks: tuple[str, ...] = ()
     decisions: tuple[str, ...] = ()
     unresolved_items: tuple[str, ...] = ()
     cleanup_status: str = ""
@@ -1042,6 +1053,7 @@ class OutcomeReport:
             "review_findings",
             "review_fixes",
             "accepted_risks",
+            "residual_risks",
             "decisions",
             "unresolved_items",
             "next_user_actions",
@@ -1064,6 +1076,12 @@ class OutcomeReport:
             elif not isinstance(value, model):
                 raise OutcomeModelError(f"{field_name} must be a {model.__name__}")
             object.__setattr__(self, field_name, value)
+        if not self.residual_risks and self.manual_final_review is not None:
+            object.__setattr__(
+                self,
+                "residual_risks",
+                self.manual_final_review.residual_risks,
+            )
         warnings = _unique_texts(self.postmortem_warnings, "postmortem_warnings")
         if not warnings and any(
             value is not None
@@ -1171,6 +1189,8 @@ class OutcomeReport:
             "external_goal_blocked": self.external_goal_blocked,
             "finalized": self.finalized,
         }
+        if self.residual_risks:
+            record["review"]["residual_risks"] = list(self.residual_risks)
         optional_projections = (
             ("manager_invocation", self.manager_invocation),
             ("execution_metrics", self.execution_metrics),
@@ -1218,6 +1238,7 @@ class OutcomeReport:
             review_findings=tuple(review.get("confirmed_findings") or ()),
             review_fixes=tuple(review.get("fixes") or ()),
             accepted_risks=tuple(review.get("accepted_risks") or ()),
+            residual_risks=review.get("residual_risks", ()),
             decisions=tuple(record.get("decisions") or ()),
             unresolved_items=tuple(record.get("unresolved_items") or ()),
             cleanup_status=str(record.get("cleanup_status") or ""),
@@ -1339,6 +1360,9 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
     lines.append(
         "- Accepted risks: " + ("; ".join(report.accepted_risks) or "none")
     )
+    lines.append(
+        "- Residual risks: " + ("; ".join(report.residual_risks) or "none")
+    )
 
     lines.extend(["", "## Decisions and Unresolved Items", ""])
     lines.append("- Decisions: " + ("; ".join(report.decisions) or "none"))
@@ -1410,11 +1434,26 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
                 f"- Findings: {metrics.candidate_count} candidates, "
                 f"{metrics.confirmed_count} confirmed"
             )
+            finding_origins = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_origin_counts.items()
+            ) or "none"
+            contract_relations = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_contract_relation_counts.items()
+            ) or "none"
+            decision_requirements = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_decision_requirement_counts.items()
+            ) or "none"
             dispositions = ", ".join(
                 f"{key}={count}"
                 for key, count in metrics.finding_disposition_counts.items()
             ) or "none"
-            lines.append(f"- Finding dispositions: {dispositions}")
+            lines.append(f"- Finding origin counts: {finding_origins}")
+            lines.append(f"- Finding contract relation counts: {contract_relations}")
+            lines.append(f"- Finding decision requirement counts: {decision_requirements}")
+            lines.append(f"- Finding disposition counts: {dispositions}")
             lines.append(f"- Review fix rounds: {metrics.review_fix_rounds}")
             lines.append(
                 "- Review attempts: "
@@ -1499,10 +1538,19 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
                 f"shortfalls {shortfalls if shortfalls is not None else 'not recorded'}"
             )
             lines.append(f"- Manual final status: {manual.status}")
+            lines.append(f"- Manual final target SHA: `{manual.target_sha or '-'}`")
             if manual.lane_count:
                 lines.append(
                     f"- Manual final lanes: {manual.lane_completed_count}/{manual.lane_count}"
                 )
+            lines.append(
+                "- Manual final residual risks: "
+                + ("; ".join(manual.residual_risks) or "none")
+            )
+            lines.append(
+                "- Manual final follow-up references: "
+                + (", ".join(manual.follow_up_refs) or "none")
+            )
 
         lines.extend(["", "## Postmortem Warnings", ""])
         lines.extend(f"- {item}" for item in report.postmortem_warnings)
