@@ -60,7 +60,7 @@ new loop. Findings are triaged across the independent axes
 be made non-blocking merely by labeling it a follow-up.
 
 Manual-final certification is a separate review evidence gate. Its
-`reviews/final/PLAN.json`, `MANIFEST.json`, and non-empty `REPORT.md` must
+`reviews/final/PLAN.json`, `MANIFEST.json`, and non-empty `FINAL.md` must
 share the prepared certification id, release-scope snapshot, base/target
 identity, and target SHA. Recording recomputes all expected lanes, required
 independent verifications, shortfalls, manifest completeness, report

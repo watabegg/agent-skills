@@ -1275,6 +1275,14 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
                 f"- Tasks: {metrics.planned_task_count} planned, "
                 f"{metrics.remediation_task_count} remediation"
             )
+            task_origins = ", ".join(
+                f"{key}={count}" for key, count in metrics.task_origin_counts.items()
+            ) or "none"
+            scope_revisions = ", ".join(
+                f"{key}={count}" for key, count in metrics.scope_revision_counts.items()
+            ) or "none"
+            lines.append(f"- Task origins: {task_origins}")
+            lines.append(f"- Scope revisions: {scope_revisions}")
             lines.append(
                 f"- Findings: {metrics.candidate_count} candidates, "
                 f"{metrics.confirmed_count} confirmed"
@@ -1285,6 +1293,41 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
             ) or "none"
             lines.append(f"- Finding dispositions: {dispositions}")
             lines.append(f"- Review fix rounds: {metrics.review_fix_rounds}")
+            lines.append(
+                "- Review attempts: "
+                f"{metrics.review_completed_count} completed, "
+                f"{metrics.stale_review_count} stale, "
+                f"{metrics.aborted_review_count} aborted, "
+                f"{metrics.timeout_review_count} timeout"
+            )
+            lines.append(
+                "- Gap attempts: "
+                f"{metrics.gap_completed_count} completed, "
+                f"{metrics.stale_gap_count} stale, "
+                f"{metrics.aborted_gap_count} aborted, "
+                f"{metrics.timeout_gap_count} timeout"
+            )
+            lines.append(
+                "- Timings (seconds): "
+                f"phase={metrics.phase_wall_time_seconds:.3f}, "
+                f"validation={metrics.validation_time_seconds:.3f}, "
+                f"review-wait={metrics.review_wait_time_seconds:.3f}, "
+                f"longest-worker={metrics.longest_worker_seconds:.3f}"
+            )
+            lines.append(
+                f"- Workers: {metrics.worker_count}; planned tasks complete: "
+                f"{str(metrics.planned_task_completed).lower()}"
+            )
+            if metrics.scope_expansion_started_at:
+                lines.append(
+                    "- Scope expansion started at: "
+                    f"`{metrics.scope_expansion_started_at}`"
+                )
+            if metrics.scope_expansion_user_input_id:
+                lines.append(
+                    "- Scope expansion user input: "
+                    f"`{metrics.scope_expansion_user_input_id}`"
+                )
         if report.review_convergence is not None:
             convergence = report.review_convergence
             lines.append(

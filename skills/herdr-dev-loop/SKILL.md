@@ -146,7 +146,7 @@ The durable state lives under `.ai/herdr-dev-loop/loops/<namespace>`:
 - `gaps/*.md`: Gap Auditor plan/spec alignment artifacts
 - `reviews/*.md`: Reviewer artifacts
 - `reviews/convergence/PLAN.json` and `reviews/convergence/MANIFEST.json`: fixed-target pre-final convergence evidence
-- `reviews/final/PLAN.json`, `reviews/final/MANIFEST.json`, and `reviews/final/REPORT.md`: manual-final certification evidence
+- `reviews/final/PLAN.json`, `reviews/final/MANIFEST.json`, and `reviews/final/FINAL.md`: manual-final certification evidence
 - `follow-ups/FNNN.md`: first-class follow-up records
 - `advice/*.md`: explicit Advisor consultation requests and participant artifacts
 - `triage/*.fix-task-draft.md`: Manager-reviewed fix-task drafts generated from review/gap artifacts

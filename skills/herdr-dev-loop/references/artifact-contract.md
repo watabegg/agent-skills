@@ -435,7 +435,7 @@ They reference the canonical definitions in `references/schemas/` and are intend
 ```text
 reviews/final/PLAN.json
 reviews/final/MANIFEST.json
-reviews/final/REPORT.md
+reviews/final/FINAL.md
 ```
 
 The plan fixes certification id, base/target SHA, base/target ref, scope source and digest, scope revisions, protocol, lane plan, and verification policy. The manifest must include lane completion, verification completeness, all normalized findings and evidence, `manifest_complete`, `verified_actionable_findings`, and `patch_verdict`. The report must be non-empty. `hloop final-review record` recomputes completeness and invalidates the certification when target SHA or plan identity drifts. `finish` accepts only a `passed` certification whose evidence is complete and whose verified actionable finding count is zero. A follow-up may remain open without failing this gate when it is non-blocking and the current contract is satisfied.

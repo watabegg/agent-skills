@@ -206,6 +206,8 @@ class ProjectionTests(unittest.TestCase):
         rendered = render_outcome_markdown(report)
         self.assertIn("Manager invocation: codex/gpt-5.6-luna/max", rendered)
         self.assertIn("Tasks: 2 planned, 1 remediation", rendered)
+        self.assertIn("Task origins: finding=1, planned=2", rendered)
+        self.assertIn("Review attempts: 1 completed, 1 stale, 0 aborted, 0 timeout", rendered)
         self.assertIn("Follow-ups: 1", rendered)
         self.assertIn("Manual review completeness: complete, shortfalls 0", rendered)
         self.assertIn("effective-parallelism-low: 1 with 2 workers", rendered)
