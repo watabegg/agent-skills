@@ -20,6 +20,7 @@ SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
 sys.path.insert(0, str(SCRIPTS))
 
+from hloop_lib import release_scope as hloop_release_scope  # noqa: E402
 from hloop_lib.certification import (  # noqa: E402
     MANUAL_FINAL_PROTOCOL,
     CertificationPlan,
@@ -304,7 +305,7 @@ def reopen_state(*, phase: str, finding_count: int = 1, fix_round: int = 0):
         "release_scope": {
             "status": "locked",
             "source_refs": ["PLAN.md"],
-            "source_digests": {"scope": SOURCE_DIGEST},
+            "source_digests": {"PLAN.md": SOURCE_DIGEST},
             "scope_revision": 1,
             "source_snapshot_revision": 1,
             "amendment_refs": [],
@@ -362,14 +363,18 @@ class ReopenTransitionTests(unittest.TestCase):
 
     def test_scope_amend_updates_scope_and_returns_to_readiness(self):
         state = reopen_state(phase="manual_final_review_failed", finding_count=1)
-        amendment = {
-            "kind": "scope-change",
-            "input_id": "U0001",
-            "scope_revision": 2,
-            "source_snapshot_revision": 2,
-            "source_digest": "b" * 64,
-            "source_refs": ["MISSION.md", "PLAN.md"],
-        }
+        scope = hloop_release_scope.ReleaseScope.from_record(state["release_scope"])
+        amendment = hloop_release_scope.create_amendment(
+            scope,
+            amendment_id="A001",
+            kind="scope-change",
+            reason="authorized scope change",
+            new_source_digests={"PLAN.md": "b" * 64},
+            basis_refs=("REQ-005",),
+            user_input_id="U0001",
+            created_at="2026-07-16T00:00:00+00:00",
+        ).to_record()
+        amendment["reopen_user_input_id"] = "U0001"
         result = reopen_review(
             state,
             action="scope-amend",
@@ -385,11 +390,24 @@ class ReopenTransitionTests(unittest.TestCase):
     def test_failed_reopen_returns_original_frozen_state_without_mutation(self):
         state = reopen_state(phase="manual_final_review_failed", finding_count=1)
         before = json.loads(json.dumps(state))
+        scope = hloop_release_scope.ReleaseScope.from_record(state["release_scope"])
+        amendment = hloop_release_scope.create_amendment(
+            scope,
+            amendment_id="A001",
+            kind="scope-change",
+            reason="authorized scope change",
+            new_source_digests={"PLAN.md": "b" * 64},
+            basis_refs=("REQ-005",),
+            user_input_id="U0001",
+            created_at="2026-07-16T00:00:00+00:00",
+        ).to_record()
+        amendment["reopen_user_input_id"] = "U9999"
+        amendment["new_scope_revision"] = 3
         result = reopen_review(
             state,
             action="scope-amend",
             user_input_id="U0001",
-            scope_amendment={"kind": "scope-change", "input_id": "U9999"},
+            scope_amendment=amendment,
         )
         self.assertFalse(result.accepted)
         self.assertEqual(state, before)

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "hloop"
 sys.path.insert(0, str(SCRIPT.parent))
@@ -48,6 +49,8 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             "--validation",
             "true",
         )
+        code, out, err = self.run_cli("release-scope", "lock")
+        self.assertEqual((code, err), (0, ""), out)
         self.state_path = (
             self.repo
             / ".ai"
@@ -265,6 +268,117 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertIn("authorized-extra-rounds-required", json.loads(out)["issues"])
         self.assertEqual(before, self.state())
+
+    def _prepare_failed_final_review(self) -> None:
+        state = self.state()
+        state["phase"] = "manual_final_review_failed"
+        state["review_convergence"].update(
+            {
+                "status": "converged",
+                "fix_round": 0,
+                "verified_actionable_findings": 1,
+                "artifact_refs": ["reviews/convergence/MANIFEST.json"],
+            }
+        )
+        state["manual_final_review"].update(
+            {
+                "status": "failed",
+                "verified_actionable_findings": 1,
+                "manifest_complete": True,
+            }
+        )
+        state["dispatch_freeze"].update(
+            {"status": "active", "reason": "manual-final-review-failed"}
+        )
+        self.save_state(state)
+
+    def test_scope_changing_reopen_reads_source_and_records_immutable_amendment(self):
+        self._prepare_failed_final_review()
+        loop = self.state_path.parent
+        (loop / "PLAN.md").write_text(
+            (loop / "PLAN.md").read_text(encoding="utf-8")
+            + "\nScope correction for the approved reopen.\n",
+            encoding="utf-8",
+        )
+
+        code, out, err = self.run_cli(
+            "review",
+            "reopen",
+            "--action",
+            "scope-amend",
+            "--user-input-id",
+            "U0001",
+            "--scope-reason",
+            "approved scope correction",
+            "--scope-basis-ref",
+            "REQ-005",
+            "--json",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        result = json.loads(out)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["phase"], "review_readiness")
+
+        artifact_path = loop / "release-scope" / "amendments" / "A001.json"
+        self.assertEqual(Path(result["artifact"]), artifact_path)
+        amendment = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(amendment["amendment_id"], "A001")
+        self.assertEqual(amendment["kind"], "scope-change")
+        self.assertEqual(amendment["previous_scope_revision"], 1)
+        self.assertEqual(amendment["new_scope_revision"], 2)
+        self.assertEqual(amendment["previous_source_snapshot_revision"], 1)
+        self.assertEqual(amendment["new_source_snapshot_revision"], 2)
+        self.assertEqual(amendment["reason"], "approved scope correction")
+        self.assertEqual(amendment["basis_refs"], ["REQ-005"])
+        self.assertEqual(amendment["user_input_id"], "U0001")
+        state = self.state()
+        self.assertEqual(state["release_scope"]["amendment_refs"], ["A001"])
+        self.assertEqual(state["release_scope"]["scope_revision"], 2)
+        self.assertEqual(state["release_scope"]["source_snapshot_revision"], 2)
+        self.assertEqual(state["release_scope"]["last_user_input_id"], "U0001")
+        self.assertEqual(state["manual_final_review"]["status"], "pending")
+        self.assertEqual(state["dispatch_freeze"]["status"], "inactive")
+
+    def test_scope_changing_reopen_rolls_back_artifact_when_state_save_fails(self):
+        self._prepare_failed_final_review()
+        loop = self.state_path.parent
+        (loop / "PLAN.md").write_text(
+            (loop / "PLAN.md").read_text(encoding="utf-8")
+            + "\nScope correction for rollback.\n",
+            encoding="utf-8",
+        )
+        before_state = self.state_path.read_bytes()
+        parser = hloop.build_parser()
+        args = parser.parse_args(
+            [
+                "--repo",
+                str(self.repo),
+                "--namespace",
+                self.namespace,
+                "review",
+                "reopen",
+                "--action",
+                "scope-amend",
+                "--user-input-id",
+                "U0001",
+                "--scope-reason",
+                "simulated persistence failure",
+                "--scope-basis-ref",
+                "REQ-005",
+            ]
+        )
+
+        def fail_save(repo: Path, state: dict) -> None:
+            raise OSError("simulated state write failure")
+
+        with mock.patch.object(hloop, "save_state", side_effect=fail_save):
+            with self.assertRaises(hloop.HLoopError):
+                hloop.cmd_review_reopen(args)
+
+        self.assertEqual(self.state_path.read_bytes(), before_state)
+        self.assertEqual(
+            list((loop / "release-scope" / "amendments").glob("A*.json")), []
+        )
 
     def test_legacy_migration_keeps_merge_count_cadence(self):
         state = {
