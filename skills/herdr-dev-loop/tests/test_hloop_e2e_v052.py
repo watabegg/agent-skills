@@ -53,6 +53,16 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
         self.assertTrue(evidence["future_queued_tasks_did_not_block"])
         self.assertTrue(evidence["open_batch_kept_closed"])
 
+    def test_batch_performance_validation_reuse_and_conflict_avoidance(self):
+        evidence = self.run_scenario("batch-performance-validation-reuse")
+        self.assertTrue(evidence["low_parallelism_warning"])
+        self.assertTrue(evidence["replan_required"])
+        self.assertTrue(evidence["scheduler_avoided_overlap"])
+        self.assertTrue(evidence["direct_start_blocked"])
+        self.assertTrue(evidence["validation_reused"])
+        self.assertTrue(evidence["validation_invalidated_by_command_set"])
+        self.assertTrue(evidence["validation_invalidated_by_resolved_config"])
+
     def test_scope_expansion_creates_follow_up_without_gate_invalidation(self):
         evidence = self.run_scenario("scope-expansion-follow-up")
         self.assertEqual(evidence["follow_up_id"], "F001")

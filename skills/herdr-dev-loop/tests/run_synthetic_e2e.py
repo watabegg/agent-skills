@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -1488,7 +1488,12 @@ def _run_fixture_validation(fixture: dict[str, Any]) -> int:
     before = _validation_log_count(fixture)
     _fixture_cli(fixture, "validate", "--command", "true", "--no-cleanup")
     after = _validation_log_count(fixture)
-    require(after > before, "validation command did not create a validation event")
+    state = _fixture_state(fixture)
+    reused = bool((state.get("last_validation") or {}).get("reused"))
+    require(
+        after > before or reused,
+        "validation command did not create or reuse a validation event",
+    )
     return after
 
 
@@ -2009,8 +2014,13 @@ def scenario_remediation_convergence(ctx: dict[str, Any]) -> dict[str, Any]:
         source_finding=candidate.fingerprint,
         remediation_round=1,
     )
+    second_state = _fixture_state(fixture)
     second_validation = _validation_log_count(fixture)
-    require(second_validation > first_validation, "remediation batch did not receive validation")
+    require(
+        second_validation > first_validation
+        or bool((second_state.get("last_validation") or {}).get("reused")),
+        "remediation batch did not receive or reuse validation",
+    )
     next_plan = _prepare_convergence(fixture)
     _write_review_manifest(fixture, next_plan)
     converged = _record_convergence(fixture, 1)
@@ -2027,7 +2037,10 @@ def scenario_remediation_convergence(ctx: dict[str, Any]) -> dict[str, Any]:
         "review_events": 2,
         "review_per_merge": False,
         "validation_events": 2,
-        "validation_scales_by_batch": second_validation - first_validation >= 1,
+        "validation_scales_by_batch": (
+            second_validation - first_validation >= 1
+            or bool((second_state.get("last_validation") or {}).get("reused"))
+        ),
         "remediation_batch_count": 1,
         "remediation_findings_coalesced": True,
         "fix_round": 1,
@@ -2122,6 +2135,189 @@ def scenario_batch_review_cadence(ctx: dict[str, Any]) -> dict[str, Any]:
         "targets_advanced": True,
         "future_queued_tasks_did_not_block": True,
         "open_batch_kept_closed": True,
+    }
+
+
+def scenario_batch_performance_validation_reuse(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Exercise GAP8 batch metrics, validation identity, and scope conflicts."""
+
+    fixture = _new_synthetic_fixture(
+        ctx, "batch-performance-validation-reuse", task_count=2, merge_tasks=False
+    )
+    state = _fixture_state(fixture)
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+    batch_started = timestamp - timedelta(seconds=12)
+    task_times = (
+        (batch_started + timedelta(seconds=1), batch_started + timedelta(seconds=8)),
+        (batch_started + timedelta(seconds=2), batch_started + timedelta(seconds=10)),
+    )
+    state["current_batch_id"] = "B001"
+    state["batches"]["B001"].update(
+        {
+            "status": "active",
+            "started_at": batch_started.isoformat(),
+            "task_ids": ["T001", "T002"],
+        }
+    )
+    for task_id, (started_at, merged_at) in zip(("T001", "T002"), task_times):
+        state["tasks"][task_id].update(
+            {
+                "status": "merged",
+                "batch_id": "B001",
+                "write_allow": ["src/core.py"],
+                "started_at": started_at.isoformat(),
+                "merged_at": merged_at.isoformat(),
+            }
+        )
+    state["phase"] = "dispatching"
+    state["needs_validation"] = False
+    _save_fixture_state(fixture, state)
+    _fixture_cli(fixture, "batch", "close", "B001", "--summary", "record GAP8 metrics")
+
+    state = _fixture_state(fixture)
+    performance = state["batches"]["B001"].get("performance") or {}
+    require(performance.get("worker_count") == 2, "batch worker count was not persisted")
+    require(performance.get("worker_runtime_seconds", 0) > 0, "Worker runtime was not persisted")
+    require(performance.get("wall_time_seconds", 0) > 0, "batch wall time was not persisted")
+    require(
+        performance.get("effective_parallelism") is not None
+        and performance["effective_parallelism"] < 1.5,
+        "synthetic batch did not produce low effective parallelism",
+    )
+    require(
+        performance.get("longest_worker_seconds") == 8.0,
+        "longest Worker metric was not calculated",
+    )
+    require(
+        "effective-parallelism-low:" in " ".join(performance.get("warnings") or []),
+        "low-parallelism warning was not recorded",
+    )
+    require(
+        state.get("next_batch_replan", {}).get("required") is True,
+        "low-parallelism replan requirement was not recorded",
+    )
+    progress_path = state_path(fixture["repo"], fixture["namespace"]).parent / "progress" / "LATEST.md"
+    progress_text = progress_path.read_text(encoding="utf-8")
+    require("Effective parallelism:" in progress_text, "progress projection lacks batch metrics")
+    graph = state["batches"]["B001"].get("write_scope_conflict_graph") or {}
+    require(graph.get("digest"), "batch conflict graph digest was not persisted")
+    require(
+        graph.get("conflicts", {}).get("T001") == ["T002"],
+        "batch conflict graph did not record the overlapping core file",
+    )
+
+    # The scheduler must avoid the overlap even when both tasks are queued.
+    for task in state["tasks"].values():
+        task["status"] = "queued"
+    state["phase"] = "dispatching"
+    _save_fixture_state(fixture, state)
+    dry_tick = _fixture_cli(
+        fixture, "tick", "--once", "--dry-run", "--max-workers", "2"
+    )
+    require(
+        dry_tick.stdout.count("DRY RUN start worker") == 1,
+        "dispatch planning did not avoid overlapping write scopes",
+    )
+
+    # Direct Worker starts use the same guard as scheduler dispatch.
+    state = _fixture_state(fixture)
+    state["tasks"]["T001"]["status"] = "running"
+    state["tasks"]["T002"]["status"] = "queued"
+    _save_fixture_state(fixture, state)
+    blocked_start = _fixture_cli(
+        fixture, "worker", "start", "T002", "--dry-run", expected=2
+    )
+    require(
+        "write-scope conflict" in blocked_start.stderr,
+        "direct Worker start did not fail closed on scope overlap",
+    )
+
+    state = _fixture_state(fixture)
+    for task in state["tasks"].values():
+        task["status"] = "merged"
+    state["needs_validation"] = False
+    state["phase"] = "dispatching"
+    _save_fixture_state(fixture, state)
+    first = _fixture_cli(fixture, "validate", "--command", "true", "--no-cleanup")
+    first_state = _fixture_state(fixture)
+    first_record = first_state.get("last_validation") or {}
+    first_journal_count = _validation_log_count(fixture)
+    post_validation_performance = first_state["batches"]["B001"].get("performance") or {}
+    require(
+        post_validation_performance.get("validation_time_seconds", 0) > 0,
+        "batch validation time was not updated after validation",
+    )
+    refreshed_progress = progress_path.read_text(encoding="utf-8")
+    require(
+        "Validation time:" in refreshed_progress,
+        "progress projection was not refreshed with validation time",
+    )
+    identity = first_record.get("validation_identity") or {}
+    require(identity.get("target_sha"), "validation identity target SHA is missing")
+    require(identity.get("commands") == ["true"], "validation identity command set is missing")
+    require(identity.get("dependency_identity"), "dependency identity is missing")
+    require(first_record.get("reused") is False, "first validation was incorrectly reused")
+
+    second = _fixture_cli(fixture, "validate", "--command", "true", "--no-cleanup")
+    second_state = _fixture_state(fixture)
+    require(
+        second_state["last_validation"].get("reused") is True,
+        "same-target validation evidence was not reused",
+    )
+    require(
+        _validation_log_count(fixture) == first_journal_count,
+        "validation reuse unexpectedly ran a new validation event",
+    )
+
+    second_state["validation_commands"] = ["true", "true"]
+    _save_fixture_state(fixture, second_state)
+    _fixture_cli(fixture, "validate", "--no-cleanup")
+    third_state = _fixture_state(fixture)
+    require(
+        third_state["last_validation"].get("reused") is False,
+        "command-set change did not invalidate validation evidence",
+    )
+    require(
+        _validation_log_count(fixture) > first_journal_count,
+        "invalidated validation did not record a new validation event",
+    )
+    third_state["resolved_config"] = {
+        **(third_state.get("resolved_config") or {}),
+        "synthetic_revision": "changed",
+    }
+    _save_fixture_state(fixture, third_state)
+    _fixture_cli(fixture, "validate", "--no-cleanup")
+    fourth_state = _fixture_state(fixture)
+    require(
+        fourth_state["last_validation"].get("reused") is False,
+        "resolved-config change did not invalidate validation evidence",
+    )
+    _fixture_cli(fixture, "batch", "start", "follow-up", "--id", "B002")
+    follow_up_state = _fixture_state(fixture)
+    require(
+        follow_up_state["batches"]["B002"].get("replan_requirement", {}).get(
+            "source_batch_id"
+        )
+        == "B001",
+        "next batch did not acknowledge the low-parallelism replan",
+    )
+    require(
+        follow_up_state.get("next_batch_replan", {}).get("required") is False,
+        "next batch replan requirement was not acknowledged",
+    )
+    return {
+        "batch_id": "B001",
+        "effective_parallelism": performance["effective_parallelism"],
+        "low_parallelism_warning": True,
+        "replan_required": True,
+        "conflict_graph_digest": graph["digest"],
+        "scheduler_avoided_overlap": True,
+        "direct_start_blocked": True,
+        "validation_reused": True,
+        "validation_invalidated_by_command_set": True,
+        "validation_invalidated_by_resolved_config": True,
+        "validation_identity_version": identity.get("version"),
+        "validation_event_count": _validation_log_count(fixture),
     }
 
 
@@ -2747,6 +2943,7 @@ SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = 
     ("requirements-decisions-outcomes", scenario_requirements_decisions),
     ("remediation-convergence", scenario_remediation_convergence),
     ("batch-review-cadence", scenario_batch_review_cadence),
+    ("batch-performance-validation-reuse", scenario_batch_performance_validation_reuse),
     ("scope-expansion-follow-up", scenario_scope_expansion_follow_up),
     ("two-round-exhaustion", scenario_two_round_exhaustion),
     ("user-stop-freeze", scenario_user_stop_freeze),

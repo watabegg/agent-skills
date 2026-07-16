@@ -66,6 +66,40 @@
         "recorded_at": {"type": "string"}
       },
       "additionalProperties": true
+    },
+    "batchPerformanceRecord": {
+      "type": "object",
+      "properties": {
+        "batch_id": {"type": "string"},
+        "worker_count": {"type": "integer", "minimum": 0},
+        "wall_time_seconds": {"type": "number", "minimum": 0},
+        "phase_wall_time_seconds": {"type": "number", "minimum": 0},
+        "worker_runtime_seconds": {"type": "number", "minimum": 0},
+        "worker_runtime_total_seconds": {"type": "number", "minimum": 0},
+        "effective_parallelism": {"type": ["number", "null"], "minimum": 0},
+        "longest_worker_seconds": {"type": "number", "minimum": 0},
+        "validation_time_seconds": {"type": "number", "minimum": 0},
+        "review_wait_time_seconds": {"type": "number", "minimum": 0},
+        "warnings": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "replan_required": {"type": "boolean"},
+        "conflict_graph_digest": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "writeScopeConflictGraph": {
+      "type": "object",
+      "required": ["version", "task_ids", "nodes", "edges", "conflicts", "digest", "generated_at"],
+      "properties": {
+        "version": {"type": "integer", "minimum": 1},
+        "batch_id": {"type": "string"},
+        "task_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "nodes": {"type": "object", "additionalProperties": {"type": "object"}},
+        "edges": {"type": "array", "items": {"type": "object"}},
+        "conflicts": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+        "digest": {"type": "string", "minLength": 1},
+        "generated_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
     }
   },
   "properties": {
@@ -305,7 +339,13 @@
         "stale_gap_count": {"type": "integer", "minimum": 0},
         "aborted_gap_count": {"type": "integer", "minimum": 0},
         "scope_expansion_started_at": {"type": "string"},
-        "effective_parallelism": {"type": ["number", "null"], "minimum": 0}
+        "effective_parallelism": {"type": ["number", "null"], "minimum": 0},
+        "worker_runtime_seconds": {"type": "number", "minimum": 0},
+        "batch_id": {"type": "string"},
+        "batch_metrics": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/batchPerformanceRecord"}
+        }
       },
       "additionalProperties": true
     },
@@ -362,6 +402,12 @@
     "gap_runner": {"type": "string", "enum": ["tui", "exec"]},
     "spec_sources": {"type": "array", "items": {"type": "string"}},
     "current_batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
+    "validation_stale": {"type": "boolean"},
+    "validation_stale_reason": {"type": "string"},
+    "validation_history": {"type": "array", "items": {"type": "object"}},
+    "write_scope_conflict_graph": {"$ref": "#/$defs/writeScopeConflictGraph"},
+    "next_batch_replan": {"type": "object", "additionalProperties": true},
+    "progress_projection": {"type": "object", "additionalProperties": true},
     "artifact_policy": {"type": "object"},
     "resume_requirements": {"type": "array", "items": {"type": "object"}},
     "pending_fix_task_drafts": {"type": "array", "items": {"type": "string"}},
@@ -384,7 +430,18 @@
     "cleanup_history": {"type": "array", "items": {"type": "object"}},
     "lifecycle_diagnostics": {"type": "array", "items": {"type": "object"}},
     "tasks": {"type": "object"},
-    "batches": {"type": "object"},
+    "batches": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "performance": {"$ref": "#/$defs/batchPerformanceRecord"},
+          "metrics": {"$ref": "#/$defs/batchPerformanceRecord"},
+          "write_scope_conflict_graph": {"$ref": "#/$defs/writeScopeConflictGraph"}
+        },
+        "additionalProperties": true
+      }
+    },
     "reviews": {
       "type": "object",
       "additionalProperties": {
