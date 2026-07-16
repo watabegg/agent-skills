@@ -2362,6 +2362,135 @@ def read_scope_sources(repo: Path, references: Sequence[str]) -> dict[str, str]:
     return sources
 
 
+def accepted_requirement_ids(state: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return only Manager-accepted requirement IDs from the immutable ledger."""
+
+    raw_requirements = state.get("requirements")
+    if not isinstance(raw_requirements, Mapping):
+        return ()
+    accepted: set[str] = set()
+    for key, raw in raw_requirements.items():
+        if not isinstance(raw, Mapping) or str(raw.get("status") or "") != "accepted":
+            continue
+        requirement_id = str(raw.get("id") or raw.get("requirement_id") or key).strip()
+        if requirement_id:
+            accepted.add(requirement_id)
+    return tuple(sorted(accepted))
+
+
+def finding_inventory_ids(
+    state: Mapping[str, Any], *, confirmed_only: bool = False
+) -> tuple[str, ...]:
+    """Return canonical finding IDs persisted from review evidence.
+
+    Task authorization uses only records confirmed by the review manifest.  The
+    broader inventory remains available for audit and convergence accounting.
+    """
+
+    raw_inventory = state.get("finding_inventory")
+    if not isinstance(raw_inventory, Mapping):
+        return ()
+    values: set[str] = set()
+    if not confirmed_only:
+        for key in ("fingerprints", "finding_ids", "ids"):
+            values.update(
+                str(item).strip()
+                for item in normalize_list(raw_inventory.get(key))
+                if str(item).strip()
+            )
+    records = raw_inventory.get("records")
+    if isinstance(records, Mapping):
+        for fingerprint, raw_record in records.items():
+            if confirmed_only and (
+                not isinstance(raw_record, Mapping)
+                or raw_record.get("confirmed") is not True
+            ):
+                continue
+            if str(fingerprint).strip():
+                values.add(str(fingerprint).strip())
+            if not isinstance(raw_record, Mapping):
+                continue
+            values.update(
+                str(item).strip()
+                for item in normalize_list(
+                    raw_record.get("fingerprints") or raw_record.get("fingerprint")
+                )
+                if str(item).strip()
+            )
+            values.update(
+                str(item).strip()
+                for item in normalize_list(
+                    raw_record.get("finding_ids") or raw_record.get("candidate_ids")
+                )
+                if str(item).strip()
+            )
+    return tuple(sorted(values))
+
+
+def persist_finding_inventory(
+    state: dict[str, Any],
+    manifest: hloop_review.ReviewManifest,
+    *,
+    source_ref: str = "",
+) -> None:
+    """Persist canonical IDs and fingerprints from one parsed review manifest."""
+
+    inventory = state.setdefault(
+        "finding_inventory",
+        {"fingerprints": [], "finding_ids": [], "records": {}, "updated_at": ""},
+    )
+    if not isinstance(inventory, dict):
+        raise HLoopError("STATE.json finding_inventory must be an object")
+    records = inventory.setdefault("records", {})
+    if not isinstance(records, dict):
+        raise HLoopError("STATE.json finding_inventory.records must be an object")
+    confirmed = set(manifest.confirmed_fingerprints)
+    for finding in manifest.findings:
+        fingerprint = str(finding.fingerprint).strip()
+        if not fingerprint:
+            continue
+        candidate_ids = sorted(
+            {
+                str(candidate.finding_id).strip()
+                for candidate in finding.candidates
+                if str(candidate.finding_id).strip()
+            }
+            | {
+                f"{candidate.provider}:{candidate.finding_id}"
+                for candidate in finding.candidates
+                if str(candidate.finding_id).strip()
+            }
+        )
+        previous = records.get(fingerprint)
+        if not isinstance(previous, Mapping):
+            previous = {}
+        source_refs = sorted(
+            set(normalize_list(previous.get("source_refs")))
+            | ({source_ref} if source_ref else set())
+        )
+        records[fingerprint] = {
+            "fingerprint": fingerprint,
+            "finding_ids": sorted(
+                set(normalize_list(previous.get("finding_ids"))) | set(candidate_ids)
+            ),
+            "head_sha": str(finding.head_sha),
+            "source_refs": source_refs,
+            "confirmed": bool(previous.get("confirmed")) or fingerprint in confirmed,
+        }
+    inventory["records"] = records
+    inventory["fingerprints"] = sorted(str(item) for item in records)
+    inventory["finding_ids"] = sorted(
+        {
+            str(item)
+            for record in records.values()
+            if isinstance(record, Mapping)
+            for item in normalize_list(record.get("finding_ids"))
+            if str(item).strip()
+        }
+    )
+    inventory["updated_at"] = now_iso()
+
+
 def assert_release_scope_snapshot(
     repo: Path, state: dict[str, Any]
 ) -> hloop_release_scope.ReleaseScope:
@@ -2472,9 +2601,7 @@ def authorize_task_record(
             existing_task=existing_task,
             locked_plan_item_refs=scope.plan_item_refs,
             locked_requirement_refs=scope.requirement_refs,
-            locked_finding_ids=normalize_list(
-                state.get("locked_finding_ids") or state.get("finding_ids")
-            ),
+            locked_finding_ids=finding_inventory_ids(state, confirmed_only=True),
             legacy_mode=scope.status == "legacy-unlocked",
             allow_legacy_unclassified=scope.status == "legacy-unlocked",
         )
@@ -2536,9 +2663,7 @@ def validate_task_update_provenance(
             scope,
             locked_plan_item_refs=scope.plan_item_refs,
             locked_requirement_refs=scope.requirement_refs,
-            locked_finding_ids=normalize_list(
-                state.get("locked_finding_ids") or state.get("finding_ids")
-            ),
+            locked_finding_ids=finding_inventory_ids(state, confirmed_only=True),
             legacy_mode=scope.status == "legacy-unlocked",
             allow_legacy_unclassified=scope.status == "legacy-unlocked",
         )
@@ -6216,6 +6341,22 @@ def _recorded_follow_up_fingerprints(repo: Path, state: Mapping[str, Any]) -> se
     return recorded
 
 
+def _require_deferred_follow_up_completeness(
+    repo: Path, state: Mapping[str, Any]
+) -> tuple[set[str], set[str]]:
+    """Fail closed when review evidence lacks its first-class follow-up."""
+
+    deferred = _deferred_follow_up_fingerprints(repo, state)
+    recorded = _recorded_follow_up_fingerprints(repo, state)
+    unresolved = sorted(deferred - recorded)
+    if unresolved:
+        raise HLoopError(
+            "defer_follow_up candidates lack first-class follow-up artifacts: "
+            + ", ".join(unresolved)
+        )
+    return deferred, recorded
+
+
 def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     """Collect all fail-closed prerequisites for a fixed-target review."""
 
@@ -7029,6 +7170,9 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
         manifest,
         allow_legacy=scope.status == "legacy-unlocked",
     )
+    deferred_follow_ups, _recorded_follow_ups = _require_deferred_follow_up_completeness(
+        repo, state
+    )
     max_rounds = review_max_fix_rounds(state, convergence)
     if current_round > max_rounds:
         raise HLoopError(
@@ -7074,6 +7218,12 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
         )
 
     if not args.dry_run and not idempotent:
+        persist_finding_inventory(
+            state,
+            manifest,
+            source_ref=str(manifest_path.relative_to(repo)),
+        )
+        state["defer_follow_up_fingerprints"] = sorted(deferred_follow_ups)
         _update_review_execution_metrics(state, manifest, round_number)
         convergence["artifact_refs"] = [str(manifest_path.relative_to(repo))]
         convergence["verified_actionable_findings"] = actionable
@@ -7334,6 +7484,9 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
         raise HLoopError(
             f"final review target SHA is stale: converged={target or 'missing'} current={current or 'missing'}"
         )
+    deferred_follow_ups, _recorded_follow_ups = _require_deferred_follow_up_completeness(
+        repo, state
+    )
     certification_id = str(getattr(args, "certification_id", None) or _next_certification_id(state))
     paths = _final_paths(repo)
     plan, group = _final_certification_plan(
@@ -7359,6 +7512,7 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
         plan, review_manifest, verified_actionable_findings=0, patch_verdict="passed"
     )
     if not args.dry_run:
+        state["defer_follow_up_fingerprints"] = sorted(deferred_follow_ups)
         _write_json_artifact(paths["plan"], plan.to_record())
         _write_json_artifact(paths["manifest"], final_manifest.to_record())
         write_text(
@@ -7472,6 +7626,11 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
     if report_issues and status == "passed":
         status = "incomplete"
     if not args.dry_run:
+        persist_finding_inventory(
+            state,
+            evidence.review_manifest,
+            source_ref=str(manifest_path.relative_to(repo)),
+        )
         manual["status"] = status
         manual["certification_id"] = plan.certification_id
         manual["target_sha"] = plan.target_sha
@@ -9994,6 +10153,12 @@ None.
             "requirement_refs": [],
             "release_scope_refs": [],
         },
+        "finding_inventory": {
+            "fingerprints": [],
+            "finding_ids": [],
+            "records": {},
+            "updated_at": "",
+        },
         "dispatch_freeze": {
             "status": "inactive",
             "reason": "",
@@ -10154,6 +10319,10 @@ None.
         old.setdefault("batches", {})
         old.setdefault("decisions", {})
         old.setdefault("requirements", {})
+        old.setdefault(
+            "finding_inventory",
+            {"fingerprints": [], "finding_ids": [], "records": {}, "updated_at": ""},
+        )
         old.setdefault("manager_context", [])
         old.setdefault("progress_sequence", 0)
         old.setdefault("git_identity", git_executable_identity())
@@ -10207,6 +10376,8 @@ def cmd_release_scope_lock(args: argparse.Namespace) -> int:
         "PLAN.md",
     ]
     sources = read_scope_sources(repo, source_refs)
+    available_plan_item_refs = hloop_release_scope.discover_plan_item_refs(sources)
+    accepted_refs = accepted_requirement_ids(state)
     try:
         scope = hloop_release_scope.ReleaseScope.lock(
             source_refs=source_refs,
@@ -10218,6 +10389,8 @@ def cmd_release_scope_lock(args: argparse.Namespace) -> int:
             requirement_refs=_arg_list(args, "requirement_ref"),
             release_scope_refs=_arg_list(args, "scope_ref", "release_scope_ref")
             or source_refs,
+            available_plan_item_refs=available_plan_item_refs,
+            accepted_requirement_refs=accepted_refs,
         )
     except hloop_release_scope.ReleaseScopeError as exc:
         raise HLoopError(f"cannot lock release scope: {exc}") from exc
@@ -17658,6 +17831,7 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     reported_review_id = str(meta.get("review_id") or "")
     if reported_review_id and reported_review_id != review_id:
         raise HLoopError(f"review_id mismatch: expected {review_id}, got {reported_review_id}")
+    harvested_manifest: hloop_review.ReviewManifest | None = None
     if is_directory_review(review_state):
         worktree_raw = str(review_state.get("worktree") or "")
         if not worktree_raw:
@@ -17665,6 +17839,7 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
         worktree = Path(worktree_raw).resolve()
         manifest_source = review_manifest_file(worktree, review_id)
         manifest = load_review_manifest(manifest_source)
+        harvested_manifest = manifest
         if manifest.review_id != review_id:
             raise HLoopError(
                 f"review manifest id mismatch: expected {review_id}, got {manifest.review_id}"
@@ -17747,6 +17922,12 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     review_state["gate_status"] = "reported"
     review_state["artifact_status"] = artifact_status
     review_state["harvested_at"] = now_iso()
+    if harvested_manifest is not None:
+        persist_finding_inventory(
+            state,
+            harvested_manifest,
+            source_ref=str(review_state.get("manifest_path") or final_path),
+        )
     cleanup_completed_agent_pane(
         repo,
         review_state,
@@ -19093,6 +19274,12 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
                 review_manifest_file(repo, source_id),
             )
         )
+        if not args.dry_run:
+            persist_finding_inventory(
+                state,
+                manifest,
+                source_ref=str(artifact_path),
+            )
         candidates, rejected_candidates = confirmed_review_fix_task_candidates(
             manifest, candidates, rejected_candidates
         )

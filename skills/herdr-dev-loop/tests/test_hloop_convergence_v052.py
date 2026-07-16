@@ -248,15 +248,82 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8"
         )
 
+    def add_follow_up_artifact(self, fingerprint: str) -> None:
+        loop = self.state_path.parent
+        follow_up_path = loop / "follow-ups" / "F001.md"
+        follow_up_path.parent.mkdir(parents=True, exist_ok=True)
+        follow_up_path.write_text(
+            hloop.frontmatter(
+                {
+                    "id": "F001",
+                    "source_review_fingerprints": [fingerprint],
+                    "status": "deferred",
+                }
+            )
+            + "\n# Follow-up\n",
+            encoding="utf-8",
+        )
+        state = self.state()
+        state["follow_ups"]["artifact_refs"] = [
+            str(follow_up_path.relative_to(self.repo))
+        ]
+        self.save_state(state)
+
     def test_convergence_counts_use_axes_not_legacy_recommendation(self):
         self.prepare_convergence()
         self.write_policy_manifest(outside_release=True)
+        fingerprint = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        manifest = hloop_review.ReviewManifest.from_record(
+            json.loads(fingerprint.read_text(encoding="utf-8"))
+        )
+        self.add_follow_up_artifact(manifest.findings[0].fingerprint)
         code, out, err = self.run_cli("review", "convergence", "record", "--json")
         self.assertEqual((code, err), (0, ""), out)
         payload = json.loads(out)
         self.assertEqual(payload["status"], "converged")
         self.assertEqual(payload["verified_actionable_findings"], 0)
         self.assertEqual(payload["release_blocking_findings"], 0)
+
+    def test_convergence_and_final_prepare_recheck_deferred_follow_up_artifacts(self):
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=True)
+        manifest_path = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        manifest = hloop_review.ReviewManifest.from_record(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        fingerprint = manifest.findings[0].fingerprint
+        target = self.state()["review_convergence"]["target_sha"]
+
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual(code, 2)
+        self.assertIn("first-class follow-up artifacts", err)
+        state = self.state()
+        self.assertEqual(state["review_convergence"]["status"], "prepared")
+        self.assertEqual(state["review_convergence"]["target_sha"], target)
+
+        self.add_follow_up_artifact(fingerprint)
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        state = self.state()
+        self.assertEqual(state["review_convergence"]["status"], "converged")
+        self.assertEqual(state["review_convergence"]["target_sha"], target)
+        self.assertIn(fingerprint, state["finding_inventory"]["fingerprints"])
+        self.assertEqual(state["defer_follow_up_fingerprints"], [fingerprint])
+
+        follow_up_path = self.state_path.parent / "follow-ups" / "F001.md"
+        follow_up_path.unlink()
+        state = self.state()
+        state["follow_ups"]["artifact_refs"] = []
+        self.save_state(state)
+        code, out, err = self.run_cli("final-review", "prepare", "--json")
+        self.assertEqual(code, 2)
+        self.assertIn("first-class follow-up artifacts", err)
+        self.assertEqual(self.state()["review_convergence"]["target_sha"], target)
+
+        self.add_follow_up_artifact(fingerprint)
+        code, out, err = self.run_cli("final-review", "prepare", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(self.state()["manual_final_review"]["target_sha"], target)
 
     def test_readiness_fails_closed_without_changed_file_and_special_verification(self):
         target = self.state()["integration_head_sha"]

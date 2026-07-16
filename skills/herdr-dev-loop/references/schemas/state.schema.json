@@ -97,6 +97,39 @@
       },
       "additionalProperties": true
     },
+    "finding_inventory": {
+      "type": "object",
+      "required": ["fingerprints", "finding_ids", "records"],
+      "properties": {
+        "fingerprints": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "finding_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "records": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["fingerprint", "finding_ids", "head_sha", "source_refs", "confirmed"],
+            "properties": {
+              "fingerprint": {"type": "string"},
+              "finding_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+              "head_sha": {"type": "string"},
+              "source_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+              "confirmed": {"type": "boolean"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "updated_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
     "dispatch_freeze": {
       "type": "object",
       "required": ["status", "reason", "frozen_at", "source_input_id", "allowed_running_role_ids"],
