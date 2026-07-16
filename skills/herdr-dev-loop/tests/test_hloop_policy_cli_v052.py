@@ -71,6 +71,16 @@ class PolicyCliV052Tests(unittest.TestCase):
         )
         self.assertEqual(result, 0, output)
         loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+        result, output = self.run_cli(
+            repo,
+            "input",
+            "record",
+            "--source",
+            "manager-chat",
+            "--text",
+            "policy CLI fixture authorization",
+        )
+        self.assertEqual(result, 0, output)
         (loop / "PLAN.md").write_text(
             (loop / "PLAN.md").read_text(encoding="utf-8")
             + "\n- P004c: policy CLI test item\n",
@@ -454,7 +464,7 @@ class PolicyCliV052Tests(unittest.TestCase):
                 "--basis-ref",
                 "REQ-007",
                 "--user-input-id",
-                "U0002",
+                "U0001",
             )
             self.assertEqual(result, 0, output)
             result, output = self.run_cli(repo, "dispatch", "freeze", "--reason", "validation in progress")
@@ -470,7 +480,7 @@ class PolicyCliV052Tests(unittest.TestCase):
                 "--task-origin",
                 "user-amendment",
                 "--authorization-input-id",
-                "U0002",
+                "U0001",
             )
             self.assertNotEqual(result, 0)
             result, output = self.run_cli(repo, "dispatch", "unfreeze", "--user-input-id", "U0003")
@@ -540,6 +550,84 @@ class PolicyCliV052Tests(unittest.TestCase):
             payload = json.loads(output)
             self.assertFalse(payload["loop"]["dispatch_frozen"])
             self.assertNotIn("hloop reviewer start", payload["next_actions"])
+
+    def test_scope_amendment_cli_rejects_uncaptured_id_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            plan = loop / "PLAN.md"
+            plan.write_text(
+                plan.read_text(encoding="utf-8")
+                + "\nUncaptured scope amendment fixture.\n",
+                encoding="utf-8",
+            )
+            state_path = loop / "STATE.json"
+            before_state = state_path.read_bytes()
+
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "scope-change",
+                "--reason",
+                "reject uncaptured scope authorization",
+                "--user-input-id",
+                "U0002",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("captured input inventory", output)
+            self.assertEqual(before_state, state_path.read_bytes())
+            self.assertEqual(list((loop / "release-scope" / "amendments").glob("A*.json")), [])
+
+    def test_user_amendment_task_cli_rejects_uncaptured_id_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            plan = loop / "PLAN.md"
+            plan.write_text(
+                plan.read_text(encoding="utf-8")
+                + "\nAuthorized task amendment fixture.\n",
+                encoding="utf-8",
+            )
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "scope-change",
+                "--reason",
+                "record authorized scope change",
+                "--user-input-id",
+                "U0001",
+            )
+            self.assertEqual(result, 0, output)
+
+            state_path = loop / "STATE.json"
+            before_state = state_path.read_bytes()
+            task_path = loop / "tasks" / "T050.md"
+            self.assertFalse(task_path.exists())
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "uncaptured scope expansion",
+                "--id",
+                "T050",
+                "--kind",
+                "implementation",
+                "--write-allow",
+                "src/example.py",
+                "--task-origin",
+                "user-amendment",
+                "--authorization-input-id",
+                "U0002",
+                "--scope-expanding",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("captured input inventory", output)
+            self.assertEqual(before_state, state_path.read_bytes())
+            self.assertFalse(task_path.exists())
 
     def test_scope_amendment_invalidates_fixed_target_review_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

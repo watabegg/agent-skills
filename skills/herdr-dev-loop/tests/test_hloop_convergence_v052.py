@@ -49,6 +49,15 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             "--validation",
             "true",
         )
+        code, out, err = self.run_cli(
+            "input",
+            "record",
+            "--source",
+            "manager-chat",
+            "--text",
+            "convergence fixture authorization",
+        )
+        self.assertEqual((code, err), (0, ""), out)
         code, out, err = self.run_cli("release-scope", "lock")
         self.assertEqual((code, err), (0, ""), out)
         self.state_path = (
@@ -982,6 +991,16 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(json.loads(out)["status"], "pending")
 
         code, out, err = self.run_cli(
+            "input",
+            "record",
+            "--source",
+            "manager-chat",
+            "--text",
+            "second convergence fixture authorization",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+
+        code, out, err = self.run_cli(
             "review",
             "reopen",
             "--action",
@@ -1153,6 +1172,80 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertIn("authorized-extra-rounds-required", json.loads(out)["issues"])
         self.assertEqual(before, self.state())
 
+    def test_reopen_pure_transition_rejects_uncaptured_ids_atomically(self):
+        state = self.state()
+        state["phase"] = "review_convergence_exhausted"
+        state["review_convergence"].update(
+            {"status": "exhausted", "fix_round": 2, "verified_actionable_findings": 1}
+        )
+        state["dispatch_freeze"].update({"status": "active", "reason": "exhausted"})
+        state["inputs_index"] = {}
+        before = json.loads(json.dumps(state))
+
+        validation = hloop.hloop_certification.validate_reopen_transition(
+            state,
+            action="remediate",
+            user_input_id="U0001",
+            authorized_extra_rounds=1,
+            authorization_input_id="U0002",
+        )
+        self.assertFalse(validation.accepted)
+        self.assertIn("user-input-id-not-captured", validation.issues)
+        self.assertIn("authorization-input-id-not-captured", validation.issues)
+
+        result = hloop.hloop_certification.reopen_review(
+            state,
+            action="remediate",
+            user_input_id="U0001",
+            authorized_extra_rounds=1,
+            authorization_input_id="U0002",
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(state, before)
+        self.assertEqual(result.state, before)
+
+    def test_reopen_cli_rejects_uncaptured_user_and_extra_round_ids_atomically(self):
+        state = self.state()
+        state["phase"] = "review_convergence_exhausted"
+        state["review_convergence"].update(
+            {"status": "exhausted", "fix_round": 2, "verified_actionable_findings": 1}
+        )
+        state["dispatch_freeze"].update({"status": "active", "reason": "exhausted"})
+        self.save_state(state)
+        before = self.state_path.read_bytes()
+
+        code, out, err = self.run_cli(
+            "review",
+            "reopen",
+            "--action",
+            "remediate",
+            "--user-input-id",
+            "U0009",
+            "--json",
+        )
+        self.assertEqual((code, err), (2, ""), out)
+        self.assertIn("user-input-id-not-captured", json.loads(out)["issues"])
+        self.assertEqual(before, self.state_path.read_bytes())
+
+        code, out, err = self.run_cli(
+            "review",
+            "reopen",
+            "--action",
+            "remediate",
+            "--user-input-id",
+            "U0001",
+            "--authorized-extra-rounds",
+            "1",
+            "--authorization-input-id",
+            "U0009",
+            "--json",
+        )
+        self.assertEqual((code, err), (2, ""), out)
+        self.assertIn(
+            "authorization-input-id-not-captured", json.loads(out)["issues"]
+        )
+        self.assertEqual(before, self.state_path.read_bytes())
+
     def _prepare_failed_final_review(self) -> None:
         state = self.state()
         state["phase"] = "manual_final_review_failed"
@@ -1222,6 +1315,36 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(state["release_scope"]["last_user_input_id"], "U0001")
         self.assertEqual(state["manual_final_review"]["status"], "pending")
         self.assertEqual(state["dispatch_freeze"]["status"], "inactive")
+
+    def test_scope_changing_reopen_cli_rejects_uncaptured_id_before_artifact(self):
+        self._prepare_failed_final_review()
+        loop = self.state_path.parent
+        (loop / "PLAN.md").write_text(
+            (loop / "PLAN.md").read_text(encoding="utf-8")
+            + "\nScope correction for an uncaptured authorization.\n",
+            encoding="utf-8",
+        )
+        before_state = self.state_path.read_bytes()
+
+        code, out, err = self.run_cli(
+            "review",
+            "reopen",
+            "--action",
+            "scope-amend",
+            "--user-input-id",
+            "U0009",
+            "--scope-reason",
+            "uncaptured scope correction",
+            "--scope-basis-ref",
+            "REQ-005",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("captured input inventory", err)
+        self.assertEqual(before_state, self.state_path.read_bytes())
+        self.assertEqual(
+            list((loop / "release-scope" / "amendments").glob("A*.json")), []
+        )
 
     def test_task_creation_after_non_scope_amendment_rejects_without_mutation(self):
         loop = self.state_path.parent

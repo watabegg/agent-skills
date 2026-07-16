@@ -1124,16 +1124,23 @@ def _reopen_issues(
         issues.append(f"unsupported-reopen-action:{action}")
     if not _valid_user_input_id(user_input_id, "user_input_id"):
         issues.append("user-input-id-invalid")
+    elif not hloop_release_scope.is_captured_input_id(
+        user_input_id, state.get("inputs_index")
+    ):
+        issues.append("user-input-id-not-captured")
     if (
         isinstance(authorized_extra_rounds, bool)
         or not isinstance(authorized_extra_rounds, int)
         or authorized_extra_rounds < 0
     ):
         issues.append("authorized-extra-rounds-invalid")
-    if authorization_input_id is not None and not _valid_user_input_id(
-        authorization_input_id, "authorization_input_id"
-    ):
-        issues.append("authorization-input-id-invalid")
+    if authorization_input_id is not None:
+        if not _valid_user_input_id(authorization_input_id, "authorization_input_id"):
+            issues.append("authorization-input-id-invalid")
+        elif not hloop_release_scope.is_captured_input_id(
+            authorization_input_id, state.get("inputs_index")
+        ):
+            issues.append("authorization-input-id-not-captured")
 
     freeze = state.get("dispatch_freeze")
     if not isinstance(freeze, Mapping) or freeze.get("status") != "active":
