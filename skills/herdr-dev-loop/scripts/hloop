@@ -7407,6 +7407,41 @@ def _report_nonnegative_int(
     return name, None, f"{name} must be a non-negative integer"
 
 
+_MANUAL_FINAL_REPORT_LIST_ALIASES: dict[str, tuple[str, ...]] = {
+    "residual_risks": ("residual_risks", "risks", "risk"),
+    "follow_up_refs": ("follow_up_refs", "follow_ups", "follow_up"),
+}
+
+
+def _manual_final_report_list_values(
+    record: Mapping[str, Any],
+) -> tuple[dict[str, list[str]], tuple[str, ...]]:
+    """Return only non-empty, unique string lists from a manual final report."""
+
+    values: dict[str, list[str]] = {}
+    invalid: list[str] = []
+    for field_name, names in _MANUAL_FINAL_REPORT_LIST_ALIASES.items():
+        matched = next((name for name in names if name in record), None)
+        if matched is None:
+            continue
+        raw = record[matched]
+        if not isinstance(raw, list):
+            invalid.append(field_name)
+            continue
+        normalized: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                invalid.append(field_name)
+                break
+            normalized.append(item.strip())
+        else:
+            if len(set(normalized)) != len(normalized):
+                invalid.append(field_name)
+            else:
+                values[field_name] = normalized
+    return values, tuple(dict.fromkeys(invalid))
+
+
 def _manual_final_report_issues(
     repo: Path,
     plan: hloop_certification.CertificationPlan,
@@ -7457,8 +7492,7 @@ def _manual_final_report_issues(
         "diff_inventory": ("diff_inventory", "reviewed_files"),
         "verification_records": ("verification_records", "verification"),
         "verification_shortfall": ("verification_shortfall", "shortfall"),
-        "residual_risks": ("residual_risks", "risks", "risk"),
-        "follow_up_refs": ("follow_up_refs", "follow_ups", "follow_up"),
+        **_MANUAL_FINAL_REPORT_LIST_ALIASES,
     }
     resolved: dict[str, Any] = {}
     for field_name in required_fields:
@@ -7611,10 +7645,8 @@ def _manual_final_report_issues(
         expected_findings = [finding.fingerprint for finding in evidence.review_manifest.findings]
         if len(finding_refs) != len(set(finding_refs)) or sorted(finding_refs) != sorted(expected_findings):
             issues.append("report-findings-mismatch")
-    if not isinstance(resolved.get("residual_risks"), list):
-        issues.append("report-invalid:residual_risks")
-    if not isinstance(resolved.get("follow_up_refs"), list):
-        issues.append("report-invalid:follow_up_refs")
+    _, invalid_lists = _manual_final_report_list_values(record)
+    issues.extend(f"report-invalid:{field_name}" for field_name in invalid_lists)
     require_text("coordinator_session_id")
     require_text("patch_verdict", evidence.patch_verdict)
     completed_at = _parse_metric_timestamp(resolved.get("completed_at"))
@@ -8277,6 +8309,13 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         raise HLoopError("manual final review report must use reviews/final/FINAL.md")
     report_issues = _manual_final_report_issues(repo, plan, evidence, report_path)
     validation_issues = sorted(set((*validation.issues, *report_issues)))
+    report_values: dict[str, list[str]] = {}
+    if not report_issues:
+        try:
+            report_record = read_frontmatter(report_path)
+        except (OSError, HLoopError):
+            report_record = {}
+        report_values, _ = _manual_final_report_list_values(report_record)
     status = validation.status
     if report_issues and status == "passed":
         status = "incomplete"
@@ -8317,6 +8356,11 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
             for result in evidence.review_manifest.lane_results
             if result.status == "completed"
         )
+        for field_name in _MANUAL_FINAL_REPORT_LIST_ALIASES:
+            if field_name in report_values:
+                manual[field_name] = report_values[field_name]
+            else:
+                manual.pop(field_name, None)
         if status == "passed":
             state["phase"] = "manual_final_review_passed"
         elif status == "incomplete":
@@ -8334,6 +8378,8 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         "current_target_sha": current,
         "manifest_complete": evidence.completeness.complete,
         "verified_actionable_findings": evidence.recomputed_verified_actionable_count,
+        "residual_risks": report_values.get("residual_risks", []),
+        "follow_up_refs": report_values.get("follow_up_refs", []),
         "issues": validation_issues,
         "plan": str(plan_path.relative_to(repo)),
         "manifest": str(manifest_path.relative_to(repo)),

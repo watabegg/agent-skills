@@ -216,7 +216,17 @@
         },
         "lane_completed_count": {"type": "integer", "minimum": 0},
         "lane_count": {"type": "integer", "minimum": 0},
-        "incomplete_attempt_count": {"type": "integer", "minimum": 0}
+        "incomplete_attempt_count": {"type": "integer", "minimum": 0},
+        "residual_risks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "follow_up_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
       },
       "additionalProperties": false
     }
@@ -267,7 +277,8 @@
       "properties": {
         "confirmed_findings": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "fixes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-        "accepted_risks": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        "accepted_risks": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "residual_risks": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
       },
       "additionalProperties": false
     },
