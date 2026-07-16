@@ -790,6 +790,7 @@ class FindingCandidate:
     requirement_refs: tuple[str, ...] = ()
     why_fix_now: str = ""
     policy_axes_explicit: bool | None = None
+    accepted_risk_decision_id: str = ""
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -821,6 +822,11 @@ class FindingCandidate:
             raise ReviewModelError(f"unsupported finding origin: {self.origin}")
         if not isinstance(self.requires_spec_decision, bool):
             raise ReviewModelError("requires_spec_decision must be boolean")
+        object.__setattr__(
+            self,
+            "accepted_risk_decision_id",
+            str(self.accepted_risk_decision_id or "").strip(),
+        )
 
         axes, inferred_explicit = _policy_axes_from_record(
             {
@@ -891,6 +897,7 @@ class FindingCandidate:
             "requirement_refs": list(self.requirement_refs),
             "why_fix_now": self.why_fix_now,
             "policy_axes_explicit": self.policy_axes_explicit,
+            "accepted_risk_decision_id": self.accepted_risk_decision_id,
         }
 
     @classmethod
@@ -944,6 +951,9 @@ class FindingCandidate:
             requirement_refs=record.get("requirement_refs", ()),
             why_fix_now=record.get("why_fix_now", ""),
             policy_axes_explicit=record.get("policy_axes_explicit", explicit),
+            accepted_risk_decision_id=record.get(
+                "accepted_risk_decision_id", record.get("decision_id", "")
+            ),
         )
         if record["fingerprint"] != candidate.fingerprint:
             raise ReviewModelError("finding candidate fingerprint does not match its evidence")
@@ -964,6 +974,7 @@ class NormalizedFinding:
     requirement_refs: tuple[str, ...] = ()
     why_fix_now: str = ""
     policy_axes_explicit: bool | None = None
+    accepted_risk_decision_id: str = ""
 
     def __post_init__(self) -> None:
         fingerprint = _required_text(self.fingerprint, "fingerprint")
@@ -980,6 +991,23 @@ class NormalizedFinding:
         object.__setattr__(self, "fingerprint", fingerprint)
         object.__setattr__(self, "head_sha", head_sha)
         object.__setattr__(self, "candidates", candidates)
+        candidate_decision_ids = {
+            candidate.accepted_risk_decision_id
+            for candidate in candidates
+            if candidate.accepted_risk_decision_id
+        }
+        decision_id = str(self.accepted_risk_decision_id or "").strip()
+        if decision_id and candidate_decision_ids and candidate_decision_ids != {decision_id}:
+            raise ReviewModelError(
+                "normalized finding accepted-risk decision does not match candidates"
+            )
+        if not decision_id and len(candidate_decision_ids) == 1:
+            decision_id = next(iter(candidate_decision_ids))
+        if len(candidate_decision_ids) > 1:
+            raise ReviewModelError(
+                "normalized finding candidates must share one accepted-risk decision"
+            )
+        object.__setattr__(self, "accepted_risk_decision_id", decision_id)
 
         candidate_axes = [
             candidate
@@ -1123,6 +1151,7 @@ class NormalizedFinding:
             "requirement_refs": list(self.requirement_refs),
             "why_fix_now": self.why_fix_now,
             "policy_axes_explicit": self.policy_axes_explicit,
+            "accepted_risk_decision_id": self.accepted_risk_decision_id,
             "candidates": [candidate.to_record() for candidate in self.candidates],
         }
 
@@ -1167,6 +1196,9 @@ class NormalizedFinding:
             requirement_refs=record.get("requirement_refs", ()),
             why_fix_now=record.get("why_fix_now", ""),
             policy_axes_explicit=record.get("policy_axes_explicit", explicit),
+            accepted_risk_decision_id=record.get(
+                "accepted_risk_decision_id", record.get("decision_id", "")
+            ),
         )
         declared = {
             "severity": record["severity"],
@@ -1838,6 +1870,7 @@ def validate_manifest_policy(
     manifest: ReviewManifest,
     *,
     allow_legacy: bool = False,
+    accepted_risk_authorizations: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
     """Validate every finding's disposition before a review gate mutates state.
 
@@ -1867,6 +1900,57 @@ def validate_manifest_policy(
                 f"{finding.fingerprint} has candidate records without explicit policy axes"
             )
         try:
+            authorization = None
+            if finding.disposition == "accepted_risk":
+                authorization = (
+                    accepted_risk_authorizations or {}
+                ).get(finding.fingerprint)
+                if authorization is None:
+                    issues.append(
+                        "review finding "
+                        f"{finding.fingerprint} requires a finding-linked accepted-risk decision"
+                    )
+                else:
+                    resolved = getattr(authorization, "authorization", authorization)
+                    if isinstance(resolved, Mapping):
+                        auth_fingerprint = str(
+                            resolved.get(
+                                "finding_fingerprint", resolved.get("fingerprint", "")
+                            )
+                        )
+                        auth_target = str(
+                            resolved.get("target_sha", resolved.get("head_sha", ""))
+                        )
+                        auth_status = str(
+                            getattr(authorization, "status", "")
+                            or resolved.get("status", "")
+                        )
+                    else:
+                        auth_fingerprint = str(
+                            getattr(resolved, "finding_fingerprint", "")
+                        )
+                        auth_target = str(getattr(resolved, "target_sha", ""))
+                        auth_status = str(getattr(authorization, "status", ""))
+                    if auth_fingerprint != finding.fingerprint:
+                        issues.append(
+                            f"review finding {finding.fingerprint} accepted-risk decision links a different finding"
+                        )
+                    if auth_target != finding.head_sha:
+                        issues.append(
+                            f"review finding {finding.fingerprint} accepted-risk decision targets a different SHA"
+                        )
+                    if auth_status != "accepted":
+                        issues.append(
+                            f"review finding {finding.fingerprint} accepted-risk decision is not accepted"
+                        )
+                    decision_id = str(
+                        getattr(authorization, "decision_id", "")
+                        or (authorization.get("decision_id", "") if isinstance(authorization, Mapping) else "")
+                    )
+                    if finding.accepted_risk_decision_id and decision_id != finding.accepted_risk_decision_id:
+                        issues.append(
+                            f"review finding {finding.fingerprint} accepted-risk decision id does not match"
+                        )
             disposition = hloop_review_policy.FindingDisposition(
                 fact_status=finding.fact_status,
                 origin=finding.origin,
@@ -1880,6 +1964,7 @@ def validate_manifest_policy(
                 target_sha=finding.head_sha,
                 requirement_refs=finding.requirement_refs,
                 why_fix_now=finding.why_fix_now,
+                accepted_risk_decision_id=finding.accepted_risk_decision_id,
             )
             safety_critical = any(
                 hloop_review_policy.is_safety_critical_finding(
@@ -1894,6 +1979,10 @@ def validate_manifest_policy(
             hloop_review_policy.validate_disposition(
                 disposition,
                 safety_critical=safety_critical,
+                accepted_risk_authorized=(
+                    finding.disposition == "accepted_risk"
+                    and authorization is not None
+                ),
             )
         except hloop_review_policy.ReviewPolicyError as exc:
             issues.append(
@@ -1906,10 +1995,15 @@ def review_manifest_policy_counts(
     manifest: ReviewManifest,
     *,
     allow_legacy: bool = False,
+    accepted_risk_authorizations: Mapping[str, Any] | None = None,
 ) -> tuple[int, int]:
     """Return ``(actionable, release_blocking)`` after policy validation."""
 
-    issues = validate_manifest_policy(manifest, allow_legacy=allow_legacy)
+    issues = validate_manifest_policy(
+        manifest,
+        allow_legacy=allow_legacy,
+        accepted_risk_authorizations=accepted_risk_authorizations,
+    )
     if issues:
         raise ReviewModelError("; ".join(issues))
     return (

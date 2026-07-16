@@ -15,6 +15,7 @@ and no other work is active.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import re
 from typing import Any, Mapping, Sequence
 
@@ -55,6 +56,7 @@ ACTIVE_TASK_STATUSES = frozenset({"running", "result_reported"})
 _DECISION_ID = re.compile(r"^D[0-9]{3}$")
 _TASK_ID = re.compile(r"^T[0-9]{3}$")
 _OPTION_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class DecisionValidationError(ValueError):
@@ -63,6 +65,10 @@ class DecisionValidationError(ValueError):
 
 class DecisionTransitionError(ValueError):
     """Raised when response, resolution, or reclassification is not allowed."""
+
+
+class DecisionAuthorizationError(ValueError):
+    """Raised when an accepted-risk decision cannot authorize a finding."""
 
 
 def _required_text(value: Any, field_name: str) -> str:
@@ -89,6 +95,113 @@ def _text_tuple(
     if len(set(items)) != len(items):
         raise DecisionValidationError(f"{field_name} must contain unique values")
     return items
+
+
+def _optional_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _timestamp(value: str, field_name: str) -> str:
+    text = _required_text(value, field_name)
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise DecisionValidationError(
+            f"{field_name} must be an RFC 3339 timestamp"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DecisionValidationError(f"{field_name} must include a timezone")
+    return text
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedRiskAuthorization:
+    """Finding- and target-specific evidence for an accepted release risk."""
+
+    finding_fingerprint: str
+    target_sha: str
+    authorized_by: str
+    risk: str
+    reason: str
+    expires_at: str = ""
+    reconsider_condition: str = ""
+
+    def __post_init__(self) -> None:
+        fingerprint = _required_text(self.finding_fingerprint, "finding_fingerprint")
+        if not _FINGERPRINT.fullmatch(fingerprint):
+            raise DecisionValidationError(
+                "finding_fingerprint must use the sha256:<64 hex chars> format"
+            )
+        object.__setattr__(self, "finding_fingerprint", fingerprint)
+        object.__setattr__(self, "target_sha", _required_text(self.target_sha, "target_sha"))
+        object.__setattr__(
+            self, "authorized_by", _required_text(self.authorized_by, "authorized_by")
+        )
+        object.__setattr__(self, "risk", _required_text(self.risk, "risk"))
+        object.__setattr__(self, "reason", _required_text(self.reason, "reason"))
+        expires_at = _optional_text(self.expires_at)
+        reconsider = _optional_text(self.reconsider_condition)
+        if not expires_at and not reconsider:
+            raise DecisionValidationError(
+                "accepted-risk authorization requires expires_at or reconsider_condition"
+            )
+        if expires_at:
+            expires_at = _timestamp(expires_at, "expires_at")
+        object.__setattr__(self, "expires_at", expires_at)
+        object.__setattr__(self, "reconsider_condition", reconsider)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "AcceptedRiskAuthorization":
+        if not isinstance(record, Mapping):
+            raise DecisionValidationError(
+                "accepted_risk_authorization must be an object"
+            )
+        return cls(
+            finding_fingerprint=record.get(
+                "finding_fingerprint",
+                record.get("fingerprint", record.get("source_finding", "")),
+            ),
+            target_sha=record.get("target_sha", record.get("head_sha", "")),
+            authorized_by=record.get(
+                "authorized_by",
+                record.get("principal", record.get("authority", "")),
+            ),
+            risk=record.get("risk", record.get("target_risk", "")),
+            reason=record.get("reason", record.get("rationale", "")),
+            expires_at=record.get("expires_at", record.get("expires_on", "")),
+            reconsider_condition=record.get(
+                "reconsider_condition", record.get("reconsider", "")
+            ),
+        )
+
+    def to_record(self) -> dict[str, str]:
+        record = {
+            "finding_fingerprint": self.finding_fingerprint,
+            "target_sha": self.target_sha,
+            "authorized_by": self.authorized_by,
+            "risk": self.risk,
+            "reason": self.reason,
+            "expires_at": self.expires_at,
+            "reconsider_condition": self.reconsider_condition,
+        }
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedAcceptedRiskAuthorization:
+    """A validated authorization together with its canonical decision id."""
+
+    decision_id: str
+    status: str
+    authorization: AcceptedRiskAuthorization
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "decision_id": self.decision_id,
+            "status": self.status,
+            **self.authorization.to_record(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +406,7 @@ class DecisionRecord:
     response: DecisionResponse | None = None
     resolution: DecisionResolution | None = None
     created_from: str = ""
+    accepted_risk_authorization: AcceptedRiskAuthorization | None = None
 
     def __post_init__(self) -> None:
         decision_id = _required_text(self.decision_id, "decision_id")
@@ -364,6 +478,14 @@ class DecisionRecord:
                     "an accepted user decision requires a recorded response"
                 )
 
+        authorization = (
+            self.accepted_risk_authorization
+            if isinstance(self.accepted_risk_authorization, AcceptedRiskAuthorization)
+            else AcceptedRiskAuthorization.from_record(self.accepted_risk_authorization)
+            if self.accepted_risk_authorization is not None
+            else None
+        )
+
         object.__setattr__(self, "decision_id", decision_id)
         object.__setattr__(self, "question", _required_text(self.question, "question"))
         object.__setattr__(self, "options", options)
@@ -375,6 +497,7 @@ class DecisionRecord:
         object.__setattr__(self, "response", response)
         object.__setattr__(self, "resolution", resolution)
         object.__setattr__(self, "created_from", str(self.created_from or "").strip())
+        object.__setattr__(self, "accepted_risk_authorization", authorization)
 
     @property
     def unresolved(self) -> bool:
@@ -388,6 +511,11 @@ class DecisionRecord:
     def from_record(cls, record: Mapping[str, Any]) -> "DecisionRecord":
         raw_response = record.get("response")
         raw_resolution = record.get("resolution")
+        raw_authorization = record.get("accepted_risk_authorization")
+        if raw_authorization is None and isinstance(record.get("accepted_risk"), Mapping):
+            raw_authorization = record.get("accepted_risk")
+        if raw_authorization is None and record.get("authorization_kind") == "accepted_risk":
+            raw_authorization = record
         return cls(
             decision_id=record.get("id", record.get("decision_id", "")),
             decision_class=record.get("class", record.get("decision_class", "")),
@@ -402,6 +530,11 @@ class DecisionRecord:
                 _resolution(raw_resolution) if raw_resolution is not None else None
             ),
             created_from=record.get("created_from", ""),
+            accepted_risk_authorization=(
+                AcceptedRiskAuthorization.from_record(raw_authorization)
+                if raw_authorization is not None
+                else None
+            ),
         )
 
     def to_record(self) -> dict[str, Any]:
@@ -421,11 +554,117 @@ class DecisionRecord:
             record["resolution"] = self.resolution.to_record()
         if self.created_from:
             record["created_from"] = self.created_from
+        if self.accepted_risk_authorization is not None:
+            record["accepted_risk_authorization"] = (
+                self.accepted_risk_authorization.to_record()
+            )
         return record
 
 
 def _decision(value: DecisionRecord | Mapping[str, Any]) -> DecisionRecord:
     return value if isinstance(value, DecisionRecord) else DecisionRecord.from_record(value)
+
+
+def _decision_items(
+    decisions: Mapping[str, DecisionRecord | Mapping[str, Any]] | Sequence[Any],
+) -> tuple[tuple[str, DecisionRecord], ...]:
+    if isinstance(decisions, Mapping):
+        items = decisions.items()
+    elif isinstance(decisions, Sequence) and not isinstance(decisions, (str, bytes)):
+        items = (("", value) for value in decisions)
+    else:
+        raise DecisionAuthorizationError("decisions must be a mapping or sequence")
+    normalized: list[tuple[str, DecisionRecord]] = []
+    for key, value in items:
+        try:
+            record = _decision(value)
+        except (DecisionValidationError, TypeError, ValueError) as exc:
+            if str(key):
+                raise DecisionAuthorizationError(
+                    f"invalid decision record {key}: {exc}"
+                ) from exc
+            continue
+        normalized.append((record.decision_id, record))
+    return tuple(normalized)
+
+
+def resolve_accepted_risk_authorization(
+    decisions: Mapping[str, DecisionRecord | Mapping[str, Any]] | Sequence[Any],
+    *,
+    finding_fingerprint: str,
+    target_sha: str,
+    decision_id: str = "",
+    now: datetime | None = None,
+) -> ResolvedAcceptedRiskAuthorization:
+    """Resolve one accepted-risk authorization without allowing fail-open use.
+
+    A decision is eligible only when its embedded authorization names the exact
+    finding fingerprint and target SHA, and the canonical decision has the
+    terminal ``accepted`` status.  Pending, rejected, stale, ambiguous, or
+    malformed records are explicit errors rather than fallback approvals.
+    """
+
+    fingerprint = _required_text(finding_fingerprint, "finding_fingerprint")
+    if not _FINGERPRINT.fullmatch(fingerprint):
+        raise DecisionAuthorizationError(
+            "finding_fingerprint must use the sha256:<64 hex chars> format"
+        )
+    target = _required_text(target_sha, "target_sha")
+    requested_id = _optional_text(decision_id)
+    records = _decision_items(decisions)
+    candidates: list[tuple[str, DecisionRecord, AcceptedRiskAuthorization]] = []
+    mismatches: list[str] = []
+    for current_id, record in records:
+        if requested_id and current_id != requested_id:
+            continue
+        authorization = record.accepted_risk_authorization
+        if authorization is None:
+            continue
+        linked = authorization.finding_fingerprint == fingerprint or fingerprint in record.source_findings
+        if not linked:
+            continue
+        if authorization.finding_fingerprint != fingerprint:
+            mismatches.append(f"decision {current_id} links a different finding")
+            continue
+        if authorization.target_sha != target:
+            mismatches.append(f"decision {current_id} targets a different SHA")
+            continue
+        candidates.append((current_id, record, authorization))
+
+    if mismatches:
+        raise DecisionAuthorizationError("; ".join(sorted(set(mismatches))))
+    if not candidates:
+        suffix = f" decision {requested_id}" if requested_id else ""
+        raise DecisionAuthorizationError(
+            f"accepted_risk authorization is missing for {fingerprint} at {target}{suffix}"
+        )
+    if len(candidates) != 1:
+        ids = ", ".join(sorted(item[0] for item in candidates))
+        raise DecisionAuthorizationError(
+            f"accepted_risk authorization is ambiguous for {fingerprint}: {ids}"
+        )
+
+    current_id, record, authorization = candidates[0]
+    if record.status != DECISION_ACCEPTED:
+        raise DecisionAuthorizationError(
+            f"decision {current_id} is {record.status}, not accepted"
+        )
+    if record.resolution is None or record.resolution.outcome != DECISION_ACCEPTED:
+        raise DecisionAuthorizationError(
+            f"decision {current_id} has no accepted resolution"
+        )
+    reference_now = now or datetime.now(timezone.utc)
+    if authorization.expires_at:
+        expires_text = authorization.expires_at
+        candidate = expires_text[:-1] + "+00:00" if expires_text.endswith("Z") else expires_text
+        expires = datetime.fromisoformat(candidate)
+        if expires <= reference_now:
+            raise DecisionAuthorizationError(f"decision {current_id} authorization has expired")
+    return ResolvedAcceptedRiskAuthorization(
+        decision_id=current_id,
+        status=record.status,
+        authorization=authorization,
+    )
 
 
 def reclassify_decision(

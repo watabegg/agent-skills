@@ -226,8 +226,49 @@
           "type": "array",
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
+        },
+        "accepted_risk_authorizations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/accepted_risk_authorization"}
         }
       },
+      "additionalProperties": false
+    },
+    "accepted_risk_authorization": {
+      "type": "object",
+      "required": [
+        "decision_id",
+        "status",
+        "finding_fingerprint",
+        "target_sha",
+        "authorized_by",
+        "risk",
+        "reason"
+      ],
+      "properties": {
+        "decision_id": {"type": "string", "pattern": "^D[0-9]{3}$"},
+        "status": {"const": "accepted"},
+        "finding_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "target_sha": {"type": "string", "minLength": 1},
+        "authorized_by": {"type": "string", "minLength": 1},
+        "risk": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "expires_at": {"type": "string"},
+        "reconsider_condition": {"type": "string"}
+      },
+      "anyOf": [
+        {
+          "required": ["expires_at"],
+          "properties": {"expires_at": {"type": "string", "minLength": 1}}
+        },
+        {
+          "required": ["reconsider_condition"],
+          "properties": {
+            "reconsider_condition": {"type": "string", "minLength": 1}
+          }
+        }
+      ],
       "additionalProperties": false
     }
   },
@@ -278,6 +319,11 @@
         "confirmed_findings": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "fixes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "accepted_risks": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "accepted_risk_authorizations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/accepted_risk_authorization"}
+        },
         "residual_risks": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
       },
       "additionalProperties": false

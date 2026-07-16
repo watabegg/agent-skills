@@ -221,6 +221,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         product_impact: str = "the policy impact",
         disposition: str | None = None,
         release_effect: str | None = None,
+        accepted_risk_decision_id: str = "",
     ) -> None:
         loop = self.state_path.parent
         plan = json.loads(
@@ -247,6 +248,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             decision_requirement="none",
             disposition=disposition or ("defer_follow_up" if outside_release else "fix_now"),
             release_effect=release_effect or ("non_blocking" if outside_release else "blocking"),
+            accepted_risk_decision_id=accepted_risk_decision_id,
         )
         finding = hloop_review.normalize_findings((candidate,))[0]
         verification_plan = hloop_review.plan_verification(group, (finding,))
@@ -295,6 +297,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         origin: str = "introduced",
         contract_relation: str = "in_scope",
         legacy: bool = False,
+        accepted_risk_decision_id: str = "",
     ) -> None:
         self.prepare_convergence()
         self.complete_convergence_manifest()
@@ -330,6 +333,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             decision_requirement=decision_requirement,
             disposition=disposition,
             release_effect=release_effect,
+            accepted_risk_decision_id=accepted_risk_decision_id,
         )
         finding = hloop_review.normalize_findings((finding_candidate,))[0]
         verification_plan = hloop_review.plan_verification(group, (finding,))
@@ -420,6 +424,62 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         ]
         self.save_state(state)
 
+    def record_accepted_risk_decision(
+        self,
+        fingerprint: str,
+        target_sha: str,
+        *,
+        decision_id: str = "D001",
+        status: str = "accepted",
+        decision_target_sha: str | None = None,
+        decision_finding_fingerprint: str | None = None,
+        expires_at: str = "",
+        reconsider_condition: str = "Reconsider when the release contract changes.",
+    ) -> None:
+        state = self.state()
+        decision = {
+            "id": decision_id,
+            "class": "advisory",
+            "status": status,
+            "question": "Accept the concrete residual risk for this finding?",
+            "options": [
+                {
+                    "id": "opt_1",
+                    "label": "Accept the risk",
+                    "tradeoffs": ["The risk remains documented for this target."],
+                },
+                {
+                    "id": "opt_2",
+                    "label": "Do not accept the risk",
+                    "tradeoffs": ["The finding remains release-blocking."],
+                },
+            ],
+            "recommendation": {
+                "option_id": "opt_1",
+                "rationale": "The approved release contract records this risk.",
+            },
+            "source_findings": [fingerprint],
+            "accepted_risk_authorization": {
+                "finding_fingerprint": decision_finding_fingerprint or fingerprint,
+                "target_sha": decision_target_sha or target_sha,
+                "authorized_by": "release-owner",
+                "risk": "Compatibility behavior remains observable.",
+                "reason": "The approved contract explicitly accepts this residual risk.",
+                "expires_at": expires_at,
+                "reconsider_condition": reconsider_condition,
+            },
+        }
+        if status == "accepted":
+            decision["resolution"] = {
+                "outcome": "accepted",
+                "rationale": "Accepted for the fixed target.",
+                "resolved_by": "release-owner",
+                "resolved_at": hloop.now_iso(),
+                "selected_option": "opt_1",
+            }
+        state.setdefault("decisions", {})[decision_id] = decision
+        self.save_state(state)
+
     def test_convergence_counts_use_axes_not_legacy_recommendation(self):
         self.prepare_convergence()
         self.write_policy_manifest(outside_release=True)
@@ -434,6 +494,106 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(payload["status"], "converged")
         self.assertEqual(payload["verified_actionable_findings"], 0)
         self.assertEqual(payload["release_blocking_findings"], 0)
+
+    def test_convergence_accepts_only_finding_linked_decision_authorization(self):
+        self.prepare_convergence()
+        self.write_policy_manifest(
+            outside_release=True,
+            disposition="accepted_risk",
+            release_effect="non_blocking",
+        )
+        manifest_path = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        manifest = hloop_review.ReviewManifest.from_record(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        finding = manifest.findings[0]
+        target = self.state()["review_convergence"]["target_sha"]
+        self.record_accepted_risk_decision(finding.fingerprint, target)
+
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "converged")
+        self.assertEqual(payload["verified_actionable_findings"], 0)
+        self.assertEqual(payload["release_blocking_findings"], 0)
+        authorization = self.state()["accepted_risk_authorizations"][finding.fingerprint]
+        self.assertEqual(authorization["decision_id"], "D001")
+        self.assertEqual(authorization["target_sha"], target)
+        self.assertEqual(self.state()["defer_follow_up_fingerprints"], [])
+
+    def test_convergence_rejects_unauthorized_authorization_atomically(self):
+        cases = (
+            {"status": "pending"},
+            {"status": "accepted", "decision_target_sha": "wrong-target"},
+            {"status": "rejected"},
+            {
+                "status": "accepted",
+                "decision_finding_fingerprint": "sha256:" + "b" * 64,
+            },
+            {"status": "accepted", "expires_at": "2000-01-01T00:00:00Z"},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.prepare_convergence()
+                self.write_policy_manifest(
+                    outside_release=True,
+                    disposition="accepted_risk",
+                    release_effect="non_blocking",
+                )
+                manifest_path = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+                manifest = hloop_review.ReviewManifest.from_record(
+                    json.loads(manifest_path.read_text(encoding="utf-8"))
+                )
+                finding = manifest.findings[0]
+                target = self.state()["review_convergence"]["target_sha"]
+                self.record_accepted_risk_decision(
+                    finding.fingerprint,
+                    target,
+                    **case,
+                )
+                before = self.state()
+                code, out, err = self.run_cli(
+                    "review", "convergence", "record", "--json"
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("accepted-risk", err)
+                self.assertEqual(before, self.state())
+                manifest_path.unlink()
+
+    def test_manual_final_and_final_report_project_authorized_risk_without_follow_up(self):
+        self.write_final_policy_manifest(
+            disposition="accepted_risk",
+            release_effect="non_blocking",
+        )
+        loop = self.state_path.parent
+        manifest_path = loop / "reviews" / "final" / "MANIFEST.json"
+        manifest = FinalReviewManifest.from_record(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        finding = manifest.review_manifest.findings[0]
+        self.record_accepted_risk_decision(finding.fingerprint, manifest.target_sha)
+
+        code, out, err = self.run_cli("final-review", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["verified_actionable_findings"], 0)
+        self.assertEqual(payload["accepted_risks"][0]["decision_id"], "D001")
+        state = self.state()
+        self.assertEqual(
+            state["manual_final_review"]["accepted_risk_authorizations"][finding.fingerprint][
+                "decision_id"
+            ],
+            "D001",
+        )
+        self.assertEqual(state["defer_follow_up_fingerprints"], [])
+
+        code, out, err = self.run_cli("report")
+        self.assertEqual((code, err), (0, ""), out)
+        report = (loop / "reports" / "DRAFT.md").read_text(encoding="utf-8")
+        self.assertIn("D001", report)
+        self.assertIn("Compatibility behavior remains observable", report)
 
     def test_convergence_and_final_prepare_recheck_deferred_follow_up_artifacts(self):
         self.prepare_convergence()

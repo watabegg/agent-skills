@@ -873,6 +873,7 @@ def validate_final_review(
     *,
     current_target_sha: str | None = None,
     allow_legacy: bool = False,
+    accepted_risk_authorizations: Mapping[str, Any] | None = None,
 ) -> CertificationValidation:
     """Recompute final-review completeness and return a fail-closed result."""
 
@@ -897,6 +898,7 @@ def validate_final_review(
     policy_issues = validate_manifest_policy(
         evidence.review_manifest,
         allow_legacy=allow_legacy,
+        accepted_risk_authorizations=accepted_risk_authorizations,
     )
     issues.extend(f"policy:{issue}" for issue in policy_issues)
     if policy_issues:
@@ -905,6 +907,7 @@ def validate_final_review(
         recomputed_actionable_count, _ = review_manifest_policy_counts(
             evidence.review_manifest,
             allow_legacy=allow_legacy,
+            accepted_risk_authorizations=accepted_risk_authorizations,
         )
     if evidence.manifest_complete != completeness.complete:
         issues.append("manifest-complete-claim-mismatch")
@@ -951,6 +954,7 @@ def certify_final_review(
     *,
     current_target_sha: str | None = None,
     allow_legacy: bool = False,
+    accepted_risk_authorizations: Mapping[str, Any] | None = None,
 ) -> CertificationValidation:
     """Validate evidence and raise if the manual final gate cannot pass."""
 
@@ -959,6 +963,7 @@ def certify_final_review(
         manifest,
         current_target_sha=current_target_sha,
         allow_legacy=allow_legacy,
+        accepted_risk_authorizations=accepted_risk_authorizations,
     )
     result.raise_for_error()
     return result

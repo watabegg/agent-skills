@@ -85,7 +85,8 @@
       "items": {"type": "string", "minLength": 1}
     },
     "why_fix_now": {"type": "string"},
-    "policy_axes_explicit": {"type": "boolean"}
+    "policy_axes_explicit": {"type": "boolean"},
+    "accepted_risk_decision_id": {"type": "string", "pattern": "^$|^D[0-9]{3}$"}
   },
   "allOf": [
     {
@@ -100,6 +101,15 @@
     {
       "if": {"properties": {"classification": {"const": "unique"}}},
       "then": {"properties": {"cross_model_consensus": {"const": false}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "accepted_risk"}}},
+      "then": {
+        "required": ["accepted_risk_decision_id"],
+        "properties": {
+          "accepted_risk_decision_id": {"pattern": "^D[0-9]{3}$"}
+        }
+      }
     }
   ],
   "$defs": {
@@ -178,8 +188,20 @@
           "items": {"type": "string", "minLength": 1}
         },
         "why_fix_now": {"type": "string"},
-        "policy_axes_explicit": {"type": "boolean"}
+        "policy_axes_explicit": {"type": "boolean"},
+        "accepted_risk_decision_id": {"type": "string", "pattern": "^$|^D[0-9]{3}$"}
       },
+      "allOf": [
+        {
+          "if": {"properties": {"disposition": {"const": "accepted_risk"}}},
+          "then": {
+            "required": ["accepted_risk_decision_id"],
+            "properties": {
+              "accepted_risk_decision_id": {"pattern": "^D[0-9]{3}$"}
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     }
   },
