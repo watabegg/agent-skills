@@ -10,7 +10,24 @@
     "base": {"type": "string"},
     "head": {"type": "string"},
     "head_sha": {"type": "string"},
-    "status": {"enum": ["reported", "blocked", "failed"]}
+    "status": {"enum": ["reported", "blocked", "failed"]},
+    "scope_revision": {"type": "integer", "minimum": 0},
+    "source_snapshot_revision": {"type": "integer", "minimum": 0},
+    "release_scope_digest": {"type": "string", "pattern": "^(sha256:)?[0-9a-f]{64}$"},
+    "review_policy": {"type": "object"},
+    "convergence_round": {"type": "integer", "minimum": 0},
+    "disposition": {
+      "enum": [
+        "fix_now",
+        "defer_follow_up",
+        "disable_feature",
+        "mark_experimental",
+        "user_decision",
+        "accepted_risk",
+        "discard"
+      ]
+    },
+    "verified_actionable_findings": {"type": "integer", "minimum": 0}
   },
   "additionalProperties": true
 }
