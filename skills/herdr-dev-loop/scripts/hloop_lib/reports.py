@@ -8,7 +8,7 @@ execution evidence needed by a final report and postmortem.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import math
 from typing import Any, Mapping, Sequence
@@ -739,6 +739,83 @@ class ReviewConvergenceProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptedRiskProjection:
+    """Decision-backed residual-risk evidence projected into an outcome."""
+
+    decision_id: str
+    status: str
+    finding_fingerprint: str
+    target_sha: str
+    authorized_by: str
+    risk: str
+    reason: str
+    expires_at: str = ""
+    reconsider_condition: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "decision_id",
+            "status",
+            "finding_fingerprint",
+            "target_sha",
+            "authorized_by",
+            "risk",
+            "reason",
+            "expires_at",
+            "reconsider_condition",
+        ):
+            object.__setattr__(
+                self, field_name, _optional_text(getattr(self, field_name), field_name)
+            )
+        if not self.decision_id or self.status != "accepted":
+            raise OutcomeModelError(
+                "accepted-risk projection requires an accepted decision id"
+            )
+        if not self.finding_fingerprint or not self.target_sha:
+            raise OutcomeModelError(
+                "accepted-risk projection requires finding fingerprint and target SHA"
+            )
+        if not self.authorized_by or not self.risk or not self.reason:
+            raise OutcomeModelError(
+                "accepted-risk projection requires authority, risk, and reason"
+            )
+        if not self.expires_at and not self.reconsider_condition:
+            raise OutcomeModelError(
+                "accepted-risk projection requires expiry or reconsider condition"
+            )
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "AcceptedRiskProjection":
+        record = _record(value, "accepted_risk_authorization")
+        return cls(
+            decision_id=record.get("decision_id", ""),
+            status=record.get("status", ""),
+            finding_fingerprint=record.get(
+                "finding_fingerprint", record.get("fingerprint", "")
+            ),
+            target_sha=record.get("target_sha", ""),
+            authorized_by=record.get("authorized_by", record.get("principal", "")),
+            risk=record.get("risk", ""),
+            reason=record.get("reason", record.get("rationale", "")),
+            expires_at=record.get("expires_at", ""),
+            reconsider_condition=record.get("reconsider_condition", ""),
+        )
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "decision_id": self.decision_id,
+            "status": self.status,
+            "finding_fingerprint": self.finding_fingerprint,
+            "target_sha": self.target_sha,
+            "authorized_by": self.authorized_by,
+            "risk": self.risk,
+            "reason": self.reason,
+            "expires_at": self.expires_at,
+            "reconsider_condition": self.reconsider_condition,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ManualFinalReviewProjection:
     """Certification completeness evidence projected into the final report."""
 
@@ -757,6 +834,7 @@ class ManualFinalReviewProjection:
     incomplete_attempt_count: int = 0
     residual_risks: tuple[str, ...] = ()
     follow_up_refs: tuple[str, ...] = ()
+    accepted_risk_authorizations: tuple[AcceptedRiskProjection, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _required_text(self.status, "manual final status"))
@@ -798,6 +876,17 @@ class ManualFinalReviewProjection:
             object.__setattr__(
                 self, field_name, _unique_texts(getattr(self, field_name), field_name)
             )
+        authorizations = tuple(
+            item
+            if isinstance(item, AcceptedRiskProjection)
+            else AcceptedRiskProjection.from_record(item)
+            for item in (self.accepted_risk_authorizations or ())
+        )
+        if len({item.decision_id for item in authorizations}) != len(authorizations):
+            raise OutcomeModelError(
+                "accepted-risk decision ids must be unique in manual final projection"
+            )
+        object.__setattr__(self, "accepted_risk_authorizations", authorizations)
 
     @property
     def complete(self) -> bool:
@@ -831,11 +920,17 @@ class ManualFinalReviewProjection:
             "incomplete_attempt_count": self.incomplete_attempt_count,
             "residual_risks": list(self.residual_risks),
             "follow_up_refs": list(self.follow_up_refs),
+            "accepted_risk_authorizations": [
+                item.to_record() for item in self.accepted_risk_authorizations
+            ],
         }
 
     @classmethod
     def from_record(cls, value: Mapping[str, Any]) -> "ManualFinalReviewProjection":
         record = _record(value, "manual_final_review")
+        raw_authorizations = record.get("accepted_risk_authorizations") or ()
+        if isinstance(raw_authorizations, Mapping):
+            raw_authorizations = tuple(raw_authorizations.values())
         return cls(
             status=record.get("status", "pending"),
             certification_id=record.get("certification_id", ""),
@@ -852,6 +947,10 @@ class ManualFinalReviewProjection:
             incomplete_attempt_count=record.get("incomplete_attempt_count", 0),
             residual_risks=record.get("residual_risks", ()),
             follow_up_refs=record.get("follow_up_refs", ()),
+            accepted_risk_authorizations=tuple(
+                AcceptedRiskProjection.from_record(item)
+                for item in raw_authorizations
+            ),
         )
 
 
@@ -936,6 +1035,22 @@ def report_projections_from_state(state: Mapping[str, Any]) -> dict[str, Any]:
     manual_final_review = _projection_from_state(
         state, "manual_final_review", ManualFinalReviewProjection
     )
+    raw_authorizations = state.get("accepted_risk_authorizations")
+    if raw_authorizations is None and isinstance(state.get("manual_final_review"), Mapping):
+        raw_authorizations = state["manual_final_review"].get(
+            "accepted_risk_authorizations"
+        )
+    if isinstance(raw_authorizations, Mapping):
+        raw_authorizations = tuple(raw_authorizations.values())
+    accepted_risk_authorizations = tuple(
+        AcceptedRiskProjection.from_record(item)
+        for item in (raw_authorizations or ())
+    )
+    if manual_final_review is not None and accepted_risk_authorizations:
+        manual_final_review = replace(
+            manual_final_review,
+            accepted_risk_authorizations=accepted_risk_authorizations,
+        )
     warnings = compute_postmortem_warnings(
         execution_metrics,
         convergence=convergence,
@@ -1006,6 +1121,7 @@ class OutcomeReport:
     review_findings: tuple[str, ...] = ()
     review_fixes: tuple[str, ...] = ()
     accepted_risks: tuple[str, ...] = ()
+    accepted_risk_authorizations: tuple[AcceptedRiskProjection, ...] = ()
     residual_risks: tuple[str, ...] = ()
     decisions: tuple[str, ...] = ()
     unresolved_items: tuple[str, ...] = ()
@@ -1061,6 +1177,17 @@ class OutcomeReport:
             object.__setattr__(
                 self, field_name, _unique_texts(getattr(self, field_name), field_name)
             )
+        authorizations = tuple(
+            item
+            if isinstance(item, AcceptedRiskProjection)
+            else AcceptedRiskProjection.from_record(item)
+            for item in (self.accepted_risk_authorizations or ())
+        )
+        if len({item.decision_id for item in authorizations}) != len(authorizations):
+            raise OutcomeModelError(
+                "accepted-risk decision ids must be unique in outcome report"
+            )
+        object.__setattr__(self, "accepted_risk_authorizations", authorizations)
         for field_name, model in (
             ("manager_invocation", ManagerInvocation),
             ("execution_metrics", ExecutionMetrics),
@@ -1076,12 +1203,26 @@ class OutcomeReport:
             elif not isinstance(value, model):
                 raise OutcomeModelError(f"{field_name} must be a {model.__name__}")
             object.__setattr__(self, field_name, value)
-        if not self.residual_risks and self.manual_final_review is not None:
+        projected_residual_risks = tuple(
+            f"{item.decision_id}: {item.risk}"
+            for item in self.accepted_risk_authorizations
+        )
+        if self.manual_final_review is not None:
             object.__setattr__(
                 self,
                 "residual_risks",
-                self.manual_final_review.residual_risks,
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *self.residual_risks,
+                            *self.manual_final_review.residual_risks,
+                            *projected_residual_risks,
+                        )
+                    )
+                ),
             )
+        elif not self.residual_risks and projected_residual_risks:
+            object.__setattr__(self, "residual_risks", projected_residual_risks)
         warnings = _unique_texts(self.postmortem_warnings, "postmortem_warnings")
         if not warnings and any(
             value is not None
@@ -1179,6 +1320,9 @@ class OutcomeReport:
                 "confirmed_findings": list(self.review_findings),
                 "fixes": list(self.review_fixes),
                 "accepted_risks": list(self.accepted_risks),
+                "accepted_risk_authorizations": [
+                    item.to_record() for item in self.accepted_risk_authorizations
+                ],
             },
             "decisions": list(self.decisions),
             "unresolved_items": list(self.unresolved_items),
@@ -1238,6 +1382,10 @@ class OutcomeReport:
             review_findings=tuple(review.get("confirmed_findings") or ()),
             review_fixes=tuple(review.get("fixes") or ()),
             accepted_risks=tuple(review.get("accepted_risks") or ()),
+            accepted_risk_authorizations=tuple(
+                AcceptedRiskProjection.from_record(item)
+                for item in (review.get("accepted_risk_authorizations") or ())
+            ),
             residual_risks=review.get("residual_risks", ()),
             decisions=tuple(record.get("decisions") or ()),
             unresolved_items=tuple(record.get("unresolved_items") or ()),
@@ -1360,6 +1508,15 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
     lines.append(
         "- Accepted risks: " + ("; ".join(report.accepted_risks) or "none")
     )
+    if report.accepted_risk_authorizations:
+        lines.append(
+            "- Accepted-risk decisions: "
+            + "; ".join(
+                f"{item.decision_id} ({item.finding_fingerprint}): {item.risk}; "
+                f"authority={item.authorized_by}; reason={item.reason}"
+                for item in report.accepted_risk_authorizations
+            )
+        )
     lines.append(
         "- Residual risks: " + ("; ".join(report.residual_risks) or "none")
     )
@@ -1547,6 +1704,14 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
                 "- Manual final residual risks: "
                 + ("; ".join(manual.residual_risks) or "none")
             )
+            if manual.accepted_risk_authorizations:
+                lines.append(
+                    "- Manual final accepted-risk decisions: "
+                    + ", ".join(
+                        item.decision_id
+                        for item in manual.accepted_risk_authorizations
+                    )
+                )
             lines.append(
                 "- Manual final follow-up references: "
                 + (", ".join(manual.follow_up_refs) or "none")

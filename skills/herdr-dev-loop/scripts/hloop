@@ -7174,6 +7174,7 @@ def _review_manifest_policy_counts(
     manifest: hloop_review.ReviewManifest,
     *,
     allow_legacy: bool = False,
+    accepted_risk_authorizations: Mapping[str, Any] | None = None,
 ) -> tuple[int, int]:
     """Count verified findings after shared disposition-policy validation."""
 
@@ -7181,6 +7182,7 @@ def _review_manifest_policy_counts(
         return hloop_review.review_manifest_policy_counts(
             manifest,
             allow_legacy=allow_legacy,
+            accepted_risk_authorizations=accepted_risk_authorizations,
         )
     except hloop_review.ReviewModelError as exc:
         raise HLoopError(str(exc)) from exc
@@ -7188,6 +7190,31 @@ def _review_manifest_policy_counts(
 
 def _review_manifest_actionable_count(manifest: hloop_review.ReviewManifest) -> int:
     return _review_manifest_policy_counts(manifest)[0]
+
+
+def _resolve_review_accepted_risk_authorizations(
+    state: Mapping[str, Any], manifest: hloop_review.ReviewManifest
+) -> dict[str, hloop_decisions.ResolvedAcceptedRiskAuthorization]:
+    """Resolve every accepted-risk finding before a review gate mutates state."""
+
+    decisions = state.get("decisions") or {}
+    resolved: dict[str, hloop_decisions.ResolvedAcceptedRiskAuthorization] = {}
+    for finding in manifest.findings:
+        if finding.disposition != "accepted_risk":
+            continue
+        try:
+            authorization = hloop_decisions.resolve_accepted_risk_authorization(
+                decisions,
+                finding_fingerprint=finding.fingerprint,
+                target_sha=finding.head_sha,
+                decision_id=finding.accepted_risk_decision_id,
+            )
+        except hloop_decisions.DecisionAuthorizationError as exc:
+            raise HLoopError(
+                f"accepted-risk disposition policy authorization rejected for {finding.fingerprint}: {exc}"
+            ) from exc
+        resolved[finding.fingerprint] = authorization
+    return resolved
 
 
 def _update_review_execution_metrics(
@@ -7782,9 +7809,13 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
 
     completeness = manifest.completeness
     scope = release_scope_from_state(state)
+    accepted_risk_authorizations = _resolve_review_accepted_risk_authorizations(
+        state, manifest
+    )
     actionable, release_blocking = _review_manifest_policy_counts(
         manifest,
         allow_legacy=scope.status == "legacy-unlocked",
+        accepted_risk_authorizations=accepted_risk_authorizations,
     )
     deferred_follow_ups, _recorded_follow_ups = _require_deferred_follow_up_completeness(
         repo, state
@@ -7840,10 +7871,18 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
             source_ref=str(manifest_path.relative_to(repo)),
         )
         state["defer_follow_up_fingerprints"] = sorted(deferred_follow_ups)
+        state["accepted_risk_authorizations"] = {
+            fingerprint: authorization.to_record()
+            for fingerprint, authorization in accepted_risk_authorizations.items()
+        }
         _update_review_execution_metrics(state, manifest, round_number)
         convergence["artifact_refs"] = [str(manifest_path.relative_to(repo))]
         convergence["verified_actionable_findings"] = actionable
         convergence["release_blocking_findings"] = release_blocking
+        convergence["accepted_risk_authorizations"] = {
+            fingerprint: authorization.to_record()
+            for fingerprint, authorization in accepted_risk_authorizations.items()
+        }
         convergence["manifest_completeness"] = completeness.to_record()
         convergence["recorded_at"] = now_iso()
         # ``fix_round`` is the canonical counter.  ``recorded_round`` is only
@@ -8232,11 +8271,15 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
     current = current_integration_target(repo, state)
     scope = release_scope_from_state(state)
     allow_legacy = scope.status == "legacy-unlocked"
+    accepted_risk_authorizations = _resolve_review_accepted_risk_authorizations(
+        state, evidence.review_manifest
+    )
     validation = hloop_certification.validate_final_review(
         plan,
         evidence,
         current_target_sha=current,
         allow_legacy=allow_legacy,
+        accepted_risk_authorizations=accepted_risk_authorizations,
     )
     policy_issues = [
         issue for issue in validation.issues if issue.startswith("policy:")
@@ -8279,6 +8322,10 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
             evidence.review_manifest,
             source_ref=str(manifest_path.relative_to(repo)),
         )
+        state["accepted_risk_authorizations"] = {
+            fingerprint: authorization.to_record()
+            for fingerprint, authorization in accepted_risk_authorizations.items()
+        }
         manual["status"] = status
         manual["certification_id"] = plan.certification_id
         manual["target_sha"] = plan.target_sha
@@ -8290,6 +8337,10 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         manual["shortfall_count"] = len(evidence.review_manifest.verification_plan.shortfalls)
         manual["verified_actionable_findings"] = actionable
         manual["release_blocking_findings"] = release_blocking
+        manual["accepted_risk_authorizations"] = {
+            fingerprint: authorization.to_record()
+            for fingerprint, authorization in accepted_risk_authorizations.items()
+        }
         manual["validation_issues"] = validation_issues
         manual.setdefault("attempt_history", []).append(
             {
@@ -8334,6 +8385,10 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         "manifest_complete": evidence.completeness.complete,
         "verified_actionable_findings": actionable,
         "release_blocking_findings": release_blocking,
+        "accepted_risks": [
+            authorization.to_record()
+            for authorization in accepted_risk_authorizations.values()
+        ],
         "residual_risks": report_values.get("residual_risks", []),
         "follow_up_refs": report_values.get("follow_up_refs", []),
         "issues": validation_issues,
@@ -11395,6 +11450,12 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
     ensure_loop_dirs(repo)
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     follow_ups = _follow_up_state(state)
+    if args.recommended_action != "defer_follow_up":
+        raise HLoopError("follow-up add requires recommended_action=defer_follow_up")
+    if args.disposition != "defer_follow_up":
+        raise HLoopError(
+            "follow-up add accepts only defer_follow_up; accepted risk requires a decision record"
+        )
     try:
         key = hloop_review_policy.build_follow_up_issue_key(
             component=args.component,
@@ -11419,14 +11480,9 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
             acceptance_can_be_met_without_decision=bool(args.acceptance_can_be_met_without_decision),
             safety_critical=bool(args.safety_critical),
             scope_change_authorized=bool(args.scope_change_authorized),
-            accepted_risk_authorized=bool(args.accepted_risk_authorized),
         )
     except hloop_review_policy.ReviewPolicyError as exc:
         raise HLoopError(f"follow-up policy rejected: {exc}") from exc
-    if args.recommended_action != "defer_follow_up":
-        raise HLoopError("follow-up add requires recommended_action=defer_follow_up")
-    if args.disposition != "defer_follow_up":
-        raise HLoopError("follow-up add accepts only the defer_follow_up disposition")
     if not args.source_review_fingerprint:
         raise HLoopError("follow-up requires at least one --source-review-fingerprint")
     if not args.evidence:
@@ -13455,6 +13511,40 @@ def cmd_decision_new(args: argparse.Namespace) -> int:
         or "repository evidence を踏まえ、最初の選択肢を暫定の推奨案とします。",
     }
     affected = normalize_list(args.affects)
+    source_findings = list(getattr(args, "source_finding", None) or ())
+    accepted_risk_authorization = None
+    accepted_risk_fingerprint = str(
+        getattr(args, "accepted_risk_fingerprint", "") or ""
+    ).strip()
+    accepted_risk_fields_present = any(
+        str(getattr(args, field_name, "") or "").strip()
+        for field_name in (
+            "accepted_risk_fingerprint",
+            "accepted_risk_target_sha",
+            "accepted_risk_authorized_by",
+            "accepted_risk_risk",
+            "accepted_risk_reason",
+            "accepted_risk_expires_at",
+            "accepted_risk_reconsider_condition",
+        )
+    )
+    if accepted_risk_fields_present:
+        if accepted_risk_fingerprint and accepted_risk_fingerprint not in source_findings:
+            source_findings.append(accepted_risk_fingerprint)
+        try:
+            accepted_risk_authorization = hloop_decisions.AcceptedRiskAuthorization(
+                finding_fingerprint=accepted_risk_fingerprint,
+                target_sha=getattr(args, "accepted_risk_target_sha", ""),
+                authorized_by=getattr(args, "accepted_risk_authorized_by", ""),
+                risk=getattr(args, "accepted_risk_risk", ""),
+                reason=getattr(args, "accepted_risk_reason", ""),
+                expires_at=getattr(args, "accepted_risk_expires_at", ""),
+                reconsider_condition=getattr(
+                    args, "accepted_risk_reconsider_condition", ""
+                ),
+            )
+        except DecisionValidationError as exc:
+            raise HLoopError(str(exc)) from exc
     try:
         record = DecisionRecord(
             decision_id=decision_id,
@@ -13464,9 +13554,10 @@ def cmd_decision_new(args: argparse.Namespace) -> int:
             options=tuple(options),
             recommendation=recommendation,
             affected_task_ids=tuple(affected),
-            source_findings=tuple(getattr(args, "source_finding", None) or ()),
+            source_findings=tuple(source_findings),
             created_from=getattr(args, "created_from", None)
             or "specification-scout/manager fallback",
+            accepted_risk_authorization=accepted_risk_authorization,
         )
     except DecisionValidationError as exc:
         raise HLoopError(str(exc)) from exc
@@ -23743,6 +23834,26 @@ def build_outcome_report(
     review_findings: list[str] = []
     review_fixes: list[str] = []
     accepted_risks: list[str] = []
+    accepted_risk_authorizations: list[hloop_reports.AcceptedRiskProjection] = []
+    raw_accepted_risks = state.get("accepted_risk_authorizations")
+    if raw_accepted_risks is None and isinstance(state.get("manual_final_review"), Mapping):
+        raw_accepted_risks = state["manual_final_review"].get(
+            "accepted_risk_authorizations"
+        )
+    raw_accepted_risks = raw_accepted_risks or {}
+    if isinstance(raw_accepted_risks, Mapping):
+        raw_accepted_risks = raw_accepted_risks.values()
+    for raw_authorization in raw_accepted_risks:
+        try:
+            authorization = hloop_reports.AcceptedRiskProjection.from_record(
+                raw_authorization
+            )
+        except hloop_reports.OutcomeModelError as exc:
+            raise HLoopError(f"invalid accepted-risk authorization projection: {exc}") from exc
+        accepted_risk_authorizations.append(authorization)
+        accepted_risks.append(
+            f"{authorization.decision_id}: {authorization.risk} — {authorization.reason}"
+        )
     tasks = state.get("tasks") or {}
     for review_id, review in (state.get("reviews") or {}).items():
         if not isinstance(review, dict):
@@ -23787,6 +23898,7 @@ def build_outcome_report(
         "review_findings": tuple(dict.fromkeys(review_findings)),
         "review_fixes": tuple(dict.fromkeys(review_fixes)),
         "accepted_risks": tuple(dict.fromkeys(accepted_risks)),
+        "accepted_risk_authorizations": tuple(accepted_risk_authorizations),
         "decisions": tuple(resolved_decisions),
         "unresolved_items": tuple(unresolved_decisions),
         "cleanup_status": "passed" if cleanup_ok else "pending",
@@ -24178,7 +24290,10 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_unfreeze.add_argument("--json", action="store_true")
     dispatch_unfreeze.set_defaults(func=cmd_dispatch_unfreeze)
 
-    follow_up = sub.add_parser("follow-up", help="record and export stable first-class follow-ups")
+    follow_up = sub.add_parser(
+        "follow-up",
+        help="record/export defer_follow_up artifacts; accepted risks use decision records",
+    )
     follow_up_sub = follow_up.add_subparsers(dest="follow_up_command", required=True)
     follow_up_add = follow_up_sub.add_parser("add", help="record or deduplicate one follow-up")
     follow_up_add.add_argument("--title", required=True)
@@ -24204,7 +24319,12 @@ def build_parser() -> argparse.ArgumentParser:
     follow_up_add.add_argument("--decision-requirement", choices=sorted(hloop_review_policy.DECISION_REQUIREMENTS), default="none")
     follow_up_add.add_argument("--release-effect", choices=sorted(hloop_review_policy.RELEASE_EFFECTS), default="non_blocking")
     follow_up_add.add_argument("--requirement-ref", action="append")
-    follow_up_add.add_argument("--disposition", choices=sorted(hloop_review_policy.DISPOSITIONS), default="defer_follow_up")
+    follow_up_add.add_argument(
+        "--disposition",
+        choices=["defer_follow_up"],
+        default="defer_follow_up",
+        help="follow-up artifacts are defer_follow_up only; use decision new for accepted risk",
+    )
     follow_up_add.add_argument("--why-fix-now")
     follow_up_add.add_argument("--remediation-round", type=int)
     follow_up_add.add_argument("--recommended-action", default="defer_follow_up")
@@ -24220,7 +24340,6 @@ def build_parser() -> argparse.ArgumentParser:
     follow_up_add.add_argument("--acceptance-can-be-met-without-decision", action="store_true")
     follow_up_add.add_argument("--safety-critical", action="store_true")
     follow_up_add.add_argument("--scope-change-authorized", action="store_true")
-    follow_up_add.add_argument("--accepted-risk-authorized", action="store_true")
     follow_up_add.add_argument("--json", action="store_true")
     follow_up_add.set_defaults(func=cmd_follow_up_add)
     follow_up_list = follow_up_sub.add_parser("list", help="list follow-ups")
@@ -24729,6 +24848,19 @@ def build_parser() -> argparse.ArgumentParser:
     decision_new.add_argument("--recommend-option", help="option id (opt_1, opt_2, ...) to recommend")
     decision_new.add_argument("--recommend-rationale", help="rationale for the recommended option")
     decision_new.add_argument("--source-finding", action="append")
+    decision_new.add_argument(
+        "--accepted-risk-fingerprint",
+        help="finding fingerprint authorized by this decision; use with accepted-risk fields",
+    )
+    decision_new.add_argument("--accepted-risk-target-sha", help="exact integration SHA for an accepted risk")
+    decision_new.add_argument("--accepted-risk-authorized-by", help="authority principal accepting the risk")
+    decision_new.add_argument("--accepted-risk-risk", help="concrete residual risk being accepted")
+    decision_new.add_argument("--accepted-risk-reason", help="reason for accepting the residual risk")
+    decision_new.add_argument("--accepted-risk-expires-at", help="RFC 3339 expiry for the authorization")
+    decision_new.add_argument(
+        "--accepted-risk-reconsider-condition",
+        help="condition that requires reconsideration of the accepted risk",
+    )
     decision_new.add_argument("--created-from", help="Specification Scout or other source")
     decision_new.set_defaults(func=cmd_decision_new)
     decision_list = decision_sub.add_parser("list", help="list decision records")
