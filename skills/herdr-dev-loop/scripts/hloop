@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
@@ -37,6 +37,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 from hloop_lib import broker as hloop_broker
+from hloop_lib import certification as hloop_certification
 from hloop_lib import config as hloop_config
 from hloop_lib import decisions as hloop_decisions
 from hloop_lib import events as hloop_events
@@ -93,6 +94,7 @@ from hloop_lib.migration import (
     migrate_schema,
     schema_version_of,
 )
+from hloop_lib import migration as hloop_migration
 
 
 LOOP_HOME = Path(".ai") / "herdr-dev-loop"
@@ -131,8 +133,8 @@ DEFAULT_AGENT_MODEL = "auto"
 DEFAULT_AGENT_EFFORT = "auto"
 DEFAULT_CLAUDE_PERMISSION_MODE = "auto"
 STATE_FORMAT_VERSION = 3
-STATE_SCHEMA_REVISION = 1
-RUNTIME_SCHEMA_VERSION = SchemaVersion(STATE_FORMAT_VERSION, STATE_SCHEMA_REVISION)
+STATE_SCHEMA_REVISION = hloop_migration.V052_STATE_SCHEMA_VERSION.revision
+RUNTIME_SCHEMA_VERSION = hloop_migration.V052_STATE_SCHEMA_VERSION
 LEGACY_STATE_FORMAT_VERSION = 2
 DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MIN_FREE_INODES = 50_000
@@ -229,6 +231,7 @@ BUILT_IN_CONFIG_DEFAULTS = {
         "model": DEFAULT_AGENT_MODEL,
         "effort": DEFAULT_AGENT_EFFORT,
     },
+    "review": dict(hloop_config.REVIEW_POLICY_DEFAULTS),
 }
 CONFIG_TEMPLATE = """version = 1
 
@@ -246,6 +249,15 @@ effort = "auto"
 provider = "codex"
 model = "auto"
 effort = "auto"
+
+[defaults.review]
+cadence = "batch"
+pre_final_protocol = "codex-review-multi-v2"
+manual_final_protocol = "codex-review-multi-v2"
+max_fix_rounds = 2
+scope_expansion_action = "follow_up"
+final_required = "complete_zero_verified_actionable_findings"
+lane_count = "auto"
 """
 
 
@@ -950,6 +962,11 @@ def migrate_format_three_revision_one(state: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# Keep the command module's historical migration helper surface while the
+# deterministic revision-2 transform lives in the reusable migration module.
+migrate_format_three_revision_two = hloop_migration.migrate_format_three_revision_two
+
+
 RUNTIME_MIGRATION_STEPS = (
     MigrationStep(
         SchemaVersion(1, 0),
@@ -969,6 +986,7 @@ RUNTIME_MIGRATION_STEPS = (
         "format-3-revision-1",
         migrate_format_three_revision_one,
     ),
+    hloop_migration.FORMAT_3_REVISION_2_MIGRATION,
 )
 
 
@@ -983,6 +1001,15 @@ def migrated_runtime_state(repo: Path, state: dict[str, Any]) -> tuple[dict[str,
     except MigrationError as exc:
         raise HLoopError(str(exc)) from exc
     result = dict(migration.state)
+    result.setdefault(
+        "review_readiness",
+        {"status": "pending", "target_sha": "", "errors": [], "checks": {}, "updated_at": ""},
+    )
+    convergence = result.get("review_convergence")
+    if isinstance(convergence, dict):
+        convergence.setdefault("base_ref", str(result.get("base_branch") or ""))
+        convergence.setdefault("base_sha", "")
+        convergence.setdefault("attempt_history", [])
     result["skill_version"] = SKILL_VERSION
     return result, migration.applied_steps
 
@@ -1550,6 +1577,15 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
         return True
     if command == "release-scope":
         return getattr(args, "release_scope_command", "") in {"lock", "amend"}
+    if command == "review":
+        review_command = getattr(args, "review_command", "")
+        if review_command in {"readiness", "reopen"}:
+            return True
+        return review_command == "convergence" and getattr(
+            args, "review_convergence_command", ""
+        ) in {"prepare", "record"}
+    if command == "final-review":
+        return getattr(args, "final_review_command", "") in {"prepare", "record"}
     if command == "dispatch":
         return getattr(args, "dispatch_command", "") in {"freeze", "unfreeze"}
     if command == "follow-up":
@@ -1904,6 +1940,7 @@ def extract_fix_task_candidates(text: str, source_id: str) -> tuple[list[dict[st
             "why_fix_now": str(data.get("why_fix_now") or ""),
             "origin": str(data.get("origin") or ""),
             "contract_relation": str(data.get("contract_relation") or ""),
+            "decision_requirement": str(data.get("decision_requirement") or ""),
             "release_effect": str(data.get("release_effect") or ""),
             "remediation_round": data.get("remediation_round", 0),
             "fact_status": str(data.get("fact_status") or ""),
@@ -1941,12 +1978,46 @@ def confirmed_review_fix_task_candidates(
     return accepted, rejected
 
 
+def fix_now_candidate_reasons(
+    state: dict[str, Any], candidate: dict[str, Any]
+) -> list[str]:
+    """Require the review contract before a finding can create a fix task."""
+
+    if not manual_final_review_required(state):
+        return []
+    reasons: list[str] = []
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(candidate.get("source_finding") or "")):
+        reasons.append("source_finding must be a manifest fingerprint")
+    if str(candidate.get("fact_status") or "") != "confirmed":
+        reasons.append("fact_status must be confirmed")
+    if str(candidate.get("origin") or "") not in {"introduced", "diff-expanded-pre-existing"}:
+        reasons.append("origin must be introduced or diff-expanded-pre-existing")
+    if str(candidate.get("disposition") or "") != "fix_now":
+        reasons.append("disposition must be fix_now")
+    if str(candidate.get("contract_relation") or "") != "in_scope":
+        reasons.append("contract_relation must be in_scope")
+    if str(candidate.get("decision_requirement") or "") != "none":
+        reasons.append("decision_requirement must be none")
+    if not str(candidate.get("why_fix_now") or "").strip():
+        reasons.append("why_fix_now is required")
+    if not normalize_list(candidate.get("requirement_refs")) and not normalize_list(
+        candidate.get("scope_refs")
+    ):
+        reasons.append("requirement_refs or scope_refs is required")
+    effect = str(candidate.get("release_effect") or "")
+    if effect not in {"blocking", "non_blocking"}:
+        reasons.append("release_effect must be blocking or non_blocking")
+    return reasons
+
+
 def ensure_loop_dirs(repo: Path) -> None:
     for rel in [
         "tasks",
         "batches",
         "results",
         "reviews",
+        "reviews/convergence",
+        "reviews/final",
         "gaps",
         "advice",
         "prompts",
@@ -5515,6 +5586,22 @@ def pending_gap_exists(state: dict[str, Any]) -> bool:
 
 
 def review_gate_passed(state: dict[str, Any]) -> bool:
+    if manual_final_review_required(state):
+        convergence = state.get("review_convergence")
+        if isinstance(convergence, dict) and convergence.get("status") in {"prepared", "pending", "running"}:
+            return False
+        manual = state.get("manual_final_review")
+        if isinstance(manual, dict):
+            if manual.get("status") == "passed":
+                observed_target = str(
+                    state.get("completion_target_sha") or state.get("integration_head_sha") or ""
+                )
+                prepared_target = str(manual.get("target_sha") or "")
+                return not observed_target or observed_target == prepared_target
+            if manual.get("status") in {"failed", "incomplete", "prepared", "running"}:
+                return False
+        if isinstance(convergence, dict) and convergence.get("status") in {"converged", "exhausted"}:
+            return False
     if int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) <= 0:
         return True
     if state.get("needs_review"):
@@ -5548,6 +5635,827 @@ def current_integration_target(repo: Path, state: dict[str, Any]) -> str:
         return ""
     proc = run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "rev-parse", branch], check=False)
     return (proc.stdout or "").strip() if proc.returncode == 0 else ""
+
+
+def review_policy_record(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the normalized review policy without mutating persisted state."""
+
+    value = state.get("review_policy")
+    policy = dict(hloop_config.REVIEW_POLICY_DEFAULTS)
+    if isinstance(value, dict):
+        policy.update(value)
+    cadence = str(policy.get("cadence") or "batch")
+    if cadence not in {"batch", "merge-count"}:
+        raise HLoopError(f"unsupported review cadence: {cadence}")
+    try:
+        max_fix_rounds = int(policy.get("max_fix_rounds", 2))
+    except (TypeError, ValueError) as exc:
+        raise HLoopError("review max_fix_rounds must be an integer") from exc
+    if max_fix_rounds < 0 or max_fix_rounds > 2:
+        raise HLoopError("review max_fix_rounds must be between 0 and 2")
+    policy["cadence"] = cadence
+    policy["max_fix_rounds"] = max_fix_rounds
+    return policy
+
+
+def review_max_fix_rounds(state: dict[str, Any], convergence: Mapping[str, Any] | None = None) -> int:
+    policy = review_policy_record(state)
+    record = convergence if isinstance(convergence, Mapping) else state.get("review_convergence")
+    authorized = normalize_int(record.get("authorized_extra_rounds"), 0) if isinstance(record, Mapping) else 0
+    current = normalize_int(record.get("fix_round"), 0) if isinstance(record, Mapping) else 0
+    consumed = len(normalize_list(record.get("extra_round_authorization_refs"))) if isinstance(record, Mapping) else 0
+    # A consumed user authorization advances the current round even though
+    # the remaining-extra-round counter is decremented by the pure transition.
+    base = int(policy.get("max_fix_rounds", 2))
+    return max(base + authorized + consumed, current if consumed else base)
+
+
+def manual_final_review_required(state: dict[str, Any]) -> bool:
+    manual = state.get("manual_final_review")
+    if not isinstance(manual, dict) and not isinstance(state.get("review_policy"), dict):
+        # Small in-memory legacy fixtures and pre-revision callers have no
+        # certification block; retain their merge-count gate semantics.
+        return False
+    if isinstance(manual, dict) and manual.get("status") == "not-required-for-legacy-run":
+        return False
+    return not (
+        not isinstance(manual, dict)
+        and str((state.get("review_policy") or {}).get("cadence") or "") == "merge-count"
+    )
+
+
+def _review_freeze(state: dict[str, Any], *, reason: str, input_id: str = "") -> None:
+    current = dispatch_freeze_record(state)
+    state["dispatch_freeze"] = {
+        **current,
+        "status": "active",
+        "reason": reason,
+        "frozen_at": current.get("frozen_at") or now_iso(),
+        "source_input_id": input_id or str(current.get("source_input_id") or ""),
+        "allowed_running_role_ids": role_ids_running(state),
+    }
+
+
+def _review_unfreeze(state: dict[str, Any], *, reason: str, input_id: str = "") -> None:
+    current = dispatch_freeze_record(state)
+    state["dispatch_freeze"] = {
+        **current,
+        "status": "inactive",
+        "reason": reason,
+        "frozen_at": "",
+        "source_input_id": input_id,
+        "allowed_running_role_ids": [],
+    }
+
+
+def invalidate_review_gates_for_change(
+    state: dict[str, Any], *, reason: str, target_sha: str = ""
+) -> None:
+    """Invalidate frozen review evidence after a new integration change.
+
+    Legacy migrated loops intentionally keep their old merge-count behavior;
+    new/revision-2 loops must require a fresh fixed-target review instead.
+    """
+
+    if not manual_final_review_required(state):
+        return
+    convergence = state.setdefault("review_convergence", {})
+    if not isinstance(convergence, dict):
+        convergence = {}
+        state["review_convergence"] = convergence
+    convergence.update(
+        {
+            "status": "pending",
+            "target_sha": target_sha,
+            "verified_actionable_findings": None,
+            "artifact_refs": [],
+            "invalidated_at": now_iso(),
+            "invalidated_reason": reason,
+        }
+    )
+    manual = state.setdefault("manual_final_review", {})
+    if not isinstance(manual, dict):
+        manual = {}
+        state["manual_final_review"] = manual
+    if manual.get("status") not in {"pending", "not-required-for-legacy-run"}:
+        attempts = list(manual.get("attempt_history") or [])
+        attempts.append({"status": manual.get("status", ""), "reason": reason, "at": now_iso()})
+        manual["attempt_history"] = attempts
+    manual.update(
+        {
+            "status": "pending",
+            "certification_id": "",
+            "target_sha": target_sha,
+            "prepared_plan": "",
+            "prepared_plan_digest": "",
+            "manifest": "",
+            "report": "",
+            "manifest_complete": None,
+            "verified_actionable_findings": None,
+            "invalidated_at": now_iso(),
+            "invalidated_reason": reason,
+        }
+    )
+    state["review_readiness"] = {
+        "status": "pending",
+        "target_sha": target_sha,
+        "errors": [],
+        "checks": {},
+        "updated_at": now_iso(),
+    }
+    if str(state.get("phase") or "") in {
+        "review_readiness",
+        "review_convergence",
+        "review_convergence_exhausted",
+        "awaiting_manual_final_review",
+        "manual_final_review_failed",
+        "manual_final_review_incomplete",
+        "manual_final_review_passed",
+        "ready_to_finish",
+        "manager_qa",
+    }:
+        state["phase"] = "dispatching"
+
+
+def _review_validation_is_current(state: dict[str, Any], target: str) -> bool:
+    validation = state.get("last_validation")
+    if not isinstance(validation, dict):
+        return False
+    results = validation.get("results")
+    return bool(results) and str(validation.get("head_sha") or "") == target and all(
+        isinstance(item, dict) and item.get("result") == "passed" for item in results
+    )
+
+
+def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Collect all fail-closed prerequisites for a fixed-target review."""
+
+    errors: list[str] = []
+    target = current_integration_target(repo, state)
+    base_ref = str(state.get("base_branch") or "")
+    base_sha = ""
+    if not target:
+        errors.append("integration branch cannot be resolved")
+    if base_ref:
+        try:
+            base_sha = git(repo, ["rev-parse", base_ref])
+        except (HLoopError, subprocess.CalledProcessError):
+            errors.append(f"base branch cannot be resolved: {base_ref}")
+    else:
+        errors.append("base branch is not configured")
+    if current_batch_id(state):
+        errors.append("current batch is still open")
+    elif any(
+        isinstance(batch, dict) and str(batch.get("status") or "") not in {"closed", "abandoned"}
+        for batch in (state.get("batches") or {}).values()
+    ):
+        errors.append("an unclosed batch remains")
+    if not all_tasks_merged(state):
+        errors.append("all tasks must be merged before review readiness")
+    running = running_agent_ids(state)
+    if running:
+        errors.append("role agents are still running: " + ", ".join(running))
+    if state.get("active_merge"):
+        errors.append("a merge transaction is active")
+    dirty = unsafe_dirty_paths(repo)
+    if dirty:
+        errors.append("Manager checkout has non-loop dirty files: " + ", ".join(dirty))
+    if pending_blocking_user_decisions(state):
+        errors.append("blocking user decisions remain")
+    if target and not _review_validation_is_current(state, target):
+        errors.append("current integration target lacks passing validation")
+    pending_drafts = normalize_list(state.get("pending_fix_task_drafts"))
+    if pending_drafts:
+        errors.append("pending fix-task drafts remain: " + ", ".join(pending_drafts))
+    try:
+        scope = assert_release_scope_snapshot(repo, state)
+    except HLoopError as exc:
+        errors.append(str(exc))
+        scope = release_scope_from_state(state)
+    inventory: list[str] = []
+    if base_sha and target:
+        proc = run_cmd(
+            [TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--name-only", f"{base_sha}...{target}"],
+            check=False,
+        )
+        if proc.returncode != 0:
+            errors.append("cannot compute changed-file inventory")
+        else:
+            inventory = sorted({line.strip() for line in (proc.stdout or "").splitlines() if line.strip()})
+    checks = {
+        "target_sha": target,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "current_batch_closed": not current_batch_id(state),
+        "all_tasks_merged": all_tasks_merged(state),
+        "running_roles": running,
+        "dirty_paths": dirty,
+        "validation_current": bool(target and _review_validation_is_current(state, target)),
+        "pending_fix_task_drafts": pending_drafts,
+        "scope_status": scope.status,
+        "scope_revision": scope.scope_revision,
+        "source_snapshot_revision": scope.source_snapshot_revision,
+        "diff_inventory": inventory,
+        "changed_file_validation": {
+            "status": "passed" if not any(
+                item.startswith("cannot compute changed-file") for item in errors
+            ) else "failed",
+            "target_sha": target,
+            "paths": inventory,
+        },
+    }
+    return {"ready": not errors, "target_sha": target, "base_sha": base_sha, "errors": errors, "checks": checks}
+
+
+def _review_plan_for_target(
+    state: dict[str, Any],
+    target: str,
+    *,
+    mode: str | None = None,
+    providers: Sequence[str] | None = None,
+    probe_count: int | None = None,
+    probes_per_provider: int | None = None,
+) -> hloop_review.ReviewGroupPlan:
+    topology = resolved_reviewer_topology(
+        state,
+        mode=mode,
+        providers=providers,
+        probe_count=probe_count,
+        probes_per_provider=probes_per_provider,
+    )
+    try:
+        return build_reviewer_group_plan(
+            topology["mode"],
+            target,
+            role_agent_config(state, "reviewer"),
+            topology=topology,
+        )
+    except (HLoopError, hloop_review.ReviewModelError) as exc:
+        raise HLoopError(f"cannot build review plan: {exc}") from exc
+
+
+def _write_json_artifact(path: Path, value: Mapping[str, Any]) -> None:
+    write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _review_manifest_from_path(path: Path) -> hloop_review.ReviewManifest:
+    try:
+        record = json.loads(read_text(path))
+        if isinstance(record, dict) and isinstance(record.get("review_manifest"), dict):
+            record = record["review_manifest"]
+        return hloop_review.ReviewManifest.from_record(record)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError, hloop_review.ReviewModelError) as exc:
+        raise HLoopError(f"invalid review manifest {path}: {exc}") from exc
+
+
+def _review_manifest_actionable_count(manifest: hloop_review.ReviewManifest) -> int:
+    incomplete = set(manifest.completeness.incomplete_findings)
+    by_fingerprint: dict[str, list[Any]] = {}
+    for record in manifest.verifications:
+        by_fingerprint.setdefault(record.fingerprint, []).append(record)
+    return len({
+        finding.fingerprint
+        for finding in manifest.findings
+        if finding.fingerprint not in incomplete
+        and by_fingerprint.get(finding.fingerprint)
+        and all(record.fact_status == "confirmed" for record in by_fingerprint[finding.fingerprint])
+        and any(
+            record.recommended_action in {"fix_task", "ask_user"}
+            and record.ignore_status == "must_not_ignore"
+            for record in by_fingerprint[finding.fingerprint]
+        )
+    })
+
+
+def _final_paths(repo: Path) -> dict[str, Path]:
+    directory = loop_path(repo) / "reviews" / "final"
+    return {
+        "directory": directory,
+        "plan": directory / "PLAN.json",
+        "manifest": directory / "MANIFEST.json",
+        "report": directory / "FINAL.md",
+    }
+
+
+def _scope_certification_identity(repo: Path, state: dict[str, Any]) -> tuple[int, int, str, tuple[str, ...]]:
+    scope = assert_release_scope_snapshot(repo, state)
+    if scope.status == "locked":
+        digest = scope.scope_digest or hloop_certification.canonical_digest(scope.to_record())
+        return (
+            scope.scope_revision,
+            scope.source_snapshot_revision,
+            digest,
+            tuple(scope.source_refs),
+        )
+    return (
+        scope.scope_revision,
+        scope.source_snapshot_revision,
+        hloop_certification.canonical_digest({"status": scope.status, "scope": scope.to_record()}),
+        tuple(scope.source_refs),
+    )
+
+
+def _final_certification_plan(
+    repo: Path,
+    state: dict[str, Any],
+    target: str,
+    *,
+    certification_id: str,
+    base_sha: str = "",
+    mode: str | None = None,
+    providers: Sequence[str] | None = None,
+    probe_count: int | None = None,
+    probes_per_provider: int | None = None,
+) -> tuple[hloop_certification.CertificationPlan, hloop_review.ReviewGroupPlan]:
+    group = _review_plan_for_target(
+        state,
+        target,
+        mode=mode,
+        providers=providers,
+        probe_count=probe_count,
+        probes_per_provider=probes_per_provider,
+    )
+    scope_revision, snapshot_revision, source_digest, source_refs = _scope_certification_identity(repo, state)
+    policy = hloop_certification.VerificationPolicy(
+        max_parallel_verifiers=group.budget.max_parallel_verifiers,
+        max_verifications=group.budget.max_verifications,
+        time_limit_seconds=group.budget.time_limit_seconds,
+        provider_limits=tuple(group.budget.provider_limits),
+    )
+    lanes = tuple(
+        hloop_certification.FinalReviewLane(
+            provider=lane.provider,
+            lane_id=lane.lane_id,
+            purpose=lane.purpose,
+            agent_label=lane.agent_label,
+        )
+        for lane in group.expected_lanes
+    )
+    plan = hloop_certification.CertificationPlan(
+        certification_id=certification_id,
+        base_ref=str(state.get("base_branch") or ""),
+        base_sha=base_sha or git(repo, ["rev-parse", str(state.get("base_branch") or "HEAD")]),
+        target_ref=str(state.get("integration_branch") or ""),
+        target_sha=target,
+        scope_source=source_refs,
+        scope_revision=scope_revision,
+        source_snapshot_revision=snapshot_revision,
+        source_digest=source_digest,
+        protocol=hloop_certification.MANUAL_FINAL_PROTOCOL,
+        lane_plan=lanes,
+        verification_policy=policy,
+    )
+    return plan, group
+
+
+def _next_certification_id(state: dict[str, Any]) -> str:
+    used = {
+        str(item.get("certification_id") or "")
+        for item in (state.get("manual_final_review", {}).get("attempt_history") or [])
+        if isinstance(item, dict)
+    }
+    current = str((state.get("manual_final_review") or {}).get("certification_id") or "")
+    if current:
+        used.add(current)
+    index = 1
+    while f"C{index:03d}" in used:
+        index += 1
+    return f"C{index:03d}"
+
+
+def cmd_review_readiness(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    snapshot = _review_readiness_snapshot(repo, state)
+    if not args.dry_run:
+        state["review_readiness"] = {
+            "status": "ready" if snapshot["ready"] else "blocked",
+            "target_sha": snapshot["target_sha"],
+            "base_sha": snapshot["base_sha"],
+            "errors": snapshot["errors"],
+            "checks": snapshot["checks"],
+            "updated_at": now_iso(),
+        }
+        if snapshot["ready"]:
+            state["phase"] = "review_readiness"
+        save_state(repo, state)
+    payload = {
+        "ready": snapshot["ready"],
+        "status": "ready" if snapshot["ready"] else "blocked",
+        "target_sha": snapshot["target_sha"],
+        "base_sha": snapshot["base_sha"],
+        "errors": snapshot["errors"],
+        "checks": snapshot["checks"],
+        "dry_run": bool(args.dry_run),
+    }
+    print_policy_payload(payload, as_json=bool(args.json), label="review readiness")
+    return 0 if snapshot["ready"] else 2
+
+
+def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    policy = review_policy_record(state)
+    if review_max_fix_rounds(state, state.get("review_convergence")) == 0:
+        raise HLoopError("review convergence is disabled by max_fix_rounds=0")
+    snapshot = _review_readiness_snapshot(repo, state)
+    if not snapshot["ready"]:
+        raise HLoopError("review readiness is blocked: " + "; ".join(snapshot["errors"]))
+    convergence = state.setdefault("review_convergence", {})
+    if not isinstance(convergence, dict):
+        raise HLoopError("STATE.json review_convergence must be an object")
+    if str(convergence.get("status") or "") == "exhausted":
+        raise HLoopError("review convergence is exhausted; use `hloop review reopen` first")
+    target = snapshot["target_sha"]
+    group = _review_plan_for_target(
+        state,
+        target,
+        mode=getattr(args, "mode", None),
+        providers=getattr(args, "providers", None),
+        probe_count=getattr(args, "probe_count", None),
+        probes_per_provider=getattr(args, "probes_per_provider", None),
+    )
+    plan_path = loop_path(repo) / "reviews" / "convergence" / "PLAN.json"
+    manifest_path = loop_path(repo) / "reviews" / "convergence" / "MANIFEST.json"
+    plan_record = {
+        "protocol": str(policy.get("pre_final_protocol") or hloop_certification.MANUAL_FINAL_PROTOCOL),
+        "base_ref": str(state.get("base_branch") or ""),
+        "base_sha": snapshot["base_sha"],
+        "target_ref": str(state.get("integration_branch") or ""),
+        "target_sha": target,
+        "fix_round": normalize_int(convergence.get("fix_round"), 0),
+        "max_fix_rounds": review_max_fix_rounds(state, convergence),
+        "review_plan": group.to_record(),
+        "readiness": snapshot["checks"],
+        "prepared_at": now_iso(),
+    }
+    if not args.dry_run:
+        _write_json_artifact(plan_path, plan_record)
+        # A missing-lane manifest is intentionally incomplete.  It gives the
+        # Manager a safe structured starting point and cannot pass by claim.
+        empty_manifest = hloop_review.ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=(),
+            findings=(),
+            verification_plan=hloop_review.plan_verification(group, ()),
+            verifications=(),
+        )
+        _write_json_artifact(manifest_path, empty_manifest.to_record())
+        convergence.update(
+            {
+                "status": "prepared",
+                "base_ref": str(state.get("base_branch") or ""),
+                "base_sha": snapshot["base_sha"],
+                "target_sha": target,
+                "review_plan": group.to_record(),
+                "artifact_refs": [str(plan_path.relative_to(repo)), str(manifest_path.relative_to(repo))],
+                "prepared_at": now_iso(),
+                "last_status": "prepared",
+            }
+        )
+        state["review_readiness"] = {
+            "status": "ready",
+            "target_sha": target,
+            "base_sha": snapshot["base_sha"],
+            "errors": [],
+            "checks": snapshot["checks"],
+            "updated_at": now_iso(),
+        }
+        state["phase"] = "review_convergence"
+        state["needs_review"] = False
+        state["review_convergence_auto_start"] = False
+        save_state(repo, state)
+        journal(repo, f"Prepared fixed-target review convergence for `{target}` without starting a Reviewer.")
+    payload = {
+        "status": "prepared",
+        "target_sha": target,
+        "base_sha": snapshot["base_sha"],
+        "plan": str(plan_path.relative_to(repo)),
+        "manifest": str(manifest_path.relative_to(repo)),
+        "review_plan": group.to_record(),
+        "automatic_reviewer_started": False,
+        "dry_run": bool(args.dry_run),
+    }
+    print_policy_payload(payload, as_json=bool(args.json), label="review convergence prepared")
+    return 0
+
+
+def cmd_review_convergence_record(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    convergence = state.get("review_convergence")
+    if not isinstance(convergence, dict) or convergence.get("status") != "prepared":
+        raise HLoopError("review convergence must be prepared before record")
+    target = str(convergence.get("target_sha") or "")
+    current = current_integration_target(repo, state)
+    if not target or not current or target != current:
+        raise HLoopError(
+            f"review convergence target SHA is stale: prepared={target or 'missing'} current={current or 'missing'}"
+        )
+    manifest_raw = getattr(args, "manifest", None)
+    manifest_path = (
+        safe_repo_path(repo, manifest_raw, default_loop_path=True)
+        if manifest_raw
+        else loop_path(repo) / "reviews" / "convergence" / "MANIFEST.json"
+    )
+    manifest = _review_manifest_from_path(manifest_path)
+    expected_plan = convergence.get("review_plan")
+    if isinstance(expected_plan, dict) and manifest.plan.to_record() != expected_plan:
+        raise HLoopError("review convergence manifest does not match the prepared plan")
+    completeness = manifest.completeness
+    actionable = _review_manifest_actionable_count(manifest)
+    max_rounds = review_max_fix_rounds(state, convergence)
+    current_round = normalize_int(convergence.get("fix_round"), 0)
+    requested_round = getattr(args, "fix_round", None)
+    round_number = current_round if requested_round is None else int(requested_round)
+    if round_number < 0 or round_number > max_rounds:
+        raise HLoopError(f"fix round must be between 0 and {max_rounds}")
+    if not args.dry_run:
+        convergence["artifact_refs"] = [str(manifest_path.relative_to(repo))]
+        convergence["verified_actionable_findings"] = actionable
+        convergence["manifest_completeness"] = completeness.to_record()
+        convergence["recorded_at"] = now_iso()
+        convergence["recorded_round"] = round_number
+        convergence["last_status"] = "complete" if completeness.complete else "incomplete"
+        if not completeness.complete:
+            convergence["status"] = "pending"
+            convergence["last_status"] = "incomplete"
+            _review_freeze(state, reason="review-convergence-incomplete")
+            state["phase"] = "review_convergence"
+        elif actionable > 0:
+            if round_number >= max_rounds:
+                convergence["status"] = "exhausted"
+                convergence["last_status"] = "exhausted"
+                _review_freeze(state, reason="review-convergence-rounds-exhausted")
+                state["phase"] = "review_convergence_exhausted"
+            else:
+                convergence["status"] = "pending"
+                convergence["last_status"] = "remediation-required"
+                _review_freeze(state, reason="review-convergence-actionable-findings")
+                state["phase"] = "review_convergence"
+        else:
+            convergence["status"] = "converged"
+            convergence["last_status"] = "converged"
+            _review_freeze(state, reason="review-convergence-converged")
+            state["phase"] = "awaiting_manual_final_review"
+            state["needs_review"] = False
+        save_state(repo, state)
+    payload = {
+        "status": str(convergence.get("status") or ("pending" if not completeness.complete else "converged")),
+        "target_sha": target,
+        "manifest": str(manifest_path.relative_to(repo)),
+        "manifest_complete": completeness.complete,
+        "manifest_issues": list(completeness.issues),
+        "verified_actionable_findings": actionable,
+        "fix_round": round_number,
+        "max_fix_rounds": max_rounds,
+        "automatic_reviewer_started": False,
+        "dry_run": bool(args.dry_run),
+    }
+    print_policy_payload(payload, as_json=bool(args.json), label="review convergence recorded")
+    if not completeness.complete:
+        return 2
+    if actionable > 0 and round_number >= max_rounds:
+        return 2
+    return 0
+
+
+def cmd_review_reopen(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    scope_amendment = None
+    if getattr(args, "scope_kind", None) or getattr(args, "scope_digest", None):
+        try:
+            source_digests = json.loads(args.source_digests) if args.source_digests else {}
+        except json.JSONDecodeError as exc:
+            raise HLoopError(f"--source-digests must be a JSON object: {exc}") from exc
+        if not isinstance(source_digests, dict):
+            raise HLoopError("--source-digests must be a JSON object")
+        scope_amendment = {
+            "kind": args.scope_kind,
+            "input_id": args.user_input_id,
+            "scope_revision": args.scope_revision,
+            "source_snapshot_revision": args.source_snapshot_revision,
+            "source_digest": args.scope_digest,
+            "source_refs": args.scope_source or [],
+            "source_digests": source_digests,
+        }
+    result = hloop_certification.reopen_review(
+        state,
+        action=args.action,
+        user_input_id=args.user_input_id,
+        authorized_extra_rounds=int(args.authorized_extra_rounds or 0),
+        authorization_input_id=args.authorization_input_id,
+        scope_amendment=scope_amendment,
+    )
+    payload = {
+        "accepted": result.accepted,
+        "action": args.action,
+        "source_phase": result.validation.source_phase,
+        "issues": list(result.issues),
+        "dry_run": bool(args.dry_run),
+    }
+    if result.accepted and not args.dry_run:
+        candidate = dict(result.state)
+        # certification.py uses this transient marker to explain an
+        # invalidation; STATE.json has a deliberately narrower enum.
+        manual = candidate.get("manual_final_review")
+        if isinstance(manual, dict) and manual.get("status") == "invalidated":
+            manual["invalidated_status"] = "invalidated"
+            manual["status"] = "pending"
+        save_state(repo, candidate)
+        journal(repo, f"Applied review reopen action `{args.action}` from `{result.validation.source_phase}`.")
+        payload["phase"] = candidate.get("phase")
+        payload["dispatch_freeze"] = candidate.get("dispatch_freeze")
+    print_policy_payload(payload, as_json=bool(args.json), label="review reopen")
+    return 0 if result.accepted else 2
+
+
+def cmd_final_review_prepare(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    convergence = state.get("review_convergence")
+    if not isinstance(convergence, dict) or convergence.get("status") != "converged":
+        raise HLoopError("final review requires converged pre-final review evidence")
+    target = str(convergence.get("target_sha") or "")
+    current = current_integration_target(repo, state)
+    if not target or target != current:
+        raise HLoopError(
+            f"final review target SHA is stale: converged={target or 'missing'} current={current or 'missing'}"
+        )
+    certification_id = str(getattr(args, "certification_id", None) or _next_certification_id(state))
+    paths = _final_paths(repo)
+    plan, group = _final_certification_plan(
+        repo,
+        state,
+        target,
+        certification_id=certification_id,
+        base_sha=str(convergence.get("base_sha") or ""),
+        mode=getattr(args, "mode", None),
+        providers=getattr(args, "providers", None),
+        probe_count=getattr(args, "probe_count", None),
+        probes_per_provider=getattr(args, "probes_per_provider", None),
+    )
+    review_manifest = hloop_review.ReviewManifest(
+        review_id="R001",
+        plan=group,
+        lane_results=(),
+        findings=(),
+        verification_plan=hloop_review.plan_verification(group, ()),
+        verifications=(),
+    )
+    final_manifest = hloop_certification.FinalReviewManifest.from_review_manifest(
+        plan, review_manifest, verified_actionable_findings=0, patch_verdict="passed"
+    )
+    if not args.dry_run:
+        _write_json_artifact(paths["plan"], plan.to_record())
+        _write_json_artifact(paths["manifest"], final_manifest.to_record())
+        write_text(
+            paths["report"],
+            "# Manual Final Review\n\n"
+            f"Certification: `{certification_id}`\n\n"
+            "Record structured lane and verification evidence in `MANIFEST.json`, then run "
+            "`hloop final-review record`.\n",
+        )
+        manual = state.setdefault("manual_final_review", {})
+        manual.update(
+            {
+                "status": "prepared",
+                "certification_id": certification_id,
+                "target_sha": target,
+                "prepared_plan": str(paths["plan"].relative_to(repo)),
+                "prepared_plan_digest": plan.digest,
+                "manifest": str(paths["manifest"].relative_to(repo)),
+                "report": str(paths["report"].relative_to(repo)),
+                "manifest_complete": False,
+                "verified_actionable_findings": None,
+                "prepared_at": now_iso(),
+            }
+        )
+        _review_freeze(state, reason="manual-final-review-prepared")
+        state["phase"] = "awaiting_manual_final_review"
+        state["needs_review"] = False
+        save_state(repo, state)
+        journal(repo, f"Prepared manual final review `{certification_id}` for `{target}`.")
+    payload = {
+        "status": "prepared",
+        "certification_id": certification_id,
+        "target_sha": target,
+        "plan": str(paths["plan"].relative_to(repo)),
+        "manifest": str(paths["manifest"].relative_to(repo)),
+        "report": str(paths["report"].relative_to(repo)),
+        "plan_digest": plan.digest,
+        "automatic_reviewer_started": False,
+        "dry_run": bool(args.dry_run),
+    }
+    print_policy_payload(payload, as_json=bool(args.json), label="manual final review prepared")
+    return 0
+
+
+def cmd_final_review_record(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    manual = state.get("manual_final_review")
+    if not isinstance(manual, dict) or not manual.get("prepared_plan"):
+        raise HLoopError("manual final review must be prepared before record")
+    paths = _final_paths(repo)
+    plan_path = safe_repo_path(repo, str(manual.get("prepared_plan")), default_loop_path=False)
+    manifest_path = (
+        safe_repo_path(repo, args.manifest, default_loop_path=True)
+        if getattr(args, "manifest", None)
+        else safe_repo_path(repo, str(manual.get("manifest") or paths["manifest"]), default_loop_path=False)
+    )
+    report_path = (
+        safe_repo_path(repo, args.report, default_loop_path=True)
+        if getattr(args, "report", None)
+        else safe_repo_path(repo, str(manual.get("report") or paths["report"]), default_loop_path=False)
+    )
+    try:
+        plan = hloop_certification.CertificationPlan.from_record(json.loads(read_text(plan_path)))
+        evidence = hloop_certification.FinalReviewManifest.from_record(
+            json.loads(read_text(manifest_path))
+        )
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError, hloop_certification.CertificationModelError) as exc:
+        raise HLoopError(f"invalid manual final review artifact: {exc}") from exc
+    current = current_integration_target(repo, state)
+    validation = hloop_certification.validate_final_review(
+        plan, evidence, current_target_sha=current
+    )
+    if not report_path.is_file() or not read_text(report_path).strip():
+        raise HLoopError(f"manual final review report is missing or empty: {report_path}")
+    status = validation.status
+    if not args.dry_run:
+        manual["status"] = status
+        manual["certification_id"] = plan.certification_id
+        manual["target_sha"] = plan.target_sha
+        manual["prepared_plan"] = str(plan_path.relative_to(repo))
+        manual["prepared_plan_digest"] = plan.digest
+        manual["manifest"] = str(manifest_path.relative_to(repo))
+        manual["report"] = str(report_path.relative_to(repo))
+        manual["manifest_complete"] = evidence.completeness.complete
+        manual["verified_actionable_findings"] = evidence.recomputed_verified_actionable_count
+        manual["validation_issues"] = list(validation.issues)
+        manual.setdefault("attempt_history", []).append(
+            {
+                "certification_id": plan.certification_id,
+                "status": status,
+                "target_sha": plan.target_sha,
+                "issues": list(validation.issues),
+                "recorded_at": now_iso(),
+            }
+        )
+        if status == "passed":
+            state["phase"] = "manual_final_review_passed"
+        elif status == "incomplete":
+            state["phase"] = "manual_final_review_incomplete"
+            _review_freeze(state, reason="manual-final-review-incomplete")
+        else:
+            state["phase"] = "manual_final_review_failed"
+            _review_freeze(state, reason="manual-final-review-failed")
+        save_state(repo, state)
+        journal(repo, f"Recorded manual final review `{plan.certification_id}` with status `{status}`.")
+    payload = {
+        "status": status,
+        "certification_id": plan.certification_id,
+        "target_sha": plan.target_sha,
+        "current_target_sha": current,
+        "manifest_complete": evidence.completeness.complete,
+        "verified_actionable_findings": evidence.recomputed_verified_actionable_count,
+        "issues": list(validation.issues),
+        "plan": str(plan_path.relative_to(repo)),
+        "manifest": str(manifest_path.relative_to(repo)),
+        "report": str(report_path.relative_to(repo)),
+        "dry_run": bool(args.dry_run),
+    }
+    print_policy_payload(payload, as_json=bool(args.json), label="manual final review recorded")
+    return 0 if validation.passed else 2
+
+
+def cmd_final_review_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    manual = state.get("manual_final_review") if isinstance(state.get("manual_final_review"), dict) else {}
+    paths = _final_paths(repo)
+    target = current_integration_target(repo, state)
+    payload = {
+        "status": manual.get("status", "pending"),
+        "certification_id": manual.get("certification_id", ""),
+        "target_sha": manual.get("target_sha", ""),
+        "current_target_sha": target,
+        "target_sha_drift": bool(manual.get("target_sha") and manual.get("target_sha") != target),
+        "plan": manual.get("prepared_plan") or str(paths["plan"].relative_to(repo)),
+        "manifest": manual.get("manifest") or str(paths["manifest"].relative_to(repo)),
+        "report": manual.get("report") or str(paths["report"].relative_to(repo)),
+        "manifest_complete": manual.get("manifest_complete"),
+        "verified_actionable_findings": manual.get("verified_actionable_findings"),
+        "dispatch_freeze": dispatch_freeze_record(state),
+        "phase": state.get("phase"),
+    }
+    print_policy_payload(payload, as_json=bool(args.json), label="manual final review status")
+    return 0
 
 
 def advancing_commit_count(repo: Path, old_sha: str, new_sha: str) -> int | None:
@@ -5746,8 +6654,25 @@ def final_strict_gate_armed(state: dict[str, Any]) -> bool:
 def should_open_review_gate(state: dict[str, Any]) -> bool:
     if int(state.get("max_reviewers", DEFAULT_MAX_REVIEWERS)) <= 0:
         return False
+    policy = review_policy_record(state)
+    convergence = state.get("review_convergence")
+    manual = state.get("manual_final_review")
+    if manual_final_review_required(state) and (
+        isinstance(convergence, dict)
+        and convergence.get("status") in {"prepared", "converged", "exhausted"}
+        or isinstance(manual, dict)
+        and manual.get("status") in {"prepared", "running", "passed", "failed", "incomplete"}
+    ):
+        # The explicit convergence/final-review commands own these gates; a
+        # normal tick must never silently replace a fixed-target plan.
+        return False
     if state.get("needs_review") or pending_review_exists(state):
         return False
+    if policy.get("cadence") == "batch" and isinstance(state.get("review_policy"), dict):
+        if current_batch_id(state) or not all_tasks_merged(state):
+            return False
+        count = normalize_int(state.get("unreviewed_merge_count"), 0)
+        return count > 0 and not final_strict_gate_armed(state)
     count = normalize_int(state.get("unreviewed_merge_count"), 0)
     if count >= review_after_merges(state):
         return True
@@ -6493,6 +7418,7 @@ def render_reviewer_prompt(
 - If blocked or failed, still write the artifact with the concrete reason.
 - Include a `## Fix Task Candidates` section. For every finding that should become a Worker fix task, add:
   `### FTNNN: <title>`, `action: fix_task`, `severity: P0|P1|P2|P3`, non-empty `write_allow:`, non-empty `acceptance:`, and non-empty `rationale:`.
+  Also record `fact_status: confirmed`, `origin: introduced|diff-expanded-pre-existing`, `contract_relation: in_scope`, `decision_requirement: none`, `disposition: fix_now`, `release_effect: blocking|non_blocking`, and a non-empty `why_fix_now` plus `requirement_refs` or `scope_refs`.
   Incomplete candidates are rejected by `hloop triage` and will not become tasks.
   If no fix task is needed, write `No fix task candidates.`
 """
@@ -6522,6 +7448,7 @@ Directory artifact contract:
 - `FINAL.md` must have frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, base, head, head_sha: {head_sha}, status: reported|blocked|failed.
 - `FINAL.md` must summarize confirmed, refuted, needs-spec, and insufficient-evidence findings without promoting incomplete evidence.
 - Include `## Fix Task Candidates` in `FINAL.md`. A candidate is permitted only when all required manifest verification records for its fingerprint have `fact_status: confirmed`; include `source_finding: <sha256 fingerprint>` plus action, severity, write_allow, acceptance, and rationale. Non-confirmed or unknown fingerprints are rejected by `hloop triage`.
+- A task candidate must additionally carry `fact_status: confirmed`, `origin: introduced|diff-expanded-pre-existing`, `contract_relation: in_scope`, `decision_requirement: none`, `disposition: fix_now`, `release_effect: blocking|non_blocking`, a non-empty `why_fix_now`, and `requirement_refs` or `scope_refs`; otherwise `hloop triage` rejects it.
 - If no confirmed finding needs a task, write `No fix task candidates.`
 - If blocked or failed, still write all available artifacts truthfully; missing data must leave manifest completeness false.
 """
@@ -7877,6 +8804,40 @@ None.
         "review_wait_ms": args.review_wait_ms,
         "gap_wait_ms": args.gap_wait_ms,
         "review_after_merges": args.review_after_merges,
+        "review_policy": dict(
+            (config_resolution.as_dict().get("review") or hloop_config.REVIEW_POLICY_DEFAULTS)
+        ),
+        "review_readiness": {
+            "status": "pending",
+            "target_sha": "",
+            "errors": [],
+            "checks": {},
+            "updated_at": "",
+        },
+        "review_convergence": {
+            "status": "not-started",
+            "base_ref": base,
+            "base_sha": "",
+            "target_sha": "",
+            "fix_round": 0,
+            "authorized_extra_rounds": 0,
+            "extra_round_authorization_refs": [],
+            "verified_actionable_findings": None,
+            "artifact_refs": [],
+            "attempt_history": [],
+        },
+        "manual_final_review": {
+            "status": "pending",
+            "certification_id": "",
+            "target_sha": "",
+            "prepared_plan": "",
+            "prepared_plan_digest": "",
+            "manifest": "",
+            "report": "",
+            "manifest_complete": None,
+            "verified_actionable_findings": None,
+            "attempt_history": [],
+        },
         "gap_after_merges": args.gap_after_merges,
         "unreviewed_merge_count": 0,
         "ungapped_merge_count": 0,
@@ -7992,6 +8953,46 @@ None.
         old.setdefault("advice", {})
         old.setdefault("review_lanes", args.review_lane or DEFAULT_REVIEW_LANES)
         old.setdefault("review_after_merges", args.review_after_merges)
+        old.setdefault(
+            "review_policy",
+            dict(
+                (config_resolution.as_dict().get("review") or hloop_config.REVIEW_POLICY_DEFAULTS)
+            ),
+        )
+        old.setdefault(
+            "review_readiness",
+            {"status": "pending", "target_sha": "", "errors": [], "checks": {}, "updated_at": ""},
+        )
+        old.setdefault(
+            "review_convergence",
+            {
+                "status": "not-started",
+                "base_ref": str(old.get("base_branch") or base),
+                "base_sha": "",
+                "target_sha": "",
+                "fix_round": 0,
+                "authorized_extra_rounds": 0,
+                "extra_round_authorization_refs": [],
+                "verified_actionable_findings": None,
+                "artifact_refs": [],
+                "attempt_history": [],
+            },
+        )
+        old.setdefault(
+            "manual_final_review",
+            {
+                "status": "pending",
+                "certification_id": "",
+                "target_sha": "",
+                "prepared_plan": "",
+                "prepared_plan_digest": "",
+                "manifest": "",
+                "report": "",
+                "manifest_complete": None,
+                "verified_actionable_findings": None,
+                "attempt_history": [],
+            },
+        )
         old.setdefault("gap_after_merges", args.gap_after_merges)
         old.setdefault("unreviewed_merge_count", 0)
         old.setdefault("ungapped_merge_count", 0)
@@ -10326,6 +11327,11 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
             dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
         )
         write_batch_artifact(repo, state, resolved_batch_id)
+    invalidate_review_gates_for_change(
+        state,
+        reason=f"new task created: {task_id}",
+        target_sha="",
+    )
     disarm_final_gate_for_new_task(state, task_id)
     return task_id
 
@@ -10451,6 +11457,11 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
             dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
         )
         write_batch_artifact(repo, state, resolved_batch_id)
+    invalidate_review_gates_for_change(
+        state,
+        reason=f"new task created: {task_id}",
+        target_sha="",
+    )
     disarm_final_gate_for_new_task(state, task_id)
     state["phase"] = "dispatching"
     save_state(repo, state)
@@ -13139,6 +14150,11 @@ def complete_merge_state(repo: Path, state: dict[str, Any], task_id: str, mode: 
     state["last_merged_task"] = task_id
     state["unreviewed_merge_count"] = normalize_int(state.get("unreviewed_merge_count"), 0) + 1
     state["ungapped_merge_count"] = normalize_int(state.get("ungapped_merge_count"), 0) + 1
+    invalidate_review_gates_for_change(
+        state,
+        reason=f"integration merge completed: {task_id}",
+        target_sha="",
+    )
     if manager_qa_required(state):
         state["manager_qa_status"] = "pending"
         state.pop("manager_qa_head_sha", None)
@@ -16564,6 +17580,17 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
         candidates, rejected_candidates = confirmed_review_fix_task_candidates(
             manifest, candidates, rejected_candidates
         )
+    if source_type == "review":
+        guarded_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            reasons = fix_now_candidate_reasons(state, candidate)
+            if reasons:
+                rejected_candidates.append(
+                    reject_fix_task_candidate(candidate["title"], reasons)
+                )
+            else:
+                guarded_candidates.append(candidate)
+        candidates = guarded_candidates
     draft_path = triage_draft_file(repo, source_id)
     draft = render_fix_task_draft(
         source_type,
@@ -19742,6 +20769,38 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def manual_final_gate_errors(repo: Path, state: dict[str, Any], target: str) -> list[str]:
+    if not manual_final_review_required(state):
+        return []
+    manual = state.get("manual_final_review")
+    if not isinstance(manual, dict):
+        return ["manual final review state is missing"]
+    errors: list[str] = []
+    if manual.get("status") != "passed":
+        errors.append(
+            "manual final review is not passed: " + str(manual.get("status") or "pending")
+        )
+    if str(manual.get("target_sha") or "") != target:
+        errors.append("manual final review target SHA is stale")
+    if manual.get("manifest_complete") is not True:
+        errors.append("manual final review manifest is incomplete")
+    if normalize_int(manual.get("verified_actionable_findings"), 0) != 0:
+        errors.append("manual final review has verified actionable findings")
+    for key, label in (("prepared_plan", "PLAN.json"), ("manifest", "MANIFEST.json"), ("report", "FINAL.md")):
+        raw = str(manual.get(key) or "")
+        if not raw:
+            errors.append(f"manual final review {label} reference is missing")
+            continue
+        try:
+            path = safe_repo_path(repo, raw)
+        except HLoopError:
+            errors.append(f"manual final review {label} reference is invalid")
+            continue
+        if not path.is_file():
+            errors.append(f"manual final review {label} is missing")
+    return errors
+
+
 def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     target = git(repo, ["rev-parse", str(state["integration_branch"])])
@@ -19757,6 +20816,7 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("current completion target lacks passing validation")
     if not review_gate_passed(state):
         errors.append("current completion target lacks a closed review gate")
+    errors.extend(manual_final_gate_errors(repo, state, target))
     if not gap_gate_passed(state):
         errors.append("current completion target lacks a closed gap gate")
     if not manager_qa_passed(state):
@@ -20329,6 +21389,78 @@ def build_parser() -> argparse.ArgumentParser:
     release_scope_amend.add_argument("--affected-task-id", action="append")
     release_scope_amend.add_argument("--json", action="store_true")
     release_scope_amend.set_defaults(func=cmd_release_scope_amend)
+
+    review = sub.add_parser("review", help="review readiness, bounded convergence, and reopen operations")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    review_readiness = review_sub.add_parser("readiness", help="check fixed-target review prerequisites")
+    review_readiness.add_argument("--json", action="store_true")
+    review_readiness.add_argument("--dry-run", action="store_true")
+    review_readiness.set_defaults(func=cmd_review_readiness)
+
+    convergence = review_sub.add_parser("convergence", help="prepare or record bounded pre-final review convergence")
+    convergence_sub = convergence.add_subparsers(dest="review_convergence_command", required=True)
+    for command_name, func, help_text in (
+        ("prepare", cmd_review_convergence_prepare, "freeze a fixed integration SHA for review"),
+        ("record", cmd_review_convergence_record, "record a structured convergence manifest"),
+    ):
+        command_parser = convergence_sub.add_parser(command_name, help=help_text)
+        command_parser.add_argument(
+            "--mode",
+            choices=sorted(hloop_review.REVIEW_MODES),
+            default=None,
+            help="defaults to resolved_config.reviewer.mode, then single",
+        )
+        command_parser.add_argument("--providers", nargs="+", choices=sorted(AGENT_PROVIDERS))
+        command_parser.add_argument("--probe-count", type=int)
+        command_parser.add_argument("--probes-per-provider", type=int)
+        command_parser.add_argument("--json", action="store_true")
+        command_parser.add_argument("--dry-run", action="store_true")
+        if command_name == "record":
+            command_parser.add_argument("--manifest")
+            command_parser.add_argument("--fix-round", type=int)
+        command_parser.set_defaults(func=func)
+
+    reopen = review_sub.add_parser("reopen", help="apply an explicit user-authorized review reopen transition")
+    reopen.add_argument(
+        "--action",
+        choices=sorted(hloop_certification.REOPEN_ACTIONS),
+        required=True,
+    )
+    reopen.add_argument("--user-input-id", "--input-id", dest="user_input_id", required=True)
+    reopen.add_argument("--authorized-extra-rounds", type=int, default=0)
+    reopen.add_argument("--authorization-input-id")
+    reopen.add_argument("--scope-kind", choices=sorted(hloop_certification.SCOPE_AMENDMENT_KINDS))
+    reopen.add_argument("--scope-digest")
+    reopen.add_argument("--scope-source", action="append")
+    reopen.add_argument("--scope-revision", type=int)
+    reopen.add_argument("--source-snapshot-revision", type=int)
+    reopen.add_argument("--source-digests", help="JSON object mapping scope sources to digests")
+    reopen.add_argument("--json", action="store_true")
+    reopen.add_argument("--dry-run", action="store_true")
+    reopen.set_defaults(func=cmd_review_reopen)
+
+    final_review = sub.add_parser("final-review", help="prepare, record, and inspect manual final review certification")
+    final_review_sub = final_review.add_subparsers(dest="final_review_command", required=True)
+    for command_name, func, help_text in (
+        ("prepare", cmd_final_review_prepare, "freeze the manual final-review plan and evidence paths"),
+        ("record", cmd_final_review_record, "recompute manual final-review completeness"),
+    ):
+        command_parser = final_review_sub.add_parser(command_name, help=help_text)
+        command_parser.add_argument("--mode", choices=sorted(hloop_review.REVIEW_MODES), default=None)
+        command_parser.add_argument("--providers", nargs="+", choices=sorted(AGENT_PROVIDERS))
+        command_parser.add_argument("--probe-count", type=int)
+        command_parser.add_argument("--probes-per-provider", type=int)
+        command_parser.add_argument("--json", action="store_true")
+        command_parser.add_argument("--dry-run", action="store_true")
+        if command_name == "prepare":
+            command_parser.add_argument("--certification-id")
+        else:
+            command_parser.add_argument("--manifest")
+            command_parser.add_argument("--report")
+        command_parser.set_defaults(func=func)
+    final_review_status = final_review_sub.add_parser("status", help="show current manual final-review certification status")
+    final_review_status.add_argument("--json", action="store_true")
+    final_review_status.set_defaults(func=cmd_final_review_status)
 
     dispatch = sub.add_parser("dispatch", help="control new role dispatch without pausing safe Manager operations")
     dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
