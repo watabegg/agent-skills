@@ -89,6 +89,43 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertIsNone(state["execution_metrics"]["effective_parallelism"])
         self.assertEqual(state["execution_metrics"]["planned_task_count"], 0)
 
+    def test_review_lane_count_resolves_swarm_topology_without_changing_holistic_modes(self):
+        state = {
+            "resolved_config": {
+                "reviewer": {"mode": "swarm", "provider": "codex"},
+                "review": {"lane_count": "auto"},
+            },
+            "review_policy": {"cadence": "batch", "lane_count": "auto"},
+        }
+        for lane_count in (4, 6, 8):
+            state["resolved_config"]["review"]["lane_count"] = lane_count
+            topology = hloop.resolved_reviewer_topology(state)
+            self.assertEqual(topology["probe_count"], lane_count)
+            plan = hloop.build_reviewer_group_plan(
+                "swarm",
+                "head-sha",
+                {"provider": "codex", "model": "auto"},
+                topology=topology,
+            )
+            self.assertEqual(len(plan.expected_lanes), lane_count)
+
+        explicit = hloop.resolved_reviewer_topology(
+            state, probe_count=4
+        )
+        self.assertEqual(explicit["probe_count"], 4)
+        holistic = hloop.resolved_reviewer_topology(state, mode="single")
+        self.assertIsNone(holistic["probe_count"])
+        self.assertIsNone(holistic["probes_per_provider"])
+
+        legacy = {
+            "resolved_config": {
+                "reviewer": {"mode": "swarm", "probe_count": 4}
+            },
+            "review_policy": {"cadence": "merge-count"},
+        }
+        legacy_topology = hloop.resolved_reviewer_topology(legacy)
+        self.assertEqual(legacy_topology["probe_count"], 4)
+
     def _make_ready_state(self) -> None:
         state = self.state()
         target = subprocess.check_output(
@@ -358,6 +395,104 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         ready = json.loads(out)
         self.assertEqual(ready["checks"]["changed_file_validation"]["status"], "passed")
         self.assertEqual(ready["checks"]["special_verification"]["status"], "passed")
+
+    def test_special_verification_record_cli_requires_current_evidence(self):
+        target = self.state()["integration_head_sha"]
+        inventory = [
+            "migration/step.py",
+            "schemas/release.schema.json",
+            "docs/release.md",
+            "security/auth.py",
+        ]
+        domains = {"migration", "schema", "public-docs", "security-boundary"}
+        for domain in sorted(domains):
+            code, out, err = self.run_cli(
+                "verification",
+                "record",
+                "--domain",
+                domain,
+                "--target-sha",
+                target,
+                "--status",
+                "passed",
+                "--evidence-ref",
+                f"{domain}.log",
+                "--json",
+            )
+            self.assertEqual((code, err), (0, ""), out)
+            self.assertEqual(json.loads(out)["target_sha"], target)
+
+        state = self.state()
+        self.assertEqual(set(state["special_verification_evidence"]), domains)
+        state["changed_file_validation"] = {
+            "status": "passed",
+            "target_sha": target,
+            "paths": inventory,
+            "mapping": {path: ["validation.log"] for path in inventory},
+        }
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=inventory):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+
+        before = self.state()["special_verification_evidence"]
+        code, out, err = self.run_cli(
+            "verification",
+            "record",
+            "--domain",
+            "migration",
+            "--target-sha",
+            target,
+            "--status",
+            "passed",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("requires at least one --evidence-ref", err)
+        self.assertEqual(self.state()["special_verification_evidence"], before)
+
+        code, out, err = self.run_cli(
+            "verification",
+            "record",
+            "--domain",
+            "migration",
+            "--target-sha",
+            target,
+            "--status",
+            "failed",
+            "--evidence-ref",
+            "failed.log",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=inventory):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual(code, 2)
+        blocked = json.loads(out)
+        self.assertIn(
+            "special verification evidence is not passed: migration",
+            blocked["errors"],
+        )
+
+        (self.repo / "README.md").write_text("fixture changed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "advance integration head"],
+            cwd=self.repo,
+            check=True,
+        )
+        code, out, err = self.run_cli(
+            "verification",
+            "record",
+            "--domain",
+            "schema",
+            "--target-sha",
+            target,
+            "--status",
+            "passed",
+            "--evidence-ref",
+            "stale.log",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("target SHA is stale", err)
 
     def test_readiness_requires_first_class_follow_up_for_deferred_candidate(self):
         fingerprint = "sha256:" + "d" * 64
@@ -787,6 +922,71 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertFalse(hloop.should_open_review_gate(state))
         state["unreviewed_merge_count"] = 2
         self.assertTrue(hloop.should_open_review_gate(state))
+
+    def test_batch_review_opens_for_closed_batch_with_future_queued_tasks(self):
+        target = "head-sha"
+        state = {
+            "max_reviewers": 1,
+            "review_policy": {"cadence": "batch", "lane_count": "auto"},
+            "needs_review": False,
+            "reviews": {},
+            "unreviewed_merge_count": 1,
+            "integration_head_sha": target,
+            "completion_target_sha": target,
+            "last_validation": {
+                "head_sha": target,
+                "results": [{"command": "true", "result": "passed"}],
+            },
+            "tasks": {
+                "T001": {"status": "merged"},
+                "T002": {"status": "queued"},
+            },
+            "batches": {
+                "B001": {
+                    "status": "closed",
+                    "closed_at": "2026-07-16T00:00:00+00:00",
+                    "task_ids": ["T001"],
+                },
+                "B002": {
+                    "status": "active",
+                    "task_ids": ["T002"],
+                },
+            },
+            "current_batch_id": "",
+        }
+        self.assertTrue(hloop.should_open_review_gate(state))
+        state["current_batch_id"] = "B002"
+        self.assertFalse(hloop.should_open_review_gate(state))
+        state["current_batch_id"] = ""
+        state["last_validation"]["head_sha"] = "stale"
+        self.assertFalse(hloop.should_open_review_gate(state))
+
+    def test_batch_readiness_accepts_future_queued_tasks_after_closed_batch(self):
+        state = self.state()
+        target = state["integration_head_sha"]
+        state["tasks"] = {
+            "T001": {"status": "merged"},
+            "T002": {"status": "queued"},
+        }
+        state["batches"] = {
+            "B001": {
+                "status": "closed",
+                "closed_at": "2026-07-16T00:00:00+00:00",
+                "task_ids": ["T001"],
+            }
+        }
+        state["current_batch_id"] = ""
+        state["last_validation"] = {
+            "head_sha": target,
+            "results": [{"command": "true", "result": "passed"}],
+        }
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=[]):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        ready = json.loads(out)
+        self.assertFalse(ready["checks"]["all_tasks_merged"])
+        self.assertTrue(ready["checks"]["review_batch_tasks_merged"])
 
 
 if __name__ == "__main__":
