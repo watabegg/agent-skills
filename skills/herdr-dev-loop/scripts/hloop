@@ -1695,11 +1695,245 @@ def assert_mutating_state_schema_compatible(repo: Path) -> None:
 
 def save_state(repo: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = now_iso()
+    _refresh_execution_metrics(state)
     write_text(
         state_path(repo),
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         durable=True,
     )
+
+
+def _parse_metric_timestamp(value: Any) -> datetime | None:
+    """Parse an observed state timestamp without manufacturing a value."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _observed_duration_seconds(start: Any, end: Any) -> float | None:
+    started = _parse_metric_timestamp(start)
+    finished = _parse_metric_timestamp(end)
+    if started is None or finished is None:
+        return None
+    value = (finished - started).total_seconds()
+    return round(value, 6) if value >= 0 else None
+
+
+def _state_metric_counts(
+    records: Mapping[str, Any] | None,
+    *,
+    key: str,
+    statuses: set[str],
+) -> int:
+    if not isinstance(records, Mapping):
+        return 0
+    return sum(
+        1
+        for record in records.values()
+        if isinstance(record, Mapping) and str(record.get(key) or "") in statuses
+    )
+
+
+def _refresh_execution_metrics(state: dict[str, Any]) -> None:
+    """Refresh counters that are derivable from the durable state snapshot.
+
+    This deliberately leaves values unknown when the state has no timestamp or
+    evidence for them.  The helper is called at every state write so CLI
+    transitions cannot silently leave the report projection stale.
+    """
+
+    metrics = state.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        return
+
+    tasks = state.get("tasks")
+    tasks = tasks if isinstance(tasks, Mapping) else {}
+    origin_counts: dict[str, int] = {}
+    scope_revision_counts: dict[str, int] = {}
+    planned_task_ids: list[str] = []
+    worker_durations: list[float] = []
+    worker_intervals: list[tuple[datetime, datetime, float]] = []
+    worker_started_count = 0
+    for task_id, task in tasks.items():
+        if not isinstance(task, Mapping):
+            continue
+        origin = str(task.get("task_origin") or "legacy-unclassified")
+        origin_counts[origin] = origin_counts.get(origin, 0) + 1
+        scope_revision = str(task.get("release_scope_revision") or 0)
+        scope_revision_counts[scope_revision] = scope_revision_counts.get(scope_revision, 0) + 1
+        if origin == "planned":
+            planned_task_ids.append(str(task_id))
+        if task.get("started_at"):
+            worker_started_count += 1
+            ended_value = (
+                task.get("completed_at")
+                or task.get("harvested_at")
+                or task.get("finished_at")
+                or task.get("merged_at")
+                or task.get("updated_at")
+            )
+            duration = _observed_duration_seconds(task.get("started_at"), ended_value)
+            if duration is not None:
+                worker_durations.append(duration)
+                started = _parse_metric_timestamp(task.get("started_at"))
+                ended = _parse_metric_timestamp(ended_value)
+                if started is not None and ended is not None:
+                    worker_intervals.append((started, ended, duration))
+
+    metrics["planned_task_count"] = origin_counts.get("planned", 0)
+    metrics["remediation_task_count"] = origin_counts.get("finding", 0)
+    metrics["task_origin_counts"] = dict(sorted(origin_counts.items()))
+    metrics["scope_revision_counts"] = dict(sorted(scope_revision_counts.items()))
+    metrics["worker_count"] = worker_started_count
+    metrics["longest_worker_seconds"] = max(worker_durations, default=0.0)
+    if worker_intervals:
+        wall_start = min(item[0] for item in worker_intervals)
+        wall_end = max(item[1] for item in worker_intervals)
+        wall_seconds = (wall_end - wall_start).total_seconds()
+        metrics["effective_parallelism"] = (
+            round(sum(item[2] for item in worker_intervals) / wall_seconds, 6)
+            if wall_seconds > 0
+            else None
+        )
+    if planned_task_ids:
+        metrics["planned_task_completed"] = all(
+            str(tasks[task_id].get("status") or "") in {"done", "merged"}
+            for task_id in planned_task_ids
+            if isinstance(tasks.get(task_id), Mapping)
+        )
+    else:
+        metrics["planned_task_completed"] = False
+
+    reviews = state.get("reviews")
+    reviews = reviews if isinstance(reviews, Mapping) else {}
+    gaps = state.get("gaps")
+    gaps = gaps if isinstance(gaps, Mapping) else {}
+    metrics["review_completed_count"] = _state_metric_counts(
+        reviews, key="gate_status", statuses={"reported", "triaged", "passed", "completed"}
+    )
+    metrics["stale_review_count"] = _state_metric_counts(
+        reviews, key="status", statuses={"stale", "stale_target", "stale_review"}
+    )
+    metrics["aborted_review_count"] = _state_metric_counts(
+        reviews, key="status", statuses={"aborted", "aborted_review"}
+    )
+    metrics["timeout_review_count"] = _state_metric_counts(
+        reviews, key="status", statuses={"timeout", "timed_out"}
+    )
+    metrics["gap_completed_count"] = _state_metric_counts(
+        gaps, key="gate_status", statuses={"reported", "triaged", "passed", "completed"}
+    )
+    metrics["stale_gap_count"] = _state_metric_counts(
+        gaps, key="status", statuses={"stale", "stale_target", "stale_gap"}
+    )
+    metrics["aborted_gap_count"] = _state_metric_counts(
+        gaps, key="status", statuses={"aborted", "aborted_gap"}
+    )
+    metrics["timeout_gap_count"] = _state_metric_counts(
+        gaps, key="status", statuses={"timeout", "timed_out"}
+    )
+
+    review_durations: list[float] = []
+    for record in (*reviews.values(), *gaps.values()):
+        if not isinstance(record, Mapping):
+            continue
+        duration = _observed_duration_seconds(
+            record.get("started_at"),
+            record.get("completed_at")
+            or record.get("harvested_at")
+            or record.get("closed_at"),
+        )
+        if duration is not None:
+            review_durations.append(duration)
+    metrics["review_wait_time_seconds"] = round(sum(review_durations), 6)
+
+    convergence = state.get("review_convergence")
+    if isinstance(convergence, Mapping):
+        recorded_round = convergence.get("recorded_round", convergence.get("fix_round", 0))
+        if isinstance(recorded_round, int) and not isinstance(recorded_round, bool):
+            metrics["review_fix_rounds"] = max(0, recorded_round)
+
+    phase_started = state.get("phase_started_at") or state.get("created_at")
+    phase_duration = _observed_duration_seconds(phase_started, state.get("updated_at"))
+    if phase_duration is not None:
+        metrics["phase_wall_time_seconds"] = phase_duration
+
+
+def _empty_execution_metrics() -> dict[str, Any]:
+    """Return the complete zero-valued state projection for a fresh loop."""
+
+    return {
+        "planned_task_count": 0,
+        "remediation_task_count": 0,
+        "task_origin_counts": {},
+        "scope_revision_counts": {},
+        "review_fix_rounds": 0,
+        "candidate_count": 0,
+        "confirmed_count": 0,
+        "finding_origin_counts": {},
+        "finding_contract_relation_counts": {},
+        "finding_decision_requirement_counts": {},
+        "finding_disposition_counts": {},
+        "review_completed_count": 0,
+        "stale_review_count": 0,
+        "aborted_review_count": 0,
+        "timeout_review_count": 0,
+        "gap_completed_count": 0,
+        "stale_gap_count": 0,
+        "aborted_gap_count": 0,
+        "timeout_gap_count": 0,
+        "worker_count": 0,
+        "planned_task_completed": False,
+        "scope_expansion_started_at": "",
+        "scope_expansion_user_input_id": "",
+        "effective_parallelism": None,
+        "phase_wall_time_seconds": 0.0,
+        "validation_time_seconds": 0.0,
+        "review_wait_time_seconds": 0.0,
+        "longest_worker_seconds": 0.0,
+    }
+
+
+def _manager_invocation_record() -> dict[str, str]:
+    """Capture manager identity only when the invoking environment exposes it."""
+
+    provider = str(os.environ.get("HLOOP_MANAGER_PROVIDER") or "").strip()
+    model = str(os.environ.get("HLOOP_MANAGER_MODEL") or "").strip()
+    effort = str(os.environ.get("HLOOP_MANAGER_REASONING_EFFORT") or "").strip()
+    unavailable = "" if provider or model or effort else (
+        "manager backend identity is not exposed by the hloop invocation"
+    )
+    return {
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": effort,
+        "recorded_at": now_iso() if provider or model or effort else "",
+        "unavailable_reason": unavailable,
+    }
+
+
+def _record_scope_expansion_metric(
+    state: Mapping[str, Any], amendment: Mapping[str, Any] | None
+) -> None:
+    """Record explicit scope-change provenance when the command exposes it."""
+
+    if not isinstance(amendment, Mapping) or str(amendment.get("kind") or "") != "scope-change":
+        return
+    metrics = state.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        return
+    metrics["scope_expansion_started_at"] = str(amendment.get("created_at") or "")
+    metrics["scope_expansion_user_input_id"] = str(amendment.get("user_input_id") or "")
 
 
 def journal(repo: Path, message: str) -> None:
@@ -5805,6 +6039,170 @@ def _review_validation_is_current(state: dict[str, Any], target: str) -> bool:
     )
 
 
+def _changed_file_inventory(repo: Path, base_sha: str, target_sha: str) -> list[str]:
+    if not base_sha or not target_sha:
+        return []
+    proc = run_cmd(
+        [
+            TRUSTED_GIT_PATH,
+            "-C",
+            str(repo),
+            "diff",
+            "--name-only",
+            f"{base_sha}...{target_sha}",
+        ],
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    return sorted(
+        {
+            line.strip()
+            for line in (proc.stdout or "").splitlines()
+            if line.strip()
+        }
+    )
+
+
+def _validation_mapping_for_paths(
+    state: Mapping[str, Any], target: str, paths: Sequence[str]
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Return per-file validation references and missing mapping errors."""
+
+    evidence = state.get("changed_file_validation")
+    if not isinstance(evidence, Mapping):
+        return {}, ["changed-file validation evidence mapping is missing"] if paths else []
+    if str(evidence.get("target_sha") or "") != target:
+        return {}, ["changed-file validation evidence is stale"]
+    if str(evidence.get("status") or "") != "passed":
+        return {}, ["changed-file validation evidence is not passed"]
+    raw_mapping = evidence.get("mapping")
+    if not isinstance(raw_mapping, Mapping):
+        return {}, ["changed-file validation evidence mapping is missing"]
+    mapping: dict[str, list[str]] = {}
+    missing: list[str] = []
+    for path in paths:
+        refs = normalize_list(raw_mapping.get(path))
+        if not refs:
+            missing.append(path)
+        else:
+            mapping[path] = refs
+    return mapping, [f"changed file lacks validation evidence: {path}" for path in missing]
+
+
+def _special_verification_domains(paths: Sequence[str]) -> dict[str, list[str]]:
+    domains: dict[str, list[str]] = {}
+    for raw_path in paths:
+        path = str(raw_path).replace("\\", "/").lower()
+        matched: set[str] = set()
+        if (
+            "/migration" in path
+            or path.startswith("migration/")
+            or "migrate" in Path(path).name
+        ):
+            matched.add("migration")
+        if "/schema" in path or path.startswith("schema/") or path.endswith(".schema.json"):
+            matched.add("schema")
+        if (
+            path.endswith(".md")
+            or path.startswith("docs/")
+            or path in {"readme.md", "skill.md"}
+            or "/references/" in path
+        ):
+            matched.add("public-docs")
+        if any(
+            marker in path
+            for marker in (
+                "security",
+                "authorization",
+                "credential",
+                "permission",
+                "auth",
+                "secret",
+                "token",
+                "broker",
+                "supervisor",
+            )
+        ):
+            matched.add("security-boundary")
+        for domain in sorted(matched):
+            domains.setdefault(domain, []).append(str(raw_path))
+    return domains
+
+
+def _special_verification_errors(
+    state: Mapping[str, Any], domains: Mapping[str, Sequence[str]], target: str
+) -> tuple[dict[str, list[str]], list[str]]:
+    if not domains:
+        return {}, []
+    raw = state.get("special_verification_evidence")
+    if not isinstance(raw, Mapping):
+        raw = state.get("verification_evidence")
+    if not isinstance(raw, Mapping):
+        return {}, [
+            "special verification evidence is missing: " + ", ".join(sorted(domains))
+        ]
+    resolved: dict[str, list[str]] = {}
+    errors: list[str] = []
+    for domain in sorted(domains):
+        value = raw.get(domain)
+        if isinstance(value, Mapping):
+            if str(value.get("target_sha") or target) != target:
+                errors.append(f"special verification evidence is stale: {domain}")
+                continue
+            if str(value.get("status") or "") not in {"passed", "verified"}:
+                errors.append(f"special verification evidence is not passed: {domain}")
+                continue
+            refs = normalize_list(value.get("references") or value.get("evidence"))
+        else:
+            refs = normalize_list(value)
+        if not refs:
+            errors.append(f"special verification evidence is missing: {domain}")
+        else:
+            resolved[domain] = refs
+    return resolved, errors
+
+
+def _deferred_follow_up_fingerprints(repo: Path, state: Mapping[str, Any]) -> set[str]:
+    """Collect explicit defer_follow_up candidates without guessing findings."""
+
+    fingerprints: set[str] = set()
+    for key in ("defer_follow_up_fingerprints", "deferred_follow_up_fingerprints"):
+        fingerprints.update(str(item) for item in normalize_list(state.get(key)))
+    for review in (state.get("reviews") or {}).values():
+        if not isinstance(review, Mapping):
+            continue
+        for key in ("defer_follow_up_fingerprints", "deferred_follow_up_fingerprints"):
+            fingerprints.update(str(item) for item in normalize_list(review.get(key)))
+    reviews_root = loop_path(repo) / "reviews"
+    if reviews_root.exists():
+        for manifest_path in reviews_root.rglob("MANIFEST.json"):
+            try:
+                record = json.loads(read_text(manifest_path))
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(record, Mapping) and isinstance(record.get("review_manifest"), Mapping):
+                record = record["review_manifest"]
+            findings = record.get("findings") if isinstance(record, Mapping) else None
+            if not isinstance(findings, list):
+                continue
+            for finding in findings:
+                if not isinstance(finding, Mapping):
+                    continue
+                if finding.get("disposition") == "defer_follow_up" and finding.get("fingerprint"):
+                    fingerprints.add(str(finding["fingerprint"]))
+    return fingerprints
+
+
+def _recorded_follow_up_fingerprints(repo: Path, state: Mapping[str, Any]) -> set[str]:
+    recorded: set[str] = set()
+    for record in _follow_up_records(repo, state):
+        if not isinstance(record, Mapping):
+            continue
+        recorded.update(str(item) for item in normalize_list(record.get("source_review_fingerprints")))
+    return recorded
+
+
 def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     """Collect all fail-closed prerequisites for a fixed-target review."""
 
@@ -5854,14 +6252,38 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
         errors.append("fresh 0.5.2 loops require release-scope lock before review readiness")
     inventory: list[str] = []
     if base_sha and target:
-        proc = run_cmd(
-            [TRUSTED_GIT_PATH, "-C", str(repo), "diff", "--name-only", f"{base_sha}...{target}"],
-            check=False,
+        inventory = _changed_file_inventory(repo, base_sha, target)
+        if not inventory:
+            try:
+                probe = run_cmd(
+                    [
+                        TRUSTED_GIT_PATH,
+                        "-C",
+                        str(repo),
+                        "diff",
+                        "--name-only",
+                        f"{base_sha}...{target}",
+                    ],
+                    check=False,
+                )
+            except OSError:
+                probe = None
+            if probe is None or probe.returncode != 0:
+                errors.append("cannot compute changed-file inventory")
+
+    mapping, mapping_errors = _validation_mapping_for_paths(state, target, inventory)
+    errors.extend(mapping_errors)
+    domains = _special_verification_domains(inventory)
+    special_evidence, special_errors = _special_verification_errors(state, domains, target)
+    errors.extend(special_errors)
+    deferred = _deferred_follow_up_fingerprints(repo, state)
+    recorded_follow_ups = _recorded_follow_up_fingerprints(repo, state)
+    unresolved_follow_ups = sorted(deferred - recorded_follow_ups)
+    if unresolved_follow_ups:
+        errors.append(
+            "defer_follow_up candidates lack first-class follow-up artifacts: "
+            + ", ".join(unresolved_follow_ups)
         )
-        if proc.returncode != 0:
-            errors.append("cannot compute changed-file inventory")
-        else:
-            inventory = sorted({line.strip() for line in (proc.stdout or "").splitlines() if line.strip()})
     checks = {
         "target_sha": target,
         "base_ref": base_ref,
@@ -5877,11 +6299,21 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
         "source_snapshot_revision": scope.source_snapshot_revision,
         "diff_inventory": inventory,
         "changed_file_validation": {
-            "status": "passed" if not any(
-                item.startswith("cannot compute changed-file") for item in errors
-            ) else "failed",
+            "status": "passed" if not mapping_errors else "failed",
             "target_sha": target,
             "paths": inventory,
+            "mapping": mapping,
+        },
+        "special_verification": {
+            "status": "passed" if not special_errors else "failed",
+            "domains": domains,
+            "evidence": special_evidence,
+        },
+        "follow_up_completeness": {
+            "status": "passed" if not unresolved_follow_ups else "failed",
+            "defer_follow_up_fingerprints": sorted(deferred),
+            "recorded_fingerprints": sorted(recorded_follow_ups),
+            "unresolved": unresolved_follow_ups,
         },
     }
     return {"ready": not errors, "target_sha": target, "base_sha": base_sha, "errors": errors, "checks": checks}
@@ -5976,6 +6408,47 @@ def _review_manifest_actionable_count(manifest: hloop_review.ReviewManifest) -> 
     return _review_manifest_policy_counts(manifest)[0]
 
 
+def _update_review_execution_metrics(
+    state: Mapping[str, Any], manifest: hloop_review.ReviewManifest, round_number: int
+) -> None:
+    """Project the recorded convergence manifest into durable execution metrics."""
+
+    metrics = state.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        return
+    records = [finding.to_record() for finding in manifest.findings]
+    metrics["candidate_count"] = len(records)
+    metrics["confirmed_count"] = len(manifest.confirmed_fingerprints)
+    explicit_records = [
+        record for record in records if record.get("policy_axes_explicit") is True
+    ]
+    if explicit_records:
+        projected = hloop_reports.ExecutionMetrics.from_finding_dispositions(explicit_records)
+        metrics["finding_origin_counts"] = dict(projected.finding_origin_counts)
+        metrics["finding_contract_relation_counts"] = dict(
+            projected.finding_contract_relation_counts
+        )
+        metrics["finding_decision_requirement_counts"] = dict(
+            projected.finding_decision_requirement_counts
+        )
+        metrics["finding_disposition_counts"] = dict(projected.finding_disposition_counts)
+    else:
+        # Legacy manifests predate the independent policy axes.  Preserve the
+        # candidate/confirmed counters but do not manufacture classifications.
+        for field_name in (
+            "finding_origin_counts",
+            "finding_contract_relation_counts",
+            "finding_decision_requirement_counts",
+            "finding_disposition_counts",
+        ):
+            metrics[field_name] = {}
+    current_round = metrics.get("review_fix_rounds")
+    if isinstance(current_round, int) and not isinstance(current_round, bool):
+        metrics["review_fix_rounds"] = max(current_round, max(0, round_number))
+    else:
+        metrics["review_fix_rounds"] = max(0, round_number)
+
+
 def _final_paths(repo: Path) -> dict[str, Path]:
     directory = loop_path(repo) / "reviews" / "final"
     return {
@@ -6055,6 +6528,242 @@ def _final_certification_plan(
         verification_policy=policy,
     )
     return plan, group
+
+
+def _report_field(record: Mapping[str, Any], *names: str) -> tuple[str, Any]:
+    for name in names:
+        if name in record:
+            return name, record[name]
+    return names[0], None
+
+
+def _report_nonnegative_int(
+    record: Mapping[str, Any], *names: str
+) -> tuple[str, int | None, str | None]:
+    name, value = _report_field(record, *names)
+    if isinstance(value, bool):
+        return name, None, f"{name} must be a non-negative integer"
+    if isinstance(value, int):
+        return name, value, None if value >= 0 else f"{name} must be a non-negative integer"
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return name, int(value.strip()), None
+    return name, None, f"{name} must be a non-negative integer"
+
+
+def _manual_final_report_issues(
+    repo: Path,
+    plan: hloop_certification.CertificationPlan,
+    evidence: hloop_certification.FinalReviewManifest,
+    report_path: Path,
+) -> list[str]:
+    """Validate the human-facing FINAL.md certification record.
+
+    The structured manifest remains the source for recomputed findings and
+    lane completeness.  FINAL.md is required as an auditable human projection
+    and must carry the same fixed identity and explicit evidence references.
+    """
+
+    try:
+        record = read_frontmatter(report_path)
+    except (OSError, HLoopError) as exc:
+        return [f"report-unreadable:{exc}"]
+    issues: list[str] = []
+    required_fields = (
+        "protocol",
+        "certification_id",
+        "prepared_plan_digest",
+        "base_sha",
+        "target_sha",
+        "scope_revision",
+        "source_snapshot_revision",
+        "source_digest",
+        "lane_count",
+        "lane_names",
+        "lane_outcomes",
+        "coordinator_session_id",
+        "diff_inventory",
+        "verification_records",
+        "verification_shortfall",
+        "incomplete_findings",
+        "manifest_complete",
+        "verified_actionable_findings",
+        "findings",
+        "residual_risks",
+        "follow_up_refs",
+        "patch_verdict",
+        "completed_at",
+    )
+    aliases = {
+        "prepared_plan_digest": ("prepared_plan_digest", "plan_digest"),
+        "lane_names": ("lane_names", "lanes"),
+        "coordinator_session_id": ("coordinator_session_id", "coordinator_session"),
+        "diff_inventory": ("diff_inventory", "reviewed_files"),
+        "verification_records": ("verification_records", "verification"),
+        "verification_shortfall": ("verification_shortfall", "shortfall"),
+        "residual_risks": ("residual_risks", "risks", "risk"),
+        "follow_up_refs": ("follow_up_refs", "follow_ups", "follow_up"),
+    }
+    resolved: dict[str, Any] = {}
+    for field_name in required_fields:
+        names = aliases.get(field_name, (field_name,))
+        matched = next((name for name in names if name in record), None)
+        if matched is None:
+            issues.append(f"report-missing:{field_name}")
+        else:
+            resolved[field_name] = record[matched]
+
+    def require_text(field_name: str, expected: str | None = None) -> None:
+        value = resolved.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            issues.append(f"report-invalid:{field_name}")
+        elif expected is not None and value.strip() != expected:
+            issues.append(f"report-identity-mismatch:{field_name}")
+
+    require_text("protocol", plan.protocol)
+    require_text("certification_id", plan.certification_id)
+    require_text("prepared_plan_digest", plan.digest)
+    require_text("base_sha", plan.base_sha)
+    require_text("target_sha", plan.target_sha)
+    require_text("source_digest", plan.source_digest)
+    if str(evidence.protocol or "") != plan.protocol:
+        issues.append("report-identity-mismatch:manifest-protocol")
+
+    for field_name, expected in (
+        ("scope_revision", plan.scope_revision),
+        ("source_snapshot_revision", plan.source_snapshot_revision),
+    ):
+        raw = resolved.get(field_name)
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            issues.append(f"report-invalid:{field_name}")
+        else:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = -1
+            if value != expected:
+                issues.append(f"report-identity-mismatch:{field_name}")
+
+    lane_names = normalize_list(resolved.get("lane_names"))
+    lane_outcomes = normalize_list(resolved.get("lane_outcomes"))
+    expected_lanes = tuple(plan.lane_plan)
+    lane_count = resolved.get("lane_count")
+    try:
+        lane_count_value = -1 if isinstance(lane_count, bool) else int(lane_count)
+    except (TypeError, ValueError):
+        lane_count_value = -1
+    if lane_count_value != len(expected_lanes):
+        issues.append("report-lane-count-mismatch")
+    if len(lane_names) != len(expected_lanes) or len(lane_outcomes) != len(expected_lanes):
+        issues.append("report-lane-inventory-incomplete")
+    expected_lane_tokens = {
+        token
+        for lane in expected_lanes
+        for token in (
+            f"{lane.provider}:{lane.lane_id}",
+            lane.lane_id,
+            lane.agent_label,
+        )
+    }
+    if not set(lane_names).issubset(expected_lane_tokens) or len(set(lane_names)) != len(lane_names):
+        issues.append("report-lane-names-mismatch")
+    actual_lane_results = {
+        f"{result.provider}:{result.lane_id}": result.status
+        for result in evidence.review_manifest.lane_results
+    }
+    for lane in expected_lanes:
+        key = f"{lane.provider}:{lane.lane_id}"
+        name_matches = [
+            item
+            for item in lane_names
+            if item in {key, lane.lane_id, lane.agent_label}
+        ]
+        if len(name_matches) != 1:
+            issues.append(f"report-lane-name-missing:{key}")
+        matching = [
+            item
+            for item in lane_outcomes
+            if any(
+                item.startswith(f"{token}:")
+                for token in (key, lane.lane_id, lane.agent_label)
+            )
+        ]
+        if not matching:
+            issues.append(f"report-lane-outcome-missing:{key}")
+        else:
+            actual_status = actual_lane_results.get(key)
+            if actual_status and not any(
+                item.rsplit(":", 1)[-1] == actual_status for item in matching
+            ):
+                issues.append(f"report-lane-outcome-mismatch:{key}")
+
+    inventory = normalize_list(resolved.get("diff_inventory"))
+    actual_inventory = _changed_file_inventory(repo, plan.base_sha, plan.target_sha)
+    if actual_inventory:
+        missing = sorted(set(actual_inventory) - set(inventory))
+        extra = sorted(set(inventory) - set(actual_inventory))
+        if missing:
+            issues.append("report-diff-inventory-missing:" + ",".join(missing))
+        if extra:
+            issues.append("report-diff-inventory-extra:" + ",".join(extra))
+    elif not inventory or inventory == [""]:
+        issues.append("report-diff-inventory-missing")
+
+    verification_records = normalize_list(resolved.get("verification_records"))
+    if evidence.review_manifest.findings and not verification_records:
+        issues.append("report-verification-records-missing")
+    expected_verifications = {
+        record.fingerprint for record in evidence.review_manifest.verifications
+    }
+    if expected_verifications and not all(
+        any(fingerprint in reference for reference in verification_records)
+        for fingerprint in expected_verifications
+    ):
+        issues.append("report-verification-records-mismatch")
+    shortfall_name, shortfall, shortfall_issue = _report_nonnegative_int(
+        resolved, "verification_shortfall"
+    )
+    if shortfall_issue:
+        issues.append(f"report-invalid:{shortfall_name}")
+    elif shortfall != len(evidence.review_manifest.verification_plan.shortfalls):
+        issues.append("report-verification-shortfall-mismatch")
+    incomplete = normalize_list(resolved.get("incomplete_findings"))
+    expected_incomplete = list(evidence.completeness.incomplete_findings)
+    if sorted(incomplete) != sorted(expected_incomplete):
+        issues.append("report-incomplete-findings-mismatch")
+    if resolved.get("manifest_complete") is not evidence.manifest_complete:
+        issues.append("report-manifest-complete-mismatch")
+    _, actionable, actionable_issue = _report_nonnegative_int(
+        resolved, "verified_actionable_findings"
+    )
+    if actionable_issue:
+        issues.append("report-invalid:verified_actionable_findings")
+    elif actionable != evidence.recomputed_verified_actionable_count:
+        issues.append("report-verified-actionable-findings-mismatch")
+    report_findings = resolved.get("findings")
+    if not isinstance(report_findings, list):
+        issues.append("report-invalid:findings")
+    else:
+        finding_refs = []
+        for item in report_findings:
+            if isinstance(item, Mapping):
+                fingerprint = str(item.get("fingerprint") or "").strip()
+            else:
+                fingerprint = str(item).strip()
+            if fingerprint:
+                finding_refs.append(fingerprint)
+        expected_findings = [finding.fingerprint for finding in evidence.review_manifest.findings]
+        if len(finding_refs) != len(set(finding_refs)) or sorted(finding_refs) != sorted(expected_findings):
+            issues.append("report-findings-mismatch")
+    if not isinstance(resolved.get("residual_risks"), list):
+        issues.append("report-invalid:residual_risks")
+    if not isinstance(resolved.get("follow_up_refs"), list):
+        issues.append("report-invalid:follow_up_refs")
+    require_text("coordinator_session_id")
+    require_text("patch_verdict", evidence.patch_verdict)
+    completed_at = _parse_metric_timestamp(resolved.get("completed_at"))
+    if completed_at is None:
+        issues.append("report-invalid:completed_at")
+    return sorted(set(issues))
 
 
 def _next_certification_id(state: dict[str, Any]) -> str:
@@ -6222,6 +6931,7 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
     if round_number < 0 or round_number > max_rounds:
         raise HLoopError(f"fix round must be between 0 and {max_rounds}")
     if not args.dry_run:
+        _update_review_execution_metrics(state, manifest, round_number)
         convergence["artifact_refs"] = [str(manifest_path.relative_to(repo))]
         convergence["verified_actionable_findings"] = actionable
         convergence["release_blocking_findings"] = release_blocking
@@ -6402,6 +7112,7 @@ def _persist_review_reopen(
             json.dumps(amendment_record, ensure_ascii=False, indent=2) + "\n",
             durable=True,
         )
+        _record_scope_expansion_metric(candidate, amendment_record)
         save_state(repo, candidate)
     except Exception as exc:
         try:
@@ -6499,10 +7210,37 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
         _write_json_artifact(paths["manifest"], final_manifest.to_record())
         write_text(
             paths["report"],
-            "# Manual Final Review\n\n"
+            frontmatter(
+                {
+                    "protocol": plan.protocol,
+                    "certification_id": plan.certification_id,
+                    "prepared_plan_digest": plan.digest,
+                    "base_sha": plan.base_sha,
+                    "target_sha": plan.target_sha,
+                    "scope_revision": plan.scope_revision,
+                    "source_snapshot_revision": plan.source_snapshot_revision,
+                    "source_digest": plan.source_digest,
+                    "lane_count": len(plan.lane_plan),
+                    "lane_names": [],
+                    "lane_outcomes": [],
+                    "coordinator_session_id": "",
+                    "diff_inventory": [],
+                    "verification_records": [],
+                    "verification_shortfall": "",
+                    "incomplete_findings": [],
+                    "manifest_complete": False,
+                    "verified_actionable_findings": "",
+                    "findings": [],
+                    "residual_risks": [],
+                    "follow_up_refs": [],
+                    "patch_verdict": "",
+                    "completed_at": "",
+                }
+            )
+            + "\n# Manual Final Review\n\n"
             f"Certification: `{certification_id}`\n\n"
-            "Record structured lane and verification evidence in `MANIFEST.json`, then run "
-            "`hloop final-review record`.\n",
+            "Replace this template with the completed lane, inventory, verification, risk, "
+            "follow-up, verdict, and timestamp evidence before running `hloop final-review record`.\n",
         )
         manual = state.setdefault("manual_final_review", {})
         manual.update(
@@ -6515,7 +7253,10 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                 "manifest": str(paths["manifest"].relative_to(repo)),
                 "report": str(paths["report"].relative_to(repo)),
                 "manifest_complete": False,
+                "shortfall_count": None,
                 "verified_actionable_findings": None,
+                "lane_completed_count": 0,
+                "lane_count": len(plan.lane_plan),
                 "prepared_at": now_iso(),
             }
         )
@@ -6570,7 +7311,13 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
     )
     if not report_path.is_file() or not read_text(report_path).strip():
         raise HLoopError(f"manual final review report is missing or empty: {report_path}")
+    if report_path.resolve() != paths["report"].resolve():
+        raise HLoopError("manual final review report must use reviews/final/FINAL.md")
+    report_issues = _manual_final_report_issues(repo, plan, evidence, report_path)
+    validation_issues = sorted(set((*validation.issues, *report_issues)))
     status = validation.status
+    if report_issues and status == "passed":
+        status = "incomplete"
     if not args.dry_run:
         manual["status"] = status
         manual["certification_id"] = plan.certification_id
@@ -6580,16 +7327,28 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         manual["manifest"] = str(manifest_path.relative_to(repo))
         manual["report"] = str(report_path.relative_to(repo))
         manual["manifest_complete"] = evidence.completeness.complete
+        manual["shortfall_count"] = len(evidence.review_manifest.verification_plan.shortfalls)
         manual["verified_actionable_findings"] = evidence.recomputed_verified_actionable_count
-        manual["validation_issues"] = list(validation.issues)
+        manual["validation_issues"] = validation_issues
         manual.setdefault("attempt_history", []).append(
             {
                 "certification_id": plan.certification_id,
                 "status": status,
                 "target_sha": plan.target_sha,
-                "issues": list(validation.issues),
+                "issues": validation_issues,
                 "recorded_at": now_iso(),
             }
+        )
+        manual["incomplete_attempt_count"] = sum(
+            1
+            for item in manual["attempt_history"]
+            if isinstance(item, Mapping) and item.get("status") == "incomplete"
+        )
+        manual["lane_count"] = len(plan.lane_plan)
+        manual["lane_completed_count"] = sum(
+            1
+            for result in evidence.review_manifest.lane_results
+            if result.status == "completed"
         )
         if status == "passed":
             state["phase"] = "manual_final_review_passed"
@@ -6608,14 +7367,14 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         "current_target_sha": current,
         "manifest_complete": evidence.completeness.complete,
         "verified_actionable_findings": evidence.recomputed_verified_actionable_count,
-        "issues": list(validation.issues),
+        "issues": validation_issues,
         "plan": str(plan_path.relative_to(repo)),
         "manifest": str(manifest_path.relative_to(repo)),
         "report": str(report_path.relative_to(repo)),
         "dry_run": bool(args.dry_run),
     }
     print_policy_payload(payload, as_json=bool(args.json), label="manual final review recorded")
-    return 0 if validation.passed else 2
+    return 0 if status == "passed" and not report_issues and validation.passed else 2
 
 
 def cmd_final_review_status(args: argparse.Namespace) -> int:
@@ -6634,7 +7393,11 @@ def cmd_final_review_status(args: argparse.Namespace) -> int:
         "manifest": manual.get("manifest") or str(paths["manifest"].relative_to(repo)),
         "report": manual.get("report") or str(paths["report"].relative_to(repo)),
         "manifest_complete": manual.get("manifest_complete"),
+        "shortfall_count": manual.get("shortfall_count"),
         "verified_actionable_findings": manual.get("verified_actionable_findings"),
+        "lane_completed_count": manual.get("lane_completed_count", 0),
+        "lane_count": manual.get("lane_count", 0),
+        "incomplete_attempt_count": manual.get("incomplete_attempt_count", 0),
         "dispatch_freeze": dispatch_freeze_record(state),
         "phase": state.get("phase"),
     }
@@ -9044,7 +9807,11 @@ None.
             "manifest": "",
             "report": "",
             "manifest_complete": None,
+            "shortfall_count": None,
             "verified_actionable_findings": None,
+            "lane_completed_count": 0,
+            "lane_count": 0,
+            "incomplete_attempt_count": 0,
             "attempt_history": [],
         },
         "gap_after_merges": args.gap_after_merges,
@@ -9113,7 +9880,10 @@ None.
             "broker": "local-only",
         },
         "git_identity": git_executable_identity(),
+        "manager_invocation": _manager_invocation_record(),
+        "execution_metrics": _empty_execution_metrics(),
         "created_at": now_iso(),
+        "phase_started_at": now_iso(),
     }
     if state_path(repo).exists() and not args.force:
         old = load_state(repo)
@@ -9213,7 +9983,11 @@ None.
                 "manifest": "",
                 "report": "",
                 "manifest_complete": None,
+                "shortfall_count": None,
                 "verified_actionable_findings": None,
+                "lane_completed_count": 0,
+                "lane_count": 0,
+                "incomplete_attempt_count": 0,
                 "attempt_history": [],
             },
         )
@@ -9230,6 +10004,8 @@ None.
         old.setdefault("manager_context", [])
         old.setdefault("progress_sequence", 0)
         old.setdefault("git_identity", git_executable_identity())
+        old.setdefault("manager_invocation", _manager_invocation_record())
+        old.setdefault("execution_metrics", _empty_execution_metrics())
         write_requirement_artifacts(repo, old)
         write_manager_context_artifact(repo, old)
         write_decision_artifacts(repo, old)
@@ -9242,6 +10018,9 @@ None.
     save_state(repo, state)
     archive_note = f" Archived previous loop at `{archived_loop}`." if archived_loop else ""
     journal(repo, f"Initialized loop `{goal_id}` run `{run_id}` on integration branch `{integration}`.{archive_note}")
+    invocation = state.get("manager_invocation")
+    if isinstance(invocation, Mapping) and invocation.get("unavailable_reason"):
+        journal(repo, "Manager invocation identity unavailable: " + str(invocation["unavailable_reason"]))
     print(f"initialized {LOOP_DIR.as_posix()} for {goal_id}")
     if (repo / LEGACY_LOOP_DIR).exists():
         print(f"ignored legacy loop: {LEGACY_LOOP_DIR.as_posix()}")
@@ -9359,6 +10138,7 @@ def cmd_release_scope_amend(args: argparse.Namespace) -> int:
     amendment_path = loop_path(repo) / "release-scope" / "amendments" / f"{amendment_id}.json"
     write_text(amendment_path, json.dumps(amendment.to_record(), ensure_ascii=False, indent=2) + "\n")
     state["release_scope"] = updated_scope.to_record()
+    _record_scope_expansion_metric(state, amendment.to_record())
     invalidate_review_gates_for_change(
         state,
         reason=f"release-scope-amendment:{amendment_id}",
@@ -16356,6 +17136,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
     state["integration_head_sha"] = head_sha
     state["completion_target_sha"] = head_sha
+    validation_started = time.monotonic()
     results = []
     failed = False
     for index, command in enumerate(commands, start=1):
@@ -16399,7 +17180,29 @@ def cmd_validate(args: argparse.Namespace) -> int:
             failed = True
             break
     if not args.dry_run:
-        state["last_validation"] = {"at": now_iso(), "head_sha": head_sha, "results": results}
+        completed_at = now_iso()
+        state["last_validation"] = {"at": completed_at, "head_sha": head_sha, "results": results}
+        try:
+            base_sha = git(repo, ["rev-parse", str(state.get("base_branch") or "")])
+        except (HLoopError, subprocess.CalledProcessError):
+            base_sha = ""
+        inventory = _changed_file_inventory(repo, base_sha, head_sha)
+        evidence_refs = [
+            str(item.get("log") or item.get("command") or "validation")
+            for item in results
+            if item.get("result") == "passed"
+        ]
+        state["changed_file_validation"] = {
+            "status": "passed" if not failed and evidence_refs else "failed",
+            "target_sha": head_sha,
+            "paths": inventory,
+            "mapping": {path: list(evidence_refs) for path in inventory},
+        }
+        metrics = state.get("execution_metrics")
+        if isinstance(metrics, dict):
+            metrics["validation_time_seconds"] = round(
+                max(0.0, time.monotonic() - validation_started), 6
+            )
         state["needs_validation"] = failed
         if failed:
             state["phase"] = "failed_validation"
@@ -21485,6 +22288,7 @@ def build_outcome_report(
     kind: str,
     blocking_reason: str = "",
 ) -> hloop_reports.OutcomeReport:
+    _refresh_execution_metrics(state)
     target = git(repo, ["rev-parse", str(state["integration_branch"])])
     current = git(repo, ["rev-parse", "HEAD"])
     validation_results = list((state.get("last_validation") or {}).get("results") or [])
@@ -21676,6 +22480,7 @@ def build_outcome_report(
         ),
         "blocking_reason": blocking_reason,
     }
+    kwargs.update(hloop_reports.report_projections_from_state(state))
     try:
         if kind == "FINAL":
             return hloop_reports.final_outcome(**kwargs)

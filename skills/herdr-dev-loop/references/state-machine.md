@@ -85,7 +85,7 @@ For a new 0.5.2 loop, the review transition is itself bounded and artifact-drive
 1. close the current task batch and verify the release-scope snapshot, current validation, clean Manager checkout, and no active role or merge;
 2. enter `review_readiness`, then prepare `reviews/convergence/PLAN.json` and an intentionally incomplete `MANIFEST.json` at one base/target SHA;
 3. collect fixed-target lane and verification evidence and record the manifest; if actionable findings remain, keep dispatch frozen while the Manager performs at most two automatic fix rounds;
-4. when convergence records zero verified actionable findings, prepare `reviews/final/PLAN.json`, `MANIFEST.json`, and `REPORT.md`, then record the independent manual-final certification;
+4. when convergence records zero verified actionable findings, prepare `reviews/final/PLAN.json`, `MANIFEST.json`, and `FINAL.md`, then record the independent manual-final certification;
 5. permit `hloop review reopen` only for an exhausted, failed, or incomplete review state, with explicit user-input provenance and the selected remediation, scope amendment, feature action, retry, or abort policy.
 
 The convergence and manual-final artifacts are not interchangeable. A new task,

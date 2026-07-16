@@ -82,6 +82,11 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
         self.assertIn("failed", evidence["attempt_history_statuses"])
         self.assertIn("passed", evidence["attempt_history_statuses"])
 
+    def test_finish_projects_state_metrics_into_final_outcome(self):
+        evidence = self.run_scenario("final-gate-and-finish")
+        self.assertTrue(evidence["metrics_projected"])
+        self.assertEqual(evidence["phase"], "done")
+
 
 if __name__ == "__main__":
     unittest.main()
