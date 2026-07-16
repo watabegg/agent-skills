@@ -604,6 +604,31 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertIn("D001", report)
         self.assertIn("Compatibility behavior remains observable", report)
 
+        self.assertEqual(
+            hloop._finish_accepted_risk_errors(
+                self.repo, self.state(), manifest.target_sha
+            ),
+            [],
+        )
+        state = self.state()
+        state.pop("accepted_risk_authorizations", None)
+        state["manual_final_review"].pop("accepted_risk_authorizations", None)
+        self.save_state(state)
+        projection_errors = hloop._finish_accepted_risk_errors(
+            self.repo, self.state(), manifest.target_sha
+        )
+        self.assertIn(
+            "accepted-risk authorization projection does not match final-review findings",
+            projection_errors,
+        )
+        state = self.state()
+        state["decisions"]["D001"]["accepted_risk_authorization"][
+            "target_sha"
+        ] = "stale-target"
+        self.save_state(state)
+        errors = hloop._finish_accepted_risk_errors(self.repo, self.state(), manifest.target_sha)
+        self.assertTrue(any("revalidation" in error for error in errors))
+
     def test_convergence_and_final_prepare_recheck_deferred_follow_up_artifacts(self):
         self.prepare_convergence()
         self.write_policy_manifest(outside_release=True)
@@ -796,6 +821,62 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("target SHA is stale", err)
+
+    def test_readiness_rejects_legacy_special_verification_without_target_identity(self):
+        target = self.state()["integration_head_sha"]
+        state = self.state()
+        state["changed_file_validation"] = {
+            "status": "passed",
+            "target_sha": target,
+            "paths": ["migration/step.py"],
+            "mapping": {"migration/step.py": ["validation.log"]},
+        }
+        state["special_verification_evidence"] = {
+            "migration": ["legacy-migration.log"],
+        }
+        self.save_state(state)
+        with mock.patch.object(
+            hloop, "_changed_file_inventory", return_value=["migration/step.py"]
+        ):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "")
+        payload = json.loads(out)
+        self.assertIn(
+            "special verification evidence identity is missing: migration",
+            payload["errors"],
+        )
+
+    def test_validation_evidence_reuse_requires_exact_command_order(self):
+        identity = {
+            "target_sha": "target",
+            "commands": ["lint", "test"],
+            "dependency_identity": "dependencies",
+        }
+        record = {"validation_identity": identity}
+        self.assertTrue(hloop._validation_identity_matches(record, identity))
+        reordered = {
+            **identity,
+            "commands": ["test", "lint"],
+        }
+        self.assertFalse(hloop._validation_identity_matches(record, reordered))
+
+    def test_manual_final_protocol_does_not_fallback_to_implemented_protocol(self):
+        target = self.state()["integration_head_sha"]
+        state = self.state()
+        state["review_policy"]["manual_final_protocol"] = "native"
+        state["review_convergence"] = {
+            "status": "converged",
+            "target_sha": target,
+            "base_sha": target,
+            "fix_round": 0,
+            "artifact_refs": [],
+        }
+        self.save_state(state)
+        code, out, err = self.run_cli("final-review", "prepare", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("unsupported manual-final protocol", err)
 
     def test_readiness_requires_first_class_follow_up_for_deferred_candidate(self):
         fingerprint = "sha256:" + "d" * 64
@@ -1334,6 +1415,9 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(state["release_scope"]["source_snapshot_revision"], 2)
         self.assertEqual(state["release_scope"]["last_user_input_id"], "U0001")
         self.assertEqual(state["manual_final_review"]["status"], "pending")
+        self.assertEqual(state["review_convergence"]["status"], "pending")
+        self.assertEqual(state["review_convergence"]["artifact_refs"], [])
+        self.assertEqual(state["review_readiness"]["status"], "pending")
         self.assertEqual(state["dispatch_freeze"]["status"], "inactive")
 
     def test_scope_changing_reopen_cli_rejects_uncaptured_id_before_artifact(self):
