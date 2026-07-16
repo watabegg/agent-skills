@@ -669,6 +669,56 @@ def follow_up_relation(
     )
 
 
+def resolve_issue_key_alias(
+    issue_key: str,
+    aliases: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve an issue-key alias chain to one canonical key.
+
+    Alias maps are persisted by the CLI, but the resolution rule belongs in
+    the policy layer so every caller rejects malformed keys and cycles in the
+    same way.  A relation target is never accepted merely because it happens
+    to be present as an unvalidated dictionary key.
+    """
+
+    current = _issue_key_text(issue_key)
+    mapping = aliases or {}
+    if not isinstance(mapping, Mapping):
+        raise ReviewPolicyError("issue key aliases must be an object")
+    visited: set[str] = set()
+    while current in mapping:
+        if current in visited:
+            raise ReviewPolicyError("follow-up issue-key alias cycle detected")
+        visited.add(current)
+        current = _issue_key_text(mapping[current], "canonical_issue_key")
+    return current
+
+
+def validate_follow_up_relation(
+    value: FollowUpRelation | Mapping[str, Any],
+    *,
+    known_issue_keys: Sequence[str] = (),
+    aliases: Mapping[str, str] | None = None,
+) -> FollowUpRelation:
+    """Validate a relation against known canonical or aliased issue keys."""
+
+    relation = value if isinstance(value, FollowUpRelation) else FollowUpRelation.from_record(value)
+    known = {
+        resolve_issue_key_alias(key, aliases)
+        for key in known_issue_keys
+    }
+    target = resolve_issue_key_alias(relation.target_issue_key, aliases)
+    if known and target not in known:
+        raise ReviewPolicyError(
+            f"follow-up relation target is unknown: {relation.target_issue_key}"
+        )
+    if relation.source_issue_key:
+        source = resolve_issue_key_alias(relation.source_issue_key, aliases)
+        if source == target:
+            raise ReviewPolicyError("follow-up relation cannot target itself")
+    return relation
+
+
 def same_follow_up_issue(
     left: FollowUpIssueKey | str, right: FollowUpIssueKey | str
 ) -> bool:
@@ -726,6 +776,8 @@ __all__ = [
     "follow_up_relation",
     "issue_key_components",
     "same_follow_up_issue",
+    "resolve_issue_key_alias",
+    "validate_follow_up_relation",
     "validate_disposition",
     "validate_finding_policy",
 ]

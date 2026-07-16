@@ -491,6 +491,173 @@ class PolicyCliV052Tests(unittest.TestCase):
                 self.assertIn("review reopen", output)
                 self.assertEqual(state_path.read_bytes(), before)
 
+    def test_follow_up_relations_promote_and_preserve_one_canonical_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "1" * 64
+
+            def add_follow_up(*extra: str) -> dict:
+                args = [
+                    "follow-up",
+                    "add",
+                    "--title",
+                    "Review follow-up",
+                    "--component",
+                    "review runtime",
+                    "--trigger-class",
+                    "classification drift",
+                    "--product-impact",
+                    "operator needs a later release decision",
+                    "--source-review-fingerprint",
+                    fingerprint,
+                    "--discovered-head",
+                    "abc123",
+                    "--evidence",
+                    "review evidence one",
+                    "--impact",
+                    "outside the current release contract",
+                    "--affected-path",
+                    "src/review.py",
+                    "--fact-status",
+                    "confirmed",
+                    "--severity",
+                    "P2",
+                    "--origin",
+                    "unrelated-pre-existing",
+                    "--contract-relation",
+                    "outside_release",
+                    "--decision-requirement",
+                    "none",
+                    "--release-effect",
+                    "non_blocking",
+                    "--disposition",
+                    "defer_follow_up",
+                    "--recommended-action",
+                    "defer_follow_up",
+                    "--deferred-reason",
+                    "outside this release",
+                    "--reconsider-condition",
+                    "next release scope lock",
+                    "--json",
+                    *extra,
+                ]
+                result, output = self.run_cli(repo, *args)
+                self.assertEqual(result, 0, output)
+                return json.loads(output)
+
+            provisional = add_follow_up()
+            provisional_key = provisional["follow_up"]["issue_key"]
+            self.assertTrue(provisional["follow_up"]["provisional"])
+
+            final = add_follow_up(
+                "--root-cause",
+                "unsafe disposition merge",
+                "--alias-of",
+                provisional_key,
+                "--evidence",
+                "review evidence two",
+                "--source-review-fingerprint",
+                "sha256:" + "2" * 64,
+            )
+            final_record = final["follow_up"]
+            final_key = final_record["issue_key"]
+            self.assertEqual(final["status"], "deduplicated")
+            self.assertEqual(final_record["id"], "F001")
+            self.assertFalse(final_record["provisional"])
+            self.assertIn(provisional_key, final_record["aliases"])
+            self.assertEqual(
+                final_record["source_review_fingerprints"],
+                [fingerprint, "sha256:" + "2" * 64],
+            )
+            self.assertEqual(
+                final_record["evidence"],
+                ["review evidence one", "review evidence two"],
+            )
+            self.assertTrue(final_record["history"])
+            state = hloop.load_state(repo)
+            self.assertEqual(state["follow_ups"]["issue_keys"], {final_key: "F001"})
+            self.assertEqual(
+                state["follow_ups"]["issue_key_aliases"][provisional_key], final_key
+            )
+            result, output = self.run_cli(
+                repo, "follow-up", "show", provisional_key, "--json"
+            )
+            self.assertEqual(result, 0, output)
+            self.assertEqual(json.loads(output)["id"], "F001")
+            self.assertEqual(json.loads(output)["issue_key"], final_key)
+
+            duplicate = add_follow_up(
+                "--root-cause",
+                "different wording",
+                "--duplicate-of",
+                final_key,
+            )
+            duplicate_key = duplicate["follow_up"]["issue_key"]
+            self.assertEqual(duplicate["follow_up"]["id"], "F001")
+            self.assertEqual(
+                hloop.load_state(repo)["follow_ups"]["issue_key_aliases"][duplicate_key],
+                final_key,
+            )
+
+            superseding = add_follow_up(
+                "--component",
+                "review runtime replacement",
+                "--root-cause",
+                "replacement design",
+                "--supersedes",
+                final_key,
+            )
+            self.assertEqual(superseding["follow_up"]["id"], "F002")
+            superseding_key = superseding["follow_up"]["issue_key"]
+            state = hloop.load_state(repo)
+            self.assertEqual(state["follow_ups"]["issue_keys"], {superseding_key: "F002"})
+            self.assertEqual(
+                state["follow_ups"]["issue_key_aliases"][final_key], superseding_key
+            )
+            self.assertEqual(
+                hloop.read_frontmatter(loop / "follow-ups" / "F001.md")["status"],
+                "superseded",
+            )
+            result, output = self.run_cli(
+                repo, "follow-up", "show", provisional_key, "--json"
+            )
+            self.assertEqual(result, 0, output)
+            self.assertEqual(json.loads(output)["id"], "F002")
+
+            before = (loop / "STATE.json").read_bytes()
+            result, output = self.run_cli(
+                repo,
+                "follow-up",
+                "add",
+                "--title",
+                "Self relation",
+                "--component",
+                "review runtime",
+                "--trigger-class",
+                "classification drift",
+                "--product-impact",
+                "operator needs a later release decision",
+                "--root-cause",
+                "unsafe disposition merge",
+                "--source-review-fingerprint",
+                "sha256:" + "3" * 64,
+                "--evidence",
+                "invalid relation",
+                "--impact",
+                "invalid",
+                "--affected-path",
+                "src/review.py",
+                "--deferred-reason",
+                "invalid",
+                "--reconsider-condition",
+                "invalid",
+                "--alias-of",
+                final_key,
+            )
+            self.assertNotEqual(result, 0, output)
+            self.assertEqual((loop / "STATE.json").read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,12 @@
     "fingerprint",
     "head_sha",
     "severity",
+    "fact_status",
+    "origin",
+    "contract_relation",
+    "decision_requirement",
+    "disposition",
+    "release_effect",
     "requires_spec_decision",
     "classification",
     "cross_model_consensus",
@@ -78,7 +84,8 @@
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
     },
-    "why_fix_now": {"type": "string"}
+    "why_fix_now": {"type": "string"},
+    "policy_axes_explicit": {"type": "boolean"}
   },
   "allOf": [
     {
@@ -114,7 +121,12 @@
         "product_impact",
         "origin",
         "proposed_fix",
-        "requires_spec_decision"
+        "requires_spec_decision",
+        "fact_status",
+        "contract_relation",
+        "decision_requirement",
+        "disposition",
+        "release_effect"
       ],
       "properties": {
         "finding_id": {"type": "string", "minLength": 1},
@@ -134,7 +146,8 @@
           "enum": [
             "introduced",
             "diff-expanded-pre-existing",
-            "unrelated-pre-existing"
+            "unrelated-pre-existing",
+            "unknown"
           ]
         },
         "proposed_fix": {"type": "string", "minLength": 1},
@@ -164,7 +177,8 @@
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
         },
-        "why_fix_now": {"type": "string"}
+        "why_fix_now": {"type": "string"},
+        "policy_axes_explicit": {"type": "boolean"}
       },
       "additionalProperties": false
     }
