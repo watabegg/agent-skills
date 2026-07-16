@@ -219,6 +219,38 @@ DANGEROUS_AGENT_MARKERS = (
 )
 SUSPICIOUS_WORKER_HEADS = {"manager-working-tree", "pending_code_commit"}
 BATCH_ID_RE = re.compile(r"^B[0-9]{3}$")
+VALIDATION_SNAPSHOT_VERSION = 1
+DEPENDENCY_LOCKFILE_NAMES = frozenset(
+    {
+        "bun.lock",
+        "bun.lockb",
+        "cargo.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "go.sum",
+        "npm-shrinkwrap.json",
+        "package-lock.json",
+        "pipfile.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "uv.lock",
+        "yarn.lock",
+    }
+)
+TOOLCHAIN_FILE_NAMES = frozenset(
+    {
+        ".node-version",
+        ".nvmrc",
+        ".python-version",
+        ".ruby-version",
+        ".tool-versions",
+        "go.mod",
+        "go.work",
+        "mise.toml",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+    }
+)
 CHECKPOINT_TRAILER_KIND = "HLoop-Checkpoint"
 CHECKPOINT_TRAILER_BATCH = "HLoop-Batch"
 CHECKPOINT_KIND_LOOP_STATE = "loop-state"
@@ -1704,6 +1736,7 @@ def assert_mutating_state_schema_compatible(repo: Path) -> None:
 
 def save_state(repo: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = now_iso()
+    _refresh_validation_staleness(repo, state)
     _refresh_execution_metrics(state)
     write_text(
         state_path(repo),
@@ -1736,6 +1769,532 @@ def _observed_duration_seconds(start: Any, end: Any) -> float | None:
         return None
     value = (finished - started).total_seconds()
     return round(value, 6) if value >= 0 else None
+
+
+def _canonical_digest(value: Any) -> str:
+    """Hash JSON-compatible evidence without depending on mapping order."""
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _repository_visible_paths(repo: Path) -> list[str]:
+    """Return tracked and non-ignored paths used for identity snapshots."""
+
+    try:
+        output = git(repo, ["ls-files", "--cached", "--others", "--exclude-standard"])
+    except (HLoopError, OSError, subprocess.CalledProcessError):
+        return []
+    return sorted(
+        {
+            normalize_match_path(line.strip())
+            for line in output.splitlines()
+            if line.strip()
+        }
+    )
+
+
+def _snapshot_file_group(repo: Path, paths: Sequence[str]) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for raw_path in sorted(dict.fromkeys(normalize_match_path(path) for path in paths)):
+        path = repo / raw_path
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            entries.append({"path": raw_path, "exists": True, "sha256": digest})
+        else:
+            # Retain deleted tracked files in the snapshot so deletion also
+            # invalidates evidence recorded before the file disappeared.
+            entries.append({"path": raw_path, "exists": False, "sha256": ""})
+    return {
+        "files": entries,
+        "digest": _canonical_digest(entries),
+    }
+
+
+def _validation_dependency_identity(repo: Path, state: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the dependency/config/toolchain identity bound to validation."""
+
+    visible_paths = _repository_visible_paths(repo)
+    lockfiles = [
+        path
+        for path in visible_paths
+        if Path(path).name.lower() in DEPENDENCY_LOCKFILE_NAMES
+        or Path(path).name.lower().endswith((".lock", ".lockb", ".lockfile"))
+    ]
+    # Root-level dependency manifests are included because a repository can
+    # intentionally omit a lockfile while still using a package manifest as
+    # its dependency contract.
+    dependency_manifests = [
+        path
+        for path in visible_paths
+        if Path(path).name.lower()
+        in {
+            "cargo.toml",
+            "composer.json",
+            "gemfile",
+            "package.json",
+            "pipfile",
+            "poetry.toml",
+            "pyproject.toml",
+            "requirements.txt",
+            "setup.cfg",
+            "setup.py",
+        }
+    ]
+    lockfile_snapshot = _snapshot_file_group(repo, [*lockfiles, *dependency_manifests])
+    toolchain_paths = [
+        path
+        for path in visible_paths
+        if Path(path).name.lower() in TOOLCHAIN_FILE_NAMES
+    ]
+    toolchain_snapshot = _snapshot_file_group(repo, toolchain_paths)
+    toolchain_snapshot["runtime"] = {
+        "python_implementation": getattr(sys.implementation, "name", ""),
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "platform": sys.platform,
+    }
+    toolchain_snapshot["digest"] = _canonical_digest(toolchain_snapshot)
+    resolved_config = state.get("resolved_config")
+    resolved_config_snapshot = {
+        "digest": _canonical_digest(resolved_config if resolved_config is not None else {}),
+        "value": resolved_config if isinstance(resolved_config, Mapping) else {},
+    }
+    dependency_identity = _canonical_digest(
+        {
+            "lockfiles": lockfile_snapshot,
+            "toolchain": toolchain_snapshot,
+            "resolved_config": resolved_config_snapshot,
+        }
+    )
+    return {
+        "version": VALIDATION_SNAPSHOT_VERSION,
+        "dependency_identity": dependency_identity,
+        "lockfile_snapshot": lockfile_snapshot,
+        "toolchain_snapshot": toolchain_snapshot,
+        "resolved_config_snapshot": resolved_config_snapshot,
+    }
+
+
+def build_validation_identity(
+    repo: Path,
+    state: Mapping[str, Any],
+    target_sha: str,
+    commands: Sequence[str],
+) -> dict[str, Any]:
+    """Return the exact evidence identity required for validation reuse."""
+
+    normalized_commands = [str(command) for command in commands]
+    dependency = _validation_dependency_identity(repo, state)
+    return {
+        "version": VALIDATION_SNAPSHOT_VERSION,
+        "target_sha": str(target_sha),
+        "commands": normalized_commands,
+        "command_set": sorted(normalized_commands),
+        **dependency,
+    }
+
+
+# Keep a concise public spelling for tests and repository integrations.
+validation_identity = build_validation_identity
+
+
+def _validation_identity_matches(
+    record: Mapping[str, Any] | None, identity: Mapping[str, Any]
+) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    stored = record.get("validation_identity")
+    if not isinstance(stored, Mapping):
+        stored = {
+            "target_sha": record.get("head_sha"),
+            "commands": record.get("commands"),
+            "dependency_identity": record.get("dependency_identity"),
+        }
+    stored_commands = sorted(str(item) for item in normalize_list(stored.get("commands")))
+    current_commands = sorted(str(item) for item in normalize_list(identity.get("commands")))
+    return (
+        str(stored.get("target_sha") or "") == str(identity.get("target_sha") or "")
+        and stored_commands == current_commands
+        and str(stored.get("dependency_identity") or "")
+        == str(identity.get("dependency_identity") or "")
+    )
+
+
+def _validation_reusable(
+    state: Mapping[str, Any], identity: Mapping[str, Any]
+) -> bool:
+    last = state.get("last_validation")
+    if not isinstance(last, Mapping) or normalize_bool(state.get("validation_stale")):
+        return False
+    results = last.get("results")
+    return bool(results) and all(
+        isinstance(item, Mapping) and item.get("result") == "passed"
+        for item in results
+    ) and _validation_identity_matches(last, identity)
+
+
+def _refresh_validation_staleness(repo: Path, state: dict[str, Any]) -> None:
+    """Mark evidence stale when its fixed target or dependency identity drifts."""
+
+    last = state.get("last_validation")
+    if not isinstance(last, dict) or not isinstance(last.get("validation_identity"), Mapping):
+        return
+    integration = str(state.get("integration_branch") or "")
+    if not integration:
+        return
+    try:
+        target = git(repo, ["rev-parse", integration])
+    except (HLoopError, OSError, subprocess.CalledProcessError):
+        return
+    commands = normalize_list(state.get("validation_commands")) or normalize_list(
+        last.get("commands")
+    )
+    current = build_validation_identity(repo, state, target, commands)
+    if _validation_identity_matches(last, current):
+        state["validation_stale"] = False
+        state.pop("validation_stale_reason", None)
+        return
+    state["validation_stale"] = True
+    state["validation_stale_reason"] = (
+        "validation identity changed: target SHA, command set, lockfile, "
+        "toolchain, or resolved-config snapshot"
+    )
+
+
+def _validation_batch_id(state: Mapping[str, Any]) -> str:
+    try:
+        active = current_batch_id(dict(state))
+    except HLoopError:
+        active = ""
+    return active or latest_closed_batch_id(state)
+
+
+def _validation_duration(record: Mapping[str, Any]) -> float:
+    raw = record.get("duration_seconds")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+        return round(float(raw), 6)
+    duration = _observed_duration_seconds(
+        record.get("started_at") or record.get("validation_started_at"),
+        record.get("completed_at") or record.get("at"),
+    )
+    return duration or 0.0
+
+
+def _record_interval(record: Mapping[str, Any]) -> tuple[datetime, datetime] | None:
+    started = _parse_metric_timestamp(record.get("started_at") or record.get("validation_started_at"))
+    ended = _parse_metric_timestamp(record.get("completed_at") or record.get("closed_at") or record.get("at"))
+    if started is None or ended is None or ended < started:
+        return None
+    return started, ended
+
+
+def _batch_task_ids_for_metrics(state: Mapping[str, Any], batch_id: str) -> list[str]:
+    batch = (state.get("batches") or {}).get(batch_id)
+    if not isinstance(batch, Mapping):
+        return []
+    task_ids = set(normalize_list(batch.get("task_ids")))
+    for task_id, task in (state.get("tasks") or {}).items():
+        if isinstance(task, Mapping) and str(task.get("batch_id") or "") == batch_id:
+            task_ids.add(str(task_id))
+    return sorted(task_ids)
+
+
+def _worker_interval(task: Mapping[str, Any]) -> tuple[datetime, datetime, float] | None:
+    started = _parse_metric_timestamp(task.get("started_at"))
+    if started is None:
+        return None
+    ended_value = next(
+        (
+            task.get(field_name)
+            for field_name in (
+                "completed_at",
+                "finished_at",
+                "harvested_at",
+                "merged_at",
+                "updated_at",
+            )
+            if task.get(field_name)
+        ),
+        None,
+    )
+    ended = _parse_metric_timestamp(ended_value)
+    if ended is None or ended < started:
+        return None
+    duration = round((ended - started).total_seconds(), 6)
+    return started, ended, duration
+
+
+def _interval_inside(
+    interval: tuple[datetime, datetime] | None,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    if interval is None:
+        return False
+    observed_start, observed_end = interval
+    if start is not None and observed_start < start:
+        return False
+    if end is not None and observed_end > end:
+        return False
+    return True
+
+
+def _batch_validation_records(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    records: list[Mapping[str, Any]] = []
+    history = state.get("validation_history")
+    if isinstance(history, Sequence) and not isinstance(history, (str, bytes)):
+        records.extend(item for item in history if isinstance(item, Mapping))
+    last = state.get("last_validation")
+    if isinstance(last, Mapping):
+        last_key = (
+            str(last.get("validation_id") or ""),
+            str(last.get("at") or last.get("completed_at") or ""),
+            str(last.get("head_sha") or ""),
+            tuple(normalize_list(last.get("commands"))),
+            bool(last.get("reused")),
+        )
+        if not any(
+            (
+                str(item.get("validation_id") or ""),
+                str(item.get("at") or item.get("completed_at") or ""),
+                str(item.get("head_sha") or ""),
+                tuple(normalize_list(item.get("commands"))),
+                bool(item.get("reused")),
+            )
+            == last_key
+            for item in records
+        ):
+            records.append(last)
+    return records
+
+
+def _batch_role_records(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    records: list[Mapping[str, Any]] = []
+    for group_name in ("reviews", "gaps"):
+        group = state.get(group_name)
+        if isinstance(group, Mapping):
+            records.extend(item for item in group.values() if isinstance(item, Mapping))
+    return records
+
+
+def _batch_performance_record(
+    state: Mapping[str, Any], batch_id: str, *, closed_at: str | None = None
+) -> dict[str, Any]:
+    batch = (state.get("batches") or {}).get(batch_id)
+    if not isinstance(batch, Mapping):
+        raise HLoopError(f"unknown batch: {batch_id}")
+    task_ids = _batch_task_ids_for_metrics(state, batch_id)
+    worker_intervals: list[tuple[datetime, datetime, float]] = []
+    for task_id in task_ids:
+        task = (state.get("tasks") or {}).get(task_id)
+        if isinstance(task, Mapping):
+            interval = _worker_interval(task)
+            if interval is not None:
+                worker_intervals.append(interval)
+
+    batch_start = _parse_metric_timestamp(batch.get("started_at") or batch.get("created_at"))
+    batch_end = _parse_metric_timestamp(closed_at or batch.get("closed_at"))
+    if batch_start is None and worker_intervals:
+        batch_start = min(item[0] for item in worker_intervals)
+    if batch_end is None and worker_intervals:
+        batch_end = max(item[1] for item in worker_intervals)
+    wall_time = 0.0
+    if batch_start is not None and batch_end is not None and batch_end >= batch_start:
+        wall_time = round((batch_end - batch_start).total_seconds(), 6)
+    worker_runtime = round(sum(item[2] for item in worker_intervals), 6)
+    longest_worker = max((item[2] for item in worker_intervals), default=0.0)
+    effective_parallelism = (
+        round(worker_runtime / wall_time, 6) if wall_time > 0 else None
+    )
+
+    validation_time = 0.0
+    review_wait = 0.0
+    for record in _batch_validation_records(state):
+        tagged = str(record.get("batch_id") or "") == batch_id
+        if not tagged and not _interval_inside(_record_interval(record), batch_start, batch_end):
+            continue
+        validation_time += _validation_duration(record)
+    for record in _batch_role_records(state):
+        tagged = str(record.get("batch_id") or "") == batch_id
+        interval = _record_interval(record)
+        if not tagged and not _interval_inside(interval, batch_start, batch_end):
+            continue
+        if interval is not None:
+            review_wait += round((interval[1] - interval[0]).total_seconds(), 6)
+        else:
+            review_wait += _observed_duration_seconds(
+                record.get("started_at"),
+                record.get("completed_at") or record.get("harvested_at") or record.get("closed_at"),
+            ) or 0.0
+
+    warnings: list[str] = []
+    if (
+        len(worker_intervals) >= 2
+        and effective_parallelism is not None
+        and effective_parallelism < 1.5
+    ):
+        warnings.append(
+            "effective-parallelism-low: "
+            f"{effective_parallelism:g} with {len(worker_intervals)} workers"
+        )
+    graph = batch.get("write_scope_conflict_graph")
+    graph_digest = str(graph.get("digest") or "") if isinstance(graph, Mapping) else ""
+    return {
+        "batch_id": batch_id,
+        "worker_count": len(worker_intervals),
+        "wall_time_seconds": wall_time,
+        "phase_wall_time_seconds": wall_time,
+        "worker_runtime_seconds": worker_runtime,
+        "worker_runtime_total_seconds": worker_runtime,
+        "effective_parallelism": effective_parallelism,
+        "longest_worker_seconds": round(longest_worker, 6),
+        "validation_time_seconds": round(validation_time, 6),
+        "review_wait_time_seconds": round(review_wait, 6),
+        "warnings": list(dict.fromkeys(warnings)),
+        "replan_required": bool(warnings),
+        "conflict_graph_digest": graph_digest,
+    }
+
+
+def _refresh_batch_performance(
+    state: dict[str, Any], batch_id: str, *, closed_at: str | None = None
+) -> dict[str, Any]:
+    batch = require_batch(state, batch_id)
+    performance = _batch_performance_record(state, batch_id, closed_at=closed_at)
+    batch["performance"] = performance
+    # ``metrics`` is retained as a concise compatibility spelling for callers
+    # that treat the batch record as a metrics envelope.
+    batch["metrics"] = dict(performance)
+    for key, value in performance.items():
+        if key in {
+            "batch_id",
+            "worker_count",
+            "wall_time_seconds",
+            "worker_runtime_seconds",
+            "effective_parallelism",
+            "longest_worker_seconds",
+            "validation_time_seconds",
+            "review_wait_time_seconds",
+            "warnings",
+            "replan_required",
+            "conflict_graph_digest",
+        }:
+            batch[key] = value
+    return performance
+
+
+def _batch_performance_records(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    batches = state.get("batches")
+    if not isinstance(batches, Mapping):
+        return records
+    for batch_id, batch in batches.items():
+        if not isinstance(batch, Mapping):
+            continue
+        performance = batch.get("performance") or batch.get("metrics")
+        if isinstance(performance, Mapping):
+            record = dict(performance)
+            record.setdefault("batch_id", str(batch_id))
+            records.append(record)
+    return sorted(records, key=lambda item: str(item.get("batch_id") or ""))
+
+
+def build_write_scope_conflict_graph(
+    state: Mapping[str, Any],
+    task_ids: Sequence[str] | None = None,
+    *,
+    batch_id: str = "",
+) -> dict[str, Any]:
+    """Build deterministic evidence for pairwise Worker write-scope conflicts."""
+
+    if task_ids is None:
+        selected = (
+            _batch_task_ids_for_metrics(state, batch_id)
+            if batch_id
+            else sorted(str(task_id) for task_id in (state.get("tasks") or {}))
+        )
+    else:
+        selected = sorted(dict.fromkeys(str(task_id) for task_id in task_ids))
+    tasks = state.get("tasks")
+    tasks = tasks if isinstance(tasks, Mapping) else {}
+    nodes: dict[str, dict[str, Any]] = {}
+    for task_id in selected:
+        task = tasks.get(task_id)
+        if not isinstance(task, Mapping):
+            continue
+        nodes[task_id] = {
+            "status": str(task.get("status") or ""),
+            "batch_id": str(task.get("batch_id") or ""),
+            "write_allow": sorted(dict.fromkeys(normalize_list(task.get("write_allow")))),
+        }
+    edges: list[dict[str, Any]] = []
+    conflicts = {task_id: [] for task_id in nodes}
+    node_ids = sorted(nodes)
+    for index, left_id in enumerate(node_ids):
+        for right_id in node_ids[index + 1 :]:
+            left_allow = nodes[left_id]["write_allow"]
+            right_allow = nodes[right_id]["write_allow"]
+            if not write_sets_overlap(left_allow, right_allow):
+                continue
+            edges.append(
+                {
+                    "tasks": [left_id, right_id],
+                    "write_allow": sorted(dict.fromkeys([*left_allow, *right_allow])),
+                }
+            )
+            conflicts[left_id].append(right_id)
+            conflicts[right_id].append(left_id)
+    graph = {
+        "version": 1,
+        "batch_id": batch_id,
+        "task_ids": node_ids,
+        "nodes": nodes,
+        "edges": edges,
+        "conflicts": {task_id: sorted(values) for task_id, values in conflicts.items()},
+    }
+    graph["digest"] = _canonical_digest(graph)
+    graph["generated_at"] = now_iso()
+    return graph
+
+
+def persist_write_scope_conflict_graph(
+    state: dict[str, Any],
+    *,
+    batch_id: str = "",
+    task_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    graph = build_write_scope_conflict_graph(state, task_ids, batch_id=batch_id)
+    state["write_scope_conflict_graph"] = graph
+    resolved_batch_id = batch_id or str(state.get("current_batch_id") or "")
+    if resolved_batch_id:
+        batches = state.get("batches")
+        batch = batches.get(resolved_batch_id) if isinstance(batches, Mapping) else None
+        if isinstance(batch, dict):
+            batch["write_scope_conflict_graph"] = json.loads(
+                json.dumps(graph, ensure_ascii=False)
+            )
+    return graph
+
+
+def active_write_scope_conflicts(state: Mapping[str, Any], task_id: str) -> list[str]:
+    graph = build_write_scope_conflict_graph(state)
+    conflicts = graph.get("conflicts")
+    tasks = state.get("tasks")
+    if not isinstance(conflicts, Mapping) or not isinstance(tasks, Mapping):
+        return []
+    return sorted(
+        conflict_id
+        for conflict_id in normalize_list(conflicts.get(task_id))
+        if isinstance(tasks.get(conflict_id), Mapping)
+        and str(tasks[conflict_id].get("status") or "")
+        in {"running", "starting", "awaiting_result"}
+    )
 
 
 def _state_metric_counts(
@@ -1804,6 +2363,7 @@ def _refresh_execution_metrics(state: dict[str, Any]) -> None:
     metrics["task_origin_counts"] = dict(sorted(origin_counts.items()))
     metrics["scope_revision_counts"] = dict(sorted(scope_revision_counts.items()))
     metrics["worker_count"] = worker_started_count
+    metrics["worker_runtime_seconds"] = round(sum(worker_durations), 6)
     metrics["longest_worker_seconds"] = max(worker_durations, default=0.0)
     if worker_intervals:
         wall_start = min(item[0] for item in worker_intervals)
@@ -1877,6 +2437,12 @@ def _refresh_execution_metrics(state: dict[str, Any]) -> None:
     if phase_duration is not None:
         metrics["phase_wall_time_seconds"] = phase_duration
 
+    batch_records = _batch_performance_records(state)
+    metrics["batch_metrics"] = batch_records
+    metrics["batch_id"] = (
+        str(batch_records[-1].get("batch_id") or "") if batch_records else ""
+    )
+
 
 def _empty_execution_metrics() -> dict[str, Any]:
     """Return the complete zero-valued state projection for a fresh loop."""
@@ -1910,6 +2476,9 @@ def _empty_execution_metrics() -> dict[str, Any]:
         "validation_time_seconds": 0.0,
         "review_wait_time_seconds": 0.0,
         "longest_worker_seconds": 0.0,
+        "worker_runtime_seconds": 0.0,
+        "batch_id": "",
+        "batch_metrics": [],
     }
 
 
@@ -2708,6 +3277,13 @@ def dispatch_start_preflight(
                 raise HLoopError(f"task {role_id} is missing immutable provenance")
         else:
             authorize_task_record(repo, state, record)
+        conflicts = active_write_scope_conflicts(state, role_id)
+        if conflicts:
+            raise HLoopError(
+                f"write-scope conflict prevents concurrent start of {role_id}: "
+                + ", ".join(conflicts)
+            )
+        persist_write_scope_conflict_graph(state)
 
 
 def assert_task_creation_dispatchable(state: dict[str, Any]) -> None:
@@ -5973,6 +6549,8 @@ def closed_batch_tasks_merged(state: dict[str, Any]) -> bool:
 
 
 def last_validation_passed(state: dict[str, Any]) -> bool:
+    if normalize_bool(state.get("validation_stale")):
+        return False
     results = state.get("last_validation", {}).get("results", [])
     target = str(state.get("completion_target_sha") or state.get("integration_head_sha") or "")
     recorded = str(state.get("last_validation", {}).get("head_sha") or "")
@@ -6228,7 +6806,13 @@ def invalidate_review_gates_for_change(
         state["phase"] = "dispatching"
 
 
-def _review_validation_is_current(state: dict[str, Any], target: str) -> bool:
+def _review_validation_is_current(
+    state: dict[str, Any], target: str, repo: Path | None = None
+) -> bool:
+    if repo is not None:
+        _refresh_validation_staleness(repo, state)
+    if normalize_bool(state.get("validation_stale")):
+        return False
     validation = state.get("last_validation")
     if not isinstance(validation, dict):
         return False
@@ -6460,7 +7044,7 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
         errors.append("Manager checkout has non-loop dirty files: " + ", ".join(dirty))
     if pending_blocking_user_decisions(state):
         errors.append("blocking user decisions remain")
-    if target and not _review_validation_is_current(state, target):
+    if target and not _review_validation_is_current(state, target, repo):
         errors.append("current integration target lacks passing validation")
     pending_drafts = normalize_list(state.get("pending_fix_task_drafts"))
     if pending_drafts:
@@ -6515,7 +7099,9 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
         "review_batch_tasks_merged": closed_batch_tasks_merged(state) if batch_cadence else None,
         "running_roles": running,
         "dirty_paths": dirty,
-        "validation_current": bool(target and _review_validation_is_current(state, target)),
+        "validation_current": bool(
+            target and _review_validation_is_current(state, target, repo)
+        ),
         "pending_fix_task_drafts": pending_drafts,
         "scope_status": scope.status,
         "scope_revision": scope.scope_revision,
@@ -11466,6 +12052,13 @@ def write_batch_artifact(repo: Path, state: dict[str, Any], batch_id: str) -> No
     batch = require_batch(state, batch_id)
     task_ids = batch_task_ids(state, batch_id)
     batch["task_ids"] = task_ids
+    performance = batch.get("performance") or batch.get("metrics") or {}
+    if not isinstance(performance, Mapping):
+        performance = {}
+    effective_parallelism = performance.get("effective_parallelism")
+    replan_requirement = batch.get("replan_requirement") or {}
+    if not isinstance(replan_requirement, Mapping):
+        replan_requirement = {}
     fields = {
         "id": batch_id,
         "title": str(batch.get("title") or batch_id),
@@ -11475,6 +12068,26 @@ def write_batch_artifact(repo: Path, state: dict[str, Any], batch_id: str) -> No
         "closed_at": str(batch.get("closed_at") or ""),
         "checkpoint_mode": str(batch.get("checkpoint_mode") or "rollup"),
         "summary": str(batch.get("summary") or ""),
+        "wall_time_seconds": performance.get("wall_time_seconds", 0.0),
+        "worker_runtime_seconds": performance.get("worker_runtime_seconds", 0.0),
+        "effective_parallelism": (
+            effective_parallelism if effective_parallelism is not None else ""
+        ),
+        "longest_worker_seconds": performance.get("longest_worker_seconds", 0.0),
+        "validation_time_seconds": performance.get("validation_time_seconds", 0.0),
+        "review_wait_time_seconds": performance.get("review_wait_time_seconds", 0.0),
+        "warnings": normalize_list(performance.get("warnings")),
+        "replan_required": bool(performance.get("replan_required", False)),
+        "replan_source_batch_id": str(replan_requirement.get("source_batch_id") or ""),
+        "replan_warnings": normalize_list(replan_requirement.get("warnings")),
+        "replan_acknowledged_by_batch_id": str(
+            replan_requirement.get("acknowledged_by_batch_id") or ""
+        ),
+        "conflict_graph_digest": str(
+            performance.get("conflict_graph_digest")
+            or (batch.get("write_scope_conflict_graph") or {}).get("digest")
+            or ""
+        ),
     }
     task_lines = [f"- {task_id}" for task_id in task_ids] or ["- No tasks assigned."]
     body = f"""# Batch {batch_id}: {fields["title"]}
@@ -11490,6 +12103,20 @@ Use `hloop checkpoint --batch {batch_id} --rollup --message "ai-loop({batch_id})
 
 ## Summary
 {fields["summary"] or "TBD by Manager."}
+
+## Performance
+- Wall time: {fields["wall_time_seconds"]} seconds
+- Worker runtime: {fields["worker_runtime_seconds"]} seconds
+- Effective parallelism: {fields["effective_parallelism"]}
+- Longest Worker: {fields["longest_worker_seconds"]} seconds
+- Validation time: {fields["validation_time_seconds"]} seconds
+- Review wait time: {fields["review_wait_time_seconds"]} seconds
+- Replan required: {str(fields["replan_required"]).lower()}
+- Replan source batch: {fields["replan_source_batch_id"] or "-"}
+- Replan acknowledged by batch: {fields["replan_acknowledged_by_batch_id"] or "-"}
+- Conflict graph digest: {fields["conflict_graph_digest"] or "-"}
+{chr(10).join(f"- Warning: {warning}" for warning in fields["warnings"]) or "- Warnings: none"}
+{chr(10).join(f"- Replan warning: {warning}" for warning in fields["replan_warnings"]) if fields["replan_warnings"] else ""}
 """
     write_text(batch_file(repo, batch_id), frontmatter(fields) + "\n" + body)
 
@@ -11529,8 +12156,19 @@ def cmd_batch_start(args: argparse.Namespace) -> int:
         "started_at": now,
         "checkpoint_mode": "rollup",
     }
+    batch = batches[batch_id]
     if args.task:
         assign_tasks_to_batch(repo, state, batch_id, args.task)
+    replan = state.get("next_batch_replan")
+    if isinstance(replan, Mapping) and normalize_bool(replan.get("required")):
+        batch["replan_requirement"] = dict(replan)
+        state["next_batch_replan"] = {
+            **dict(replan),
+            "required": False,
+            "acknowledged_by_batch_id": batch_id,
+            "acknowledged_at": now,
+        }
+    persist_write_scope_conflict_graph(state, batch_id=batch_id)
     if not args.no_current:
         state["current_batch_id"] = batch_id
     write_batch_artifact(repo, state, batch_id)
@@ -11547,6 +12185,7 @@ def cmd_batch_assign(args: argparse.Namespace) -> int:
     batch_id = validate_batch_id(args.batch_id)
     require_batch(state, batch_id)
     assign_tasks_to_batch(repo, state, batch_id, args.task_id)
+    persist_write_scope_conflict_graph(state, batch_id=batch_id)
     write_batch_artifact(repo, state, batch_id)
     save_state(repo, state)
     journal(repo, f"Assigned tasks to batch `{batch_id}`: {', '.join(args.task_id)}")
@@ -11561,11 +12200,24 @@ def cmd_batch_close(args: argparse.Namespace) -> int:
     batch_id = validate_batch_id(args.batch_id or current_batch_id(state))
     batch = require_batch(state, batch_id)
     batch["status"] = args.status
-    batch["closed_at"] = now_iso()
+    closed_at = now_iso()
+    batch["closed_at"] = closed_at
     batch["summary"] = args.summary
     if current_batch_id(state) == batch_id:
         state.pop("current_batch_id", None)
+    persist_write_scope_conflict_graph(state, batch_id=batch_id)
+    performance = _refresh_batch_performance(state, batch_id, closed_at=closed_at)
+    if performance.get("replan_required"):
+        state["next_batch_replan"] = {
+            "required": True,
+            "source_batch_id": batch_id,
+            "warnings": list(performance.get("warnings") or []),
+            "recorded_at": closed_at,
+            "acknowledged_by_batch_id": "",
+            "acknowledged_at": "",
+        }
     write_batch_artifact(repo, state, batch_id)
+    write_progress_artifact(repo, state)
     save_state(repo, state)
     journal(repo, f"Closed batch `{batch_id}` as `{args.status}`: {args.summary}")
     print(f"closed {batch_id}")
@@ -13079,6 +13731,9 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
             dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
         )
         write_batch_artifact(repo, state, resolved_batch_id)
+    persist_write_scope_conflict_graph(
+        state, batch_id=resolved_batch_id or str(state.get("current_batch_id") or "")
+    )
     invalidate_review_gates_for_change(
         state,
         reason=f"new task created: {task_id}",
@@ -13209,6 +13864,9 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
             dict.fromkeys([*normalize_list(batch.get("task_ids")), task_id])
         )
         write_batch_artifact(repo, state, resolved_batch_id)
+    persist_write_scope_conflict_graph(
+        state, batch_id=resolved_batch_id or str(state.get("current_batch_id") or "")
+    )
     invalidate_review_gates_for_change(
         state,
         reason=f"new task created: {task_id}",
@@ -13325,6 +13983,11 @@ def cmd_task_update(args: argparse.Namespace) -> int:
             kind="task-contract",
             required_reack_after_sequence=ack_floor,
         )
+    if "write_allow" in updates:
+        batch_id = str(task_state.get("batch_id") or state.get("current_batch_id") or "")
+        persist_write_scope_conflict_graph(state, batch_id=batch_id)
+        if batch_id and batch_id in state_batches(state):
+            write_batch_artifact(repo, state, batch_id)
     save_state(repo, state)
     if task_state.get("status") == "running":
         refresh_running_worker_contract_snapshot(
@@ -13343,7 +14006,7 @@ def cmd_task_update(args: argparse.Namespace) -> int:
             "before finalize, harvest, or merge. Send the changed requirements with `hloop worker message`."
         )
     else:
-        print("checkpoint required before starting this task")
+            print("checkpoint required before starting this task")
     return 0
 
 
@@ -17548,7 +18211,92 @@ def cmd_validate(args: argparse.Namespace) -> int:
     head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
     state["integration_head_sha"] = head_sha
     state["completion_target_sha"] = head_sha
+    _refresh_validation_staleness(repo, state)
+    identity = build_validation_identity(repo, state, head_sha, commands)
     validation_started = time.monotonic()
+
+    def record_validation_history(record: dict[str, Any]) -> None:
+        history = state.setdefault("validation_history", [])
+        if not isinstance(history, list):
+            history = []
+            state["validation_history"] = history
+        history.append(json.loads(json.dumps(record, ensure_ascii=False)))
+        del history[:-64]
+
+    def apply_validation_transition(failed: bool) -> None:
+        state["needs_validation"] = failed
+        if failed:
+            state["phase"] = "failed_validation"
+            return
+        if not getattr(args, "no_cleanup", False):
+            cleanup_merged_tasks(repo, state)
+        if should_open_gap_gate(state):
+            state["needs_gap_check"] = True
+        if should_open_review_gate(state):
+            state["needs_review"] = True
+        if state.get("needs_gap_check"):
+            state["phase"] = "gap_checking"
+        elif state.get("needs_review"):
+            state["phase"] = "reviewing"
+        else:
+            state["phase"] = "dispatching"
+
+    if not args.dry_run and _validation_reusable(state, identity):
+        previous = state.get("last_validation")
+        if not isinstance(previous, Mapping):
+            raise HLoopError("passing validation evidence disappeared before reuse")
+        reused_at = now_iso()
+        reused_record = json.loads(json.dumps(previous, ensure_ascii=False))
+        reused_record.update(
+            {
+                "validation_id": str(previous.get("validation_id") or f"V{time.time_ns()}"),
+                "at": reused_at,
+                "completed_at": reused_at,
+                "duration_seconds": 0.0,
+                "reused": True,
+                "reused_at": reused_at,
+                "head_sha": head_sha,
+                "commands": list(commands),
+                "batch_id": _validation_batch_id(state),
+                "validation_identity": identity,
+            }
+        )
+        state["last_validation"] = reused_record
+        record_validation_history(reused_record)
+        try:
+            base_sha = git(repo, ["rev-parse", str(state.get("base_branch") or "")])
+        except (HLoopError, subprocess.CalledProcessError):
+            base_sha = ""
+        inventory = _changed_file_inventory(repo, base_sha, head_sha)
+        evidence_refs = [
+            str(item.get("log") or item.get("command") or "validation")
+            for item in reused_record.get("results", [])
+            if isinstance(item, Mapping) and item.get("result") == "passed"
+        ]
+        state["changed_file_validation"] = {
+            "status": "passed" if evidence_refs else "failed",
+            "target_sha": head_sha,
+            "paths": inventory,
+            "mapping": {path: list(evidence_refs) for path in inventory},
+            "validation_identity": identity,
+        }
+        state["validation_stale"] = False
+        state.pop("validation_stale_reason", None)
+        metrics = state.get("execution_metrics")
+        if isinstance(metrics, dict):
+            metrics["validation_time_seconds"] = 0.0
+        apply_validation_transition(False)
+        batch_id = str(reused_record.get("batch_id") or "")
+        if batch_id and batch_id in state_batches(state):
+            _refresh_batch_performance(state, batch_id)
+            write_batch_artifact(repo, state, batch_id)
+            write_progress_artifact(repo, state)
+        save_state(repo, state)
+        journal(repo, f"Reused passing validation evidence for `{head_sha}`: {identity}")
+        print(f"reused validation evidence for {head_sha}")
+        return 0
+
+    validation_started_at = now_iso()
     results = []
     failed = False
     for index, command in enumerate(commands, start=1):
@@ -17593,7 +18341,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
             break
     if not args.dry_run:
         completed_at = now_iso()
-        state["last_validation"] = {"at": completed_at, "head_sha": head_sha, "results": results}
+        validation_record = {
+            "validation_id": f"V{time.time_ns()}",
+            "at": completed_at,
+            "started_at": validation_started_at,
+            "completed_at": completed_at,
+            "duration_seconds": round(max(0.0, time.monotonic() - validation_started), 6),
+            "head_sha": head_sha,
+            "commands": list(commands),
+            "batch_id": _validation_batch_id(state),
+            "validation_identity": identity,
+            "reused": False,
+            "results": results,
+        }
+        state["last_validation"] = validation_record
+        record_validation_history(validation_record)
         try:
             base_sha = git(repo, ["rev-parse", str(state.get("base_branch") or "")])
         except (HLoopError, subprocess.CalledProcessError):
@@ -17609,28 +18371,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
             "target_sha": head_sha,
             "paths": inventory,
             "mapping": {path: list(evidence_refs) for path in inventory},
+            "validation_identity": identity,
         }
         metrics = state.get("execution_metrics")
         if isinstance(metrics, dict):
             metrics["validation_time_seconds"] = round(
                 max(0.0, time.monotonic() - validation_started), 6
             )
-        state["needs_validation"] = failed
-        if failed:
-            state["phase"] = "failed_validation"
-        else:
-            if not getattr(args, "no_cleanup", False):
-                cleanup_merged_tasks(repo, state)
-            if should_open_gap_gate(state):
-                state["needs_gap_check"] = True
-            if should_open_review_gate(state):
-                state["needs_review"] = True
-            if state.get("needs_gap_check"):
-                state["phase"] = "gap_checking"
-            elif state.get("needs_review"):
-                state["phase"] = "reviewing"
-            else:
-                state["phase"] = "dispatching"
+        state["validation_stale"] = False
+        state.pop("validation_stale_reason", None)
+        apply_validation_transition(failed)
+        batch_id = str(validation_record.get("batch_id") or "")
+        if batch_id and batch_id in state_batches(state):
+            _refresh_batch_performance(state, batch_id)
+            write_batch_artifact(repo, state, batch_id)
+            write_progress_artifact(repo, state)
         save_state(repo, state)
         journal(repo, f"Validation results: {results}")
     return 1 if failed else 0
@@ -19551,7 +20306,22 @@ def cmd_triage_gap(args: argparse.Namespace) -> int:
 def write_sets_overlap(a: list[str], b: list[str]) -> bool:
     for left in a:
         for right in b:
-            if left == right or path_matches_pattern(left, right) or path_matches_pattern(right, left):
+            normalized_left = normalize_match_path(left).rstrip("/")
+            normalized_right = normalize_match_path(right).rstrip("/")
+            literal_prefix_overlap = (
+                normalized_left
+                and normalized_right
+                and (
+                    normalized_left.startswith(normalized_right + "/")
+                    or normalized_right.startswith(normalized_left + "/")
+                )
+            )
+            if (
+                left == right
+                or literal_prefix_overlap
+                or path_matches_pattern(left, right)
+                or path_matches_pattern(right, left)
+            ):
                 return True
     return False
 
@@ -19614,6 +20384,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
             "integration validation is not configured; use `hloop validation configure --command ...`"
         )
     if not args.dry_run:
+        persist_write_scope_conflict_graph(state)
         state["cycle"] = int(state.get("cycle", 0)) + 1
         save_state(repo, state)
     scheduler_decision = build_decision_scheduler(state)
@@ -21485,18 +22256,55 @@ def write_progress_artifact(repo: Path, state: dict[str, Any]) -> Path:
     )
     progress_dir = loop_path(repo) / "progress"
     progress_dir.mkdir(parents=True, exist_ok=True)
+    batch_records = _batch_performance_records(state)
+    latest_batch = batch_records[-1] if batch_records else {}
+    effective_parallelism = latest_batch.get("effective_parallelism")
+    progress_projection = {
+        "batch_id": str(latest_batch.get("batch_id") or ""),
+        "performance": dict(latest_batch),
+    }
+    state["progress_projection"] = progress_projection
     lines = ["# Progress", "", snapshot.summary(), "", "## Requirements", ""]
     for item in snapshot.requirements:
         suffix = item.remaining_work or "; ".join(item.blockers) or "完了条件を確認中"
         lines.append(f"- {item.requirement_id}: `{item.status}` — {suffix}")
     if not snapshot.requirements:
         lines.append("- 受け入れ済み要件はありません。")
+    lines.extend(["", "## Batch performance", ""])
+    if latest_batch:
+        lines.extend(
+            [
+                f"- Batch: `{latest_batch.get('batch_id') or '-'}`",
+                f"- Wall time: {latest_batch.get('wall_time_seconds', 0.0)} seconds",
+                f"- Worker runtime: {latest_batch.get('worker_runtime_seconds', 0.0)} seconds",
+                f"- Effective parallelism: {latest_batch.get('effective_parallelism')}",
+                f"- Longest Worker: {latest_batch.get('longest_worker_seconds', 0.0)} seconds",
+                f"- Validation time: {latest_batch.get('validation_time_seconds', 0.0)} seconds",
+                f"- Review wait time: {latest_batch.get('review_wait_time_seconds', 0.0)} seconds",
+                f"- Replan required: {str(bool(latest_batch.get('replan_required'))).lower()}",
+            ]
+        )
+        for warning in normalize_list(latest_batch.get("warnings")):
+            lines.append(f"- Warning: {warning}")
+    else:
+        lines.append("- No closed batch performance has been recorded.")
     path = progress_dir / f"{progress_id}.md"
     content = frontmatter(
         {
             "progress_id": progress_id,
             "created_at": snapshot.created_at,
             "requirement_count": len(snapshot.requirements),
+            "batch_id": str(latest_batch.get("batch_id") or ""),
+            "wall_time_seconds": latest_batch.get("wall_time_seconds", 0.0),
+            "worker_runtime_seconds": latest_batch.get("worker_runtime_seconds", 0.0),
+            "effective_parallelism": (
+                effective_parallelism if effective_parallelism is not None else ""
+            ),
+            "longest_worker_seconds": latest_batch.get("longest_worker_seconds", 0.0),
+            "validation_time_seconds": latest_batch.get("validation_time_seconds", 0.0),
+            "review_wait_time_seconds": latest_batch.get("review_wait_time_seconds", 0.0),
+            "warnings": normalize_list(latest_batch.get("warnings")),
+            "replan_required": bool(latest_batch.get("replan_required", False)),
         }
     ) + "\n" + "\n".join(lines) + "\n"
     write_text(path, content)

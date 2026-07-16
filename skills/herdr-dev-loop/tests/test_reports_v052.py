@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from hloop_lib.requirements import EvidenceRef, RequirementProgress  # noqa: E402
 from hloop_lib.reports import (  # noqa: E402
+    BatchPerformance,
     ExecutionMetrics,
     FollowUpProjection,
     ManualFinalReviewProjection,
@@ -125,6 +126,48 @@ def projection_set() -> dict[str, object]:
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_batch_performance_round_trip_and_advisory_warning(self):
+        batch = BatchPerformance(
+            batch_id="B008",
+            worker_count=2,
+            wall_time_seconds=10.0,
+            worker_runtime_seconds=12.0,
+            effective_parallelism=1.2,
+            longest_worker_seconds=8.0,
+            validation_time_seconds=3.0,
+            review_wait_time_seconds=4.0,
+            warnings=("effective-parallelism-low: 1.2 with 2 workers",),
+            replan_required=True,
+            conflict_graph_digest="d" * 64,
+        )
+        metrics = ExecutionMetrics(
+            worker_count=2,
+            worker_runtime_seconds=12.0,
+            batch_id="B008",
+            batch_metrics=(batch,),
+        )
+
+        restored = ExecutionMetrics.from_record(metrics.to_record())
+        self.assertEqual(restored, metrics)
+        self.assertIn("effective-parallelism-low: 1.2 with 2 workers", metrics.postmortem_warnings())
+
+        report = draft_outcome(
+            run_id="run-001",
+            goal="batch evidence",
+            generated_at=NOW,
+            requirement_progress=(RequirementProgress("REQ-001"),),
+            gates=(OutcomeGate(name="validation", status="pending"),),
+            integration_target_sha="",
+            current_branch_sha="",
+            execution_metrics=metrics,
+        )
+        rendered = render_outcome_markdown(report)
+        self.assertIn("Batch performance records:", rendered)
+        self.assertIn(
+            "B008: wall=10.000, worker-runtime=12.000, effective-parallelism=1.200",
+            rendered,
+        )
+
     def test_finding_disposition_projection_counts_each_axis(self):
         metrics = ExecutionMetrics.from_finding_dispositions(
             (

@@ -215,6 +215,96 @@ class ManagerInvocation:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchPerformance:
+    """Observed execution evidence for one closed implementation batch."""
+
+    batch_id: str = ""
+    worker_count: int = 0
+    wall_time_seconds: float = 0.0
+    worker_runtime_seconds: float = 0.0
+    effective_parallelism: float | None = None
+    longest_worker_seconds: float = 0.0
+    validation_time_seconds: float = 0.0
+    review_wait_time_seconds: float = 0.0
+    warnings: tuple[str, ...] = ()
+    replan_required: bool = False
+    conflict_graph_digest: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "batch_id", _optional_text(self.batch_id, "batch_id"))
+        object.__setattr__(
+            self, "worker_count", _nonnegative_int(self.worker_count, "worker_count")
+        )
+        for field_name in (
+            "wall_time_seconds",
+            "worker_runtime_seconds",
+            "longest_worker_seconds",
+            "validation_time_seconds",
+            "review_wait_time_seconds",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _nonnegative_float(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "effective_parallelism",
+            _nullable_nonnegative_float(
+                self.effective_parallelism, "effective_parallelism"
+            ),
+        )
+        object.__setattr__(
+            self, "warnings", _unique_texts(self.warnings, "batch warnings")
+        )
+        if not isinstance(self.replan_required, bool):
+            raise OutcomeModelError("replan_required must be a boolean")
+        object.__setattr__(
+            self,
+            "conflict_graph_digest",
+            _optional_text(self.conflict_graph_digest, "conflict_graph_digest"),
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        record = {
+            "batch_id": self.batch_id,
+            "worker_count": self.worker_count,
+            "wall_time_seconds": self.wall_time_seconds,
+            "worker_runtime_seconds": self.worker_runtime_seconds,
+            "effective_parallelism": self.effective_parallelism,
+            "longest_worker_seconds": self.longest_worker_seconds,
+            "validation_time_seconds": self.validation_time_seconds,
+            "review_wait_time_seconds": self.review_wait_time_seconds,
+            "warnings": list(self.warnings),
+            "replan_required": self.replan_required,
+            "conflict_graph_digest": self.conflict_graph_digest,
+        }
+        return record
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "BatchPerformance":
+        record = _record(value, "batch_metrics")
+        return cls(
+            batch_id=record.get("batch_id", ""),
+            worker_count=record.get("worker_count", 0),
+            wall_time_seconds=record.get("wall_time_seconds", 0.0),
+            worker_runtime_seconds=record.get("worker_runtime_seconds", 0.0),
+            effective_parallelism=record.get("effective_parallelism"),
+            longest_worker_seconds=record.get("longest_worker_seconds", 0.0),
+            validation_time_seconds=record.get("validation_time_seconds", 0.0),
+            review_wait_time_seconds=record.get("review_wait_time_seconds", 0.0),
+            warnings=tuple(record.get("warnings") or ()),
+            replan_required=record.get("replan_required", False),
+            conflict_graph_digest=record.get("conflict_graph_digest", ""),
+        )
+
+
+# The shorter name is useful to callers that treat the record as a metrics
+# value, while keeping ``BatchPerformance`` descriptive in rendered reports.
+BatchMetrics = BatchPerformance
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionMetrics:
     """Deterministic counts and timings projected into an outcome report.
 
@@ -252,6 +342,9 @@ class ExecutionMetrics:
     validation_time_seconds: float = 0.0
     review_wait_time_seconds: float = 0.0
     longest_worker_seconds: float = 0.0
+    worker_runtime_seconds: float = 0.0
+    batch_id: str = ""
+    batch_metrics: tuple[BatchPerformance, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -312,12 +405,25 @@ class ExecutionMetrics:
             "validation_time_seconds",
             "review_wait_time_seconds",
             "longest_worker_seconds",
+            "worker_runtime_seconds",
         ):
             object.__setattr__(
                 self,
                 field_name,
                 _nonnegative_float(getattr(self, field_name), field_name),
             )
+        object.__setattr__(self, "batch_id", _optional_text(self.batch_id, "batch_id"))
+        raw_batch_metrics = self.batch_metrics
+        if isinstance(raw_batch_metrics, (str, bytes)):
+            raise OutcomeModelError("batch_metrics must be a sequence of objects")
+        normalized_batch_metrics: list[BatchPerformance] = []
+        for value in raw_batch_metrics or ():
+            normalized_batch_metrics.append(
+                value
+                if isinstance(value, BatchPerformance)
+                else BatchPerformance.from_record(_record(value, "batch_metrics item"))
+            )
+        object.__setattr__(self, "batch_metrics", tuple(normalized_batch_metrics))
 
     @property
     def review_attempt_count(self) -> int:
@@ -373,10 +479,12 @@ class ExecutionMetrics:
                 "effective-parallelism-low: "
                 f"{self.effective_parallelism:g} with {self.worker_count} workers"
             )
-        return tuple(warnings)
+        for batch in self.batch_metrics:
+            warnings.extend(batch.warnings)
+        return tuple(dict.fromkeys(warnings))
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "planned_task_count": self.planned_task_count,
             "remediation_task_count": self.remediation_task_count,
             "task_origin_counts": dict(self.task_origin_counts),
@@ -410,6 +518,18 @@ class ExecutionMetrics:
             "review_wait_time_seconds": self.review_wait_time_seconds,
             "longest_worker_seconds": self.longest_worker_seconds,
         }
+        # Preserve the legacy outcome schema when no GAP8 batch evidence was
+        # observed. New fields become visible as one coherent projection once
+        # a runtime or batch record is present.
+        if self.worker_runtime_seconds or self.batch_id or self.batch_metrics:
+            record.update(
+                {
+                    "worker_runtime_seconds": self.worker_runtime_seconds,
+                    "batch_id": self.batch_id,
+                    "batch_metrics": [item.to_record() for item in self.batch_metrics],
+                }
+            )
+        return record
 
     @classmethod
     def from_record(cls, value: Mapping[str, Any]) -> "ExecutionMetrics":
@@ -451,6 +571,9 @@ class ExecutionMetrics:
             validation_time_seconds=record.get("validation_time_seconds", 0.0),
             review_wait_time_seconds=record.get("review_wait_time_seconds", 0.0),
             longest_worker_seconds=record.get("longest_worker_seconds", 0.0),
+            worker_runtime_seconds=record.get("worker_runtime_seconds", 0.0),
+            batch_id=record.get("batch_id", ""),
+            batch_metrics=tuple(record.get("batch_metrics") or ()),
         )
 
     @classmethod
@@ -1312,12 +1435,34 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
                 f"phase={metrics.phase_wall_time_seconds:.3f}, "
                 f"validation={metrics.validation_time_seconds:.3f}, "
                 f"review-wait={metrics.review_wait_time_seconds:.3f}, "
-                f"longest-worker={metrics.longest_worker_seconds:.3f}"
+                f"longest-worker={metrics.longest_worker_seconds:.3f}, "
+                f"worker-runtime={metrics.worker_runtime_seconds:.3f}"
             )
             lines.append(
                 f"- Workers: {metrics.worker_count}; planned tasks complete: "
                 f"{str(metrics.planned_task_completed).lower()}"
             )
+            if metrics.batch_metrics:
+                lines.append(
+                    f"- Batch performance records: {len(metrics.batch_metrics)}"
+                )
+                for batch in metrics.batch_metrics:
+                    parallelism = (
+                        "unknown"
+                        if batch.effective_parallelism is None
+                        else f"{batch.effective_parallelism:.3f}"
+                    )
+                    lines.append(
+                        f"  - {batch.batch_id or 'batch'}: "
+                        f"wall={batch.wall_time_seconds:.3f}, "
+                        f"worker-runtime={batch.worker_runtime_seconds:.3f}, "
+                        f"effective-parallelism={parallelism}, "
+                        f"longest-worker={batch.longest_worker_seconds:.3f}, "
+                        f"validation={batch.validation_time_seconds:.3f}, "
+                        f"review-wait={batch.review_wait_time_seconds:.3f}"
+                    )
+                    for warning in batch.warnings:
+                        lines.append(f"    - Warning: {warning}")
             if metrics.scope_expansion_started_at:
                 lines.append(
                     "- Scope expansion started at: "
