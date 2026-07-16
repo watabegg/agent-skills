@@ -96,6 +96,76 @@ class PolicyCliV052Tests(unittest.TestCase):
         self.assertEqual(result, 0, output)
         return loop
 
+    def test_fresh_init_requires_scope_lock_but_migrated_legacy_keeps_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            result, output = self.run_cli(
+                repo,
+                "init",
+                "--goal-id",
+                "policy-cli-v052",
+                "--goal",
+                "policy CLI",
+                "--base",
+                "main",
+                "--integration",
+                "main",
+                "--create-branch",
+                "--specification-scout",
+                "off",
+            )
+            self.assertEqual(result, 0, output)
+            loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["release_scope"]["status"], "unlocked")
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "before lock",
+                "--id",
+                "T001",
+                "--kind",
+                "research",
+                "--allow-no-write",
+            )
+            self.assertNotEqual(result, 0, output)
+            with self.assertRaises(hloop.HLoopError):
+                hloop.dispatch_start_preflight(
+                    repo,
+                    json.loads(state_path.read_text(encoding="utf-8")),
+                    role_id="T001",
+                    role_kind="worker",
+                    task_meta={"task_origin": "planned"},
+                )
+
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["schema_revision"] = 1
+            legacy.pop("release_scope", None)
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+            result, output = self.run_cli(repo, "migrate", "--apply")
+            self.assertEqual(result, 0, output)
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["release_scope"]["status"], "legacy-unlocked")
+            self.assertEqual(migrated["review_policy"]["cadence"], "merge-count")
+            self.assertEqual(
+                migrated["manual_final_review"]["status"],
+                "not-required-for-legacy-run",
+            )
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "legacy task",
+                "--id",
+                "T001",
+                "--kind",
+                "research",
+                "--allow-no-write",
+            )
+            self.assertEqual(result, 0, output)
+
     def test_task_creation_and_update_use_immutable_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.make_repo(Path(directory))
@@ -304,6 +374,122 @@ class PolicyCliV052Tests(unittest.TestCase):
             payload = json.loads(output)
             self.assertFalse(payload["loop"]["dispatch_frozen"])
             self.assertNotIn("hloop reviewer start", payload["next_actions"])
+
+    def test_scope_amendment_invalidates_fixed_target_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            target = subprocess.check_output(
+                ["git", "rev-parse", "main"], cwd=repo, text=True
+            ).strip()
+            state.update(
+                {
+                    "phase": "awaiting_manual_final_review",
+                    "review_readiness": {
+                        "status": "ready",
+                        "target_sha": target,
+                        "errors": [],
+                        "checks": {"scope_status": "locked"},
+                    },
+                    "review_convergence": {
+                        "status": "converged",
+                        "target_sha": target,
+                        "verified_actionable_findings": 0,
+                        "artifact_refs": ["reviews/convergence/MANIFEST.json"],
+                    },
+                    "manual_final_review": {
+                        "status": "passed",
+                        "target_sha": target,
+                        "certification_id": "C001",
+                        "prepared_plan": "reviews/final/PLAN.json",
+                        "prepared_plan_digest": "sha256:" + "a" * 64,
+                        "manifest": "reviews/final/MANIFEST.json",
+                        "report": "reviews/final/FINAL.md",
+                        "manifest_complete": True,
+                        "verified_actionable_findings": 0,
+                        "attempt_history": [],
+                    },
+                }
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            (loop / "MISSION.md").write_text(
+                "changed after the fixed review snapshot\n", encoding="utf-8"
+            )
+            source_args = [
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PLAN.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PROFILE.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/DECISIONS.md",
+            ]
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "editorial",
+                "--reason",
+                "record the approved editorial source change",
+                *source_args,
+            )
+            self.assertEqual(result, 0, output)
+            after = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(after["release_scope"]["scope_revision"], 1)
+            self.assertEqual(after["release_scope"]["source_snapshot_revision"], 2)
+            self.assertEqual(after["review_readiness"]["status"], "pending")
+            self.assertEqual(after["review_convergence"]["status"], "pending")
+            self.assertEqual(after["manual_final_review"]["status"], "pending")
+            self.assertEqual(after["phase"], "dispatching")
+            self.assertEqual(after["review_convergence"]["target_sha"], target)
+
+    def test_review_failure_phases_reject_ordinary_dispatch_unfreeze(self) -> None:
+        for phase in (
+            "review_convergence_exhausted",
+            "manual_final_review_failed",
+            "manual_final_review_incomplete",
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                repo = self.make_repo(Path(directory))
+                loop = self.init_and_lock(repo)
+                state_path = loop / "STATE.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["phase"] = phase
+                state["dispatch_freeze"] = {
+                    "status": "active",
+                    "reason": "review stop",
+                    "frozen_at": "2026-07-16T00:00:00+00:00",
+                    "source_input_id": "",
+                    "allowed_running_role_ids": [],
+                }
+                state["review_convergence"] = {
+                    "status": "exhausted" if phase == "review_convergence_exhausted" else "pending",
+                    "fix_round": 2,
+                    "verified_actionable_findings": 1,
+                }
+                state["manual_final_review"] = {
+                    "status": phase.removeprefix("manual_final_review_")
+                    if phase.startswith("manual_final_review_")
+                    else "pending",
+                    "verified_actionable_findings": 1,
+                    "attempt_history": [],
+                }
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                before = state_path.read_bytes()
+                result, output = self.run_cli(
+                    repo,
+                    "dispatch",
+                    "unfreeze",
+                    "--reason",
+                    "attempt bypass",
+                )
+                self.assertNotEqual(result, 0, output)
+                self.assertIn("review reopen", output)
+                self.assertEqual(state_path.read_bytes(), before)
 
 
 if __name__ == "__main__":

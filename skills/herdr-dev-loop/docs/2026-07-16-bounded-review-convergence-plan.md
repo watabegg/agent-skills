@@ -907,9 +907,9 @@ synthetic E2Eでは、次を確認する。
 2. `hloop selftest`とskill quick validationを通す。
 3. temporary repositoryで新規loopとmigrated loopを確認する。
 4. 小規模な実装をdogfoodし、pre-final review、follow-up分類、manual final reviewを実行する。
-5. repo copyとCodex install copyを同期する。
-6. Claude install copyを同期する。
-7. `diff -qr`でinstall parityを確認する。
+5. PR merge後のrelease-owner handoffとして、repo copyをCodex install copyへ同期する（このPRのWorker/Manager write scope外）。
+6. 同じくPR merge後のrelease-owner handoffとして、Claude install copyを同期する（このPRのWorker/Manager write scope外）。
+7. release-owner handoffで`diff -qr`を実行してinstall parityを確認する（このPRのacceptanceおよび実装作業には含めない）。
 8. 実行時間、planned/remediation task数、review回数、stale/aborted数、validation回数、finding disposition、Manager invocationをpostmortemへ記録する。
 
 ## 非目標
