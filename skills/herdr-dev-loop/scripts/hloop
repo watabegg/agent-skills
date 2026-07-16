@@ -3158,6 +3158,13 @@ def provenance_record_from_args(
         "fact_status": str(get("fact_status") or candidate.get("fact_status") or ""),
         "disposition": str(get("disposition") or candidate.get("disposition") or ""),
     }
+    if task_origin == "user-amendment" and scope.amendment_refs:
+        # Preserve the supported CLI path while making the authorization
+        # provenance explicit in the task artifact.  The shared validator
+        # still rejects editorial/clarification-only revisions because their
+        # authorization input is empty after amendment application.
+        scope_refs = list(dict.fromkeys([*scope_refs, scope.amendment_refs[-1]]))
+        record["scope_refs"] = scope_refs
     scope_expanding = bool(get("scope_expanding") or candidate.get("scope_expanding", False))
     if scope_expanding:
         record["scope_expanding"] = True

@@ -332,13 +332,67 @@ class TaskAuthorizationTests(unittest.TestCase):
             release_scope_revision=2,
             plan_item_refs=[],
             authorization_input_id="U0002",
-            scope_refs=["release-scope"],
+            scope_refs=["A001"],
         )
         self.assertEqual(authorize_task_creation(task, amended_scope).task_origin, "user-amendment")
+        with self.assertRaisesRegex(
+            TaskAuthorizationError, "latest scope-change amendment"
+        ):
+            authorize_task_creation(
+                {**task, "scope_refs": ["release-scope"]}, amended_scope
+            )
         with self.assertRaisesRegex(TaskAuthorizationError, "latest locked input"):
             authorize_task_creation(
                 {**task, "authorization_input_id": "U0003"}, amended_scope
             )
+
+    def test_editorial_and_clarification_amendments_clear_scope_authorization(self):
+        scope = locked_scope()
+        scope_change = create_amendment(
+            scope,
+            amendment_id="A001",
+            kind="scope-change",
+            new_source_contents={
+                "MISSION.md": "expanded\n",
+                "PLAN.md": SOURCES["PLAN.md"],
+            },
+            reason="User-authorized scope addition.",
+            user_input_id="U0002",
+        )
+        scope_after_change = scope.apply_amendment(scope_change)
+        task = planned_task(
+            task_origin="user-amendment",
+            release_scope_revision=2,
+            plan_item_refs=[],
+            authorization_input_id="U0002",
+            scope_refs=["A001"],
+        )
+
+        for kind, contents, basis_refs in (
+            (
+                "editorial",
+                {"MISSION.md": "expanded,\n", "PLAN.md": SOURCES["PLAN.md"]},
+                (),
+            ),
+            (
+                "clarification",
+                {"MISSION.md": "expanded\n", "PLAN.md": "P001: bounded core clarified\n"},
+                ("REQ-001",),
+            ),
+        ):
+            with self.subTest(kind=kind):
+                amendment = create_amendment(
+                    scope_after_change,
+                    amendment_id="A002",
+                    kind=kind,
+                    new_source_contents=contents,
+                    reason=f"{kind} source update.",
+                    basis_refs=basis_refs,
+                )
+                amended_scope = scope_after_change.apply_amendment(amendment)
+                self.assertEqual(amended_scope.last_user_input_id, "")
+                with self.assertRaisesRegex(TaskAuthorizationError, "latest locked input"):
+                    authorize_task_creation(task, amended_scope)
 
     def test_operational_task_cannot_change_product_or_release_artifact(self):
         scope = locked_scope()

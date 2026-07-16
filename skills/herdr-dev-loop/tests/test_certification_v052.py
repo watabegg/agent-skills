@@ -524,6 +524,34 @@ class ReopenTransitionTests(unittest.TestCase):
         self.assertEqual(result.state["release_scope"]["source_snapshot_revision"], 2)
         self.assertEqual(result.state["release_scope"]["last_user_input_id"], "U0001")
 
+    def test_non_scope_reopen_amendments_do_not_record_outer_user_input(self):
+        for kind, basis_refs in (("editorial", ()), ("clarification", ("REQ-005",))):
+            with self.subTest(kind=kind):
+                state = reopen_state(phase="manual_final_review_failed", finding_count=1)
+                scope = hloop_release_scope.ReleaseScope.from_record(
+                    state["release_scope"]
+                )
+                amendment = hloop_release_scope.create_amendment(
+                    scope,
+                    amendment_id="A001",
+                    kind=kind,
+                    reason=f"{kind} reopen amendment",
+                    new_source_digests={"PLAN.md": "b" * 64},
+                    basis_refs=basis_refs,
+                    created_at="2026-07-16T00:00:00+00:00",
+                ).to_record()
+                amendment["reopen_user_input_id"] = "U0001"
+                result = reopen_review(
+                    state,
+                    action="scope-amend",
+                    user_input_id="U0001",
+                    scope_amendment=amendment,
+                )
+                self.assertTrue(result.accepted)
+                self.assertEqual(
+                    result.state["release_scope"]["last_user_input_id"], ""
+                )
+
     def test_failed_reopen_returns_original_frozen_state_without_mutation(self):
         state = reopen_state(phase="manual_final_review_failed", finding_count=1)
         before = json.loads(json.dumps(state))

@@ -1223,6 +1223,99 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(state["manual_final_review"]["status"], "pending")
         self.assertEqual(state["dispatch_freeze"]["status"], "inactive")
 
+    def test_task_creation_after_non_scope_amendment_rejects_without_mutation(self):
+        loop = self.state_path.parent
+        for kind, basis_args in (
+            ("editorial", ()),
+            ("clarification", ("--basis-ref", "REQ-001")),
+        ):
+            with self.subTest(kind=kind):
+                plan = loop / "PLAN.md"
+                plan.write_text(
+                    plan.read_text(encoding="utf-8")
+                    + f"\n{kind} amendment fixture.\n",
+                    encoding="utf-8",
+                )
+                code, out, err = self.run_cli(
+                    "release-scope",
+                    "amend",
+                    "--kind",
+                    kind,
+                    "--reason",
+                    f"record {kind} fixture",
+                    *basis_args,
+                )
+                self.assertEqual((code, err), (0, ""), out)
+                self.assertEqual(self.state()["release_scope"]["last_user_input_id"], "")
+
+                before_state = self.state_path.read_bytes()
+                task_path = loop / "tasks" / "T050.md"
+                self.assertFalse(task_path.exists())
+                code, out, err = self.run_cli(
+                    "task",
+                    "new",
+                    "unauthorized scope expansion",
+                    "--id",
+                    "T050",
+                    "--kind",
+                    "implementation",
+                    "--write-allow",
+                    "src/example.py",
+                    "--task-origin",
+                    "user-amendment",
+                    "--authorization-input-id",
+                    "U0001",
+                    "--scope-expanding",
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("latest locked input", err)
+                self.assertEqual(before_state, self.state_path.read_bytes())
+                self.assertFalse(task_path.exists())
+
+    def test_scope_change_task_records_specific_amendment_and_input(self):
+        loop = self.state_path.parent
+        plan = loop / "PLAN.md"
+        plan.write_text(
+            plan.read_text(encoding="utf-8")
+            + "\nAuthorized scope-change fixture.\n",
+            encoding="utf-8",
+        )
+        code, out, err = self.run_cli(
+            "release-scope",
+            "amend",
+            "--kind",
+            "scope-change",
+            "--reason",
+            "record authorized scope change",
+            "--user-input-id",
+            "U0001",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+
+        code, out, err = self.run_cli(
+            "task",
+            "new",
+            "authorized scope expansion",
+            "--id",
+            "T050",
+            "--kind",
+            "implementation",
+            "--write-allow",
+            "src/example.py",
+            "--task-origin",
+            "user-amendment",
+            "--authorization-input-id",
+            "U0001",
+            "--scope-expanding",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        task_path = loop / "tasks" / "T050.md"
+        task = hloop.read_frontmatter(task_path)
+        self.assertEqual(task["release_scope_revision"], "2")
+        self.assertEqual(task["authorization_input_id"], "U0001")
+        self.assertEqual(task["scope_refs"], ["A001"])
+
     def test_scope_changing_reopen_rolls_back_artifact_when_state_save_fails(self):
         self._prepare_failed_final_review()
         loop = self.state_path.parent
