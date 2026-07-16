@@ -184,6 +184,7 @@ class ReleaseScopeTests(unittest.TestCase):
         self.assertEqual(updated.scope_revision, 2)
         self.assertEqual(updated.source_snapshot_revision, 2)
         self.assertEqual(updated.last_user_input_id, "U0002")
+        self.assertEqual(updated.consumed_user_input_ids, ("U0002",))
         self.assertEqual(updated.source_refs, ("MISSION.md", "PLAN.md", "SCOPE.md"))
         second = create_amendment(
             updated,
@@ -214,6 +215,139 @@ class ReleaseScopeTests(unittest.TestCase):
                 user_input_id="U0002",
                 captured_input_ids={"U0001": {"source": "manager-chat"}},
             )
+
+    def test_scope_change_cannot_reuse_input_after_editorial_or_clarification(self):
+        scope = locked_scope()
+        scope_change = create_amendment(
+            scope,
+            amendment_id="A001",
+            kind="scope-change",
+            new_source_contents={
+                "MISSION.md": "expanded\n",
+                "PLAN.md": SOURCES["PLAN.md"],
+            },
+            reason="User-authorized scope addition.",
+            user_input_id="U0002",
+        )
+        scope_after_change = scope.apply_amendment(scope_change)
+
+        for kind, contents, basis_refs in (
+            (
+                "editorial",
+                {"MISSION.md": "expanded,\n", "PLAN.md": SOURCES["PLAN.md"]},
+                (),
+            ),
+            (
+                "clarification",
+                {"MISSION.md": "expanded\n", "PLAN.md": "P001: bounded core clarified\n"},
+                ("REQ-001",),
+            ),
+        ):
+            with self.subTest(kind=kind):
+                non_scope_amendment = create_amendment(
+                    scope_after_change,
+                    amendment_id="A002",
+                    kind=kind,
+                    new_source_contents=contents,
+                    reason=f"{kind} source update.",
+                    basis_refs=basis_refs,
+                )
+                amended_scope = scope_after_change.apply_amendment(non_scope_amendment)
+                self.assertEqual(amended_scope.last_user_input_id, "U0002")
+
+                reused = create_amendment(
+                    amended_scope,
+                    amendment_id="A003",
+                    kind="scope-change",
+                    new_source_contents={
+                        "MISSION.md": "reused authorization\n",
+                        "PLAN.md": SOURCES["PLAN.md"],
+                    },
+                    reason="Reject reuse of the consumed authorization input.",
+                    user_input_id="U0002",
+                )
+                with self.assertRaisesRegex(
+                    AmendmentValidationError, "already authorized an earlier amendment"
+                ):
+                    amended_scope.apply_amendment(reused)
+
+    def test_scope_change_history_rejects_old_input_after_a_different_change_and_round_trips(self):
+        scope = locked_scope()
+        first = scope.apply_amendment(
+            create_amendment(
+                scope,
+                amendment_id="A001",
+                kind="scope-change",
+                new_source_contents={
+                    "MISSION.md": "expanded once\n",
+                    "PLAN.md": SOURCES["PLAN.md"],
+                },
+                reason="First authorized scope change.",
+                user_input_id="U0001",
+            )
+        )
+        second = first.apply_amendment(
+            create_amendment(
+                first,
+                amendment_id="A002",
+                kind="scope-change",
+                new_source_contents={
+                    "MISSION.md": "expanded twice\n",
+                    "PLAN.md": SOURCES["PLAN.md"],
+                },
+                reason="Second authorized scope change.",
+                user_input_id="U0002",
+            )
+        )
+        self.assertEqual(second.last_user_input_id, "U0002")
+        self.assertEqual(second.consumed_user_input_ids, ("U0001", "U0002"))
+
+        editorial = second.apply_amendment(
+            create_amendment(
+                second,
+                amendment_id="A003",
+                kind="editorial",
+                new_source_contents={
+                    "MISSION.md": "expanded twice,\n",
+                    "PLAN.md": SOURCES["PLAN.md"],
+                },
+                reason="Editorial source correction.",
+            )
+        )
+        self.assertEqual(editorial.consumed_user_input_ids, ("U0001", "U0002"))
+
+        reused = create_amendment(
+            editorial,
+            amendment_id="A004",
+            kind="scope-change",
+            new_source_contents={
+                "MISSION.md": "reused first authorization\n",
+                "PLAN.md": SOURCES["PLAN.md"],
+            },
+            reason="Reject reuse of the first consumed authorization.",
+            user_input_id="U0001",
+        )
+        with self.assertRaisesRegex(
+            AmendmentValidationError, "already authorized an earlier amendment"
+        ):
+            editorial.apply_amendment(reused)
+
+        restored = ReleaseScope.from_record(editorial.to_record())
+        self.assertEqual(restored.consumed_user_input_ids, ("U0001", "U0002"))
+        self.assertEqual(restored.to_record(), editorial.to_record())
+
+        legacy_record = editorial.to_record()
+        legacy_record.pop("consumed_user_input_ids")
+        legacy = ReleaseScope.from_record(legacy_record)
+        self.assertEqual(legacy.consumed_user_input_ids, ("U0002",))
+
+    def test_legacy_scope_record_with_only_last_input_is_normalized_for_reuse_checks(self):
+        scope = locked_scope()
+        legacy_record = scope.to_record()
+        legacy_record["last_user_input_id"] = "U0007"
+        legacy = ReleaseScope.from_record(legacy_record)
+        self.assertEqual(legacy.consumed_user_input_ids, ("U0007",))
+        self.assertEqual(legacy.to_record()["consumed_user_input_ids"], ["U0007"])
 
     def test_amendment_cannot_start_from_another_lock_or_be_reapplied(self):
         scope = locked_scope()
@@ -460,7 +594,7 @@ class TaskAuthorizationTests(unittest.TestCase):
                 captured_input_ids={"U0001": {"source": "manager-chat"}},
             )
 
-    def test_editorial_and_clarification_amendments_clear_scope_authorization(self):
+    def test_editorial_and_clarification_amendments_preserve_scope_authorization(self):
         scope = locked_scope()
         scope_change = create_amendment(
             scope,
@@ -504,8 +638,10 @@ class TaskAuthorizationTests(unittest.TestCase):
                     basis_refs=basis_refs,
                 )
                 amended_scope = scope_after_change.apply_amendment(amendment)
-                self.assertEqual(amended_scope.last_user_input_id, "")
-                with self.assertRaisesRegex(TaskAuthorizationError, "latest locked input"):
+                self.assertEqual(amended_scope.last_user_input_id, "U0002")
+                with self.assertRaisesRegex(
+                    TaskAuthorizationError, "latest scope-change amendment"
+                ):
                     authorize_task_creation(task, amended_scope)
 
     def test_operational_task_cannot_change_product_or_release_artifact(self):
@@ -521,6 +657,39 @@ class TaskAuthorizationTests(unittest.TestCase):
             authorize_task_creation(
                 {**operational, "write_allow": ["src/feature.py"]}, scope
             )
+
+        for field_name in ("changed_files", "product_paths", "release_artifact_paths"):
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(
+                    TaskAuthorizationError, "product or release artifacts"
+                ):
+                    authorize_task_creation(
+                        {**operational, field_name: ["unclassified-output.bin"]},
+                        scope,
+                    )
+
+        with self.assertRaisesRegex(
+            TaskAuthorizationError, "product or release artifacts"
+        ):
+            authorize_task_creation(
+                {**operational, "changed_files": ["../reports/escape.bin"]},
+                scope,
+            )
+
+    def test_task_provenance_scope_expanding_round_trips_and_legacy_defaults_false(self):
+        record = finding_task(scope_expanding=True)
+        provenance = TaskProvenance.from_record(record)
+        self.assertTrue(provenance.scope_expanding)
+        self.assertTrue(TaskProvenance.from_record(provenance.to_record()).scope_expanding)
+
+        legacy_record = dict(record)
+        legacy_record.pop("scope_expanding")
+        legacy = TaskProvenance.from_record(legacy_record)
+        self.assertFalse(legacy.scope_expanding)
+        self.assertFalse(legacy.to_record()["scope_expanding"])
+
+        with self.assertRaisesRegex(TaskAuthorizationError, "scope_expanding must be boolean"):
+            TaskProvenance.from_record({**legacy_record, "scope_expanding": "true"})
 
     def test_legacy_unclassified_is_readable_only_in_legacy_scope(self):
         legacy = ReleaseScope(status="legacy-unlocked")
@@ -560,8 +729,20 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(provenance_schema["title"], "Herdr Dev Loop Task Provenance")
         if jsonschema is not None:
             jsonschema.Draft202012Validator(scope_schema).validate(scope.to_record())
+            jsonschema.Draft202012Validator(scope_schema).validate(
+                ReleaseScope.from_record(
+                    {
+                        **scope.to_record(),
+                        "last_user_input_id": "U0002",
+                        "consumed_user_input_ids": ["U0001", "U0002"],
+                    }
+                ).to_record()
+            )
             jsonschema.Draft202012Validator(provenance_schema).validate(
                 TaskProvenance.from_record(finding_task()).to_record()
+            )
+            jsonschema.Draft202012Validator(provenance_schema).validate(
+                TaskProvenance.from_record(finding_task(scope_expanding=True)).to_record()
             )
         self.assertEqual(
             type(amendment.to_record()["new_source_digests"]).__name__, "dict"

@@ -12,6 +12,7 @@
     "scope_digest",
     "locked_at",
     "last_user_input_id",
+    "consumed_user_input_ids",
     "amendment_refs",
     "plan_item_refs",
     "requirement_refs",
@@ -38,6 +39,11 @@
     "scope_digest": {"$ref": "#/$defs/optional-digest"},
     "locked_at": {"$ref": "#/$defs/optional-timestamp"},
     "last_user_input_id": {"$ref": "#/$defs/optional-input-id"},
+    "consumed_user_input_ids": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/input-id"},
+      "uniqueItems": true
+    },
     "amendment_refs": {
       "type": "array",
       "items": {"type": "string", "pattern": "^A[0-9]{3}$"},
@@ -104,6 +110,10 @@
         {"const": ""},
         {"type": "string", "pattern": "^U[0-9]{4}$"}
       ]
+    },
+    "input-id": {
+      "type": "string",
+      "pattern": "^U[0-9]{4}$"
     },
     "optional-timestamp": {
       "anyOf": [

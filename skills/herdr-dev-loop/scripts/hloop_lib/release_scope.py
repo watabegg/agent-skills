@@ -291,6 +291,7 @@ class ReleaseScope:
     scope_digest: str = ""
     locked_at: str = ""
     last_user_input_id: str = ""
+    consumed_user_input_ids: tuple[str, ...] = ()
     amendment_refs: tuple[str, ...] = ()
     plan_item_refs: tuple[str, ...] = ()
     requirement_refs: tuple[str, ...] = ()
@@ -353,6 +354,22 @@ class ReleaseScope:
         last_user_input_id = _optional_input_id(
             self.last_user_input_id, "last_user_input_id"
         )
+        consumed_user_input_ids = _unique_texts(
+            self.consumed_user_input_ids, "consumed_user_input_ids"
+        )
+        for input_id in consumed_user_input_ids:
+            _input_id(input_id, "consumed_user_input_ids")
+        if last_user_input_id and last_user_input_id not in consumed_user_input_ids:
+            # Records written before the history field existed only carried
+            # the latest consumed input.  Normalize that legacy value into a
+            # one-item history while retaining the compatibility alias.
+            consumed_user_input_ids += (last_user_input_id,)
+        elif consumed_user_input_ids:
+            if last_user_input_id and last_user_input_id != consumed_user_input_ids[-1]:
+                raise ScopeValidationError(
+                    "last_user_input_id must match the latest consumed user input"
+                )
+            last_user_input_id = consumed_user_input_ids[-1]
 
         object.__setattr__(self, "source_refs", source_refs)
         object.__setattr__(self, "source_digests", source_digests)
@@ -361,6 +378,7 @@ class ReleaseScope:
         object.__setattr__(self, "scope_digest", scope_digest)
         object.__setattr__(self, "locked_at", locked_at)
         object.__setattr__(self, "last_user_input_id", last_user_input_id)
+        object.__setattr__(self, "consumed_user_input_ids", consumed_user_input_ids)
         object.__setattr__(self, "amendment_refs", amendment_refs)
         object.__setattr__(self, "plan_item_refs", plan_item_refs)
         object.__setattr__(self, "requirement_refs", requirement_refs)
@@ -454,6 +472,9 @@ class ReleaseScope:
             scope_digest=str(value.get("scope_digest") or ""),
             locked_at=str(value.get("locked_at") or ""),
             last_user_input_id=str(value.get("last_user_input_id") or ""),
+            consumed_user_input_ids=tuple(
+                value.get("consumed_user_input_ids") or ()
+            ),
             amendment_refs=tuple(value.get("amendment_refs") or ()),
             plan_item_refs=tuple(value.get("plan_item_refs") or ()),
             requirement_refs=tuple(value.get("requirement_refs") or ()),
@@ -474,6 +495,7 @@ class ReleaseScope:
             "scope_digest": self.scope_digest,
             "locked_at": self.locked_at,
             "last_user_input_id": self.last_user_input_id,
+            "consumed_user_input_ids": list(self.consumed_user_input_ids),
             "amendment_refs": list(self.amendment_refs),
             "plan_item_refs": list(self.plan_item_refs),
             "requirement_refs": list(self.requirement_refs),
@@ -527,11 +549,19 @@ class ReleaseScope:
             scope_revision=amendment.new_scope_revision,
             source_snapshot_revision=amendment.new_source_snapshot_revision,
             scope_digest=amendment.new_scope_digest,
-            # Only a semantic scope change creates a new task-authorization
-            # boundary.  Editorial and clarification amendments must not
-            # inherit or replace the input used by a prior scope change.
+            # Keep the consumed authorization input as part of the immutable
+            # release-scope history.  Editorial and clarification amendments
+            # update only the source snapshot; clearing this value would make
+            # the same user input reusable for a later scope change.
             last_user_input_id=(
-                amendment.user_input_id if amendment.kind == "scope-change" else ""
+                amendment.user_input_id
+                if amendment.kind == "scope-change"
+                else self.last_user_input_id
+            ),
+            consumed_user_input_ids=(
+                self.consumed_user_input_ids + (amendment.user_input_id,)
+                if amendment.kind == "scope-change"
+                else self.consumed_user_input_ids
             ),
             amendment_refs=self.amendment_refs + (amendment.amendment_id,),
         )
@@ -770,8 +800,7 @@ def validate_amendment(
         raise AmendmentValidationError("amendment starts from a different source snapshot")
     if (
         amendment.kind == "scope-change"
-        and scope.last_user_input_id
-        and amendment.user_input_id == scope.last_user_input_id
+        and amendment.user_input_id in scope.consumed_user_input_ids
     ):
         raise AmendmentValidationError(
             "scope-change user_input_id has already authorized an earlier amendment"
@@ -912,6 +941,7 @@ class TaskProvenance:
     disposition: str = ""
     severity: str = ""
     decision_requirement: str = ""
+    scope_expanding: bool = False
 
     def __post_init__(self) -> None:
         if self.task_origin not in TASK_ORIGINS:
@@ -968,6 +998,9 @@ class TaskProvenance:
             raise TaskAuthorizationError(
                 f"unknown decision_requirement: {decision_requirement}"
             )
+        scope_expanding = self.scope_expanding
+        if not isinstance(scope_expanding, bool):
+            raise TaskAuthorizationError("scope_expanding must be boolean")
 
         object.__setattr__(self, "release_scope_revision", scope_revision)
         object.__setattr__(self, "plan_item_refs", plan_item_refs)
@@ -985,6 +1018,7 @@ class TaskProvenance:
         object.__setattr__(self, "disposition", disposition)
         object.__setattr__(self, "severity", severity)
         object.__setattr__(self, "decision_requirement", decision_requirement)
+        object.__setattr__(self, "scope_expanding", scope_expanding)
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "TaskProvenance":
@@ -1022,6 +1056,9 @@ class TaskProvenance:
             disposition=str(value.get("disposition") or ""),
             severity=str(value.get("severity") or value.get("priority") or ""),
             decision_requirement=str(value.get("decision_requirement") or ""),
+            # Records written before this field was introduced are normalized
+            # to the safe, non-expanding default.
+            scope_expanding=value.get("scope_expanding", False),
         )
 
     def to_record(self) -> dict[str, Any]:
@@ -1043,6 +1080,7 @@ class TaskProvenance:
             "disposition": self.disposition,
             "severity": self.severity,
             "decision_requirement": self.decision_requirement,
+            "scope_expanding": self.scope_expanding,
         }
 
 
@@ -1084,7 +1122,19 @@ def _value_bool(record: Mapping[str, Any], *names: str) -> bool:
 
 
 def _path_changes_product_or_release(path: str) -> bool:
-    normalized = path.replace("\\", "/").lstrip("./")
+    normalized = path.replace("\\", "/")
+    # Paths in task records are repository-relative.  Absolute paths and
+    # traversal segments are outside that contract and must fail closed even
+    # when their textual destination resembles an evidence directory.
+    if (
+        not normalized.strip()
+        or normalized.startswith("/")
+        or normalized == ".."
+        or normalized.startswith("../")
+        or "/../" in normalized
+    ):
+        return True
+    normalized = normalized.lstrip("./")
     if normalized.startswith((".ai/", "reports/", "qa/", "validation/", "results/", "follow-ups/")):
         return False
     if normalized.startswith(("tests/", "test/")):
@@ -1099,7 +1149,10 @@ def _path_changes_product_or_release(path: str) -> bool:
         return True
     if normalized.startswith(("docs/", "references/", "skills/")):
         return True
-    return False
+    # Operational tasks are evidence/state bookkeeping only.  Unknown paths
+    # must therefore be treated as product or release paths instead of being
+    # silently authorized by an incomplete classifier.
+    return True
 
 
 def _operational_changes_product_or_release(record: Mapping[str, Any]) -> bool:
@@ -1119,8 +1172,13 @@ def _operational_changes_product_or_release(record: Mapping[str, Any]) -> bool:
             continue
         if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
             raise TaskAuthorizationError(f"{field_name} must be an array")
-        if any(_path_changes_product_or_release(str(path)) for path in value):
-            return True
+        for path in value:
+            if not isinstance(path, str) or not path.strip():
+                raise TaskAuthorizationError(
+                    f"{field_name} must contain non-empty path strings"
+                )
+            if _path_changes_product_or_release(path):
+                return True
     return False
 
 

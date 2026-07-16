@@ -18,7 +18,8 @@
     "release_effect",
     "remediation_round",
     "fact_status",
-    "disposition"
+    "disposition",
+    "scope_expanding"
   ],
   "properties": {
     "task_origin": {
@@ -110,7 +111,8 @@
         {"const": ""},
         {"enum": ["none", "spec", "user"]}
       ]
-    }
+    },
+    "scope_expanding": {"type": "boolean"}
   },
   "allOf": [
     {
