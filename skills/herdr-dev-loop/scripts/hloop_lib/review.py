@@ -2170,15 +2170,16 @@ def check_manifest_completeness(manifest: ReviewManifest) -> ManifestCompletenes
         if len(conclusive) > 1:
             issues.add(f"verification-disagreement:{fingerprint}")
             incomplete_findings.add(fingerprint)
-        # In a fresh scope a normalized finding marked confirmed is the
-        # canonical release-disposition input.  A verifier consensus that
-        # refutes that finding must not make the manifest complete merely
-        # because the verifiers agree with one another.  Explicitly refuted
-        # findings are already forced through the non-actionable discard
-        # policy, while legacy findings retain their compatibility semantics.
+        # In a fresh scope a normalized finding's explicit fact status is the
+        # canonical release-disposition input.  A conclusive verifier
+        # consensus that disagrees in either direction must not make the
+        # manifest complete merely because the verifiers agree with one
+        # another.  Explicitly refuted findings are already forced through
+        # the non-actionable discard policy, while legacy findings retain
+        # their compatibility semantics.
         if (
             finding.policy_axes_explicit
-            and finding.fact_status == "confirmed"
+            and finding.fact_status in {"confirmed", "refuted"}
             and len(conclusive) == 1
         ):
             consensus = next(iter(conclusive))

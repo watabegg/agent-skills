@@ -43,10 +43,10 @@ $HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create
 $HLOOP input record --source manager-chat --text '<user requirement>'
 $HLOOP requirement new --source-input U0001 --acceptance '<observable result>' --priority P1
 $HLOOP release-scope lock --source MISSION.md --source PLAN.md \
-  --plan-item-ref P001 --requirement-ref REQ-001 --scope-ref release-scope-contract
+  --requirement-ref REQ-001 --scope-ref release-scope-contract
 $HLOOP batch start "Initial implementation batch"
 $HLOOP task new "Implement bounded slice" \
-  --plan-item-ref P001 --requirement-ref REQ-001 \
+  --requirement-ref REQ-001 \
   --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 $HLOOP dashboard
 $HLOOP pump --max-transitions 20 --max-workers 3

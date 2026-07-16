@@ -10,6 +10,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+try:
+    import jsonschema
+except ImportError:  # pragma: no cover - optional for minimal skill installs
+    jsonschema = None
+
 import importlib.machinery
 import importlib.util
 import sys
@@ -54,6 +59,21 @@ class PolicyCliV052Tests(unittest.TestCase):
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             result = hloop.main(["--repo", str(repo), "--namespace", self.namespace, *arguments])
         return result, output.getvalue()
+
+    def assert_follow_up_schema(self, record: dict) -> None:
+        if jsonschema is None:
+            self.skipTest("jsonschema is optional")
+        schema = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "references"
+                / "schemas"
+                / "follow-up.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = jsonschema.Draft202012Validator(schema)
+        self.assertEqual(list(validator.iter_errors(record)), [], record)
 
     def init_and_lock(self, repo: Path) -> Path:
         result, output = self.run_cli(
@@ -959,6 +979,8 @@ class PolicyCliV052Tests(unittest.TestCase):
             provisional = add_follow_up()
             provisional_key = provisional["follow_up"]["issue_key"]
             self.assertTrue(provisional["follow_up"]["provisional"])
+            self.assert_follow_up_schema(provisional["follow_up"])
+            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
 
             final = add_follow_up(
                 "--root-cause",
@@ -985,6 +1007,8 @@ class PolicyCliV052Tests(unittest.TestCase):
                 ["review evidence one", "review evidence two"],
             )
             self.assertTrue(final_record["history"])
+            self.assert_follow_up_schema(final_record)
+            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
             state = hloop.load_state(repo)
             self.assertEqual(state["follow_ups"]["issue_keys"], {final_key: "F001"})
             self.assertEqual(
@@ -1003,12 +1027,14 @@ class PolicyCliV052Tests(unittest.TestCase):
                 "--duplicate-of",
                 final_key,
             )
-            duplicate_key = duplicate["follow_up"]["issue_key"]
+            duplicate_key = duplicate["relation"]["source_issue_key"]
             self.assertEqual(duplicate["follow_up"]["id"], "F001")
             self.assertEqual(
                 hloop.load_state(repo)["follow_ups"]["issue_key_aliases"][duplicate_key],
                 final_key,
             )
+            self.assert_follow_up_schema(duplicate["follow_up"])
+            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
 
             superseding = add_follow_up(
                 "--component",
@@ -1029,6 +1055,9 @@ class PolicyCliV052Tests(unittest.TestCase):
                 hloop.read_frontmatter(loop / "follow-ups" / "F001.md")["status"],
                 "superseded",
             )
+            self.assert_follow_up_schema(superseding["follow_up"])
+            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F001.md"))
+            self.assert_follow_up_schema(hloop.read_frontmatter(loop / "follow-ups" / "F002.md"))
             result, output = self.run_cli(
                 repo, "follow-up", "show", provisional_key, "--json"
             )
@@ -1133,6 +1162,7 @@ class PolicyCliV052Tests(unittest.TestCase):
             )
             self.assertEqual(result, 0, output)
             payload = json.loads(output)
+            self.assert_follow_up_schema(payload["follow_up"])
             self.assertEqual(payload["follow_up"]["decision_summary"], decision_summary)
             self.assertEqual(
                 payload["follow_up"]["verification_evidence"], verification_evidence
@@ -1143,6 +1173,7 @@ class PolicyCliV052Tests(unittest.TestCase):
             )
 
             artifact = hloop.read_frontmatter(loop / "follow-ups" / "F001.md")
+            self.assert_follow_up_schema(artifact)
             self.assertEqual(artifact["decision_summary"], decision_summary)
             self.assertEqual(artifact["verification_evidence"], verification_evidence)
             self.assertEqual(
@@ -1154,6 +1185,7 @@ class PolicyCliV052Tests(unittest.TestCase):
             )
             self.assertEqual(result, 0, output)
             shown = json.loads(output)
+            self.assert_follow_up_schema(shown)
             self.assertEqual(shown["decision_summary"], decision_summary)
             self.assertEqual(shown["verification_evidence"], verification_evidence)
             self.assertEqual(
@@ -1161,80 +1193,109 @@ class PolicyCliV052Tests(unittest.TestCase):
             )
 
     def test_follow_up_supersedes_failure_does_not_leave_partial_state(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = self.make_repo(Path(directory))
-            loop = self.init_and_lock(repo)
-            fingerprint = "sha256:" + "5" * 64
-            base_args = [
-                "follow-up",
-                "add",
-                "--title",
-                "Atomic follow-up",
-                "--component",
-                "review runtime",
-                "--trigger-class",
-                "classification drift",
-                "--product-impact",
-                "operator needs a later release decision",
-                "--source-review-fingerprint",
-                fingerprint,
-                "--evidence",
-                "review evidence",
-                "--impact",
-                "outside the current release contract",
-                "--affected-path",
-                "src/review.py",
-                "--fact-status",
-                "confirmed",
-                "--origin",
-                "unrelated-pre-existing",
-                "--contract-relation",
-                "outside_release",
-                "--decision-requirement",
-                "none",
-                "--release-effect",
-                "non_blocking",
-                "--disposition",
-                "defer_follow_up",
-                "--recommended-action",
-                "defer_follow_up",
-                "--deferred-reason",
-                "outside this release",
-                "--reconsider-condition",
-                "next release scope lock",
-                "--json",
-            ]
-            result, output = self.run_cli(repo, *base_args)
-            self.assertEqual(result, 0, output)
-            first = json.loads(output)["follow_up"]
-            before_state = (loop / "STATE.json").read_bytes()
-            before_target = (loop / "follow-ups" / "F001.md").read_bytes()
-            target_path = (loop / "follow-ups" / "F001.md").resolve()
-            injected = False
-            original_write_text = hloop.write_text
+        boundaries = ("new_artifact", "old_artifact", "state", "journal")
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                repo = self.make_repo(Path(directory))
+                loop = self.init_and_lock(repo)
+                fingerprint = "sha256:" + "5" * 64
+                base_args = [
+                    "follow-up",
+                    "add",
+                    "--title",
+                    "Atomic follow-up",
+                    "--component",
+                    "review runtime",
+                    "--trigger-class",
+                    "classification drift",
+                    "--product-impact",
+                    "operator needs a later release decision",
+                    "--source-review-fingerprint",
+                    fingerprint,
+                    "--evidence",
+                    "review evidence",
+                    "--impact",
+                    "outside the current release contract",
+                    "--affected-path",
+                    "src/review.py",
+                    "--fact-status",
+                    "confirmed",
+                    "--origin",
+                    "unrelated-pre-existing",
+                    "--contract-relation",
+                    "outside_release",
+                    "--decision-requirement",
+                    "none",
+                    "--release-effect",
+                    "non_blocking",
+                    "--disposition",
+                    "defer_follow_up",
+                    "--recommended-action",
+                    "defer_follow_up",
+                    "--deferred-reason",
+                    "outside this release",
+                    "--reconsider-condition",
+                    "next release scope lock",
+                    "--json",
+                ]
+                result, output = self.run_cli(repo, *base_args)
+                self.assertEqual(result, 0, output)
+                first = json.loads(output)["follow_up"]
+                paths = {
+                    "new_artifact": (loop / "follow-ups" / "F002.md").resolve(),
+                    "old_artifact": (loop / "follow-ups" / "F001.md").resolve(),
+                    "state": (loop / "STATE.json").resolve(),
+                    "journal": (loop / "JOURNAL.md").resolve(),
+                }
+                before = {
+                    path: path.read_bytes() if path.exists() else None
+                    for path in paths.values()
+                }
+                injected = False
+                original_write_text = hloop.write_text
+                original_append_text = hloop.append_text
 
-            def fail_once(path: Path, text: str, *, durable: bool = False) -> None:
-                nonlocal injected
-                if Path(path).resolve() == target_path and not injected:
-                    injected = True
-                    raise hloop.HLoopError("injected follow-up persistence failure")
-                original_write_text(path, text, durable=durable)
+                def fail_write(path: Path, text: str, *, durable: bool = False) -> None:
+                    nonlocal injected
+                    if (
+                        boundary != "journal"
+                        and Path(path).resolve() == paths[boundary]
+                        and not injected
+                    ):
+                        injected = True
+                        raise hloop.HLoopError(
+                            f"injected follow-up persistence failure at {boundary}"
+                        )
+                    original_write_text(path, text, durable=durable)
 
-            with mock.patch.object(hloop, "write_text", side_effect=fail_once):
-                result, output = self.run_cli(
-                    repo,
-                    *base_args[:-1],
-                    "--root-cause",
-                    "replacement design",
-                    "--supersedes",
-                    first["issue_key"],
-                )
-            self.assertNotEqual(result, 0, output)
-            self.assertIn("injected follow-up persistence failure", output)
-            self.assertTrue(injected)
-            self.assertEqual((loop / "STATE.json").read_bytes(), before_state)
-            self.assertEqual((loop / "follow-ups" / "F001.md").read_bytes(), before_target)
-            self.assertFalse((loop / "follow-ups" / "F002.md").exists())
+                def fail_append(path: Path, text: str) -> None:
+                    nonlocal injected
+                    if boundary == "journal" and Path(path).resolve() == paths[boundary] and not injected:
+                        injected = True
+                        raise hloop.HLoopError(
+                            "injected follow-up persistence failure at journal"
+                        )
+                    original_append_text(path, text)
+
+                with mock.patch.object(hloop, "write_text", side_effect=fail_write), mock.patch.object(
+                    hloop, "append_text", side_effect=fail_append
+                ):
+                    result, output = self.run_cli(
+                        repo,
+                        *base_args[:-1],
+                        "--root-cause",
+                        "replacement design",
+                        "--supersedes",
+                        first["issue_key"],
+                    )
+                self.assertNotEqual(result, 0, output)
+                self.assertIn("injected follow-up persistence failure", output)
+                self.assertTrue(injected)
+                for path, expected in before.items():
+                    if expected is None:
+                        self.assertFalse(path.exists(), path)
+                    else:
+                        self.assertEqual(path.read_bytes(), expected, path)
 
 
 if __name__ == "__main__":

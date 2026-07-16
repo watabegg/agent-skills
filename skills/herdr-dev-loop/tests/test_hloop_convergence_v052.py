@@ -703,10 +703,11 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertIn("special verification evidence is missing: public-docs", blocked["errors"])
 
         state = self.state()
+        inventory = ["README.md", "docs.md"]
         state["changed_file_validation"] = {
             "status": "passed",
             "target_sha": target,
-            "paths": ["README.md"],
+            "paths": inventory,
             "mapping": {"README.md": ["validation.log"]},
         }
         state["special_verification_evidence"] = {
@@ -717,7 +718,35 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             }
         }
         self.save_state(state)
-        with mock.patch.object(hloop, "_changed_file_inventory", return_value=["README.md"]):
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=inventory):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (2, ""), out)
+        blocked = json.loads(out)
+        self.assertIn(
+            "changed file lacks validation evidence: docs.md", blocked["errors"]
+        )
+
+        state = self.state()
+        state["changed_file_validation"]["mapping"]["docs.md"] = [
+            "validation.log"
+        ]
+        state["changed_file_validation"]["mapping"]["unexpected.md"] = [
+            "validation.log"
+        ]
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=inventory):
+            code, out, err = self.run_cli("review", "readiness", "--json")
+        self.assertEqual((code, err), (2, ""), out)
+        blocked = json.loads(out)
+        self.assertIn(
+            "changed-file validation evidence has unexpected paths: unexpected.md",
+            blocked["errors"],
+        )
+
+        state = self.state()
+        state["changed_file_validation"]["mapping"].pop("unexpected.md")
+        self.save_state(state)
+        with mock.patch.object(hloop, "_changed_file_inventory", return_value=inventory):
             code, out, err = self.run_cli("review", "readiness", "--json")
         self.assertEqual((code, err), (0, ""), out)
         ready = json.loads(out)

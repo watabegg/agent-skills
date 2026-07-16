@@ -1134,7 +1134,8 @@ def _path_changes_product_or_release(path: str) -> bool:
         or "/../" in normalized
     ):
         return True
-    normalized = normalized.lstrip("./")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
     if normalized.startswith((".ai/", "reports/", "qa/", "validation/", "results/", "follow-ups/")):
         return False
     if normalized.startswith(("tests/", "test/")):

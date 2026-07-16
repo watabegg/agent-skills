@@ -211,7 +211,11 @@ STRUCTURED_JSON_FIELDS = (
     "decision_summary",
     "verification_evidence",
     "implementation_constraints",
+    "duplicate_relation",
+    "relations",
+    "history",
 )
+INTEGER_FRONTMATTER_FIELDS = frozenset({"issue_key_version"})
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 DANGEROUS_AGENT_MARKERS = (
     "danger-full-access",
@@ -2566,6 +2570,10 @@ def parse_scalar(raw: str, key: str | None = None) -> Any:
         if not isinstance(decoded, (dict, list)):
             raise HLoopError(f"{key} must be a JSON object or array")
         return decoded
+    if key in INTEGER_FRONTMATTER_FIELDS:
+        if not re.fullmatch(r"[0-9]+", value):
+            raise HLoopError(f"{key} must be a non-negative integer")
+        return int(value)
     lower = value.lower()
     if lower == "true":
         return True
@@ -7012,25 +7020,14 @@ def _review_validation_is_current(
 def _changed_file_inventory(repo: Path, base_sha: str, target_sha: str) -> list[str]:
     if not base_sha or not target_sha:
         return []
-    proc = run_cmd(
-        [
-            TRUSTED_GIT_PATH,
-            "-C",
-            str(repo),
-            "diff",
-            "--name-only",
-            f"{base_sha}...{target_sha}",
-        ],
-        check=False,
-    )
-    if proc.returncode != 0:
-        return []
     return sorted(
-        {
-            line.strip()
-            for line in (proc.stdout or "").splitlines()
-            if line.strip()
-        }
+        set(
+            git_name_only_z(
+                repo,
+                ["diff", "--name-only", f"{base_sha}...{target_sha}"],
+                command="git diff --name-only -z",
+            )
+        )
     )
 
 
