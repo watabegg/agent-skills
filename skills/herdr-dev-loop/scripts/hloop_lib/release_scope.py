@@ -49,6 +49,7 @@ _DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{64}$")
 _INPUT_ID_RE = re.compile(r"^U[0-9]{4}$")
 _AMENDMENT_ID_RE = re.compile(r"^A[0-9]{3}$")
 _TASK_ID_RE = re.compile(r"^T[0-9]{3}$")
+_PLAN_ITEM_RE = re.compile(r"(?<![A-Za-z0-9_])P[0-9]{3}[a-z]?(?![A-Za-z0-9_])")
 
 
 class ReleaseScopeError(ValueError):
@@ -209,6 +210,24 @@ def compute_source_digests(sources: Mapping[str, str]) -> dict[str, str]:
     return normalized
 
 
+def discover_plan_item_refs(sources: Mapping[str, str]) -> tuple[str, ...]:
+    """Return stable PLAN item identifiers present in a source snapshot."""
+
+    if not isinstance(sources, Mapping):
+        raise ScopeValidationError("sources must be an object mapping paths to text")
+    refs: set[str] = set()
+    for raw_path, content in sources.items():
+        path = _required_text(raw_path, "source path")
+        if not isinstance(content, str):
+            raise ScopeValidationError(
+                f"source content for {raw_path!r} must be a string"
+            )
+        if path.replace("\\", "/").rsplit("/", 1)[-1].lower() != "plan.md":
+            continue
+        refs.update(_PLAN_ITEM_RE.findall(content))
+    return tuple(sorted(refs))
+
+
 def source_digests(sources: Mapping[str, str]) -> dict[str, str]:
     """Compatibility alias for :func:`compute_source_digests`."""
 
@@ -339,6 +358,8 @@ class ReleaseScope:
         plan_item_refs: Sequence[str] = (),
         requirement_refs: Sequence[str] = (),
         release_scope_refs: Sequence[str] = (),
+        available_plan_item_refs: Sequence[str] | None = None,
+        accepted_requirement_refs: Sequence[str] | None = None,
     ) -> "ReleaseScope":
         """Create a new lock from contents or already computed digests."""
 
@@ -353,6 +374,35 @@ class ReleaseScope:
                 source_refs = tuple(computed)
         if source_refs is None and source_digests is not None:
             source_refs = tuple(source_digests)
+        normalized_plan_refs = _unique_texts(plan_item_refs, "plan_item_refs")
+        normalized_requirement_refs = _unique_texts(
+            requirement_refs, "requirement_refs"
+        )
+        if available_plan_item_refs is None and source_contents is not None:
+            available_plan_item_refs = discover_plan_item_refs(source_contents)
+        if available_plan_item_refs is not None:
+            available_plan = set(
+                _unique_texts(available_plan_item_refs, "available_plan_item_refs")
+            )
+            missing_plan = sorted(set(normalized_plan_refs) - available_plan)
+            if missing_plan:
+                raise ScopeValidationError(
+                    "missing locked PLAN reference: " + ", ".join(missing_plan)
+                )
+        if accepted_requirement_refs is not None:
+            accepted_requirements = set(
+                _unique_texts(
+                    accepted_requirement_refs, "accepted_requirement_refs"
+                )
+            )
+            missing_requirements = sorted(
+                set(normalized_requirement_refs) - accepted_requirements
+            )
+            if missing_requirements:
+                raise ScopeValidationError(
+                    "missing accepted requirement reference: "
+                    + ", ".join(missing_requirements)
+                )
         return cls(
             status="locked",
             source_refs=tuple(source_refs or ()),
@@ -360,8 +410,8 @@ class ReleaseScope:
             scope_revision=scope_revision,
             source_snapshot_revision=source_snapshot_revision,
             locked_at=locked_at,
-            plan_item_refs=tuple(plan_item_refs),
-            requirement_refs=tuple(requirement_refs),
+            plan_item_refs=normalized_plan_refs,
+            requirement_refs=normalized_requirement_refs,
             release_scope_refs=tuple(release_scope_refs),
         )
 
@@ -1094,10 +1144,16 @@ def validate_task_provenance(
             raise TaskAuthorizationError(
                 f"missing locked requirement reference: {reference}"
             )
-    if provenance.source_finding and available_findings and provenance.source_finding not in available_findings:
-        raise TaskAuthorizationError(
-            f"missing locked finding reference: {provenance.source_finding}"
-        )
+    if provenance.source_finding:
+        if not available_findings:
+            raise TaskAuthorizationError(
+                "missing locked finding reference: "
+                f"{provenance.source_finding} (finding inventory is empty)"
+            )
+        if provenance.source_finding not in available_findings:
+            raise TaskAuthorizationError(
+                f"missing locked finding reference: {provenance.source_finding}"
+            )
 
     if provenance.task_origin == "planned":
         if not provenance.plan_item_refs and not provenance.requirement_refs:
@@ -1181,7 +1237,9 @@ def _validate_finding_task(
         )
     if not provenance.requirement_refs and provenance.scope_refs:
         locked_scope_refs = set(available_scope_refs)
-        if locked_scope_refs and not set(provenance.scope_refs).intersection(locked_scope_refs):
+        if not locked_scope_refs or not set(provenance.scope_refs).intersection(
+            locked_scope_refs
+        ):
             raise TaskAuthorizationError(
                 "finding task does not reference the locked release scope"
             )
@@ -1190,9 +1248,19 @@ def _validate_finding_task(
             "only in_scope findings may create remediation tasks"
         )
     if provenance.origin not in {"introduced", "diff-expanded-pre-existing"}:
-        raise TaskAuthorizationError(
-            "finding task origin must be introduced or diff-expanded-pre-existing"
+        requirement_basis = bool(
+            provenance.requirement_refs
+            and set(provenance.requirement_refs).intersection(available_requirements)
         )
+        scope_basis = bool(
+            provenance.scope_refs
+            and set(provenance.scope_refs).intersection(available_scope_refs)
+        )
+        if not (requirement_basis or scope_basis):
+            raise TaskAuthorizationError(
+                "finding task origin must be introduced or diff-expanded-pre-existing, "
+                "or cite an accepted requirement or locked safety invariant"
+            )
     if provenance.fact_status != "confirmed":
         raise TaskAuthorizationError(
             "finding task requires fact_status confirmed"

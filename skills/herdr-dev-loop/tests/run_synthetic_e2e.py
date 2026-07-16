@@ -1536,6 +1536,13 @@ def _new_synthetic_fixture(
         "--manager-qa-profile",
         "none",
     )
+    loop = repo / ".ai" / "herdr-dev-loop" / "loops" / namespace
+    plan_path = loop / "PLAN.md"
+    plan_path.write_text(
+        plan_path.read_text(encoding="utf-8")
+        + "\n- P005: synthetic bounded-convergence implementation item\n",
+        encoding="utf-8",
+    )
     source_args = (
         "--source-ref",
         f".ai/herdr-dev-loop/loops/{namespace}/MISSION.md",
@@ -1552,8 +1559,6 @@ def _new_synthetic_fixture(
         *source_args,
         "--plan-item-ref",
         "P005",
-        "--requirement-ref",
-        "REQ-005",
         "--scope-ref",
         "release-contract",
     )
@@ -1864,8 +1869,6 @@ def _create_finding_task(
         "finding",
         "--source-finding",
         source_finding,
-        "--requirement-ref",
-        "REQ-005",
         "--scope-ref",
         "release-contract",
         "--origin",
@@ -2052,8 +2055,26 @@ def scenario_scope_expansion_follow_up(ctx: dict[str, Any]) -> dict[str, Any]:
         candidates=(candidate,),
         recommended_action="accepted_risk_candidate",
     )
-    convergence = _record_convergence(fixture, 0)
-    require(convergence["status"] == "converged", "scope expansion candidate blocked convergence")
+    blocked = _fixture_cli(
+        fixture,
+        "review",
+        "convergence",
+        "record",
+        "--fix-round",
+        "0",
+        "--json",
+        expected=2,
+    )
+    require(
+        "first-class follow-up artifacts" in blocked.stderr,
+        "scope expansion convergence did not fail closed before follow-up",
+    )
+    state_before_follow_up = _fixture_state(fixture)
+    require(
+        state_before_follow_up["review_convergence"]["status"] == "prepared",
+        "blocked convergence mutated the convergence gate",
+    )
+    target_sha = state_before_follow_up["review_convergence"]["target_sha"]
     follow_up = _fixture_cli(
         fixture,
         "follow-up",
@@ -2099,6 +2120,12 @@ def scenario_scope_expansion_follow_up(ctx: dict[str, Any]) -> dict[str, Any]:
         "--reconsider-condition",
         "the next release scope review includes this component",
         "--json",
+    )
+    convergence = _record_convergence(fixture, 0)
+    require(convergence["status"] == "converged", "follow-up did not permit convergence")
+    require(
+        _fixture_state(fixture)["review_convergence"]["target_sha"] == target_sha,
+        "follow-up changed the fixed review target",
     )
     follow_up_payload = json.loads(follow_up.stdout)
     follow_up_id = str(follow_up_payload["follow_up"]["id"])

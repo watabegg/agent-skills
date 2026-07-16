@@ -48,6 +48,7 @@ def locked_scope(**overrides):
         "plan_item_refs": ("P001",),
         "requirement_refs": ("REQ-001",),
         "release_scope_refs": ("release-scope",),
+        "accepted_requirement_refs": ("REQ-001",),
     }
     values.update(overrides)
     return ReleaseScope.lock(**values)
@@ -250,7 +251,14 @@ class TaskAuthorizationTests(unittest.TestCase):
 
     def test_finding_task_requires_confirmed_in_scope_fix_now_provenance(self):
         scope = locked_scope()
-        self.assertEqual(authorize_task_creation(finding_task(), scope).task_origin, "finding")
+        self.assertEqual(
+            authorize_task_creation(
+                finding_task(), scope, locked_finding_ids=("FND-001",)
+            ).task_origin,
+            "finding",
+        )
+        with self.assertRaisesRegex(TaskAuthorizationError, "finding inventory is empty"):
+            authorize_task_creation(finding_task(), scope)
         for mutation, message in (
             ({"contract_relation": "outside_release"}, "in_scope"),
             ({"fact_status": "insufficient_evidence"}, "fact_status confirmed"),
@@ -261,6 +269,52 @@ class TaskAuthorizationTests(unittest.TestCase):
                 candidate = finding_task(**mutation)
                 with self.assertRaisesRegex(TaskAuthorizationError, message):
                     authorize_task_creation(candidate, scope, locked_finding_ids=("FND-001",))
+
+    def test_finding_task_can_repair_confirmed_requirement_or_safety_invariant_violation(self):
+        scope = locked_scope()
+        requirement_violation = finding_task(origin="unrelated-pre-existing")
+        self.assertEqual(
+            authorize_task_creation(
+                requirement_violation, scope, locked_finding_ids=("FND-001",)
+            ).task_origin,
+            "finding",
+        )
+        safety_violation = finding_task(
+            origin="unknown",
+            requirement_refs=[],
+            scope_refs=["release-scope"],
+        )
+        self.assertEqual(
+            authorize_task_creation(
+                safety_violation, scope, locked_finding_ids=("FND-001",)
+            ).task_origin,
+            "finding",
+        )
+        with self.assertRaisesRegex(TaskAuthorizationError, "only in_scope"):
+            authorize_task_creation(
+                finding_task(
+                    origin="unrelated-pre-existing", contract_relation="outside_release"
+                ),
+                scope,
+                locked_finding_ids=("FND-001",),
+            )
+
+    def test_lock_rejects_references_outside_source_and_accepted_inventory(self):
+        with self.assertRaisesRegex(ScopeValidationError, "missing locked PLAN reference"):
+            ReleaseScope.lock(
+                source_contents=SOURCES,
+                locked_at=NOW,
+                plan_item_refs=("P999",),
+                accepted_requirement_refs=("REQ-001",),
+            )
+        with self.assertRaisesRegex(ScopeValidationError, "accepted requirement"):
+            ReleaseScope.lock(
+                source_contents=SOURCES,
+                locked_at=NOW,
+                plan_item_refs=("P001",),
+                requirement_refs=("REQ-999",),
+                accepted_requirement_refs=("REQ-001",),
+            )
 
     def test_user_amendment_task_requires_matching_recorded_authorization(self):
         scope = locked_scope()

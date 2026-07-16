@@ -71,6 +71,27 @@ class PolicyCliV052Tests(unittest.TestCase):
         )
         self.assertEqual(result, 0, output)
         loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+        (loop / "PLAN.md").write_text(
+            (loop / "PLAN.md").read_text(encoding="utf-8")
+            + "\n- P004c: policy CLI test item\n",
+            encoding="utf-8",
+        )
+        state_path = loop / "STATE.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["requirements"] = {
+            "REQ-007": {
+                "id": "REQ-007",
+                "source_inputs": ["U0001"],
+                "acceptance": ["policy CLI test requirement"],
+                "priority": "P1",
+                "dependencies": [],
+                "accepted_at": "2026-07-16T00:00:00+00:00",
+                "status": "accepted",
+                "supersedes": [],
+                "superseded_by": "",
+            }
+        }
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         source_args = [
             "--source-ref",
             f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
@@ -95,6 +116,80 @@ class PolicyCliV052Tests(unittest.TestCase):
         )
         self.assertEqual(result, 0, output)
         return loop
+
+    def test_release_scope_lock_rejects_unknown_plan_and_requirement_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            result, output = self.run_cli(
+                repo,
+                "init",
+                "--goal-id",
+                "policy-cli-v052",
+                "--goal",
+                "policy CLI",
+                "--base",
+                "main",
+                "--integration",
+                "main",
+                "--create-branch",
+                "--specification-scout",
+                "off",
+            )
+            self.assertEqual(result, 0, output)
+            loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+            (loop / "PLAN.md").write_text(
+                (loop / "PLAN.md").read_text(encoding="utf-8")
+                + "\n- P004c: policy CLI test item\n",
+                encoding="utf-8",
+            )
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["requirements"] = {
+                "REQ-007": {
+                    "id": "REQ-007",
+                    "source_inputs": ["U0001"],
+                    "acceptance": ["policy CLI test requirement"],
+                    "priority": "P1",
+                    "dependencies": [],
+                    "accepted_at": "2026-07-16T00:00:00+00:00",
+                    "status": "accepted",
+                    "supersedes": [],
+                    "superseded_by": "",
+                }
+            }
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            source_args = [
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PLAN.md",
+            ]
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "lock",
+                *source_args,
+                "--plan-item-ref",
+                "P999",
+                "--requirement-ref",
+                "REQ-007",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("missing locked PLAN reference", output)
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "lock",
+                *source_args,
+                "--plan-item-ref",
+                "P004c",
+                "--requirement-ref",
+                "REQ-999",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("accepted requirement", output)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["release_scope"]["status"], "unlocked")
 
     def test_fresh_init_requires_scope_lock_but_migrated_legacy_keeps_cadence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -257,6 +352,77 @@ class PolicyCliV052Tests(unittest.TestCase):
                 "outside_release",
             )
             self.assertNotEqual(result, 0)
+
+    def test_finding_task_requires_persisted_evidence_and_allows_contract_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "a" * 64
+            finding_args = [
+                "task",
+                "new",
+                "contract recovery",
+                "--kind",
+                "fix",
+                "--write-allow",
+                "scripts/fix.py",
+                "--task-origin",
+                "finding",
+                "--source-finding",
+                fingerprint,
+                "--requirement-ref",
+                "REQ-007",
+                "--why-fix-now",
+                "confirmed accepted requirement violation",
+                "--origin",
+                "unrelated-pre-existing",
+                "--contract-relation",
+                "in_scope",
+                "--release-effect",
+                "non_blocking",
+                "--fact-status",
+                "confirmed",
+                "--disposition",
+                "fix_now",
+                "--remediation-round",
+                "1",
+            ]
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("finding inventory is empty", output)
+
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["finding_inventory"] = {
+                "fingerprints": [fingerprint],
+                "finding_ids": ["FND-RECOVERY"],
+                "records": {
+                    fingerprint: {
+                        "fingerprint": fingerprint,
+                        "finding_ids": ["FND-RECOVERY"],
+                        "head_sha": "a" * 40,
+                        "source_refs": ["reviews/R001/MANIFEST.json"],
+                        "confirmed": True,
+                    }
+                },
+                "updated_at": "2026-07-16T00:00:00+00:00",
+            }
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = False
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("finding inventory is empty", output)
+
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = True
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertEqual(result, 0, output)
+
+            outside_args = list(finding_args)
+            outside_args[outside_args.index("in_scope")] = "outside_release"
+            result, output = self.run_cli(repo, *outside_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("in_scope", output)
 
     def test_scope_amendment_dispatch_freeze_and_follow_up_deduplicate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
