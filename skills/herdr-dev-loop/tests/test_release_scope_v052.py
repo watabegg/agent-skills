@@ -653,6 +653,14 @@ class TaskAuthorizationTests(unittest.TestCase):
             write_allow=["reports/FINAL.md"],
         )
         self.assertEqual(authorize_task_creation(operational, scope).task_origin, "operational")
+        canonical_evidence = ".ai/herdr-dev-loop/loops/release-scope/validation/T001.log"
+        self.assertEqual(
+            authorize_task_creation(
+                {**operational, "write_allow": [canonical_evidence]},
+                scope,
+            ).task_origin,
+            "operational",
+        )
         with self.assertRaisesRegex(TaskAuthorizationError, "product or release artifacts"):
             authorize_task_creation(
                 {**operational, "write_allow": ["src/feature.py"]}, scope

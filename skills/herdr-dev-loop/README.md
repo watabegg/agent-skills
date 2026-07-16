@@ -389,7 +389,7 @@ hloop --repo <repo> init \
 
 `--worktree-root` を指定すると、Worker、Reviewer、Gap Auditor、Advisorのworktreeがすべてその配下へ作られます。相対パスは対象リポジトリを基準に解決されます。`init --force`で再初期化した場合、旧loopは`.ai/herdr-dev-loop/archive/<namespace>/`へ退避され、新しい`run_id`が発行されます。
 
-### 3. batchとtaskを作る
+### 3. Quick Start: 要件からbatchとtaskを作る
 
 ```bash
 hloop --repo <repo> input record --source manager-chat --text '<利用者の指示>'
@@ -399,11 +399,11 @@ hloop --repo <repo> requirement new \
   --priority P1
 hloop --repo <repo> release-scope lock \
   --source MISSION.md --source PLAN.md \
-  --plan-item-ref P001 --requirement-ref REQ-001 \
+  --requirement-ref REQ-001 \
   --scope-ref release-scope-contract
 hloop --repo <repo> batch start "Initial implementation batch"
 hloop --repo <repo> task new "<担当範囲の実装>" \
-  --plan-item-ref P001 --requirement-ref REQ-001 \
+  --requirement-ref REQ-001 \
   --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 ```
 

@@ -132,8 +132,9 @@ def candidate(
     origin: str = "introduced",
     contract_relation: str = "in_scope",
     decision_requirement: str = "none",
-    disposition: str = "fix_now",
-    release_effect: str = "blocking",
+    fact_status: str = "confirmed",
+    disposition: str | None = None,
+    release_effect: str | None = None,
     product_impact: str = "the item is never processed",
 ) -> FindingCandidate:
     return FindingCandidate(
@@ -151,11 +152,12 @@ def candidate(
         product_impact=product_impact,
         origin=origin,
         proposed_fix="commit acknowledgement with the state transition",
-        fact_status="confirmed",
+        fact_status=fact_status,
         contract_relation=contract_relation,
         decision_requirement=decision_requirement,
-        disposition=disposition,
-        release_effect=release_effect,
+        disposition=disposition or ("discard" if fact_status == "refuted" else "fix_now"),
+        release_effect=release_effect
+        or ("non_blocking" if fact_status == "refuted" else "blocking"),
     )
 
 
@@ -431,34 +433,47 @@ class FinalManifestCompletenessTests(unittest.TestCase):
     def test_explicit_verification_consensus_must_match_normalized_fact(self):
         group = review_plan()
         plan = certification_plan(group)
-        normalized = normalize_findings((candidate(),))
-        verification = plan_verification(group, normalized)
-        refuted_records = tuple(
-            VerificationRecord.from_assignment(
-                assignment,
-                fact_status="refuted",
-                ignore_status="no_action",
-                decision_status="none",
-                progress_without_decision="yes",
-                severity="P2",
-                recommended_action="discard",
-            )
-            for assignment in verification.assignments
-        )
-        manifest = final_manifest(
-            plan,
-            group,
-            findings=normalized,
-            verifications=refuted_records,
-        )
+        for normalized_fact, verifier_fact in (
+            ("confirmed", "refuted"),
+            ("refuted", "confirmed"),
+        ):
+            with self.subTest(normalized_fact=normalized_fact, verifier_fact=verifier_fact):
+                normalized = normalize_findings(
+                    (candidate(fact_status=normalized_fact),)
+                )
+                verification = plan_verification(group, normalized)
+                verifier_records = tuple(
+                    VerificationRecord.from_assignment(
+                        assignment,
+                        fact_status=verifier_fact,
+                        ignore_status=(
+                            "must_not_ignore"
+                            if verifier_fact == "confirmed"
+                            else "no_action"
+                        ),
+                        decision_status="none",
+                        progress_without_decision="yes",
+                        severity="P2",
+                        recommended_action=(
+                            "fix_task" if verifier_fact == "confirmed" else "discard"
+                        ),
+                    )
+                    for assignment in verification.assignments
+                )
+                manifest = final_manifest(
+                    plan,
+                    group,
+                    findings=normalized,
+                    verifications=verifier_records,
+                )
 
-        self.assertFalse(manifest.completeness.complete)
-        self.assertIn(
-            f"verification-consensus-mismatch:{normalized[0].fingerprint}",
-            manifest.completeness.issues,
-        )
-        result = validate_final_review(plan, manifest)
-        self.assertFalse(result.passed)
+                self.assertFalse(manifest.completeness.complete)
+                self.assertIn(
+                    f"verification-consensus-mismatch:{normalized[0].fingerprint}",
+                    manifest.completeness.issues,
+                )
+                result = validate_final_review(plan, manifest)
+                self.assertFalse(result.passed)
 
     def test_finish_time_accepted_risk_revalidation_checks_identity_and_expiry(self):
         fingerprint = "sha256:" + "a" * 64

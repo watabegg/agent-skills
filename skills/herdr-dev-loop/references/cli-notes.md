@@ -25,7 +25,7 @@ $HLOOP namespaces
 
 Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revision 0/1 state. herdr-dev-loop 0.5.2 writes format 3 revision 2 and rejects mutation from an unknown future revision. The migration preserves legacy merge-count cadence and disables the new manual-final requirement for migrated legacy runs. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
 
-Use `config path`, `config validate`, `config explain`, and `config init` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; 0.5.2 has no in-place `config apply` subcommand. New-loop review defaults are stored under `review_policy` and use batch cadence, a two-round fix cap, `follow_up` for scope expansion, and complete-zero manual final certification.
+Use `config path`, `config validate`, `config explain`, `config init`, and `config apply` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; `config apply --dry-run` previews changes, while `config apply --apply` updates an idle active loop's runtime-facing snapshot and `review_policy`. Changing the review policy invalidates the existing readiness, convergence, and manual-final evidence. New-loop review defaults are stored under `review_policy` and use batch cadence, a two-round fix cap, `follow_up` for scope expansion, and complete-zero manual final certification.
 
 ## 0.5.2 release-scope and review commands
 

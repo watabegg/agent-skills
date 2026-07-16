@@ -88,6 +88,33 @@ class ExactGitPathTests(unittest.TestCase):
                 [],
             )
 
+    def test_changed_file_inventory_is_nul_safe_and_utf8_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            base_sha = self.seed_special_paths(repo)
+            for name in self.SPECIAL_PATHS:
+                (repo / name).write_text(f"changed {name!r}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "changed special paths"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            head_sha = hloop.git(repo, ["rev-parse", "HEAD"])
+
+            self.assertEqual(
+                set(hloop._changed_file_inventory(repo, base_sha, head_sha)),
+                set(self.SPECIAL_PATHS),
+            )
+            with mock.patch.object(
+                hloop,
+                "git_bytes",
+                return_value=b"valid.txt\0invalid-\xff.txt\0",
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "non-UTF-8"):
+                    hloop._changed_file_inventory(repo, base_sha, head_sha)
+
     def test_repository_visible_inventory_is_nul_safe_and_utf8_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = self.init_repo(Path(directory))

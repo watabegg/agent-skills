@@ -35,7 +35,7 @@ Values resolve from lowest to highest precedence in this order:
 4. task override
 5. explicit role-start override
 
-`config explain` returns the final value and source for every leaf. `init` stores `config_source` and `resolved_config` in `STATE.json`; a later global configuration edit does not silently rewrite an existing loop. The 0.5.2 CLI does not expose an in-place `config apply` command. To change an active loop, use the supported task or role-specific update command, or initialize a new namespace after reviewing `config explain`.
+`config explain` returns the final value and source for every leaf. `init` stores `config_source` and `resolved_config` in `STATE.json`; a later global configuration edit does not silently rewrite an existing loop. Use `config apply --dry-run` to preview changes, then `config apply --apply` to update an idle active loop's runtime-facing snapshot, including `review_policy`. A review-policy change invalidates review readiness, convergence, and manual-final evidence, which must be regenerated before finishing.
 
 ## Review policy defaults
 
