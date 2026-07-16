@@ -421,6 +421,17 @@ reviews/convergence/MANIFEST.json
 
 `PLAN.json` records `base_ref`, `base_sha`, `target_ref`, `target_sha`, `fix_round`, `max_fix_rounds`, the review plan, readiness checks, protocol, and preparation time. `MANIFEST.json` records the same review-plan identity, lane results, normalized findings, verifier assignments/results, completeness issues, and the recomputed verified actionable finding count. The prepared target SHA and plan must match exactly when the manifest is recorded. An incomplete manifest or a nonzero actionable count keeps convergence open or exhausted; the Manager must not substitute a plain review artifact for these fixed-target records.
 
+Before fixed-target readiness, changed files in the migration, schema,
+public-docs, or security-boundary domains require explicit current-head
+evidence. Use `hloop verification record --domain <domain> --status passed
+--target-sha <integration-head> --evidence-ref <reference>` once per detected
+domain. HLoop stores the record under
+`STATE.json.special_verification_evidence.<domain>` and rejects unknown
+domains, empty references, and stale target SHAs. A failed or blocked record
+does not pass readiness, and legacy `verified` records remain readable but are
+not a replacement for current evidence. The record is part of the fixed-target
+validation contract; direct `STATE.json` edits are not an accepted substitute.
+
 Public validation entry points are:
 
 - `schemas/final-review-plan.schema.json`

@@ -50,6 +50,24 @@
     "advice",
     "decisions"
   ],
+  "$defs": {
+    "specialVerificationRecord": {
+      "type": "object",
+      "required": ["target_sha", "status", "references"],
+      "properties": {
+        "target_sha": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["passed", "verified", "failed", "blocked"]},
+        "references": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "recorded_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  },
   "properties": {
     "state_format_version": {"const": 3},
     "schema_revision": {"type": "integer", "minimum": 1},
@@ -171,6 +189,16 @@
         }
       },
       "additionalProperties": true
+    },
+    "special_verification_evidence": {
+      "type": "object",
+      "properties": {
+        "migration": {"$ref": "#/$defs/specialVerificationRecord"},
+        "schema": {"$ref": "#/$defs/specialVerificationRecord"},
+        "public-docs": {"$ref": "#/$defs/specialVerificationRecord"},
+        "security-boundary": {"$ref": "#/$defs/specialVerificationRecord"}
+      },
+      "additionalProperties": false
     },
     "review_convergence": {
       "type": "object",

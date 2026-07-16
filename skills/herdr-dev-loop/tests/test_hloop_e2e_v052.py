@@ -43,6 +43,16 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
         self.assertTrue(evidence["remediation_findings_coalesced"])
         self.assertEqual(evidence["final_status"], "passed")
 
+    def test_batch_review_cadence_pins_each_closed_batch_head(self):
+        evidence = self.run_scenario("batch-review-cadence")
+        self.assertEqual(evidence["review_events"], 2)
+        self.assertTrue(evidence["targets_advanced"])
+        self.assertNotEqual(
+            evidence["first_review_target_sha"], evidence["second_review_target_sha"]
+        )
+        self.assertTrue(evidence["future_queued_tasks_did_not_block"])
+        self.assertTrue(evidence["open_batch_kept_closed"])
+
     def test_scope_expansion_creates_follow_up_without_gate_invalidation(self):
         evidence = self.run_scenario("scope-expansion-follow-up")
         self.assertEqual(evidence["follow_up_id"], "F001")

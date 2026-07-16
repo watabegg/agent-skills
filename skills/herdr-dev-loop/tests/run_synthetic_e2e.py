@@ -2035,6 +2035,96 @@ def scenario_remediation_convergence(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def scenario_batch_review_cadence(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Exercise intermediate and final review openings across two batches."""
+
+    fixture = _new_synthetic_fixture(
+        ctx, "batch-review-cadence", task_count=1, merge_tasks=False
+    )
+    state = _fixture_state(fixture)
+    state["max_reviewers"] = 1
+    state["review_policy"]["cadence"] = "batch"
+    state["review_policy"]["lane_count"] = "auto"
+    state["unreviewed_merge_count"] = 1
+    state["needs_review"] = False
+    _save_fixture_state(fixture, state)
+    _mark_tasks_merged(fixture, ("T001",))
+    target_one = git(fixture["repo"], "rev-parse", "master").stdout.strip()
+
+    # A future queued task is deliberately outside the closed batch. It must
+    # not prevent a review for B001 from opening at the current head.
+    state = _fixture_state(fixture)
+    state["tasks"]["T002"] = {"status": "queued"}
+    state["unreviewed_merge_count"] = 1
+    state["needs_review"] = False
+    state["current_batch_id"] = ""
+    _save_fixture_state(fixture, state)
+    _run_fixture_validation(fixture)
+    first_review_state = _fixture_state(fixture)
+    require(first_review_state["needs_review"], "closed batch review did not open")
+    require(
+        first_review_state["last_validation"]["head_sha"] == target_one,
+        "first review did not pin the current integration head",
+    )
+
+    # Simulate the Manager consuming the first gate, then leave B002 open. A
+    # current open batch must keep the next review gate closed.
+    state = first_review_state
+    state["needs_review"] = False
+    state["unreviewed_merge_count"] = 0
+    state["batches"]["B002"] = {
+        "status": "active",
+        "task_ids": ["T002"],
+        "created_at": now(),
+        "started_at": now(),
+    }
+    state["tasks"]["T002"]["batch_id"] = "B002"
+    state["current_batch_id"] = "B002"
+    _save_fixture_state(fixture, state)
+    _run_fixture_validation(fixture)
+    open_batch_state = _fixture_state(fixture)
+    require(
+        not open_batch_state["needs_review"],
+        "review opened while the current batch was still open",
+    )
+
+    # Close B002 and advance the integration head before its validation. The
+    # second review must pin the new head rather than reuse target_one.
+    (fixture["repo"] / "README.md").write_text(
+        "synthetic batch review advance\n", encoding="utf-8"
+    )
+    git(fixture["repo"], "add", "README.md")
+    git(fixture["repo"], "commit", "-m", "advance second batch")
+    target_two = git(fixture["repo"], "rev-parse", "master").stdout.strip()
+    state = _fixture_state(fixture)
+    state["batches"]["B002"].update(
+        {"status": "closed", "closed_at": now(), "summary": "second batch merged"}
+    )
+    state["current_batch_id"] = ""
+    state["tasks"]["T002"].update({"status": "merged", "head_sha": target_two})
+    state["integration_head_sha"] = target_two
+    state["completion_target_sha"] = target_two
+    state["unreviewed_merge_count"] = 1
+    state["needs_review"] = False
+    _save_fixture_state(fixture, state)
+    _run_fixture_validation(fixture)
+    second_review_state = _fixture_state(fixture)
+    require(second_review_state["needs_review"], "second closed batch review did not open")
+    require(
+        second_review_state["last_validation"]["head_sha"] == target_two,
+        "second review did not pin the advanced integration head",
+    )
+    require(target_one != target_two, "batch review targets did not advance")
+    return {
+        "review_events": 2,
+        "first_review_target_sha": target_one,
+        "second_review_target_sha": target_two,
+        "targets_advanced": True,
+        "future_queued_tasks_did_not_block": True,
+        "open_batch_kept_closed": True,
+    }
+
+
 def scenario_scope_expansion_follow_up(ctx: dict[str, Any]) -> dict[str, Any]:
     fixture = _new_synthetic_fixture(ctx, "scope-expansion-follow-up")
     plan = _prepare_convergence(fixture)
@@ -2656,6 +2746,7 @@ SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = 
     ("scout-liaison-report-ack-attention", scenario_scout_liaison_reports),
     ("requirements-decisions-outcomes", scenario_requirements_decisions),
     ("remediation-convergence", scenario_remediation_convergence),
+    ("batch-review-cadence", scenario_batch_review_cadence),
     ("scope-expansion-follow-up", scenario_scope_expansion_follow_up),
     ("two-round-exhaustion", scenario_two_round_exhaustion),
     ("user-stop-freeze", scenario_user_stop_freeze),

@@ -78,6 +78,30 @@ reference schemas and are checked by the 0.5.2 selftest. Provider E2E is
 reported separately: `--allow-skip --skip-reason <reason>` proves that the
 probe was intentionally not run, but it never turns into a provider pass.
 
+### Special verification evidence
+
+`hloop validate` records ordinary changed-file validation, but special domains
+must be recorded explicitly at the current integration head. For every domain
+reported by `hloop review readiness`, run:
+
+```sh
+hloop verification record \
+  --domain <migration|schema|public-docs|security-boundary> \
+  --target-sha <current-integration-head> \
+  --status passed \
+  --evidence-ref <non-empty-reference>
+```
+
+Repeat the command for each detected domain and use another
+`--evidence-ref` for additional logs or reports. The command writes one record
+under `STATE.json.special_verification_evidence.<domain>` with `target_sha`,
+`status`, `references`, and `recorded_at`. Unknown domains, empty evidence,
+and a target SHA different from the current integration head are rejected
+before state is written. `failed` and `blocked` records are retained for
+diagnostics but never satisfy readiness; `verified` remains accepted only for
+legacy evidence compatibility. Do not edit `STATE.json` directly to bypass
+this contract.
+
 ## Command Selection
 
 Pick commands from current repository evidence:
