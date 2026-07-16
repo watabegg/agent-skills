@@ -1619,6 +1619,7 @@ def _candidate_for_lane(
     finding_id: str,
     severity: str,
     title: str,
+    fact_status: str = "confirmed",
     origin: str = "introduced",
     contract_relation: str = "in_scope",
     decision_requirement: str = "none",
@@ -1641,7 +1642,7 @@ def _candidate_for_lane(
         origin=origin,
         proposed_fix="apply the bounded synthetic remediation",
         requires_spec_decision=False,
-        fact_status="confirmed",
+        fact_status=fact_status,
         contract_relation=contract_relation,
         decision_requirement=decision_requirement,
         disposition=disposition,
@@ -1670,7 +1671,7 @@ def _write_review_manifest(
     verifications = tuple(
         hloop_review.VerificationRecord.from_assignment(
             assignment,
-            fact_status="confirmed",
+            fact_status=by_fingerprint[assignment.fingerprint].fact_status,
             ignore_status=ignore_status,
             decision_status="none",
             progress_without_decision="yes",
@@ -1768,7 +1769,7 @@ def _write_final_manifest(
     verifications = tuple(
         hloop_review.VerificationRecord.from_assignment(
             assignment,
-            fact_status="confirmed",
+            fact_status=by_fingerprint[assignment.fingerprint].fact_status,
             ignore_status="must_not_ignore",
             decision_status="none",
             progress_without_decision="yes",
