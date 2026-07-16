@@ -1243,6 +1243,31 @@ def validate_reopen_transition(
 
 
 def _clear_certification(state: dict[str, Any], *, prior_phase: str, action: str) -> None:
+    convergence = state.get("review_convergence")
+    if isinstance(convergence, dict):
+        # A reopen invalidates the fixed-target evidence as one atomic unit.
+        # In particular, leaving the recorded digest or prepared plan behind
+        # would let ``review convergence record`` treat an old manifest as an
+        # idempotent retry after a scope amendment.
+        convergence["status"] = "pending"
+        convergence["verified_actionable_findings"] = None
+        convergence["release_blocking_findings"] = None
+        convergence["artifact_refs"] = []
+        for field_name in (
+            "review_plan",
+            "base_ref",
+            "base_sha",
+            "prepared_at",
+            "recorded_at",
+            "recorded_round",
+            "recorded_manifest_digest",
+            "recorded_status",
+            "last_status",
+            "manifest_completeness",
+            "accepted_risk_authorizations",
+        ):
+            convergence.pop(field_name, None)
+
     manual = state.setdefault("manual_final_review", {})
     if not isinstance(manual, dict):
         manual = {}
@@ -1265,6 +1290,8 @@ def _clear_certification(state: dict[str, Any], *, prior_phase: str, action: str
     manual["shortfall_count"] = None
     manual["verified_actionable_findings"] = None
     manual["release_blocking_findings"] = None
+    manual.pop("accepted_risk_authorizations", None)
+    state.pop("accepted_risk_authorizations", None)
 
 
 def _apply_scope_amendment(
