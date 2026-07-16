@@ -29,6 +29,8 @@ from .review import (
     ReviewManifest,
     ReviewModelError,
     SUPPORTED_PROVIDERS,
+    review_manifest_policy_counts,
+    validate_manifest_policy,
 )
 
 
@@ -669,29 +671,55 @@ class FinalReviewManifest:
     def recomputed_verified_actionable_fingerprints(self) -> tuple[str, ...]:
         """Return findings that are fully verified and still require action."""
 
-        incomplete = set(self.completeness.incomplete_findings)
-        by_fingerprint: dict[str, list[Any]] = {}
-        for record in self.review_manifest.verifications:
-            by_fingerprint.setdefault(record.fingerprint, []).append(record)
+        return self.recomputed_verified_actionable_fingerprints_for_scope()
 
-        actionable: list[str] = []
-        for finding in self.review_manifest.findings:
-            if finding.fingerprint in incomplete:
-                continue
-            records = by_fingerprint.get(finding.fingerprint, [])
-            if not records or any(record.fact_status != "confirmed" for record in records):
-                continue
-            if any(
-                record.recommended_action in {"fix_task", "ask_user"}
-                and record.ignore_status == "must_not_ignore"
-                for record in records
-            ):
-                actionable.append(finding.fingerprint)
-        return tuple(sorted(set(actionable)))
+    def recomputed_verified_actionable_fingerprints_for_scope(
+        self, *, allow_legacy: bool = False
+    ) -> tuple[str, ...]:
+        """Return verified actionable findings for the current scope policy."""
+
+        return self.review_manifest.verified_actionable_fingerprints_for_scope(
+            allow_legacy=allow_legacy
+        )
 
     @property
     def recomputed_verified_actionable_count(self) -> int:
         return len(self.recomputed_verified_actionable_fingerprints)
+
+    def recomputed_verified_actionable_count_for_scope(
+        self, *, allow_legacy: bool = False
+    ) -> int:
+        return len(
+            self.recomputed_verified_actionable_fingerprints_for_scope(
+                allow_legacy=allow_legacy
+            )
+        )
+
+    @property
+    def recomputed_verified_release_blocking_fingerprints(self) -> tuple[str, ...]:
+        return self.recomputed_verified_release_blocking_fingerprints_for_scope()
+
+    def recomputed_verified_release_blocking_fingerprints_for_scope(
+        self, *, allow_legacy: bool = False
+    ) -> tuple[str, ...]:
+        """Return verified findings that independently block the release."""
+
+        return self.review_manifest.verified_release_blocking_fingerprints_for_scope(
+            allow_legacy=allow_legacy
+        )
+
+    @property
+    def recomputed_verified_release_blocking_count(self) -> int:
+        return len(self.recomputed_verified_release_blocking_fingerprints)
+
+    def recomputed_verified_release_blocking_count_for_scope(
+        self, *, allow_legacy: bool = False
+    ) -> int:
+        return len(
+            self.recomputed_verified_release_blocking_fingerprints_for_scope(
+                allow_legacy=allow_legacy
+            )
+        )
 
     def to_record(self) -> dict[str, Any]:
         record = dict(self.review_manifest.to_record())
@@ -844,6 +872,7 @@ def validate_final_review(
     manifest: FinalReviewManifest | Mapping[str, Any],
     *,
     current_target_sha: str | None = None,
+    allow_legacy: bool = False,
 ) -> CertificationValidation:
     """Recompute final-review completeness and return a fail-closed result."""
 
@@ -865,11 +894,23 @@ def validate_final_review(
         prepared, evidence, current_target_sha=current_target_sha
     )
     issues.extend(f"manifest:{issue}" for issue in completeness.issues)
+    policy_issues = validate_manifest_policy(
+        evidence.review_manifest,
+        allow_legacy=allow_legacy,
+    )
+    issues.extend(f"policy:{issue}" for issue in policy_issues)
+    if policy_issues:
+        recomputed_actionable_count = 0
+    else:
+        recomputed_actionable_count, _ = review_manifest_policy_counts(
+            evidence.review_manifest,
+            allow_legacy=allow_legacy,
+        )
     if evidence.manifest_complete != completeness.complete:
         issues.append("manifest-complete-claim-mismatch")
     if (
         evidence.verified_actionable_findings
-        != evidence.recomputed_verified_actionable_count
+        != recomputed_actionable_count
     ):
         issues.append("verified-actionable-finding-count-mismatch")
     if evidence.verified_actionable_findings:
@@ -883,7 +924,14 @@ def validate_final_review(
     status = "passed"
     if issues:
         status = "incomplete" if has_incomplete_evidence and not any(
-            issue.startswith(("identity-mismatch:", "target-sha-drift", "verified-actionable"))
+            issue.startswith(
+                (
+                    "identity-mismatch:",
+                    "target-sha-drift",
+                    "verified-actionable",
+                    "policy:",
+                )
+            )
             for issue in issues
         ) else "failed"
     return CertificationValidation(
@@ -902,11 +950,15 @@ def certify_final_review(
     manifest: FinalReviewManifest | Mapping[str, Any],
     *,
     current_target_sha: str | None = None,
+    allow_legacy: bool = False,
 ) -> CertificationValidation:
     """Validate evidence and raise if the manual final gate cannot pass."""
 
     result = validate_final_review(
-        plan, manifest, current_target_sha=current_target_sha
+        plan,
+        manifest,
+        current_target_sha=current_target_sha,
+        allow_legacy=allow_legacy,
     )
     result.raise_for_error()
     return result
@@ -1200,6 +1252,7 @@ def _clear_certification(state: dict[str, Any], *, prior_phase: str, action: str
     manual["manifest_complete"] = None
     manual["shortfall_count"] = None
     manual["verified_actionable_findings"] = None
+    manual["release_blocking_findings"] = None
 
 
 def _apply_scope_amendment(

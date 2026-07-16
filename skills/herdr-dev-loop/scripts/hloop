@@ -6781,6 +6781,7 @@ def invalidate_review_gates_for_change(
             "report": "",
             "manifest_complete": None,
             "verified_actionable_findings": None,
+            "release_blocking_findings": None,
             "invalidated_at": now_iso(),
             "invalidated_reason": reason,
         }
@@ -7174,91 +7175,15 @@ def _review_manifest_policy_counts(
     *,
     allow_legacy: bool = False,
 ) -> tuple[int, int]:
-    """Count verified findings from the Manager's policy axes.
+    """Count verified findings after shared disposition-policy validation."""
 
-    A pre-0.5.2 manifest has no policy axes.  Its recommendation fields are
-    retained as an explicit compatibility fallback only for a migrated legacy
-    scope; every fresh manifest takes the axis path and therefore cannot turn
-    an outside-release follow-up into fix-now work merely because a verifier
-    suggested a task.
-    """
-
-    def validate_finding_policy(finding: hloop_review.NormalizedFinding) -> None:
-        try:
-            disposition = hloop_review_policy.FindingDisposition(
-                fact_status=finding.fact_status,
-                origin=finding.origin,
-                contract_relation=finding.contract_relation,
-                decision_requirement=finding.decision_requirement,
-                severity=finding.severity,
-                disposition=finding.disposition,
-                release_effect=finding.release_effect,
-                finding_id=finding.fingerprint,
-                fingerprint=finding.fingerprint,
-                target_sha=finding.head_sha,
-                requirement_refs=finding.requirement_refs,
-                why_fix_now=finding.why_fix_now,
-            )
-            safety_critical = any(
-                hloop_review_policy.is_safety_critical_finding(
-                    severity=candidate.severity,
-                    title=candidate.title,
-                    trigger=candidate.trigger,
-                    product_impact=candidate.product_impact,
-                    proposed_fix=candidate.proposed_fix,
-                )
-                for candidate in finding.candidates
-            )
-            hloop_review_policy.validate_disposition(
-                disposition,
-                safety_critical=safety_critical,
-            )
-        except hloop_review_policy.ReviewPolicyError as exc:
-            raise HLoopError(
-                f"review finding {finding.fingerprint} violates disposition policy: {exc}"
-            ) from exc
-
-    incomplete = set(manifest.completeness.incomplete_findings)
-    by_fingerprint: dict[str, list[Any]] = {}
-    for record in manifest.verifications:
-        by_fingerprint.setdefault(record.fingerprint, []).append(record)
-    actionable: set[str] = set()
-    release_blocking: set[str] = set()
-    for finding in manifest.findings:
-        if not finding.policy_axes_explicit:
-            if not allow_legacy:
-                raise HLoopError(
-                    "fresh 0.5.2 convergence requires explicit policy axes for "
-                    f"finding {finding.fingerprint}"
-                )
-        else:
-            # Validate all explicit findings, including incomplete ones, before
-            # any convergence state is eligible for mutation.
-            validate_finding_policy(finding)
-        if finding.fingerprint in incomplete:
-            continue
-        records = by_fingerprint.get(finding.fingerprint, [])
-        if not records or any(record.fact_status != "confirmed" for record in records):
-            continue
-        if finding.policy_axes_explicit:
-            if finding.is_actionable:
-                actionable.add(finding.fingerprint)
-            if finding.is_release_blocking:
-                release_blocking.add(finding.fingerprint)
-            continue
-
-        # Legacy review manifests predate the independent disposition axes.
-        # Keep their old verifier recommendation semantics while making this
-        # branch explicit and isolated from the 0.5.2 path.
-        if any(
-            record.recommended_action in {"fix_task", "ask_user"}
-            and record.ignore_status == "must_not_ignore"
-            for record in records
-        ):
-            actionable.add(finding.fingerprint)
-            if finding.severity in hloop_review.CRITICAL_SEVERITIES:
-                release_blocking.add(finding.fingerprint)
-    return len(actionable), len(release_blocking)
+    try:
+        return hloop_review.review_manifest_policy_counts(
+            manifest,
+            allow_legacy=allow_legacy,
+        )
+    except hloop_review.ReviewModelError as exc:
+        raise HLoopError(str(exc)) from exc
 
 
 def _review_manifest_actionable_count(manifest: hloop_review.ReviewManifest) -> int:
@@ -7447,6 +7372,8 @@ def _manual_final_report_issues(
     plan: hloop_certification.CertificationPlan,
     evidence: hloop_certification.FinalReviewManifest,
     report_path: Path,
+    *,
+    allow_legacy: bool = False,
 ) -> list[str]:
     """Validate the human-facing FINAL.md certification record.
 
@@ -7628,7 +7555,9 @@ def _manual_final_report_issues(
     )
     if actionable_issue:
         issues.append("report-invalid:verified_actionable_findings")
-    elif actionable != evidence.recomputed_verified_actionable_count:
+    elif actionable != evidence.recomputed_verified_actionable_count_for_scope(
+        allow_legacy=allow_legacy
+    ):
         issues.append("report-verified-actionable-findings-mismatch")
     report_findings = resolved.get("findings")
     if not isinstance(report_findings, list):
@@ -8249,6 +8178,7 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                 "manifest_complete": False,
                 "shortfall_count": None,
                 "verified_actionable_findings": None,
+                "release_blocking_findings": None,
                 "lane_completed_count": 0,
                 "lane_count": len(plan.lane_plan),
                 "prepared_at": now_iso(),
@@ -8300,14 +8230,38 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
     except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError, hloop_certification.CertificationModelError) as exc:
         raise HLoopError(f"invalid manual final review artifact: {exc}") from exc
     current = current_integration_target(repo, state)
+    scope = release_scope_from_state(state)
+    allow_legacy = scope.status == "legacy-unlocked"
     validation = hloop_certification.validate_final_review(
-        plan, evidence, current_target_sha=current
+        plan,
+        evidence,
+        current_target_sha=current,
+        allow_legacy=allow_legacy,
+    )
+    policy_issues = [
+        issue for issue in validation.issues if issue.startswith("policy:")
+    ]
+    if policy_issues:
+        raise HLoopError(
+            "manual final review disposition policy: " + "; ".join(policy_issues)
+        )
+    actionable = evidence.recomputed_verified_actionable_count_for_scope(
+        allow_legacy=allow_legacy
+    )
+    release_blocking = evidence.recomputed_verified_release_blocking_count_for_scope(
+        allow_legacy=allow_legacy
     )
     if not report_path.is_file() or not read_text(report_path).strip():
         raise HLoopError(f"manual final review report is missing or empty: {report_path}")
     if report_path.resolve() != paths["report"].resolve():
         raise HLoopError("manual final review report must use reviews/final/FINAL.md")
-    report_issues = _manual_final_report_issues(repo, plan, evidence, report_path)
+    report_issues = _manual_final_report_issues(
+        repo,
+        plan,
+        evidence,
+        report_path,
+        allow_legacy=allow_legacy,
+    )
     validation_issues = sorted(set((*validation.issues, *report_issues)))
     report_values: dict[str, list[str]] = {}
     if not report_issues:
@@ -8334,7 +8288,8 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         manual["report"] = str(report_path.relative_to(repo))
         manual["manifest_complete"] = evidence.completeness.complete
         manual["shortfall_count"] = len(evidence.review_manifest.verification_plan.shortfalls)
-        manual["verified_actionable_findings"] = evidence.recomputed_verified_actionable_count
+        manual["verified_actionable_findings"] = actionable
+        manual["release_blocking_findings"] = release_blocking
         manual["validation_issues"] = validation_issues
         manual.setdefault("attempt_history", []).append(
             {
@@ -8377,7 +8332,8 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         "target_sha": plan.target_sha,
         "current_target_sha": current,
         "manifest_complete": evidence.completeness.complete,
-        "verified_actionable_findings": evidence.recomputed_verified_actionable_count,
+        "verified_actionable_findings": actionable,
+        "release_blocking_findings": release_blocking,
         "residual_risks": report_values.get("residual_risks", []),
         "follow_up_refs": report_values.get("follow_up_refs", []),
         "issues": validation_issues,
@@ -8408,6 +8364,7 @@ def cmd_final_review_status(args: argparse.Namespace) -> int:
         "manifest_complete": manual.get("manifest_complete"),
         "shortfall_count": manual.get("shortfall_count"),
         "verified_actionable_findings": manual.get("verified_actionable_findings"),
+        "release_blocking_findings": manual.get("release_blocking_findings"),
         "lane_completed_count": manual.get("lane_completed_count", 0),
         "lane_count": manual.get("lane_count", 0),
         "incomplete_attempt_count": manual.get("incomplete_attempt_count", 0),
@@ -10839,6 +10796,7 @@ None.
             "manifest_complete": None,
             "shortfall_count": None,
             "verified_actionable_findings": None,
+            "release_blocking_findings": None,
             "lane_completed_count": 0,
             "lane_count": 0,
             "incomplete_attempt_count": 0,
@@ -11021,6 +10979,7 @@ None.
                 "manifest_complete": None,
                 "shortfall_count": None,
                 "verified_actionable_findings": None,
+                "release_blocking_findings": None,
                 "lane_completed_count": 0,
                 "lane_count": 0,
                 "incomplete_attempt_count": 0,
@@ -23506,6 +23465,8 @@ def manual_final_gate_errors(repo: Path, state: dict[str, Any], target: str) -> 
         errors.append("manual final review manifest is incomplete")
     if normalize_int(manual.get("verified_actionable_findings"), 0) != 0:
         errors.append("manual final review has verified actionable findings")
+    if normalize_int(manual.get("release_blocking_findings"), 0) != 0:
+        errors.append("manual final review has release-blocking findings")
     for key, label in (("prepared_plan", "PLAN.json"), ("manifest", "MANIFEST.json"), ("report", "FINAL.md")):
         raw = str(manual.get(key) or "")
         if not raw:
