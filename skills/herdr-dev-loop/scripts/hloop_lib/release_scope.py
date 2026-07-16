@@ -506,7 +506,12 @@ class ReleaseScope:
             scope_revision=amendment.new_scope_revision,
             source_snapshot_revision=amendment.new_source_snapshot_revision,
             scope_digest=amendment.new_scope_digest,
-            last_user_input_id=amendment.user_input_id or self.last_user_input_id,
+            # Only a semantic scope change creates a new task-authorization
+            # boundary.  Editorial and clarification amendments must not
+            # inherit or replace the input used by a prior scope change.
+            last_user_input_id=(
+                amendment.user_input_id if amendment.kind == "scope-change" else ""
+            ),
             amendment_refs=self.amendment_refs + (amendment.amendment_id,),
         )
 
@@ -1132,7 +1137,12 @@ def validate_task_provenance(
     available_findings = set(
         _unique_texts(locked_finding_ids or finding_ids, "locked_finding_ids")
     )
-    available_scope_refs = set(normalized_scope.release_scope_refs)
+    # Amendment IDs are first-class release-scope references for the
+    # user-amendment path.  This keeps the task provenance schema unchanged
+    # while requiring the task to cite the exact amendment that authorized it.
+    available_scope_refs = set(normalized_scope.release_scope_refs) | set(
+        normalized_scope.amendment_refs
+    )
 
     for reference in provenance.plan_item_refs:
         if reference not in available_plan:
@@ -1182,6 +1192,11 @@ def validate_task_provenance(
         if not normalized_scope.amendment_refs:
             raise TaskAuthorizationError(
                 "user-amendment task requires a recorded scope amendment reference"
+            )
+        latest_amendment = normalized_scope.amendment_refs[-1]
+        if latest_amendment not in provenance.scope_refs:
+            raise TaskAuthorizationError(
+                "user-amendment task must cite the latest scope-change amendment"
             )
 
     elif provenance.task_origin == "operational":

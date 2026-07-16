@@ -1269,11 +1269,6 @@ def _apply_scope_amendment(
     current = hloop_release_scope.ReleaseScope.from_record(release_scope)
     immutable = hloop_release_scope.ScopeAmendment.from_record(amendment)
     updated = current.apply_amendment(immutable).to_record()
-    # The outer user input authorizes the reopen even for an editorial or
-    # clarification amendment whose immutable source record intentionally has
-    # no scope-change authorization field.
-    if user_input_id:
-        updated["last_user_input_id"] = user_input_id
     release_scope.clear()
     release_scope.update(updated)
 
