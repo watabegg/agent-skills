@@ -86,6 +86,15 @@
         ]
       }
     },
+    "decision_summary": {
+      "type": ["object", "array"]
+    },
+    "verification_evidence": {
+      "type": ["object", "array"]
+    },
+    "implementation_constraints": {
+      "type": ["object", "array"]
+    },
     "impact": {"type": "string", "minLength": 1},
     "affected_path": {"type": "string"},
     "symbol": {"type": "string"},

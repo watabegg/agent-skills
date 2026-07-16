@@ -1068,6 +1068,174 @@ class PolicyCliV052Tests(unittest.TestCase):
             self.assertNotEqual(result, 0, output)
             self.assertEqual((loop / "STATE.json").read_bytes(), before)
 
+    def test_follow_up_structured_fields_round_trip_as_json_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "4" * 64
+            decision_summary = {
+                "decision": "defer",
+                "rationale": "outside the current release",
+            }
+            verification_evidence = [
+                {"reference": "review/R001.md#FND-004", "status": "confirmed"},
+                {"reference": "tests/review.py", "status": "reproduced"},
+            ]
+            implementation_constraints = [
+                "requires a new scope amendment",
+                {"owner": "review-runtime", "milestone": "next release"},
+            ]
+            result, output = self.run_cli(
+                repo,
+                "follow-up",
+                "add",
+                "--title",
+                "Structured follow-up",
+                "--component",
+                "review runtime",
+                "--trigger-class",
+                "classification drift",
+                "--product-impact",
+                "operator needs a later release decision",
+                "--source-review-fingerprint",
+                fingerprint,
+                "--evidence",
+                "review evidence",
+                "--impact",
+                "outside the current release contract",
+                "--affected-path",
+                "src/review.py",
+                "--fact-status",
+                "confirmed",
+                "--origin",
+                "unrelated-pre-existing",
+                "--contract-relation",
+                "outside_release",
+                "--decision-requirement",
+                "none",
+                "--release-effect",
+                "non_blocking",
+                "--disposition",
+                "defer_follow_up",
+                "--recommended-action",
+                "defer_follow_up",
+                "--deferred-reason",
+                "outside this release",
+                "--reconsider-condition",
+                "next release scope lock",
+                "--decision-summary",
+                json.dumps(decision_summary, ensure_ascii=False),
+                "--verification-evidence",
+                json.dumps(verification_evidence, ensure_ascii=False),
+                "--implementation-constraints",
+                json.dumps(implementation_constraints, ensure_ascii=False),
+                "--json",
+            )
+            self.assertEqual(result, 0, output)
+            payload = json.loads(output)
+            self.assertEqual(payload["follow_up"]["decision_summary"], decision_summary)
+            self.assertEqual(
+                payload["follow_up"]["verification_evidence"], verification_evidence
+            )
+            self.assertEqual(
+                payload["follow_up"]["implementation_constraints"],
+                implementation_constraints,
+            )
+
+            artifact = hloop.read_frontmatter(loop / "follow-ups" / "F001.md")
+            self.assertEqual(artifact["decision_summary"], decision_summary)
+            self.assertEqual(artifact["verification_evidence"], verification_evidence)
+            self.assertEqual(
+                artifact["implementation_constraints"], implementation_constraints
+            )
+
+            result, output = self.run_cli(
+                repo, "follow-up", "show", "F001", "--json"
+            )
+            self.assertEqual(result, 0, output)
+            shown = json.loads(output)
+            self.assertEqual(shown["decision_summary"], decision_summary)
+            self.assertEqual(shown["verification_evidence"], verification_evidence)
+            self.assertEqual(
+                shown["implementation_constraints"], implementation_constraints
+            )
+
+    def test_follow_up_supersedes_failure_does_not_leave_partial_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "5" * 64
+            base_args = [
+                "follow-up",
+                "add",
+                "--title",
+                "Atomic follow-up",
+                "--component",
+                "review runtime",
+                "--trigger-class",
+                "classification drift",
+                "--product-impact",
+                "operator needs a later release decision",
+                "--source-review-fingerprint",
+                fingerprint,
+                "--evidence",
+                "review evidence",
+                "--impact",
+                "outside the current release contract",
+                "--affected-path",
+                "src/review.py",
+                "--fact-status",
+                "confirmed",
+                "--origin",
+                "unrelated-pre-existing",
+                "--contract-relation",
+                "outside_release",
+                "--decision-requirement",
+                "none",
+                "--release-effect",
+                "non_blocking",
+                "--disposition",
+                "defer_follow_up",
+                "--recommended-action",
+                "defer_follow_up",
+                "--deferred-reason",
+                "outside this release",
+                "--reconsider-condition",
+                "next release scope lock",
+                "--json",
+            ]
+            result, output = self.run_cli(repo, *base_args)
+            self.assertEqual(result, 0, output)
+            first = json.loads(output)["follow_up"]
+            before_state = (loop / "STATE.json").read_bytes()
+            before_target = (loop / "follow-ups" / "F001.md").read_bytes()
+            target_path = (loop / "follow-ups" / "F001.md").resolve()
+            injected = False
+            original_write_text = hloop.write_text
+
+            def fail_once(path: Path, text: str, *, durable: bool = False) -> None:
+                nonlocal injected
+                if Path(path).resolve() == target_path and not injected:
+                    injected = True
+                    raise hloop.HLoopError("injected follow-up persistence failure")
+                original_write_text(path, text, durable=durable)
+
+            with mock.patch.object(hloop, "write_text", side_effect=fail_once):
+                result, output = self.run_cli(
+                    repo,
+                    *base_args[:-1],
+                    "--root-cause",
+                    "replacement design",
+                    "--supersedes",
+                    first["issue_key"],
+                )
+            self.assertNotEqual(result, 0, output)
+            self.assertIn("injected follow-up persistence failure", output)
+            self.assertTrue(injected)
+            self.assertEqual((loop / "STATE.json").read_bytes(), before_state)
+            self.assertEqual((loop / "follow-ups" / "F001.md").read_bytes(), before_target)
+            self.assertFalse((loop / "follow-ups" / "F002.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
