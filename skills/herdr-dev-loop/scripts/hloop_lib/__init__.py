@@ -2,6 +2,7 @@
 
 __all__ = [
     "broker",
+    "certification",
     "config",
     "decisions",
     "events",
