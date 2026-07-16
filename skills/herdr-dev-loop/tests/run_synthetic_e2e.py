@@ -29,6 +29,8 @@ sys.path.insert(0, str(SCRIPT.parent))
 
 from hloop_lib.broker import spool_client_event  # noqa: E402
 from hloop_lib.events import prepare_client_event, utc_now  # noqa: E402
+from hloop_lib import review as hloop_review  # noqa: E402
+from hloop_lib.certification import CertificationPlan, FinalReviewManifest  # noqa: E402
 from hloop_lib.lifecycle import (  # noqa: E402
     AttemptIdentity,
     MERGE_ACTIVE,
@@ -200,7 +202,10 @@ probes_per_provider = 4
     path = state_path(repo, namespace)
     state = json.loads(path.read_text(encoding="utf-8"))
     require(state["state_format_version"] == 3, "init did not create format 3")
-    require(state["schema_revision"] == 1, "init did not create revision 1")
+    require(
+        state["schema_revision"] == hloop.STATE_SCHEMA_REVISION,
+        "init did not create the current schema revision",
+    )
     require(state["skill_version"] == ctx["runtime_version"], "state version mismatch")
     require(state["resolved_config"]["max_workers"] == 2, "config snapshot missing")
     require(state["specification_scout"] == "always", "Scout policy missing")
@@ -238,7 +243,10 @@ probes_per_provider = 4
     )
     migration_plan = json.loads(dry_run.stdout)
     require(migration_plan["to_format"] == 3, "migration target format mismatch")
-    require(migration_plan["to_revision"] == 1, "migration target revision mismatch")
+    require(
+        migration_plan["to_revision"] == hloop.STATE_SCHEMA_REVISION,
+        "migration target revision mismatch",
+    )
     run(
         hloop_command(repo, namespace, "migrate", "--apply"),
         cwd=root,
@@ -246,7 +254,11 @@ probes_per_provider = 4
     )
     migrated = json.loads(path.read_text(encoding="utf-8"))
     backups = list((path.parent / "migration").glob("STATE.v2.r0.*.json"))
-    require((migrated["state_format_version"], migrated["schema_revision"]) == (3, 1), "migration failed")
+    require(
+        (migrated["state_format_version"], migrated["schema_revision"])
+        == (hloop.STATE_FORMAT_VERSION, hloop.STATE_SCHEMA_REVISION),
+        "migration failed",
+    )
     require(len(backups) == 1, "migration backup missing")
     return {
         "config_source": migrated["config_source"]["kind"],
@@ -1407,6 +1419,857 @@ def finding(finding_id: str, *, path: str, symbol: str) -> FindingCandidate:
     )
 
 
+def _fixture_state(fixture: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(
+        state_path(fixture["repo"], fixture["namespace"]).read_text(encoding="utf-8")
+    )
+
+
+def _save_fixture_state(fixture: dict[str, Any], state: dict[str, Any]) -> None:
+    state_path(fixture["repo"], fixture["namespace"]).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _fixture_cli(
+    fixture: dict[str, Any], *args: str, expected: int | set[int] = 0
+) -> subprocess.CompletedProcess[str]:
+    return run(
+        hloop_command(fixture["repo"], fixture["namespace"], *args),
+        cwd=fixture["root"],
+        env=fixture["env"],
+        expected=expected,
+    )
+
+
+def _validation_log_count(fixture: dict[str, Any]) -> int:
+    journal_path = state_path(fixture["repo"], fixture["namespace"]).parent / "JOURNAL.md"
+    if not journal_path.is_file():
+        return 0
+    return journal_path.read_text(encoding="utf-8").count("Validation results:")
+
+
+def _mark_tasks_merged(fixture: dict[str, Any], task_ids: tuple[str, ...] | None = None) -> None:
+    state = _fixture_state(fixture)
+    target = git(fixture["repo"], "rev-parse", "master").stdout.strip()
+    selected = task_ids or tuple(state.get("tasks", {}).keys())
+    for task_id in selected:
+        task = state.get("tasks", {}).get(task_id)
+        require(isinstance(task, dict), f"missing synthetic task {task_id}")
+        task.update(
+            {
+                "status": "merged",
+                "result_status": "done",
+                "merge_ready": True,
+                "cleanup_done": True,
+                "cleanup_pending": False,
+                "head_sha": target,
+                "reported_head_sha": target,
+                "worker_base_sha": target,
+                "validation_recorded": True,
+                "validation_commands": ["true"],
+                "validation_results": ["passed"],
+            }
+        )
+    state.update(
+        {
+            "integration_head_sha": target,
+            "completion_target_sha": target,
+            "phase": "dispatching",
+            "needs_review": False,
+            "needs_gap_check": False,
+        }
+    )
+    _save_fixture_state(fixture, state)
+
+
+def _run_fixture_validation(fixture: dict[str, Any]) -> int:
+    before = _validation_log_count(fixture)
+    _fixture_cli(fixture, "validate", "--command", "true", "--no-cleanup")
+    after = _validation_log_count(fixture)
+    require(after > before, "validation command did not create a validation event")
+    return after
+
+
+def _new_synthetic_fixture(
+    ctx: dict[str, Any],
+    label: str,
+    *,
+    task_count: int = 1,
+    merge_tasks: bool = True,
+) -> dict[str, Any]:
+    root: Path = ctx["root"]
+    env: dict[str, str] = ctx["env"]
+    repo = make_repo(root, f"{label}-repo")
+    namespace = f"synthetic-{label}"
+    _run = lambda *args, expected=0: run(
+        hloop_command(repo, namespace, *args),
+        cwd=root,
+        env=env,
+        expected=expected,
+    )
+    _run(
+        "init",
+        "--goal",
+        f"bounded convergence fixture: {label}",
+        "--integration",
+        "master",
+        "--max-reviewers",
+        "0",
+        "--max-gap-auditors",
+        "0",
+        "--review-after-merges",
+        "999",
+        "--gap-after-merges",
+        "999",
+        "--validation",
+        "true",
+        "--worker-runner",
+        "exec",
+        "--reviewer-runner",
+        "exec",
+        "--gap-runner",
+        "exec",
+        "--specification-scout",
+        "off",
+        "--manager-qa-profile",
+        "none",
+    )
+    source_args = (
+        "--source-ref",
+        f".ai/herdr-dev-loop/loops/{namespace}/MISSION.md",
+        "--source-ref",
+        f".ai/herdr-dev-loop/loops/{namespace}/PLAN.md",
+        "--source-ref",
+        f".ai/herdr-dev-loop/loops/{namespace}/PROFILE.md",
+        "--source-ref",
+        f".ai/herdr-dev-loop/loops/{namespace}/DECISIONS.md",
+    )
+    _run(
+        "release-scope",
+        "lock",
+        *source_args,
+        "--plan-item-ref",
+        "P005",
+        "--requirement-ref",
+        "REQ-005",
+        "--scope-ref",
+        "release-contract",
+    )
+    _run("batch", "start", f"initial batch for {label}", "--id", "B001")
+    for index in range(1, task_count + 1):
+        task_id = f"T{index:03d}"
+        _run(
+            "task",
+            "new",
+            f"synthetic {label} task {task_id}",
+            "--id",
+            task_id,
+            "--kind",
+            "implementation",
+            "--write-allow",
+            f"synthetic/{label}/{task_id}.txt",
+            "--task-origin",
+            "planned",
+            "--plan-item-ref",
+            "P005",
+            "--acceptance",
+            "synthetic task is represented in the fixture",
+        )
+    _run("batch", "close", "B001", "--summary", f"closed initial batch for {label}")
+    fixture = {
+        "root": root,
+        "repo": repo,
+        "env": env,
+        "namespace": namespace,
+        "label": label,
+    }
+    if merge_tasks:
+        _mark_tasks_merged(fixture)
+        _run_fixture_validation(fixture)
+    return fixture
+
+
+def _prepare_convergence(fixture: dict[str, Any]) -> dict[str, Any]:
+    readiness = _fixture_cli(fixture, "review", "readiness", "--json")
+    readiness_payload = json.loads(readiness.stdout)
+    require(readiness_payload["status"] == "ready", "synthetic fixture is not review-ready")
+    prepared = _fixture_cli(fixture, "review", "convergence", "prepare", "--json")
+    payload = json.loads(prepared.stdout)
+    require(not payload["automatic_reviewer_started"], "convergence started a Reviewer")
+    plan_path = state_path(fixture["repo"], fixture["namespace"]).parent / "reviews" / "convergence" / "PLAN.json"
+    return json.loads(plan_path.read_text(encoding="utf-8"))
+
+
+def _candidate_for_lane(
+    head_sha: str,
+    lane: Any,
+    *,
+    finding_id: str,
+    severity: str,
+    title: str,
+) -> FindingCandidate:
+    return FindingCandidate(
+        finding_id=finding_id,
+        provider=lane.provider,
+        head_sha=head_sha,
+        discovering_agent=lane.agent_label,
+        severity=severity,
+        confidence=0.95,
+        title=title,
+        file_path=f"src/{finding_id.lower()}.py",
+        line=1,
+        symbol="synthetic_gate",
+        trigger="synthetic bounded-convergence trigger",
+        product_impact="the synthetic release gate must account for this finding",
+        origin="introduced",
+        proposed_fix="apply the bounded synthetic remediation",
+        requires_spec_decision=False,
+    )
+
+
+def _write_review_manifest(
+    fixture: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    candidates: tuple[FindingCandidate, ...] = (),
+    recommended_action: str = "fix_task",
+    timeout_lane: bool = False,
+) -> tuple[hloop_review.ReviewManifest, tuple[hloop_review.NormalizedFinding, ...]]:
+    loop = state_path(fixture["repo"], fixture["namespace"]).parent
+    group = hloop_review.ReviewGroupPlan.from_record(plan["review_plan"])
+    normalized = normalize_findings(candidates)
+    verification_plan = plan_verification(group, normalized)
+    ignore_status = (
+        "must_not_ignore"
+        if recommended_action in {"fix_task", "ask_user"}
+        else "may_defer"
+    )
+    by_fingerprint = {item.fingerprint: item for item in normalized}
+    verifications = tuple(
+        hloop_review.VerificationRecord.from_assignment(
+            assignment,
+            fact_status="confirmed",
+            ignore_status=ignore_status,
+            decision_status="none",
+            progress_without_decision="yes",
+            severity=by_fingerprint[assignment.fingerprint].severity,
+            recommended_action=recommended_action,
+        )
+        for assignment in verification_plan.assignments
+    )
+    lane_results = []
+    for index, lane in enumerate(group.expected_lanes):
+        finding_count = sum(
+            1
+            for item in normalized
+            for candidate in item.candidates
+            if candidate.discovering_agent == lane.agent_label
+        )
+        lane_results.append(
+            lane.result(
+                status="timeout" if timeout_lane and index == 0 else "completed",
+                finding_count=finding_count,
+            )
+        )
+    manifest = hloop_review.ReviewManifest(
+        review_id="R001",
+        plan=group,
+        lane_results=tuple(lane_results),
+        findings=normalized,
+        verification_plan=verification_plan,
+        verifications=verifications,
+    )
+    manifest_path = loop / "reviews" / "convergence" / "MANIFEST.json"
+    manifest_path.write_text(
+        json.dumps(manifest.to_record(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest, normalized
+
+
+def _record_convergence(fixture: dict[str, Any], fix_round: int) -> dict[str, Any]:
+    recorded = _fixture_cli(
+        fixture,
+        "review",
+        "convergence",
+        "record",
+        "--fix-round",
+        str(fix_round),
+        "--json",
+        expected={0, 2},
+    )
+    return json.loads(recorded.stdout)
+
+
+def _prepare_final_review(fixture: dict[str, Any]) -> None:
+    _fixture_cli(fixture, "final-review", "prepare", "--json")
+
+
+def _write_final_manifest(
+    fixture: dict[str, Any],
+    *,
+    finding_spec: tuple[str, str] | None = None,
+    timeout_lane: bool = False,
+    patch_verdict: str = "passed",
+) -> FinalReviewManifest:
+    loop = state_path(fixture["repo"], fixture["namespace"]).parent
+    plan = CertificationPlan.from_record(
+        json.loads((loop / "reviews" / "final" / "PLAN.json").read_text(encoding="utf-8"))
+    )
+    current_record = json.loads((loop / "reviews" / "final" / "MANIFEST.json").read_text(encoding="utf-8"))
+    group = hloop_review.ReviewGroupPlan.from_record(current_record)
+    candidates: tuple[FindingCandidate, ...] = ()
+    if finding_spec:
+        finding_id, severity = finding_spec
+        candidates = (
+            _candidate_for_lane(
+                plan.target_sha,
+                group.expected_lanes[0],
+                finding_id=finding_id,
+                severity=severity,
+                title="synthetic final certification finding",
+            ),
+        )
+    normalized = normalize_findings(candidates)
+    verification_plan = plan_verification(group, normalized)
+    by_fingerprint = {item.fingerprint: item for item in normalized}
+    verifications = tuple(
+        hloop_review.VerificationRecord.from_assignment(
+            assignment,
+            fact_status="confirmed",
+            ignore_status="must_not_ignore",
+            decision_status="none",
+            progress_without_decision="yes",
+            severity=by_fingerprint[assignment.fingerprint].severity,
+            recommended_action="fix_task",
+        )
+        for assignment in verification_plan.assignments
+    )
+    lane_results = tuple(
+        lane.result(
+            status="timeout" if timeout_lane and index == 0 else "completed",
+            finding_count=sum(
+                1
+                for item in normalized
+                for candidate in item.candidates
+                if candidate.discovering_agent == lane.agent_label
+            ),
+        )
+        for index, lane in enumerate(group.expected_lanes)
+    )
+    review_manifest = hloop_review.ReviewManifest(
+        review_id="R001",
+        plan=group,
+        lane_results=lane_results,
+        findings=normalized,
+        verification_plan=verification_plan,
+        verifications=verifications,
+    )
+    manifest = FinalReviewManifest.from_review_manifest(
+        plan,
+        review_manifest,
+        verified_actionable_findings=len(
+            FinalReviewManifest.from_review_manifest(
+                plan, review_manifest, verified_actionable_findings=0
+            ).recomputed_verified_actionable_fingerprints
+        ),
+        patch_verdict=patch_verdict,
+    )
+    (loop / "reviews" / "final" / "MANIFEST.json").write_text(
+        json.dumps(manifest.to_record(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def _record_final_review(fixture: dict[str, Any]) -> dict[str, Any]:
+    recorded = _fixture_cli(
+        fixture, "final-review", "record", "--json", expected={0, 2}
+    )
+    return json.loads(recorded.stdout)
+
+
+def _create_finding_task(
+    fixture: dict[str, Any],
+    *,
+    task_id: str,
+    source_finding: str,
+    remediation_round: int,
+) -> None:
+    _fixture_cli(fixture, "batch", "start", "remediation batch", "--id", "B002")
+    _fixture_cli(
+        fixture,
+        "task",
+        "new",
+        "synthetic remediation task",
+        "--id",
+        task_id,
+        "--kind",
+        "fix",
+        "--write-allow",
+        f"synthetic/remediation/{task_id}.txt",
+        "--task-origin",
+        "finding",
+        "--source-finding",
+        source_finding,
+        "--requirement-ref",
+        "REQ-005",
+        "--scope-ref",
+        "release-contract",
+        "--origin",
+        "introduced",
+        "--contract-relation",
+        "in_scope",
+        "--release-effect",
+        "blocking",
+        "--fact-status",
+        "confirmed",
+        "--disposition",
+        "fix_now",
+        "--why-fix-now",
+        "the confirmed synthetic finding blocks certification",
+        "--remediation-round",
+        str(remediation_round),
+        "--acceptance",
+        "the confirmed synthetic finding is remediated",
+    )
+    _fixture_cli(
+        fixture,
+        "batch",
+        "close",
+        "B002",
+        "--summary",
+        "closed one coalesced remediation batch",
+    )
+    _mark_tasks_merged(fixture)
+    _run_fixture_validation(fixture)
+
+
+def _seed_running_worker_with_review_wait(
+    fixture: dict[str, Any], task_id: str = "T001"
+) -> None:
+    repo = fixture["repo"]
+    state = _fixture_state(fixture)
+    task = state["tasks"][task_id]
+    worktree = fixture["root"] / "safe-harvest-worker"
+    branch = str(task["branch"])
+    git(repo, "worktree", "add", "-b", branch, str(worktree), "master")
+    attempt_id = f"{task_id}-A001"
+    result_path = (
+        worktree
+        / ".ai"
+        / "herdr-dev-loop"
+        / "loops"
+        / fixture["namespace"]
+        / "results"
+        / task_id
+        / "result.md"
+    )
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        hloop.frontmatter(
+            {
+                "task_id": task_id,
+                "run_id": state["run_id"],
+                "skill_version": state["skill_version"],
+                "attempt_id": attempt_id,
+                "status": "done",
+                "merge_ready": True,
+                "branch": branch,
+                "head_sha": "HEAD",
+                "base_sha": task["base_sha"],
+                "changed_files": [result_path.relative_to(worktree).as_posix()],
+                "validation_recorded": True,
+                "validation_commands": ["true"],
+                "validation_results": ["passed"],
+                "validation_summary": "synthetic safe harvest validation",
+                "blocking_questions": [],
+            }
+        )
+        + "\n# Synthetic safe-harvest result\n",
+        encoding="utf-8",
+    )
+    git(worktree, "add", "-f", result_path.relative_to(worktree).as_posix())
+    git(worktree, "commit", "-m", "synthetic safe harvest result")
+    head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    task.update(
+        {
+            "status": "running",
+            "worktree": str(worktree),
+            "active_attempt_id": attempt_id,
+            "attempt_id": attempt_id,
+            "worker_base_sha": task["base_sha"],
+            "head_sha": head,
+            "reported_head_sha": head,
+        }
+    )
+    state["reviews"] = {
+        "R001": {"status": "running", "gate_status": "running", "head_sha": head}
+    }
+    state["needs_review"] = True
+    state["phase"] = "waiting_review"
+    _save_fixture_state(fixture, state)
+
+
+def scenario_remediation_convergence(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(
+        ctx, "remediation-convergence", task_count=3, merge_tasks=False
+    )
+    dispatch = _fixture_cli(
+        fixture, "tick", "--once", "--dry-run", "--max-workers", "3"
+    )
+    worker_starts = dispatch.stdout.count("DRY RUN start worker")
+    require(worker_starts == 3, "three non-conflicting workers were not dispatchable together")
+    _mark_tasks_merged(fixture)
+    first_validation = _run_fixture_validation(fixture)
+
+    plan = _prepare_convergence(fixture)
+    group = hloop_review.ReviewGroupPlan.from_record(plan["review_plan"])
+    candidate = _candidate_for_lane(
+        plan["target_sha"],
+        group.expected_lanes[0],
+        finding_id="F001",
+        severity="P1",
+        title="synthetic remediation finding",
+    )
+    _write_review_manifest(fixture, plan, candidates=(candidate,))
+    exhausted = _record_convergence(fixture, 2)
+    require(exhausted["status"] == "exhausted", "two-round convergence did not exhaust")
+    reopened = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "remediate",
+        "--user-input-id",
+        "U0001",
+        "--authorized-extra-rounds",
+        "1",
+        "--authorization-input-id",
+        "U0001",
+        "--json",
+    )
+    require(json.loads(reopened.stdout)["accepted"], "authorized remediation reopen was rejected")
+    reopened_state = _fixture_state(fixture)
+    require(reopened_state["review_convergence"]["fix_round"] == 1, "authorized remediation did not start a fresh bounded round")
+    _create_finding_task(
+        fixture,
+        task_id="T004",
+        source_finding=candidate.fingerprint,
+        remediation_round=1,
+    )
+    second_validation = _validation_log_count(fixture)
+    require(second_validation > first_validation, "remediation batch did not receive validation")
+    next_plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, next_plan)
+    converged = _record_convergence(fixture, 1)
+    require(converged["status"] == "converged", "remediation did not converge")
+    _prepare_final_review(fixture)
+    _write_final_manifest(fixture)
+    final = _record_final_review(fixture)
+    require(final["status"] == "passed", "remediation final certification did not pass")
+    require(plan["target_sha"] == final["target_sha"], "remediation changed the fixed review target")
+    return {
+        "parallel_workers": worker_starts,
+        "batch_count": 2,
+        "merge_events": 4,
+        "review_events": 2,
+        "review_per_merge": False,
+        "validation_events": 2,
+        "validation_scales_by_batch": second_validation - first_validation >= 1,
+        "remediation_batch_count": 1,
+        "remediation_findings_coalesced": True,
+        "fix_round": 1,
+        "final_status": final["status"],
+    }
+
+
+def scenario_scope_expansion_follow_up(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(ctx, "scope-expansion-follow-up")
+    plan = _prepare_convergence(fixture)
+    group = hloop_review.ReviewGroupPlan.from_record(plan["review_plan"])
+    candidate = _candidate_for_lane(
+        plan["target_sha"],
+        group.expected_lanes[0],
+        finding_id="F001",
+        severity="P2",
+        title="synthetic scope expansion",
+    )
+    _write_review_manifest(
+        fixture,
+        plan,
+        candidates=(candidate,),
+        recommended_action="accepted_risk_candidate",
+    )
+    convergence = _record_convergence(fixture, 0)
+    require(convergence["status"] == "converged", "scope expansion candidate blocked convergence")
+    follow_up = _fixture_cli(
+        fixture,
+        "follow-up",
+        "add",
+        "--title",
+        "synthetic scope expansion follow-up",
+        "--component",
+        "integration",
+        "--trigger-class",
+        "review-follow-up",
+        "--product-impact",
+        "scope expansion is tracked outside this release",
+        "--root-cause",
+        "review found a non-blocking scope expansion",
+        "--source-review-fingerprint",
+        candidate.fingerprint,
+        "--discovered-head",
+        plan["target_sha"],
+        "--evidence",
+        "synthetic final review evidence",
+        "--impact",
+        "no current release gate impact",
+        "--affected-path",
+        "src/follow-up.py",
+        "--fact-status",
+        "confirmed",
+        "--severity",
+        "P2",
+        "--origin",
+        "introduced",
+        "--contract-relation",
+        "outside_release",
+        "--decision-requirement",
+        "none",
+        "--release-effect",
+        "non_blocking",
+        "--disposition",
+        "defer_follow_up",
+        "--recommended-action",
+        "defer_follow_up",
+        "--deferred-reason",
+        "out of scope for this release",
+        "--reconsider-condition",
+        "the next release scope review includes this component",
+        "--json",
+    )
+    follow_up_payload = json.loads(follow_up.stdout)
+    follow_up_id = str(follow_up_payload["follow_up"]["id"])
+    require(follow_up_id == "F001", "follow-up artifact id is not deterministic")
+    follow_up_path = state_path(fixture["repo"], fixture["namespace"]).parent / "follow-ups" / "F001.md"
+    require(follow_up_path.is_file(), "scope-expanding follow-up artifact is missing")
+    state_after_follow_up = _fixture_state(fixture)
+    require(state_after_follow_up["review_convergence"]["status"] == "converged", "follow-up invalidated convergence gate")
+    _prepare_final_review(fixture)
+    _write_final_manifest(fixture)
+    final = _record_final_review(fixture)
+    require(final["status"] == "passed", "scope follow-up final certification did not pass")
+    return {
+        "follow_up_id": follow_up_id,
+        "follow_up_artifact": str(follow_up_path.relative_to(fixture["repo"])),
+        "created_tasks": 0,
+        "fixture_task_count": len(_fixture_state(fixture)["tasks"]),
+        "gate_invalidated": False,
+        "final_status": final["status"],
+    }
+
+
+def scenario_two_round_exhaustion(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(ctx, "two-round-exhaustion")
+    plan = _prepare_convergence(fixture)
+    group = hloop_review.ReviewGroupPlan.from_record(plan["review_plan"])
+    candidate = _candidate_for_lane(
+        plan["target_sha"],
+        group.expected_lanes[0],
+        finding_id="F001",
+        severity="P1",
+        title="synthetic exhausting finding",
+    )
+    _write_review_manifest(fixture, plan, candidates=(candidate,))
+    exhausted = _record_convergence(fixture, 2)
+    require(exhausted["status"] == "exhausted", "convergence did not stop at two rounds")
+    third = _fixture_cli(
+        fixture,
+        "review",
+        "convergence",
+        "prepare",
+        "--json",
+        expected=2,
+    )
+    require("exhausted" in (third.stdout + third.stderr).lower(), "third automatic round was not rejected")
+    state = _fixture_state(fixture)
+    require(state["review_convergence"]["fix_round"] == 0, "failed automatic prepare changed round state")
+    return {
+        "configured_max_fix_rounds": exhausted["max_fix_rounds"],
+        "recorded_fix_round": exhausted["fix_round"],
+        "automatic_third_round": False,
+        "dispatch_frozen": state["dispatch_freeze"]["status"] == "active",
+        "phase": state["phase"],
+    }
+
+
+def scenario_user_stop_freeze(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(
+        ctx, "user-stop-freeze", task_count=1, merge_tasks=False
+    )
+    _seed_running_worker_with_review_wait(fixture)
+    frozen = _fixture_cli(
+        fixture,
+        "dispatch",
+        "freeze",
+        "--reason",
+        "user requested stop",
+        "--user-input-id",
+        "U0001",
+        "--allowed-running-role-id",
+        "T001",
+        "--json",
+    )
+    require(json.loads(frozen.stdout)["status"] == "active", "user stop did not freeze dispatch")
+    blocked_task = _fixture_cli(
+        fixture,
+        "task",
+        "new",
+        "blocked task after user stop",
+        "--id",
+        "T002",
+        "--kind",
+        "implementation",
+        "--write-allow",
+        "blocked.txt",
+        "--task-origin",
+        "planned",
+        "--plan-item-ref",
+        "P005",
+        "--acceptance",
+        "must not dispatch",
+        expected=2,
+    )
+    require("frozen" in (blocked_task.stdout + blocked_task.stderr).lower(), "frozen dispatch allowed a new task")
+    for command in (("reviewer", "start", "--dry-run"), ("gap", "start", "--dry-run")):
+        blocked = _fixture_cli(fixture, *command, expected=2)
+        require("frozen" in (blocked.stdout + blocked.stderr).lower(), f"frozen dispatch allowed {command[0]} start")
+    harvest = _fixture_cli(
+        fixture, "tick", "--once", "--dry-run", "--max-workers", "3"
+    )
+    require(
+        "DRY RUN harvest worker T001" in harvest.stdout,
+        "safe worker harvest was not offered while review was waiting",
+    )
+    dashboard = _fixture_cli(fixture, "dashboard", "--json", "--no-pane-probe")
+    dashboard_payload = json.loads(dashboard.stdout)
+    require(
+        dashboard_payload.get("loop", {}).get("dispatch_freeze", {}).get("status") == "active",
+        "dashboard lost the user stop freeze",
+    )
+    _fixture_cli(fixture, "report")
+    report_path = state_path(fixture["repo"], fixture["namespace"]).parent / "reports" / "DRAFT.md"
+    require(report_path.is_file(), "user-stop draft report is missing")
+    state = _fixture_state(fixture)
+    require(set(state["tasks"]) == {"T001"}, "user stop created an unexpected task")
+    require(set(state["reviews"]) == {"R001"}, "user stop created an unexpected Reviewer")
+    return {
+        "freeze_status": state["dispatch_freeze"]["status"],
+        "allowed_running_role_ids": state["dispatch_freeze"]["allowed_running_role_ids"],
+        "safe_harvest_while_review_waits": True,
+        "new_task_events": 0,
+        "new_reviewer_events": 0,
+        "new_gap_events": 0,
+        "report": str(report_path.relative_to(fixture["repo"])),
+    }
+
+
+def scenario_manual_final_retry_same_sha(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(ctx, "manual-final-retry-same-sha")
+    plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, plan)
+    require(_record_convergence(fixture, 0)["status"] == "converged", "retry fixture did not converge")
+    _prepare_final_review(fixture)
+    target = plan["target_sha"]
+    _write_final_manifest(fixture, timeout_lane=True)
+    incomplete = _record_final_review(fixture)
+    require(incomplete["status"] == "incomplete", "incomplete final lane unexpectedly passed")
+    reopened = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "retry-certification",
+        "--user-input-id",
+        "U0001",
+        "--json",
+    )
+    require(json.loads(reopened.stdout)["accepted"], "same-SHA certification retry was rejected")
+    after_reopen = _fixture_state(fixture)
+    require(after_reopen["dispatch_freeze"]["status"] == "active", "certification retry unexpectedly unfroze dispatch")
+    loop_plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, loop_plan)
+    require(_record_convergence(fixture, 0)["status"] == "converged", "retry convergence evidence was not restored")
+    _prepare_final_review(fixture)
+    _write_final_manifest(fixture)
+    final = _record_final_review(fixture)
+    require(final["status"] == "passed", "same-SHA certification retry did not pass")
+    state = _fixture_state(fixture)
+    statuses = [item.get("status") for item in state["manual_final_review"]["attempt_history"]]
+    require("incomplete" in statuses and "passed" in statuses, "retry attempt history is incomplete")
+    require(target == final["target_sha"], "certification retry changed target SHA")
+    return {
+        "initial_status": incomplete["status"],
+        "retry_status": final["status"],
+        "same_target_sha": True,
+        "attempt_history_statuses": statuses,
+        "dispatch_frozen_during_retry": after_reopen["dispatch_freeze"]["status"] == "active",
+    }
+
+
+def scenario_manual_final_user_authorized_reopen(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(ctx, "manual-final-authorized-reopen")
+    plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, plan)
+    require(_record_convergence(fixture, 0)["status"] == "converged", "reopen fixture did not converge")
+    _prepare_final_review(fixture)
+    failed_manifest = _write_final_manifest(
+        fixture, finding_spec=("F001", "P1"), patch_verdict="failed"
+    )
+    failed = _record_final_review(fixture)
+    require(failed["status"] == "failed", "final actionable finding did not fail certification")
+    source_finding = str(failed_manifest.review_manifest.findings[0].fingerprint)
+    reopened = _fixture_cli(
+        fixture,
+        "review",
+        "reopen",
+        "--action",
+        "remediate",
+        "--user-input-id",
+        "U0001",
+        "--json",
+    )
+    require(json.loads(reopened.stdout)["accepted"], "user-authorized remediation reopen was rejected")
+    state_after_reopen = _fixture_state(fixture)
+    require(state_after_reopen["review_convergence"]["fix_round"] == 1, "reopen did not start remediation round one")
+    _create_finding_task(
+        fixture,
+        task_id="T002",
+        source_finding=source_finding,
+        remediation_round=1,
+    )
+    next_plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, next_plan)
+    require(_record_convergence(fixture, 1)["status"] == "converged", "authorized remediation did not converge")
+    _prepare_final_review(fixture)
+    _write_final_manifest(fixture)
+    final = _record_final_review(fixture)
+    require(final["status"] == "passed", "authorized remediation certification did not pass")
+    state = _fixture_state(fixture)
+    statuses = [item.get("status") for item in state["manual_final_review"]["attempt_history"]]
+    require("failed" in statuses and "passed" in statuses, "reopen attempt history is incomplete")
+    return {
+        "initial_status": failed["status"],
+        "reopened_with_user_input": True,
+        "remediation_round": state["review_convergence"]["fix_round"],
+        "final_status": final["status"],
+        "attempt_history_statuses": statuses,
+    }
+
+
 def scenario_review_budget(ctx: dict[str, Any]) -> dict[str, Any]:
     dual = plan_review_group(
         "dual-swarm",
@@ -1582,6 +2445,12 @@ SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = 
     ("report-broker-sleep-wake-recovery", scenario_report_broker),
     ("scout-liaison-report-ack-attention", scenario_scout_liaison_reports),
     ("requirements-decisions-outcomes", scenario_requirements_decisions),
+    ("remediation-convergence", scenario_remediation_convergence),
+    ("scope-expansion-follow-up", scenario_scope_expansion_follow_up),
+    ("two-round-exhaustion", scenario_two_round_exhaustion),
+    ("user-stop-freeze", scenario_user_stop_freeze),
+    ("manual-final-retry-same-sha", scenario_manual_final_retry_same_sha),
+    ("manual-final-authorized-reopen", scenario_manual_final_user_authorized_reopen),
     ("dual-review-and-budget", scenario_review_budget),
     ("final-gate-and-finish", scenario_finish),
 )
@@ -1592,6 +2461,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="print the structured result as JSON")
     parser.add_argument("--output", type=Path, help="also write the structured result to this path")
     parser.add_argument("--keep-workdir", action="store_true", help="retain the temporary repositories")
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        dest="scenarios",
+        help="run only this named scenario; may be repeated",
+    )
     return parser.parse_args()
 
 
@@ -1620,7 +2495,14 @@ def main() -> int:
     }
     records: list[dict[str, Any]] = []
     overall = "passed"
-    for name, scenario in SCENARIOS:
+    selected = SCENARIOS
+    if args.scenarios:
+        known = {name for name, _ in SCENARIOS}
+        unknown = sorted(set(args.scenarios) - known)
+        if unknown:
+            raise SystemExit("unknown synthetic scenario(s): " + ", ".join(unknown))
+        selected = tuple(item for item in SCENARIOS if item[0] in set(args.scenarios))
+    for name, scenario in selected:
         scenario_started = time.monotonic()
         try:
             evidence = scenario(context)
