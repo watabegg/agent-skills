@@ -396,6 +396,17 @@ class SchemaTests(unittest.TestCase):
             "source_review_fingerprints": ["sha256:" + "a" * 64],
             "discovered_head": "abc123",
             "evidence": ["review/R001.md#FND-001"],
+            "decision_summary": {
+                "decision": "defer",
+                "rationale": "Outside the current release.",
+            },
+            "verification_evidence": [
+                {"reference": "review/R001.md#FND-001", "status": "confirmed"}
+            ],
+            "implementation_constraints": [
+                "requires an explicit scope amendment",
+                {"owner": "review-runtime"},
+            ],
             "impact": "The same issue can be registered twice.",
             "affected_path": "skills/herdr-dev-loop/scripts/hloop_lib/review_policy.py",
             "fact_status": "confirmed",
@@ -412,6 +423,15 @@ class SchemaTests(unittest.TestCase):
             "updated_at": "2026-07-16T00:00:00+00:00",
         }
         self.assertTrue(validator.is_valid(record), validator.iter_errors(record))
+
+        for field in (
+            "decision_summary",
+            "verification_evidence",
+            "implementation_constraints",
+        ):
+            invalid = dict(record)
+            invalid[field] = "structured data must not be serialized as a string"
+            self.assertFalse(validator.is_valid(invalid), field)
 
 
 if __name__ == "__main__":

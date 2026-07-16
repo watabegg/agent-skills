@@ -88,6 +88,24 @@ class ExactGitPathTests(unittest.TestCase):
                 [],
             )
 
+    def test_repository_visible_inventory_is_nul_safe_and_utf8_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            self.seed_special_paths(repo)
+            expected = set((*self.SPECIAL_PATHS, self.RENAME_SOURCE))
+            self.assertEqual(set(hloop._repository_visible_paths(repo)), expected)
+
+            with mock.patch.object(
+                hloop,
+                "git_bytes",
+                return_value=b"valid.txt\0invalid-\xff.txt\0",
+            ):
+                with self.assertRaisesRegex(hloop.HLoopError, "non-UTF-8"):
+                    hloop._repository_visible_paths(repo)
+
+            with self.assertRaisesRegex(hloop.HLoopError, "non-UTF-8"):
+                hloop.git_path_from_bytes(b"invalid-\xff.txt")
+
     def test_finalize_handoff_and_seal_keep_special_names_exact(self):
         namespace = "special-path-seal"
         hloop.configure_loop_namespace(namespace)

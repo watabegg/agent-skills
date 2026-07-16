@@ -207,6 +207,11 @@ STRICT_MULTILINE_LIST_FIELDS = {
     "write_allow",
     "write_deny",
 }
+STRUCTURED_JSON_FIELDS = (
+    "decision_summary",
+    "verification_evidence",
+    "implementation_constraints",
+)
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 DANGEROUS_AGENT_MARKERS = (
     "danger-full-access",
@@ -1809,17 +1814,21 @@ def _canonical_digest(value: Any) -> str:
 
 def _repository_visible_paths(repo: Path) -> list[str]:
     """Return tracked and non-ignored paths used for identity snapshots."""
-
     try:
-        output = git(repo, ["ls-files", "--cached", "--others", "--exclude-standard"])
+        output = git_bytes(
+            repo,
+            ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            check=True,
+        )
     except (HLoopError, OSError, subprocess.CalledProcessError):
         return []
     return sorted(
-        {
-            normalize_match_path(line.strip())
-            for line in output.splitlines()
-            if line.strip()
-        }
+        set(
+            parse_name_only_z(
+                output,
+                command="git ls-files --cached --others --exclude-standard -z",
+            )
+        )
     )
 
 
@@ -2549,6 +2558,14 @@ def parse_scalar(raw: str, key: str | None = None) -> Any:
     value = raw.strip()
     if value == "":
         return ""
+    if key in STRUCTURED_JSON_FIELDS:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise HLoopError(f"{key} must be a JSON object or array: {exc}") from exc
+        if not isinstance(decoded, (dict, list)):
+            raise HLoopError(f"{key} must be a JSON object or array")
+        return decoded
     lower = value.lower()
     if lower == "true":
         return True
@@ -2627,7 +2644,11 @@ def replace_frontmatter(path: Path, updates: dict[str, Any]) -> None:
     write_text(path, frontmatter(meta) + "\n" + rest)
 
 
-def yaml_scalar(value: Any) -> str:
+def yaml_scalar(value: Any, *, key: str | None = None) -> str:
+    if key in STRUCTURED_JSON_FIELDS:
+        if not isinstance(value, (dict, list)):
+            raise HLoopError(f"{key} must be a JSON object or array")
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -2650,7 +2671,9 @@ def yaml_scalar(value: Any) -> str:
 def frontmatter(fields: dict[str, Any]) -> str:
     lines = ["---"]
     for key, value in fields.items():
-        if isinstance(value, list):
+        if key in STRUCTURED_JSON_FIELDS:
+            lines.append(f"{key}: {yaml_scalar(value, key=key)}")
+        elif isinstance(value, list):
             if value:
                 lines.append(f"{key}:")
                 for item in value:
@@ -4860,9 +4883,15 @@ def split_nul_records(data: bytes, *, command: str) -> list[bytes]:
 
 
 def git_path_from_bytes(value: bytes) -> str:
-    """Decode a Git path with the platform filesystem's surrogateescape rules."""
+    """Decode a Git path as UTF-8 and reject ambiguous byte-only filenames."""
 
-    return normalize_match_path(os.fsdecode(value))
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HLoopError(
+            "Git path inventory returned non-UTF-8 path bytes; refusing to persist an ambiguous path"
+        ) from exc
+    return normalize_match_path(decoded)
 
 
 def parse_name_status_z_records(
@@ -11646,6 +11675,26 @@ def _merge_follow_up_values(*values: Any) -> list[str]:
     return merged
 
 
+def _follow_up_structured_value(
+    args: argparse.Namespace, name: str
+) -> dict[str, Any] | list[Any] | None:
+    raw = getattr(args, name, None)
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        value = raw
+    else:
+        try:
+            value = json.loads(str(raw))
+        except json.JSONDecodeError as exc:
+            option = "--" + name.replace("_", "-")
+            raise HLoopError(f"{option} must be a JSON object or array: {exc}") from exc
+    if not isinstance(value, (dict, list)):
+        option = "--" + name.replace("_", "-")
+        raise HLoopError(f"{option} must be a JSON object or array")
+    return value
+
+
 def cmd_follow_up_add(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     ensure_loop_dirs(repo)
@@ -11806,6 +11855,10 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
     previous_relations = previous.get("relations")
     if not isinstance(previous_relations, list):
         previous_relations = []
+    structured_values = {
+        name: _follow_up_structured_value(args, name)
+        for name in STRUCTURED_JSON_FIELDS
+    }
 
     if canonical_key == issue_key:
         key_record = key.to_record()
@@ -11897,13 +11950,14 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
         value = getattr(args, name, None) or previous.get(name)
         if value:
             record[name] = value
+    for name, value in structured_values.items():
+        if value is not None:
+            record[name] = value
+        elif name in previous:
+            record[name] = previous[name]
 
-    write_text(
-        path,
-        frontmatter(record)
-        + f"\n# {record['title']}\n\n{record['impact']}\n",
-    )
-
+    target_path: Path | None = None
+    target_record: dict[str, Any] | None = None
     if relation_kind == "supersedes" and target_id:
         target_path = _follow_up_artifact(repo, target_id)
         target_record = read_frontmatter(target_path)
@@ -11923,11 +11977,16 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
             }
         )
         target_record["history"] = target_history
-        write_text(
-            target_path,
+
+    artifact_text = (
+        frontmatter(record) + f"\n# {record['title']}\n\n{record['impact']}\n"
+    )
+    target_text = None
+    if target_path is not None and target_record is not None:
+        target_text = (
             frontmatter(target_record)
             + f"\n# {target_record.get('title') or target_id}\n\n"
-            + f"{target_record.get('impact') or ''}\n",
+            + f"{target_record.get('impact') or ''}\n"
         )
 
     artifact_ref = str(path.relative_to(repo))
@@ -11955,13 +12014,47 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
             hloop_review_policy.resolve_issue_key_alias(alias_key, aliases)
         except hloop_review_policy.ReviewPolicyError as exc:
             raise HLoopError(f"invalid stored follow-up alias: {exc}") from exc
-    state["_follow_up_records_cache"] = _follow_up_records(repo, state)
-    _refresh_follow_up_count(state)
-    save_state(repo, state)
-    journal(
-        repo,
-        f"{'Updated' if duplicate else 'Recorded'} follow-up `{follow_up_id}` ({canonical_key}).",
-    )
+    state_file = state_path(repo)
+    journal_file = loop_path(repo) / "JOURNAL.md"
+    persistence_paths = [path]
+    if target_path is not None:
+        persistence_paths.append(target_path)
+    persistence_paths.extend((state_file, journal_file))
+    previous_files = {
+        candidate: candidate.read_bytes() if candidate.exists() else None
+        for candidate in dict.fromkeys(persistence_paths)
+    }
+    try:
+        write_text(path, artifact_text)
+        if target_path is not None and target_text is not None:
+            write_text(target_path, target_text)
+        state["_follow_up_records_cache"] = _follow_up_records(repo, state)
+        _refresh_follow_up_count(state)
+        save_state(repo, state)
+        journal(
+            repo,
+            f"{'Updated' if duplicate else 'Recorded'} follow-up `{follow_up_id}` ({canonical_key}).",
+        )
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for candidate, previous_bytes in reversed(tuple(previous_files.items())):
+            try:
+                if previous_bytes is None:
+                    try:
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    candidate.parent.mkdir(parents=True, exist_ok=True)
+                    candidate.write_bytes(previous_bytes)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{candidate}: {rollback_exc}")
+        if rollback_errors:
+            raise HLoopError(
+                "follow-up persistence failed and bounded rollback failed: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise HLoopError(f"follow-up persistence failed: {exc}") from exc
     payload = {
         "status": "deduplicated" if duplicate else "created",
         "follow_up": record,
@@ -24603,6 +24696,21 @@ def build_parser() -> argparse.ArgumentParser:
     follow_up_add.add_argument("--source-review-fingerprint", "--review-fingerprint", dest="source_review_fingerprint", action="append")
     follow_up_add.add_argument("--discovered-head")
     follow_up_add.add_argument("--evidence", action="append")
+    follow_up_add.add_argument(
+        "--decision-summary",
+        dest="decision_summary",
+        help="JSON object or array describing the deferral decision",
+    )
+    follow_up_add.add_argument(
+        "--verification-evidence",
+        dest="verification_evidence",
+        help="JSON object or array containing verification evidence",
+    )
+    follow_up_add.add_argument(
+        "--implementation-constraints",
+        dest="implementation_constraints",
+        help="JSON object or array containing implementation constraints",
+    )
     follow_up_add.add_argument("--impact", required=True)
     follow_up_add.add_argument("--affected-path")
     follow_up_add.add_argument("--symbol")
