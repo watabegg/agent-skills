@@ -78,6 +78,34 @@ Use `hloop batch start "<batch title>"` to group several related tasks or fix ta
 
 Use `hloop task update <task-id>` for write scope, acceptance, validation minimum, protocol, QA, or agent-backend changes. Checkpoint the changed contract before starting a Worker only in `branch-history`; `local-only` snapshots it directly. Updating a running Worker rebinds its authenticated report identity to the new task digest and re-arms the semantic ACK barrier. Also send the new requirement through `hloop worker message`; the Worker must submit a corrected ACK for that digest and wait for Manager approval before finalize, harvest, or merge.
 
+## 0.5.2 Release Scope And Review Convergence
+
+New loops use `state_format_version: 3` with `schema_revision: 2`. Their review policy defaults to `cadence: batch`, `pre_final_protocol: codex-review-multi-v2`, `manual_final_protocol: codex-review-multi-v2`, `max_fix_rounds: 2`, `scope_expansion_action: follow_up`, and `final_required: complete_zero_verified_actionable_findings`. Existing loops preserve their stored cadence and legacy finish behavior through migration.
+
+Before dispatch, Manager should lock the release contract and inspect source drift:
+
+```bash
+$HLOOP release-scope lock --source MISSION.md --source PLAN.md \
+  --plan-item-ref P001 --requirement-ref R001 --scope-ref release-scope-contract
+$HLOOP release-scope status --json
+```
+
+Tasks created after the lock carry immutable `task_origin` and release-scope provenance. `planned`, `finding`, `user-amendment`, and `operational` origins have different required references; task creation, triage, pump, and conductor use the same authorization preflight. Use `release-scope amend` for recorded editorial/clarification changes or user-authorized scope changes. Use `dispatch freeze` to stop new task and role starts while allowing validation, harvest, merge, reporting, and final evidence work.
+
+Review candidates are classified on independent fact, severity, origin, contract-relation, decision-requirement, disposition, and release-effect axes. Scope-expanding or outside-release candidates become first-class follow-ups with stable versioned issue keys; they are not silently converted into remediation tasks. Use `hloop follow-up add|list|show|export` to record and deduplicate them.
+
+After a stable implementation batch, run fixed-target convergence explicitly:
+
+```bash
+$HLOOP review readiness --json
+$HLOOP review convergence prepare --mode swarm --json
+$HLOOP review convergence record --fix-round 0 --json
+$HLOOP final-review prepare --mode swarm --json
+$HLOOP final-review record --json
+```
+
+Convergence cannot pass with an incomplete manifest or verified actionable findings. Automatic remediation is bounded to two fix rounds for new loops. A failed/incomplete manual final or exhausted convergence can return to task creation only through user-authorized atomic `hloop review reopen --action ... --user-input-id ...`; target SHA and certification evidence are invalidated as part of that transition. Manual final requires complete lane and verification evidence, manifest completeness, fixed identity/scope snapshots, and zero verified actionable findings. The public PLAN/MANIFEST schema entry points are `schemas/final-review-plan.schema.json` and `schemas/final-review-manifest.schema.json`.
+
 Workers should commit product changes first, then run `hloop worker finalize <task-id> --validation-command <command> --validation-result passed --validation-summary <summary>`. Validation results are the explicit `passed`, `failed`, or `blocked` enum; every result must be `passed` for status `done`. The helper derives and commits the result metadata. `wait`, `tick`, and `pump` do not harvest a Worker result until the exact artifact is committed at Worker HEAD. Harvest copies the verified result into the canonical Manager loop path and retains the role-worktree path only as provenance.
 
 A Codex `workspace-write` Worker that cannot write Git metadata at all runs `hloop worker finalize <task-id> --handoff` instead, leaving in-scope product changes and `result.md` uncommitted. Manager runs `hloop worker seal <task-id> [--attempt-id <id>] [--validation-command ...]` to close/confirm the quiesced Worker pane, validate the active attempt, semantic ACK, branch/worktree identity, a non-stale full write scope (committed plus dirty, rename-source-aware), and -- for `status: done` -- actually run the supplied validation command(s), all fail-closed, then commit the handoff once at Worker HEAD with Manager-measured validation fields. See `references/artifact-contract.md`.
@@ -109,12 +137,17 @@ The durable state lives under `.ai/herdr-dev-loop/loops/<namespace>`:
 - `inputs/`: redacted local-only user inputs; never checkpointed or committed
 - `STATE.json.requirements`: accepted requirements and evidence-gated progress
 - `STATE.json.decisions`: machine-readable scoped decision records backing the readable `DECISIONS.md` ledger
+- `STATE.json.release_scope`: locked source digests, scope revisions, and amendment provenance
+- `STATE.json.follow_ups`: stable first-class follow-up issue keys and artifact references
 - `inbox/` and broker storage: local-only reports, wake records, and recovery spool
 - `tasks/*.md`: Worker task contracts
 - `batches/*.md`: Manager-owned task batches for readable loop-state checkpoint history
 - `results/<task-id>/result.md`: Worker completion artifacts
 - `gaps/*.md`: Gap Auditor plan/spec alignment artifacts
 - `reviews/*.md`: Reviewer artifacts
+- `reviews/convergence/PLAN.json` and `reviews/convergence/MANIFEST.json`: fixed-target pre-final convergence evidence
+- `reviews/final/PLAN.json`, `reviews/final/MANIFEST.json`, and `reviews/final/REPORT.md`: manual-final certification evidence
+- `follow-ups/FNNN.md`: first-class follow-up records
 - `advice/*.md`: explicit Advisor consultation requests and participant artifacts
 - `triage/*.fix-task-draft.md`: Manager-reviewed fix-task drafts generated from review/gap artifacts
 - `qa/FINAL.md`: Manager-owned final QA evidence when `manager_qa_profile` is not `none`
@@ -194,7 +227,7 @@ Do not run an unbounded loop. Prefer `tick --once` while inspecting a new reposi
 
 Use `hloop triage review <review-id>` or `hloop triage gap <gap-id>` to convert machine-readable `Fix Task Candidates` sections into `.ai/herdr-dev-loop/loops/<namespace>/triage/*.fix-task-draft.md`. Add `--create-tasks` only after Manager approval; this creates queued fix Workers from the candidates.
 
-Default cadence is intentionally busy: keep up to three Workers running, run Reviewer after each validated integration advance, and run Gap Auditor every three validated merges or before final completion. Gap Auditor and Reviewer may run while Workers continue on isolated branches, but Manager must not merge Worker branches while a Gap Auditor or Reviewer is actively reading the integration branch.
+For new 0.5.2 loops, dispatch up to three Workers in non-overlapping scopes and review at batch boundaries after the batch closes. The explicit convergence and manual-final commands own fixed-target final review; the scheduler must not silently replace them with an ordinary Reviewer. A legacy or explicitly configured `merge-count` policy may still open review/gap gates from validated merge counters. Gap Auditor and Reviewer may run while Workers continue on isolated branches, but Manager must not merge Worker branches while a Gap Auditor or Reviewer is actively reading the integration branch.
 
 Default protocols are native to this skill:
 
@@ -247,6 +280,8 @@ Stop immediately when:
 
 - `HERDR_ENV=1` is not set.
 - `.ai/herdr-dev-loop/loops/<namespace>/STATE.json` is missing for a non-init operation.
+- a locked release scope has source drift without a recorded amendment.
+- dispatch is frozen and a new task or role start is requested without the authorized user transition.
 - every remaining safe task is dependency-blocked by an unresolved `blocking-user` decision. A scoped decision does not stop unrelated work.
 - an unresolved plan/spec choice must be decided from outside the original plan; record it in `DECISIONS.md` and `USER_ACTION_REQUIRED.md`.
 - a Worker changed files outside `write_allow` or inside `write_deny`.
@@ -255,6 +290,7 @@ Stop immediately when:
 - integration validation fails and rollback is not obvious.
 - Gap Auditor reports a missing, partial, or needs-decision gap that affects the mission done criteria.
 - Reviewer reports P0/P1 that needs a user decision.
+- convergence evidence is incomplete, exceeds its authorized fix-round budget, or manual final certification is incomplete/failed.
 - no progressable transition exists and no Worker, Gap Auditor, or Reviewer is merely still running.
 
 When stopped, update `STATE.json`, `JOURNAL.md`, and `USER_ACTION_REQUIRED.md` with the concrete blocker before asking the user.
