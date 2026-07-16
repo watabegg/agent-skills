@@ -442,6 +442,10 @@ effort = "medium"
             repo = self.make_repo(root)
             with self.isolated_config_env(root):
                 state_path = self.init_loop(repo, "final-gate")
+                (state_path.parent / "PLAN.md").write_text(
+                    "# Plan\n\n- P001: final gate fixture\n",
+                    encoding="utf-8",
+                )
                 prefix = ["--repo", str(repo), "--namespace", "final-gate"]
                 code, output, error = self.run_cli(
                     [*prefix, "release-scope", "lock", "--plan-item-ref", "P001"]
