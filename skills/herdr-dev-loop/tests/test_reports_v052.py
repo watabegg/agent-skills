@@ -87,6 +87,9 @@ def projection_set() -> dict[str, object]:
             review_fix_rounds=2,
             candidate_count=3,
             confirmed_count=2,
+            finding_origin_counts={"introduced": 2, "unrelated-pre-existing": 1},
+            finding_contract_relation_counts={"in_scope": 2, "outside_release": 1},
+            finding_decision_requirement_counts={"none": 2, "spec": 1},
             finding_disposition_counts={"fix_now": 1, "defer_follow_up": 1},
             review_completed_count=1,
             stale_review_count=1,
@@ -121,6 +124,11 @@ def projection_set() -> dict[str, object]:
             verified_actionable_findings=0,
             lane_completed_count=4,
             lane_count=4,
+            residual_risks=(
+                "insufficient_evidence: provider verification was unavailable",
+                "external_dependency: external provider was not exercised",
+            ),
+            follow_up_refs=("follow-ups/F001.md",),
         ),
     }
 
@@ -253,7 +261,44 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn("Review attempts: 1 completed, 1 stale, 0 aborted, 0 timeout", rendered)
         self.assertIn("Follow-ups: 1", rendered)
         self.assertIn("Manual review completeness: complete, shortfalls 0", rendered)
+        self.assertIn(
+            "Residual risks: insufficient_evidence: provider verification was unavailable; "
+            "external_dependency: external provider was not exercised",
+            rendered,
+        )
+        self.assertIn("Finding origin counts: introduced=2, unrelated-pre-existing=1", rendered)
+        self.assertIn("Finding contract relation counts: in_scope=2, outside_release=1", rendered)
+        self.assertIn("Finding decision requirement counts: none=2, spec=1", rendered)
+        self.assertIn("Finding disposition counts: defer_follow_up=1, fix_now=1", rendered)
+        self.assertIn("Manual final residual risks:", rendered)
+        self.assertIn("Manual final follow-up references: follow-ups/F001.md", rendered)
         self.assertIn("effective-parallelism-low: 1 with 2 workers", rendered)
+
+    def test_accepted_and_residual_risks_remain_separate_in_record(self):
+        report = draft_outcome(
+            run_id="run-001",
+            goal="risk projection",
+            generated_at=NOW,
+            requirement_progress=(RequirementProgress("REQ-001"),),
+            gates=(OutcomeGate(name="validation", status="pending"),),
+            integration_target_sha="",
+            current_branch_sha="",
+            accepted_risks=("manager accepted compatibility risk",),
+            residual_risks=("insufficient_evidence: provider was unavailable",),
+        )
+
+        record = report.to_record()
+        self.assertEqual(
+            record["review"]["accepted_risks"],
+            ["manager accepted compatibility risk"],
+        )
+        self.assertEqual(
+            record["review"]["residual_risks"],
+            ["insufficient_evidence: provider was unavailable"],
+        )
+        restored = OutcomeReport.from_record(record)
+        self.assertEqual(restored.accepted_risks, ("manager accepted compatibility risk",))
+        self.assertEqual(restored.residual_risks, ("insufficient_evidence: provider was unavailable",))
 
     def test_final_outcome_requires_complete_manual_final_when_projected(self):
         incomplete = projection_set()
@@ -307,6 +352,11 @@ class OutcomeSchemaTests(unittest.TestCase):
         )
         self.assertIn("execution_metrics", schema["properties"])
         self.assertIn("manual_final_review", schema["properties"])
+        self.assertIn("residual_risks", schema["properties"]["review"]["properties"])
+        self.assertIn(
+            "residual_risks",
+            schema["$defs"]["manual_final_review"]["properties"],
+        )
 
         legacy = draft_outcome(
             run_id="run-001",
