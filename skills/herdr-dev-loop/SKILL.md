@@ -40,10 +40,14 @@ $HLOOP config explain --repo <repo> --json
 $HLOOP selftest
 $HLOOP doctor
 $HLOOP init --goal-id <goal-id> --goal "<goal>" --base <main-or-master> --create-branch --persistence local-only --worktree-root ../wt/<goal-id> --merge-mode squash --branch-strategy integration --worker-protocol native --review-protocol native --worker-agent-provider codex --worker-agent-model auto --reviewer-agent-provider codex --reviewer-agent-model auto --gap-agent-provider codex --gap-agent-model auto --worker-qa-profile repo-default --manager-qa-profile none --worker-runner tui --gap-runner tui --reviewer-runner tui --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3 --validation-command '<repo test command>' --session-cleanup archive --gap-wait-ms 600000 --review-wait-ms 600000
-$HLOOP batch start "Initial implementation batch"
 $HLOOP input record --source manager-chat --text '<user requirement>'
 $HLOOP requirement new --source-input U0001 --acceptance '<observable result>' --priority P1
-$HLOOP task new "Implement bounded slice" --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
+$HLOOP release-scope lock --source MISSION.md --source PLAN.md \
+  --plan-item-ref P001 --requirement-ref REQ-001 --scope-ref release-scope-contract
+$HLOOP batch start "Initial implementation batch"
+$HLOOP task new "Implement bounded slice" \
+  --plan-item-ref P001 --requirement-ref REQ-001 \
+  --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 $HLOOP dashboard
 $HLOOP pump --max-transitions 20 --max-workers 3
 $HLOOP final-gates arm

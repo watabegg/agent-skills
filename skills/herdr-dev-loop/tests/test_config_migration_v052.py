@@ -79,6 +79,7 @@ class ReviewPolicyConfigTests(unittest.TestCase):
         cases = (
             ({"cadence": "per-merge"}, "cadence"),
             ({"pre_final_protocol": "chat"}, "pre_final_protocol"),
+            ({"manual_final_protocol": "native"}, "manual_final_protocol"),
             ({"max_fix_rounds": 3}, "max_fix_rounds"),
             ({"scope_expansion_action": "fix_now"}, "scope_expansion_action"),
             ({"final_required": "finding_count_only"}, "final_required"),
@@ -90,6 +91,12 @@ class ReviewPolicyConfigTests(unittest.TestCase):
                 data["defaults"]["review"].update(update)
                 with self.assertRaisesRegex(ConfigValidationError, field):
                     validate_config(data)
+
+    def test_pre_final_native_remains_distinct_from_manual_final_protocol(self):
+        data = self.valid_config()
+        data["defaults"]["review"]["pre_final_protocol"] = "native"
+
+        validate_config(data)
 
     def test_example_config_contains_the_approved_review_defaults(self):
         example = load_config_file(Path(__file__).parents[1] / "examples" / "config.toml")
@@ -291,6 +298,12 @@ class StateSchemaTests(unittest.TestCase):
         schema = json.loads((SCHEMAS / "state.schema.json").read_text(encoding="utf-8"))
         state = current_state_with_v052_blocks()
         state["review_policy"]["max_fix_rounds"] = 3
+        self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid(state))
+
+    def test_state_schema_rejects_native_manual_final_protocol(self):
+        schema = json.loads((SCHEMAS / "state.schema.json").read_text(encoding="utf-8"))
+        state = current_state_with_v052_blocks()
+        state["review_policy"]["manual_final_protocol"] = "native"
         self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid(state))
 
 
