@@ -2053,6 +2053,23 @@ def dispatch_is_frozen(state: dict[str, Any]) -> bool:
     return str(dispatch_freeze_record(state).get("status") or "inactive") == "active"
 
 
+def review_failure_phase(state: Mapping[str, Any]) -> str:
+    """Return a review stop phase that requires the atomic reopen command."""
+
+    phase = str(state.get("phase") or "")
+    if phase in hloop_certification.REOPENABLE_PHASES:
+        return phase
+    convergence = state.get("review_convergence")
+    if isinstance(convergence, Mapping) and convergence.get("status") == "exhausted":
+        return "review_convergence_exhausted"
+    manual = state.get("manual_final_review")
+    if isinstance(manual, Mapping):
+        status = str(manual.get("status") or "")
+        if status in {"failed", "incomplete"}:
+            return f"manual_final_review_{status}"
+    return ""
+
+
 def release_scope_from_state(state: dict[str, Any]) -> hloop_release_scope.ReleaseScope:
     """Load scope policy, treating pre-0.5.2 state as explicitly legacy."""
 
@@ -5832,6 +5849,8 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
     except HLoopError as exc:
         errors.append(str(exc))
         scope = release_scope_from_state(state)
+    if release_scope_enabled(state) and scope.status == "unlocked":
+        errors.append("fresh 0.5.2 loops require release-scope lock before review readiness")
     inventory: list[str] = []
     if base_sha and target:
         proc = run_cmd(
@@ -6222,26 +6241,153 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_review_reopen(args: argparse.Namespace) -> int:
-    repo = repo_root(Path(args.repo).resolve())
-    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
-    scope_amendment = None
-    if getattr(args, "scope_kind", None) or getattr(args, "scope_digest", None):
+def canonical_scope_digest(value: Any, field_name: str) -> str:
+    text = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", text):
+        return f"sha256:{text}"
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", text):
+        return text
+    raise HLoopError(f"{field_name} must be a SHA-256 digest")
+
+
+def _review_reopen_scope_amendment(
+    repo: Path, state: dict[str, Any], args: argparse.Namespace
+) -> tuple[dict[str, Any] | None, Path | None]:
+    scope_actions = {"disable-feature", "mark-experimental", "scope-amend"}
+    scope_fields_present = any(
+        getattr(args, name, None)
+        for name in (
+            "scope_kind",
+            "scope_digest",
+            "scope_source",
+            "scope_revision",
+            "source_snapshot_revision",
+            "source_digests",
+            "scope_reason",
+            "scope_basis_ref",
+        )
+    )
+    if args.action not in scope_actions:
+        if scope_fields_present:
+            raise HLoopError(
+                "scope amendment fields require disable-feature, mark-experimental, or scope-amend"
+            )
+        return None, None
+
+    scope = release_scope_from_state(state)
+    if scope.status != "locked":
+        raise HLoopError("scope-changing review reopen requires a locked release scope")
+    kind = str(
+        getattr(args, "scope_kind", None)
+        or ("scope-change" if args.action != "scope-amend" else "scope-change")
+    )
+    if args.action in {"disable-feature", "mark-experimental"} and kind != "scope-change":
+        raise HLoopError(f"{args.action} requires a scope-change amendment")
+    reason = str(getattr(args, "scope_reason", None) or "").strip()
+    if not reason:
+        raise HLoopError("scope-changing review reopen requires --scope-reason")
+    source_refs = _arg_list(args, "scope_source") or list(scope.source_refs)
+    sources = read_scope_sources(repo, source_refs)
+    existing_amendments = {ref: True for ref in scope.amendment_refs}
+    amendment_dir = loop_path(repo) / "release-scope" / "amendments"
+    if amendment_dir.exists():
+        existing_amendments.update({path.stem: True for path in amendment_dir.glob("A[0-9][0-9][0-9].json")})
+    amendment_id = next_id("A", existing_amendments)
+    amendment_user_input = args.user_input_id if kind == "scope-change" else ""
+    try:
+        amendment = hloop_release_scope.create_amendment(
+            scope,
+            amendment_id=amendment_id,
+            kind=kind,
+            reason=reason,
+            new_source_contents=sources,
+            basis_refs=_arg_list(args, "scope_basis_ref"),
+            user_input_id=amendment_user_input,
+            affected_task_ids=_arg_list(args, "scope_affected_task_id"),
+            created_at=now_iso(),
+        )
+    except hloop_release_scope.ReleaseScopeError as exc:
+        raise HLoopError(f"cannot create review-reopen amendment: {exc}") from exc
+
+    if args.scope_revision is not None and args.scope_revision != amendment.new_scope_revision:
+        raise HLoopError("--scope-revision does not match the actual source amendment")
+    if (
+        args.source_snapshot_revision is not None
+        and args.source_snapshot_revision != amendment.new_source_snapshot_revision
+    ):
+        raise HLoopError(
+            "--source-snapshot-revision does not match the actual source amendment"
+        )
+    if args.scope_digest is not None and canonical_scope_digest(
+        args.scope_digest, "--scope-digest"
+    ) != amendment.new_scope_digest:
+        raise HLoopError("--scope-digest does not match the actual source amendment")
+    if args.source_digests:
         try:
-            source_digests = json.loads(args.source_digests) if args.source_digests else {}
+            provided_digests = json.loads(args.source_digests)
         except json.JSONDecodeError as exc:
             raise HLoopError(f"--source-digests must be a JSON object: {exc}") from exc
-        if not isinstance(source_digests, dict):
+        if not isinstance(provided_digests, dict):
             raise HLoopError("--source-digests must be a JSON object")
-        scope_amendment = {
-            "kind": args.scope_kind,
-            "input_id": args.user_input_id,
-            "scope_revision": args.scope_revision,
-            "source_snapshot_revision": args.source_snapshot_revision,
-            "source_digest": args.scope_digest,
-            "source_refs": args.scope_source or [],
-            "source_digests": source_digests,
+        normalized_digests = {
+            str(key): canonical_scope_digest(value, f"--source-digests[{key}]")
+            for key, value in provided_digests.items()
         }
+        if normalized_digests != dict(amendment.new_source_digests):
+            raise HLoopError("--source-digests does not match the actual source contents")
+
+    record = amendment.to_record()
+    record["reopen_action"] = args.action
+    record["reopen_user_input_id"] = args.user_input_id
+    return record, amendment_dir / f"{amendment_id}.json"
+
+
+def _restore_review_reopen_path(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(previous)
+
+
+def _persist_review_reopen(
+    repo: Path,
+    candidate: dict[str, Any],
+    amendment_record: dict[str, Any],
+    amendment_path: Path,
+) -> None:
+    state_file = state_path(repo)
+    previous_state = state_file.read_bytes()
+    previous_amendment = amendment_path.read_bytes() if amendment_path.exists() else None
+    if previous_amendment is not None:
+        raise HLoopError(f"review-reopen amendment artifact already exists: {amendment_path}")
+    try:
+        write_text(
+            amendment_path,
+            json.dumps(amendment_record, ensure_ascii=False, indent=2) + "\n",
+            durable=True,
+        )
+        save_state(repo, candidate)
+    except Exception as exc:
+        try:
+            _restore_review_reopen_path(amendment_path, previous_amendment)
+            state_file.write_bytes(previous_state)
+        except Exception as rollback_exc:
+            raise HLoopError(
+                f"review reopen persistence failed and rollback failed: {exc}; {rollback_exc}"
+            ) from exc
+        raise HLoopError(f"review reopen persistence failed: {exc}") from exc
+
+
+def cmd_review_reopen(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    ensure_loop_dirs(repo)
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    amendment_record, amendment_path = _review_reopen_scope_amendment(repo, state, args)
+    scope_amendment = amendment_record
     result = hloop_certification.reopen_review(
         state,
         action=args.action,
@@ -6257,6 +6403,9 @@ def cmd_review_reopen(args: argparse.Namespace) -> int:
         "issues": list(result.issues),
         "dry_run": bool(args.dry_run),
     }
+    if amendment_record is not None and amendment_path is not None:
+        payload["amendment"] = amendment_record
+        payload["artifact"] = str(amendment_path)
     if result.accepted and not args.dry_run:
         candidate = dict(result.state)
         # certification.py uses this transient marker to explain an
@@ -6265,7 +6414,10 @@ def cmd_review_reopen(args: argparse.Namespace) -> int:
         if isinstance(manual, dict) and manual.get("status") == "invalidated":
             manual["invalidated_status"] = "invalidated"
             manual["status"] = "pending"
-        save_state(repo, candidate)
+        if amendment_record is not None and amendment_path is not None:
+            _persist_review_reopen(repo, candidate, amendment_record, amendment_path)
+        else:
+            save_state(repo, candidate)
         journal(repo, f"Applied review reopen action `{args.action}` from `{result.validation.source_phase}`.")
         payload["phase"] = candidate.get("phase")
         payload["dispatch_freeze"] = candidate.get("dispatch_freeze")
@@ -8871,9 +9023,24 @@ None.
         "max_gap_auditors": args.max_gap_auditors,
         "spec_sources": args.spec_source or [],
         "validation_commands": args.validation or [],
-        # ``release-scope lock`` adds the policy record.  Until a Manager
-        # explicitly locks the source snapshot, this state remains
-        # legacy-unlocked so existing v0.5.1 loops retain their task flow.
+        # A fresh 0.5.2 loop is intentionally fail-closed until the Manager
+        # records the source snapshot with ``release-scope lock``.  Migration
+        # of an older loop takes a separate ``legacy-unlocked`` path in the
+        # format-3 revision-2 transform, so it can retain its old cadence.
+        "release_scope": {
+            "status": "unlocked",
+            "source_refs": [],
+            "source_digests": {},
+            "scope_revision": 0,
+            "source_snapshot_revision": 0,
+            "scope_digest": "",
+            "locked_at": "",
+            "last_user_input_id": "",
+            "amendment_refs": [],
+            "plan_item_refs": [],
+            "requirement_refs": [],
+            "release_scope_refs": [],
+        },
         "dispatch_freeze": {
             "status": "inactive",
             "reason": "",
@@ -9159,6 +9326,11 @@ def cmd_release_scope_amend(args: argparse.Namespace) -> int:
     amendment_path = loop_path(repo) / "release-scope" / "amendments" / f"{amendment_id}.json"
     write_text(amendment_path, json.dumps(amendment.to_record(), ensure_ascii=False, indent=2) + "\n")
     state["release_scope"] = updated_scope.to_record()
+    invalidate_review_gates_for_change(
+        state,
+        reason=f"release-scope-amendment:{amendment_id}",
+        target_sha=current_integration_target(repo, state),
+    )
     save_state(repo, state)
     journal(repo, f"Applied release-scope amendment `{amendment_id}` ({amendment.kind}).")
     payload = {
@@ -9226,6 +9398,12 @@ def cmd_dispatch_unfreeze(args: argparse.Namespace) -> int:
     if source_input_id and not re.fullmatch(r"U[0-9]{4}", source_input_id):
         raise HLoopError("source_input_id must match U0001-style input ids")
     current = dispatch_freeze_record(state)
+    blocked_phase = review_failure_phase(state)
+    if blocked_phase:
+        raise HLoopError(
+            f"dispatch unfreeze is not allowed from {blocked_phase}; "
+            "use `hloop review reopen` with explicit user authorization"
+        )
     state["dispatch_freeze"] = {
         **current,
         "status": "inactive",
@@ -21459,6 +21637,20 @@ def build_parser() -> argparse.ArgumentParser:
     reopen.add_argument("--scope-revision", type=int)
     reopen.add_argument("--source-snapshot-revision", type=int)
     reopen.add_argument("--source-digests", help="JSON object mapping scope sources to digests")
+    reopen.add_argument(
+        "--scope-reason",
+        "--reason",
+        dest="scope_reason",
+        help="reason recorded in a scope-changing reopen amendment",
+    )
+    reopen.add_argument(
+        "--scope-basis-ref",
+        "--basis-ref",
+        dest="scope_basis_ref",
+        action="append",
+        help="plan, requirement, or decision reference supporting the amendment",
+    )
+    reopen.add_argument("--scope-affected-task-id", action="append")
     reopen.add_argument("--json", action="store_true")
     reopen.add_argument("--dry-run", action="store_true")
     reopen.set_defaults(func=cmd_review_reopen)

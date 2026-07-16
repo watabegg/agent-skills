@@ -22,6 +22,7 @@ import json
 import re
 from typing import Any, Mapping, Sequence
 
+from . import release_scope as hloop_release_scope
 from .review import (
     CRITICAL_SEVERITIES,
     ManifestCompleteness,
@@ -986,9 +987,15 @@ def _scope_amendment_issues(
     if not isinstance(amendment, Mapping):
         return ["scope-amendment-required"]
     issues: list[str] = []
-    if amendment.get("kind") not in SCOPE_AMENDMENT_KINDS:
+    kind = amendment.get("kind")
+    if kind not in SCOPE_AMENDMENT_KINDS:
         issues.append("scope-amendment-kind-invalid")
-    if amendment.get("input_id") != user_input_id:
+    amendment_input = (
+        amendment.get("reopen_user_input_id")
+        or amendment.get("input_id")
+        or amendment.get("user_input_id")
+    )
+    if amendment_input != user_input_id:
         issues.append("scope-amendment-input-mismatch")
     release_scope = state.get("release_scope")
     if not isinstance(release_scope, Mapping):
@@ -997,28 +1004,47 @@ def _scope_amendment_issues(
     current_snapshot_revision = release_scope.get("source_snapshot_revision")
     if isinstance(current_scope_revision, bool) or not isinstance(current_scope_revision, int):
         issues.append("release-scope-revision-invalid")
-    elif amendment.get("scope_revision") != current_scope_revision + 1:
-        issues.append("scope-amendment-revision-invalid")
+    else:
+        expected_scope_revision = current_scope_revision + (1 if kind == "scope-change" else 0)
+        proposed_scope_revision = amendment.get(
+            "new_scope_revision", amendment.get("scope_revision")
+        )
+        if proposed_scope_revision != expected_scope_revision:
+            issues.append("scope-amendment-revision-invalid")
     if isinstance(current_snapshot_revision, bool) or not isinstance(current_snapshot_revision, int):
         issues.append("source-snapshot-revision-invalid")
-    elif (
-        isinstance(amendment.get("source_snapshot_revision"), bool)
-        or not isinstance(amendment.get("source_snapshot_revision"), int)
-        or amendment["source_snapshot_revision"] <= current_snapshot_revision
-    ):
-        issues.append("scope-amendment-source-snapshot-invalid")
-    try:
-        _digest(amendment.get("source_digest"), "scope-amendment.source_digest")
-    except CertificationModelError:
+    else:
+        proposed_snapshot_revision = amendment.get(
+            "new_source_snapshot_revision", amendment.get("source_snapshot_revision")
+        )
+        if (
+            isinstance(proposed_snapshot_revision, bool)
+            or not isinstance(proposed_snapshot_revision, int)
+            or proposed_snapshot_revision != current_snapshot_revision + 1
+        ):
+            issues.append("scope-amendment-source-snapshot-invalid")
+    # Keep the legacy diagnostic names for callers that supplied the former
+    # transient mapping, while the canonical path below requires a complete
+    # immutable ScopeAmendment record.
+    if "amendment_id" not in amendment:
+        issues.append("scope-amendment-artifact-id-invalid")
+    if "new_scope_digest" not in amendment and "source_digest" not in amendment:
         issues.append("scope-amendment-source-digest-invalid")
-    try:
-        _text_tuple(amendment.get("source_refs", ()), "scope-amendment.source_refs")
-    except CertificationModelError:
-        issues.append("scope-amendment-source-refs-invalid")
-    source_digests = amendment.get("source_digests", {})
-    if not isinstance(source_digests, Mapping):
+    if "new_source_digests" not in amendment and "source_digests" not in amendment:
         issues.append("scope-amendment-source-digests-invalid")
-    return issues
+    try:
+        scope = hloop_release_scope.ReleaseScope.from_record(release_scope)
+    except hloop_release_scope.ReleaseScopeError as exc:
+        issues.append(f"release-scope-invalid:{exc}")
+        return list(dict.fromkeys(issues))
+    try:
+        immutable = hloop_release_scope.ScopeAmendment.from_record(amendment)
+        hloop_release_scope.validate_amendment(scope, immutable)
+        if immutable.kind == "scope-change" and immutable.user_input_id != user_input_id:
+            issues.append("scope-amendment-input-mismatch")
+    except hloop_release_scope.ReleaseScopeError as exc:
+        issues.append(f"scope-amendment-invalid:{exc}")
+    return list(dict.fromkeys(issues))
 
 
 def _reopen_issues(
@@ -1178,28 +1204,19 @@ def _clear_certification(state: dict[str, Any], *, prior_phase: str, action: str
 def _apply_scope_amendment(
     state: dict[str, Any], amendment: Mapping[str, Any], user_input_id: str
 ) -> None:
-    release_scope = state.setdefault("release_scope", {})
+    release_scope = state.get("release_scope")
     if not isinstance(release_scope, dict):
-        release_scope = {}
-        state["release_scope"] = release_scope
-    source_digests = dict(release_scope.get("source_digests") or {})
-    source_digests.update(dict(amendment.get("source_digests") or {}))
-    source_digest = str(amendment.get("source_digest") or "")
-    source_digests["scope"] = source_digest
-    refs = list(amendment.get("source_refs") or ())
-    amendment_refs = list(release_scope.get("amendment_refs") or ())
-    amendment_refs.append(user_input_id)
-    release_scope.update(
-        {
-            "status": "locked",
-            "source_refs": refs,
-            "source_digests": source_digests,
-            "scope_revision": amendment["scope_revision"],
-            "source_snapshot_revision": amendment["source_snapshot_revision"],
-            "last_user_input_id": user_input_id,
-            "amendment_refs": amendment_refs,
-        }
-    )
+        raise hloop_release_scope.ScopeValidationError("release_scope must be an object")
+    current = hloop_release_scope.ReleaseScope.from_record(release_scope)
+    immutable = hloop_release_scope.ScopeAmendment.from_record(amendment)
+    updated = current.apply_amendment(immutable).to_record()
+    # The outer user input authorizes the reopen even for an editorial or
+    # clarification amendment whose immutable source record intentionally has
+    # no scope-change authorization field.
+    if user_input_id:
+        updated["last_user_input_id"] = user_input_id
+    release_scope.clear()
+    release_scope.update(updated)
 
 
 def reopen_review(
@@ -1263,6 +1280,8 @@ def reopen_review(
                     refs = list(convergence.get("extra_round_authorization_refs") or [])
                     refs.append(authorization_input_id)
                     convergence["extra_round_authorization_refs"] = refs
+            if action in {"disable-feature", "mark-experimental"}:
+                _apply_scope_amendment(candidate, scope_amendment or {}, user_input_id)
             candidate["phase"] = "review_convergence"
             freeze.update(
                 {

@@ -442,20 +442,35 @@ effort = "medium"
             repo = self.make_repo(root)
             with self.isolated_config_env(root):
                 state_path = self.init_loop(repo, "final-gate")
+                prefix = ["--repo", str(repo), "--namespace", "final-gate"]
+                code, output, error = self.run_cli(
+                    [*prefix, "release-scope", "lock", "--plan-item-ref", "P001"]
+                )
+                self.assertEqual((code, error), (0, ""), output)
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 state["batches"] = {
                     "B001": {"id": "B001", "status": "closed", "task_ids": []}
                 }
                 state["tasks"] = {"T000": {"status": "merged", "batch_id": "B001"}}
                 state_path.write_text(json.dumps(state), encoding="utf-8")
-                prefix = ["--repo", str(repo), "--namespace", "final-gate"]
                 code, output, error = self.run_cli([*prefix, "final-gates", "arm"])
                 self.assertEqual((code, error), (0, ""), output)
                 armed = json.loads(state_path.read_text(encoding="utf-8"))["final_gate"]
                 self.assertEqual(armed["status"], "armed")
 
                 code, output, error = self.run_cli(
-                    [*prefix, "task", "new", "follow-up", "--write-allow", "src/**"]
+                    [
+                        *prefix,
+                        "task",
+                        "new",
+                        "follow-up",
+                        "--write-allow",
+                        "src/**",
+                        "--task-origin",
+                        "planned",
+                        "--plan-item-ref",
+                        "P001",
+                    ]
                 )
                 self.assertEqual((code, error), (0, ""), output)
                 disarmed = json.loads(state_path.read_text(encoding="utf-8"))["final_gate"]
