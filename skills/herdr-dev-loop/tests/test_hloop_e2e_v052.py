@@ -98,6 +98,11 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
         self.assertIn("incomplete", evidence["attempt_history_statuses"])
         self.assertIn("passed", evidence["attempt_history_statuses"])
 
+    def test_manual_final_disposition_policy_fails_closed_before_state_mutation(self):
+        evidence = self.run_scenario("manual-final-policy-fail-closed")
+        self.assertTrue(evidence["rejected"])
+        self.assertTrue(evidence["state_unchanged"])
+
     def test_user_authorized_reopen_after_final_finding_converges(self):
         evidence = self.run_scenario("manual-final-authorized-reopen")
         self.assertEqual(evidence["initial_status"], "failed")

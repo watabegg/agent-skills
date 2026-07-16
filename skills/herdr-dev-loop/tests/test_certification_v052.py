@@ -124,7 +124,16 @@ def final_manifest(
     )
 
 
-def candidate(*, severity: str = "P2") -> FindingCandidate:
+def candidate(
+    *,
+    severity: str = "P2",
+    origin: str = "introduced",
+    contract_relation: str = "in_scope",
+    decision_requirement: str = "none",
+    disposition: str = "fix_now",
+    release_effect: str = "blocking",
+    product_impact: str = "the item is never processed",
+) -> FindingCandidate:
     return FindingCandidate(
         finding_id="C-F001",
         provider="codex",
@@ -137,9 +146,14 @@ def candidate(*, severity: str = "P2") -> FindingCandidate:
         line=42,
         symbol="drain_queue",
         trigger="the worker crashes after acknowledgement",
-        product_impact="the item is never processed",
-        origin="introduced",
+        product_impact=product_impact,
+        origin=origin,
         proposed_fix="commit acknowledgement with the state transition",
+        fact_status="confirmed",
+        contract_relation=contract_relation,
+        decision_requirement=decision_requirement,
+        disposition=disposition,
+        release_effect=release_effect,
     )
 
 
@@ -256,6 +270,129 @@ class FinalManifestCompletenessTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.status, "failed")
         self.assertIn("verified-actionable-findings:1", result.issues)
+
+    def test_explicit_axes_recompute_actionable_and_blocking_counts(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        normalized = normalize_findings((candidate(),))
+        verification = plan_verification(group, normalized)
+        records = tuple(
+            VerificationRecord.from_assignment(
+                assignment,
+                fact_status="confirmed",
+                ignore_status="may_defer",
+                decision_status="none",
+                progress_without_decision="yes",
+                severity="P2",
+                # Deliberately contradict the explicit disposition axes.
+                recommended_action="discard",
+            )
+            for assignment in verification.assignments
+        )
+        manifest = final_manifest(
+            plan,
+            group,
+            findings=normalized,
+            verifications=records,
+            verified_actionable_findings=1,
+        )
+        self.assertEqual(manifest.recomputed_verified_actionable_count, 1)
+        self.assertEqual(manifest.recomputed_verified_release_blocking_count, 1)
+        result = validate_final_review(plan, manifest)
+        self.assertFalse(result.passed)
+        self.assertNotIn("verified-actionable-finding-count-mismatch", result.issues)
+
+    def test_unsafe_explicit_dispositions_are_rejected_before_zero_count(self):
+        cases = (
+            candidate(
+                severity="P1",
+                disposition="defer_follow_up",
+                release_effect="non_blocking",
+            ),
+            candidate(
+                disposition="discard",
+                release_effect="non_blocking",
+            ),
+            candidate(
+                disposition="accepted_risk",
+                release_effect="non_blocking",
+            ),
+            candidate(
+                decision_requirement="user",
+                disposition="defer_follow_up",
+                release_effect="non_blocking",
+            ),
+        )
+        for item in cases:
+            with self.subTest(disposition=item.disposition):
+                group = review_plan()
+                plan = certification_plan(group)
+                normalized = normalize_findings((item,))
+                manifest = final_manifest(plan, group, findings=normalized)
+                result = validate_final_review(plan, manifest)
+                self.assertFalse(result.passed)
+                self.assertEqual(result.status, "failed")
+                self.assertTrue(any(issue.startswith("policy:") for issue in result.issues))
+
+    def test_fresh_scope_rejects_legacy_manifest_but_migrated_scope_falls_back(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        normalized = normalize_findings(
+            (
+                candidate(
+                    origin="unrelated-pre-existing",
+                    contract_relation="outside_release",
+                    disposition="defer_follow_up",
+                    release_effect="non_blocking",
+                ),
+            )
+        )
+        verification = plan_verification(group, normalized)
+        records = tuple(
+            VerificationRecord.from_assignment(
+                assignment,
+                fact_status="confirmed",
+                ignore_status="may_defer",
+                decision_status="none",
+                progress_without_decision="yes",
+                severity="P2",
+                recommended_action="discard",
+            )
+            for assignment in verification.assignments
+        )
+        manifest = final_manifest(
+            plan,
+            group,
+            findings=normalized,
+            verifications=records,
+        )
+        record = manifest.to_record()
+        for finding in record["findings"]:
+            for field_name in (
+                "fact_status",
+                "contract_relation",
+                "decision_requirement",
+                "disposition",
+                "release_effect",
+                "policy_axes_explicit",
+            ):
+                finding.pop(field_name, None)
+            for candidate_record in finding["candidates"]:
+                for field_name in (
+                    "fact_status",
+                    "contract_relation",
+                    "decision_requirement",
+                    "disposition",
+                    "release_effect",
+                    "policy_axes_explicit",
+                ):
+                    candidate_record.pop(field_name, None)
+        legacy = FinalReviewManifest.from_record(record)
+        fresh = validate_final_review(plan, legacy)
+        self.assertFalse(fresh.passed)
+        self.assertTrue(any("explicit policy axes" in issue for issue in fresh.issues))
+        migrated = validate_final_review(plan, legacy, allow_legacy=True)
+        self.assertTrue(migrated.passed)
 
     def test_identity_and_target_drift_are_rejected(self):
         group = review_plan()
