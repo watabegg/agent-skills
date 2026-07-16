@@ -192,6 +192,7 @@ class FindingDisposition:
     why_fix_now: str = ""
     remediation_round: int | None = None
     duplicate_of: str = ""
+    accepted_risk_decision_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -234,6 +235,7 @@ class FindingDisposition:
             "target_sha",
             "why_fix_now",
             "duplicate_of",
+            "accepted_risk_decision_id",
         ):
             object.__setattr__(
                 self, field_name, _optional_text(getattr(self, field_name), field_name)
@@ -305,6 +307,7 @@ class FindingDisposition:
             "why_fix_now": self.why_fix_now,
             "remediation_round": self.remediation_round,
             "duplicate_of": self.duplicate_of,
+            "accepted_risk_decision_id": self.accepted_risk_decision_id,
         }
 
     @classmethod
@@ -338,6 +341,9 @@ class FindingDisposition:
             why_fix_now=record.get("why_fix_now", ""),
             remediation_round=record.get("remediation_round"),
             duplicate_of=record.get("duplicate_of", ""),
+            accepted_risk_decision_id=record.get(
+                "accepted_risk_decision_id", record.get("decision_id", "")
+            ),
         )
 
 
@@ -386,6 +392,8 @@ def validate_disposition(
             raise ReviewPolicyError("accepted_risk requires an explicit authorization")
         if disposition.fact_status != "confirmed":
             raise ReviewPolicyError("accepted_risk requires a confirmed finding")
+        if disposition.release_effect != "non_blocking":
+            raise ReviewPolicyError("accepted_risk must be non_blocking")
         if disposition.decision_requirement != "none":
             raise ReviewPolicyError("accepted_risk cannot bypass a specification or user decision")
 
@@ -464,6 +472,8 @@ def validate_disposition(
         allowed = {"defer_follow_up", "discard"}
         if scope_change_authorized:
             allowed.add("fix_now")
+        if accepted_risk_authorized:
+            allowed.add("accepted_risk")
         if disposition.disposition not in allowed:
             raise ReviewPolicyError(
                 "confirmed outside-release findings may only be deferred or discarded"

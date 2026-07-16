@@ -100,6 +100,42 @@
         "generated_at": {"type": "string", "minLength": 1}
       },
       "additionalProperties": true
+    },
+    "acceptedRiskAuthorization": {
+      "type": "object",
+      "required": [
+        "decision_id",
+        "status",
+        "finding_fingerprint",
+        "target_sha",
+        "authorized_by",
+        "risk",
+        "reason"
+      ],
+      "properties": {
+        "decision_id": {"type": "string", "pattern": "^D[0-9]{3}$"},
+        "status": {"const": "accepted"},
+        "finding_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "target_sha": {"type": "string", "minLength": 1},
+        "authorized_by": {"type": "string", "minLength": 1},
+        "risk": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "expires_at": {"type": "string"},
+        "reconsider_condition": {"type": "string"}
+      },
+      "anyOf": [
+        {
+          "required": ["expires_at"],
+          "properties": {"expires_at": {"type": "string", "minLength": 1}}
+        },
+        {
+          "required": ["reconsider_condition"],
+          "properties": {
+            "reconsider_condition": {"type": "string", "minLength": 1}
+          }
+        }
+      ],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -286,6 +322,10 @@
         "report": {"type": "string"},
         "manifest_complete": {"type": ["boolean", "null"]},
         "verified_actionable_findings": {"type": ["integer", "null"], "minimum": 0},
+        "accepted_risk_authorizations": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/acceptedRiskAuthorization"}
+        },
         "attempt_history": {"type": "array", "items": {"type": "object"}}
       },
       "additionalProperties": true
@@ -454,7 +494,11 @@
     },
     "gaps": {"type": "object"},
     "advice": {"type": "object"},
-    "decisions": {"type": "object"}
+    "decisions": {"type": "object"},
+    "accepted_risk_authorizations": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/acceptedRiskAuthorization"}
+    }
   },
   "additionalProperties": true
 }
