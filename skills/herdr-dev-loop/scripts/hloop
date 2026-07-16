@@ -7921,6 +7921,30 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             continue
         schemas[path.name] = data
 
+    # 0.5.2 publishes the manual-final PLAN/MANIFEST entry points beside the
+    # runtime review schemas.  Keep the public wrappers lightweight while
+    # checking that they resolve to the canonical reference schemas; older
+    # installed copies are allowed to retain their historical layout.
+    if version_text.startswith("0.5.2"):
+        runtime_schema_dir = skill_root / "schemas"
+        for name in (
+            "final-review-plan.schema.json",
+            "final-review-manifest.schema.json",
+        ):
+            path = runtime_schema_dir / name
+            if not path.is_file():
+                errors.append(f"schemas/{name} is missing from the 0.5.2 publication")
+                continue
+            try:
+                runtime_schema = json.loads(read_text(path))
+            except json.JSONDecodeError as exc:
+                errors.append(f"schemas/{name} is invalid JSON: {exc}")
+                continue
+            check(
+                runtime_schema.get("$ref", "").startswith("../references/schemas/final-review-"),
+                f"schemas/{name} does not point to the canonical final-review schema",
+            )
+
     state_schema = schemas.get("state.schema.json", {})
     contract_fields = contract_required_state_fields(
         read_text(skill_root / "references" / "artifact-contract.md")

@@ -57,6 +57,35 @@ Each finding must include:
 
 Prefer no finding over weak or speculative findings.
 
+## 0.5.2 Convergence contract
+
+For new loops, Reviewer runs are scheduled at a closed batch boundary or when
+the Manager explicitly prepares a fixed-target convergence plan. The plan
+pins `base_sha`, `target_sha`, the release-scope snapshot, the selected lanes,
+and the verification policy. Every lane, finding, and verification record
+must target that same SHA; a stale target or incomplete manifest keeps the
+convergence gate open.
+
+The Reviewer reports evidence. The Manager owns the seven finding axes
+(`fact_status`, `origin`, `contract_relation`, `decision_requirement`,
+`severity`, `disposition`, and `release_effect`) and decides whether a
+confirmed finding is fixed now, disabled, marked experimental, sent to a
+user decision, accepted as risk, discarded, or recorded as a non-blocking
+follow-up. A Reviewer must not create a Worker task from a candidate merely
+because it found the candidate. `hloop follow-up add` is the first-class path
+for deferred work and deduplicates using the stable semantic issue key.
+
+Convergence is bounded to two automatic fix rounds for new loops. After the
+manifest is complete and the verified actionable finding count reaches zero,
+the Manager prepares a separate manual-final review. Manual final is a fresh
+certification of the fixed target, not another ordinary Reviewer run: its
+PLAN, MANIFEST, report, lane completion, independent verification, shortfalls,
+scope snapshot, and recomputed zero-actionable count must all pass. A new task,
+scope amendment, target drift, or failed/incomplete certification invalidates
+the corresponding evidence. Recovery must use atomic `hloop review reopen`
+with explicit user-input provenance; do not reset state or reuse an old
+manifest by hand.
+
 ## Review Scope
 
 Default review mode is branch-style diff plus loop artifacts:

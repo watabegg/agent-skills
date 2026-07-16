@@ -1,5 +1,8 @@
 # herdr-dev-loop 0.5.2 configuration example.
 # Copy to one of the locations shown by `hloop config path --json`.
+# New loops use batch review cadence and complete-zero manual-final
+# certification by default. Legacy loops retain their stored cadence after
+# migration.
 version = 1
 
 [defaults]

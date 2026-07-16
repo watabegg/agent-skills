@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Manual Final Review Plan",
+  "$ref": "../references/schemas/final-review-plan.schema.json"
+}
