@@ -150,6 +150,13 @@ DEFAULT_REVIEW_LANES = [
     "risk",
     "validation-qa",
 ]
+SPECIAL_VERIFICATION_DOMAINS = (
+    "migration",
+    "schema",
+    "public-docs",
+    "security-boundary",
+)
+SPECIAL_VERIFICATION_STATUSES = {"passed", "verified", "failed", "blocked"}
 BRANCH_STRATEGIES = {"integration", "pr-per-task", "custom"}
 QA_PROFILES = {"repo-default", "local", "staging", "preview", "none", "custom"}
 WORKER_VALIDATION_RESULTS = frozenset({"passed", "failed", "blocked"})
@@ -1573,6 +1580,8 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
         return getattr(args, "outcome_command", "") == "blocked"
     if command == "completion":
         return True
+    if command == "verification":
+        return getattr(args, "verification_command", "") == "record"
     if command in {"init", "migrate", "merge", "validate", "validation", "qa", "tick", "pump", "report", "checkpoint", "pause", "resume", "finish", "final-gates", "cleanup"}:
         return True
     if command == "release-scope":
@@ -5911,6 +5920,58 @@ def all_tasks_merged(state: dict[str, Any]) -> bool:
     return bool(tasks) and all(task.get("status") == "merged" for task in tasks.values())
 
 
+def latest_closed_batch_id(state: Mapping[str, Any]) -> str:
+    """Return the most recently closed batch, using its durable timestamp."""
+
+    batches = state.get("batches")
+    if not isinstance(batches, Mapping):
+        return ""
+    candidates: list[tuple[str, str]] = []
+    for raw_batch_id, batch in batches.items():
+        if not isinstance(batch, Mapping) or str(batch.get("status") or "") != "closed":
+            continue
+        batch_id = str(raw_batch_id)
+        timestamp = str(
+            batch.get("closed_at")
+            or batch.get("started_at")
+            or batch.get("created_at")
+            or ""
+        )
+        candidates.append((timestamp, batch_id))
+    return max(candidates)[1] if candidates else ""
+
+
+def closed_batch_tasks_merged(state: dict[str, Any]) -> bool:
+    """Check only the latest closed batch for normal batch-cadence review."""
+
+    batches = state.get("batches")
+    if not isinstance(batches, Mapping) or not batches:
+        # Preserve the shape of migrated/hand-built states that have no batch
+        # inventory while retaining their existing all-task behavior.
+        return all_tasks_merged(state)
+    batch_id = latest_closed_batch_id(state)
+    if not batch_id:
+        return False
+    try:
+        task_ids = batch_task_ids(state, batch_id)
+    except HLoopError:
+        return False
+    if not task_ids:
+        # A batch created before task attachment may have an empty persisted
+        # task_ids list. Fall back to the legacy all-task invariant in that
+        # shape; queued tasks still keep it closed because all_tasks_merged
+        # remains false.
+        return all_tasks_merged(state)
+    tasks = state.get("tasks")
+    if not isinstance(tasks, Mapping):
+        return False
+    return all(
+        isinstance(tasks.get(task_id), Mapping)
+        and tasks[task_id].get("status") == "merged"
+        for task_id in task_ids
+    )
+
+
 def last_validation_passed(state: dict[str, Any]) -> bool:
     results = state.get("last_validation", {}).get("results", [])
     target = str(state.get("completion_target_sha") or state.get("integration_head_sha") or "")
@@ -6361,6 +6422,10 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
     """Collect all fail-closed prerequisites for a fixed-target review."""
 
     errors: list[str] = []
+    review_policy = review_policy_record(state)
+    batch_cadence = review_policy.get("cadence") == "batch" and isinstance(
+        state.get("review_policy"), dict
+    )
     target = current_integration_target(repo, state)
     base_ref = str(state.get("base_branch") or "")
     base_sha = ""
@@ -6380,7 +6445,10 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
         for batch in (state.get("batches") or {}).values()
     ):
         errors.append("an unclosed batch remains")
-    if not all_tasks_merged(state):
+    if batch_cadence:
+        if not closed_batch_tasks_merged(state):
+            errors.append("latest closed batch tasks must be merged before review readiness")
+    elif not all_tasks_merged(state):
         errors.append("all tasks must be merged before review readiness")
     running = running_agent_ids(state)
     if running:
@@ -6444,6 +6512,7 @@ def _review_readiness_snapshot(repo: Path, state: dict[str, Any]) -> dict[str, A
         "base_sha": base_sha,
         "current_batch_closed": not current_batch_id(state),
         "all_tasks_merged": all_tasks_merged(state),
+        "review_batch_tasks_merged": closed_batch_tasks_merged(state) if batch_cadence else None,
         "running_roles": running,
         "dirty_paths": dirty,
         "validation_current": bool(target and _review_validation_is_current(state, target)),
@@ -7928,7 +7997,9 @@ def should_open_review_gate(state: dict[str, Any]) -> bool:
     if state.get("needs_review") or pending_review_exists(state):
         return False
     if policy.get("cadence") == "batch" and isinstance(state.get("review_policy"), dict):
-        if current_batch_id(state) or not all_tasks_merged(state):
+        if current_batch_id(state) or not closed_batch_tasks_merged(state):
+            return False
+        if not last_validation_passed(state):
             return False
         count = normalize_int(state.get("unreviewed_merge_count"), 0)
         return count > 0 and not final_strict_gate_armed(state)
@@ -8574,26 +8645,41 @@ def resolved_reviewer_topology(
 
     Explicit CLI values always win. Anything left unset falls back to
     ``resolved_config.reviewer`` (the full hierarchical config precedence
-    chain already applied by ``config apply``), then to legacy STATE fields,
-    then to built-in defaults -- so a configured swarm/dual/probe-count
-    topology is never silently narrowed by an unrelated CLI default.
+    chain already applied by ``config apply``), with the new
+    ``resolved_config.review.lane_count`` taking precedence over legacy swarm
+    probe knobs. The legacy reviewer probe fields remain a compatibility
+    fallback when lane_count is ``auto`` or absent.
     """
 
-    reviewer_config = state.get("resolved_config", {}).get("reviewer", {})
+    resolved_config = state.get("resolved_config", {})
+    if not isinstance(resolved_config, dict):
+        resolved_config = {}
+    reviewer_config = resolved_config.get("reviewer", {})
     if not isinstance(reviewer_config, dict):
         reviewer_config = {}
     resolved_mode = mode or reviewer_config.get("mode") or state.get("review_mode") or "single"
     if resolved_mode not in hloop_review.REVIEW_MODES:
         raise HLoopError(f"unsupported review mode: {resolved_mode}")
     resolved_providers = list(providers) if providers else reviewer_config.get("providers")
-    resolved_probe_count = (
-        probe_count if probe_count is not None else reviewer_config.get("probe_count")
-    )
-    resolved_probes_per_provider = (
-        probes_per_provider
-        if probes_per_provider is not None
-        else reviewer_config.get("probes_per_provider")
-    )
+    resolved_probe_count = probe_count
+    resolved_probes_per_provider = probes_per_provider
+    if resolved_probe_count is None and resolved_probes_per_provider is None:
+        review_config = resolved_config.get("review", {})
+        if not isinstance(review_config, dict):
+            review_config = {}
+        lane_count = review_config.get("lane_count")
+        if lane_count is None:
+            policy = state.get("review_policy", {})
+            if isinstance(policy, dict):
+                lane_count = policy.get("lane_count")
+        if resolved_mode in hloop_review.SWARM_MODES and lane_count not in (None, "auto"):
+            resolved_probe_count = lane_count
+        else:
+            # Keep pre-0.5.2 reviewer topology fields working for migrated
+            # states while allowing review.py to choose its default when no
+            # explicit legacy count exists.
+            resolved_probe_count = reviewer_config.get("probe_count")
+            resolved_probes_per_provider = reviewer_config.get("probes_per_provider")
     if resolved_probe_count is not None and resolved_probes_per_provider is not None:
         raise HLoopError("set only one of --probe-count or --probes-per-provider")
     return {
@@ -17563,6 +17649,83 @@ def cmd_validation_configure(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verification_record(args: argparse.Namespace) -> int:
+    """Record current-head evidence for one special verification domain."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    domain = str(args.domain or "").strip()
+    if domain not in SPECIAL_VERIFICATION_DOMAINS:
+        raise HLoopError(
+            "unsupported special verification domain: "
+            + (domain or "<empty>")
+            + "; expected one of: "
+            + ", ".join(SPECIAL_VERIFICATION_DOMAINS)
+        )
+    status = str(args.status or "").strip().lower()
+    if status not in SPECIAL_VERIFICATION_STATUSES:
+        raise HLoopError(
+            "unsupported special verification status: "
+            + (status or "<empty>")
+            + "; expected one of: "
+            + ", ".join(sorted(SPECIAL_VERIFICATION_STATUSES))
+        )
+    references = [
+        reference
+        for reference in (str(item).strip() for item in normalize_list(args.evidence_ref))
+        if reference
+    ]
+    if not references:
+        raise HLoopError(
+            "special verification evidence requires at least one --evidence-ref"
+        )
+    target = current_integration_target(repo, state)
+    if not target:
+        raise HLoopError("integration branch cannot be resolved for special verification")
+    requested_target = str(args.target_sha or target).strip()
+    if requested_target != target:
+        raise HLoopError(
+            "special verification target SHA is stale: "
+            f"recorded={requested_target or '<empty>'} current={target}"
+        )
+
+    evidence: dict[str, Any] = {}
+    for source in (
+        state.get("verification_evidence"),
+        state.get("special_verification_evidence"),
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for known_domain in SPECIAL_VERIFICATION_DOMAINS:
+            if known_domain in source:
+                evidence[known_domain] = source[known_domain]
+    evidence[domain] = {
+        "target_sha": target,
+        "status": status,
+        "references": references,
+        "recorded_at": now_iso(),
+    }
+    state["special_verification_evidence"] = evidence
+    save_state(repo, state)
+    journal(
+        repo,
+        "Recorded special verification evidence "
+        f"for `{domain}` at `{target}` ({status}): {references}",
+    )
+    payload = {
+        "domain": domain,
+        "status": status,
+        "target_sha": target,
+        "references": references,
+        "recorded": True,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"recorded special verification: {domain} ({status}) at {target}")
+    return 0
+
+
 def cmd_reviewer_start(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
@@ -23950,6 +24113,39 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--no-cleanup", action="store_true")
     validate.add_argument("--dry-run", action="store_true")
     validate.set_defaults(func=cmd_validate)
+
+    verification = sub.add_parser(
+        "verification", help="record current-head special verification evidence"
+    )
+    verification_sub = verification.add_subparsers(
+        dest="verification_command", required=True
+    )
+    verification_record = verification_sub.add_parser(
+        "record", help="record evidence for one changed-file verification domain"
+    )
+    verification_record.add_argument(
+        "--domain", choices=list(SPECIAL_VERIFICATION_DOMAINS), required=True
+    )
+    verification_record.add_argument(
+        "--status",
+        choices=sorted(SPECIAL_VERIFICATION_STATUSES),
+        required=True,
+    )
+    verification_record.add_argument(
+        "--evidence-ref",
+        "--evidence",
+        dest="evidence_ref",
+        action="append",
+        help="non-empty evidence reference; repeat for multiple references",
+    )
+    verification_record.add_argument(
+        "--target-sha",
+        "--head-sha",
+        dest="target_sha",
+        help="integration SHA; defaults to the current integration head",
+    )
+    verification_record.add_argument("--json", action="store_true")
+    verification_record.set_defaults(func=cmd_verification_record)
 
     validation = sub.add_parser("validation", help="configure integration validation")
     validation_sub = validation.add_subparsers(dest="validation_command_name", required=True)
