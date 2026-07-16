@@ -37,6 +37,7 @@ CERTIFICATION_STATUSES = frozenset({"passed", "incomplete", "failed"})
 PATCH_VERDICTS = frozenset({"passed", "failed", "incomplete"})
 REOPENABLE_PHASES = frozenset(
     {
+        "review_convergence",
         "review_convergence_exhausted",
         "manual_final_review_failed",
         "manual_final_review_incomplete",
@@ -1266,6 +1267,12 @@ def reopen_review(
         if action in {"remediate", "disable-feature", "mark-experimental"}:
             previous_fix_round = int(convergence.get("fix_round") or 0)
             convergence["fix_round"] = previous_fix_round + 1
+            # A remediation reopen starts a new canonical round.  Clear the
+            # previous round's audit echo and manifest identity so prepare
+            # must create a fresh artifact for the advanced counter.
+            convergence.pop("recorded_round", None)
+            convergence.pop("recorded_manifest_digest", None)
+            convergence.pop("recorded_status", None)
             existing_extra_rounds = int(
                 convergence.get("authorized_extra_rounds") or 0
             )

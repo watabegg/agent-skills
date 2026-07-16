@@ -176,7 +176,15 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def write_policy_manifest(self, *, outside_release: bool) -> None:
+    def write_policy_manifest(
+        self,
+        *,
+        outside_release: bool,
+        severity: str = "P2",
+        product_impact: str = "the policy impact",
+        disposition: str | None = None,
+        release_effect: str | None = None,
+    ) -> None:
         loop = self.state_path.parent
         plan = json.loads(
             (loop / "reviews" / "convergence" / "PLAN.json").read_text(encoding="utf-8")
@@ -187,21 +195,21 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             provider="codex",
             head_sha=plan["target_sha"],
             discovering_agent="codex-reviewer",
-            severity="P2",
+            severity=severity,
             confidence=0.95,
             title="axis-derived finding",
             file_path="src/example.py",
             line=1,
             symbol="run",
             trigger="the policy trigger",
-            product_impact="the policy impact",
+            product_impact=product_impact,
             origin="unrelated-pre-existing" if outside_release else "introduced",
             proposed_fix="repair the policy path",
             fact_status="confirmed",
             contract_relation="outside_release" if outside_release else "in_scope",
             decision_requirement="none",
-            disposition="defer_follow_up" if outside_release else "fix_now",
-            release_effect="non_blocking" if outside_release else "blocking",
+            disposition=disposition or ("defer_follow_up" if outside_release else "fix_now"),
+            release_effect=release_effect or ("non_blocking" if outside_release else "blocking"),
         )
         finding = hloop_review.normalize_findings((candidate,))[0]
         verification_plan = hloop_review.plan_verification(group, (finding,))
@@ -212,7 +220,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
                 ignore_status="must_not_ignore",
                 decision_status="none",
                 progress_without_decision="yes",
-                severity="P2",
+                severity=severity,
                 # Deliberately disagree with the old recommendation.  New
                 # runtime records must use the disposition axes instead.
                 recommended_action="fix_task",
@@ -399,73 +407,171 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
 
     def test_convergence_record_exhausts_at_two_fix_rounds(self):
         self.prepare_convergence()
-        loop = self.state_path.parent
-        plan = json.loads((loop / "reviews" / "convergence" / "PLAN.json").read_text(encoding="utf-8"))
-        group = hloop_review.ReviewGroupPlan.from_record(plan["review_plan"])
-        candidate = FindingCandidate(
-            finding_id="F001",
-            provider="codex",
-            head_sha=plan["target_sha"],
-            discovering_agent="codex-reviewer",
-            severity="P1",
-            confidence=0.95,
-            title="A confirmed regression",
-            file_path="src/example.py",
-            line=1,
-            symbol="run",
-            trigger="the regression trigger",
-            product_impact="the release path fails",
-            origin="introduced",
-            proposed_fix="repair the release path",
+        self.write_policy_manifest(outside_release=False)
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--fix-round", "0", "--json"
         )
-        finding = hloop_review.normalize_findings((candidate,))[0]
-        verification_plan = hloop_review.plan_verification(group, (finding,))
-        verifications = tuple(
-            hloop_review.VerificationRecord.from_assignment(
-                assignment,
-                fact_status="confirmed",
-                ignore_status="must_not_ignore",
-                decision_status="none",
-                progress_without_decision="yes",
-                severity="P1",
-                recommended_action="fix_task",
-            )
-            for assignment in verification_plan.assignments
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(json.loads(out)["status"], "pending")
+        self.assertEqual(self.state()["review_convergence"]["fix_round"], 0)
+        manifest_path = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        manifest_before_retry = manifest_path.read_bytes()
+        self.prepare_convergence()
+        self.assertEqual(manifest_path.read_bytes(), manifest_before_retry)
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--json"
         )
-        manifest = hloop_review.ReviewManifest(
-            review_id="R001",
-            plan=group,
-            lane_results=tuple(
-                lane.result(
-                    finding_count=sum(
-                        1
-                        for item in (finding.candidates if finding else ())
-                        if item.discovering_agent == lane.agent_label
-                    )
-                )
-                for lane in group.expected_lanes
-            ),
-            findings=(finding,),
-            verification_plan=verification_plan,
-            verifications=verifications,
-        )
-        (loop / "reviews" / "convergence" / "MANIFEST.json").write_text(
-            json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8"
-        )
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(json.loads(out)["status"], "pending")
+
         code, out, err = self.run_cli(
             "review",
-            "convergence",
-            "record",
-            "--fix-round",
-            "2",
+            "reopen",
+            "--action",
+            "remediate",
+            "--user-input-id",
+            "U0001",
             "--json",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertTrue(json.loads(out)["accepted"])
+
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=False)
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--fix-round", "1", "--json"
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(json.loads(out)["status"], "pending")
+
+        code, out, err = self.run_cli(
+            "review",
+            "reopen",
+            "--action",
+            "remediate",
+            "--user-input-id",
+            "U0002",
+            "--json",
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertTrue(json.loads(out)["accepted"])
+
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=False)
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--fix-round", "2", "--json"
         )
         self.assertEqual(code, 2)
         self.assertEqual(err, "")
         self.assertEqual(json.loads(out)["status"], "exhausted")
         state = self.state()
+        self.assertEqual(state["review_convergence"]["fix_round"], 2)
         self.assertEqual(state["phase"], "review_convergence_exhausted")
         self.assertEqual(state["dispatch_freeze"]["status"], "active")
+
+    def test_convergence_record_rejects_round_injection_without_mutation(self):
+        self.prepare_convergence()
+        before = self.state()
+        code, out, err = self.run_cli(
+            "review",
+            "convergence",
+            "record",
+            "--fix-round",
+            "1",
+            "--json",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("canonical fix_round", err)
+        self.assertEqual(before, self.state())
+
+    def test_fresh_convergence_rejects_legacy_axes_before_state_mutation(self):
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=False)
+        manifest_path = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_fields = {
+            "fact_status",
+            "contract_relation",
+            "decision_requirement",
+            "disposition",
+            "release_effect",
+            "policy_axes_explicit",
+        }
+        for finding in record["findings"]:
+            for field_name in legacy_fields:
+                finding.pop(field_name, None)
+            for candidate in finding["candidates"]:
+                for field_name in legacy_fields:
+                    candidate.pop(field_name, None)
+        manifest_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+        before = self.state()
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--json"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("explicit policy axes", err)
+        self.assertEqual(before, self.state())
+
+        legacy_state = self.state()
+        legacy_state["release_scope"] = {
+            "status": "legacy-unlocked",
+            "source_refs": [],
+            "source_digests": {},
+            "scope_revision": 0,
+            "source_snapshot_revision": 0,
+            "amendment_refs": [],
+        }
+        self.save_state(legacy_state)
+        code, out, err = self.run_cli(
+            "review", "convergence", "record", "--json"
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "pending")
+        self.assertEqual(payload["verified_actionable_findings"], 1)
+
+    def test_explicit_policy_combinations_are_rejected_before_state_mutation(self):
+        cases = (
+            {
+                "outside_release": False,
+                "disposition": "discard",
+                "release_effect": "non_blocking",
+            },
+            {
+                "outside_release": True,
+                "disposition": "accepted_risk",
+                "release_effect": "non_blocking",
+            },
+            {
+                "outside_release": True,
+                "severity": "P1",
+                "product_impact": "the path can cause data loss",
+                "disposition": "defer_follow_up",
+                "release_effect": "non_blocking",
+            },
+            {
+                "outside_release": True,
+                "disposition": "user_decision",
+                "release_effect": "blocking",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.prepare_convergence()
+                self.write_policy_manifest(**case)
+                before = self.state()
+                code, out, err = self.run_cli(
+                    "review", "convergence", "record", "--json"
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("disposition policy", err)
+                self.assertEqual(before, self.state())
+                manifest_path = self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+                manifest_path.unlink()
 
     def test_reopen_rejects_exhausted_round_without_authorization_atomically(self):
         state = self.state()

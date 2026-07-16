@@ -5921,6 +5921,15 @@ def review_max_fix_rounds(state: dict[str, Any], convergence: Mapping[str, Any] 
     return max(base + authorized + consumed, current if consumed else base)
 
 
+def _canonical_review_fix_round(convergence: Mapping[str, Any]) -> int:
+    """Read the one durable convergence round counter without coercion."""
+
+    value = convergence.get("fix_round")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HLoopError("review convergence fix_round must be a non-negative integer")
+    return value
+
+
 def manual_final_review_required(state: dict[str, Any]) -> bool:
     manual = state.get("manual_final_review")
     if not isinstance(manual, dict) and not isinstance(state.get("review_policy"), dict):
@@ -5985,6 +5994,10 @@ def invalidate_review_gates_for_change(
             "invalidated_reason": reason,
         }
     )
+    # A changed integration target invalidates the prior manifest identity;
+    # retain the monotonic canonical round but require a new target manifest.
+    for field_name in ("recorded_round", "recorded_manifest_digest", "recorded_status"):
+        convergence.pop(field_name, None)
     manual = state.setdefault("manual_final_review", {})
     if not isinstance(manual, dict):
         manual = {}
@@ -6362,14 +6375,52 @@ def _review_manifest_from_path(path: Path) -> hloop_review.ReviewManifest:
 
 def _review_manifest_policy_counts(
     manifest: hloop_review.ReviewManifest,
+    *,
+    allow_legacy: bool = False,
 ) -> tuple[int, int]:
     """Count verified findings from the Manager's policy axes.
 
     A pre-0.5.2 manifest has no policy axes.  Its recommendation fields are
-    retained as an explicit compatibility fallback; every new manifest takes
-    the axis path and therefore cannot turn an outside-release follow-up into
-    fix-now work merely because a verifier suggested a task.
+    retained as an explicit compatibility fallback only for a migrated legacy
+    scope; every fresh manifest takes the axis path and therefore cannot turn
+    an outside-release follow-up into fix-now work merely because a verifier
+    suggested a task.
     """
+
+    def validate_finding_policy(finding: hloop_review.NormalizedFinding) -> None:
+        try:
+            disposition = hloop_review_policy.FindingDisposition(
+                fact_status=finding.fact_status,
+                origin=finding.origin,
+                contract_relation=finding.contract_relation,
+                decision_requirement=finding.decision_requirement,
+                severity=finding.severity,
+                disposition=finding.disposition,
+                release_effect=finding.release_effect,
+                finding_id=finding.fingerprint,
+                fingerprint=finding.fingerprint,
+                target_sha=finding.head_sha,
+                requirement_refs=finding.requirement_refs,
+                why_fix_now=finding.why_fix_now,
+            )
+            safety_critical = any(
+                hloop_review_policy.is_safety_critical_finding(
+                    severity=candidate.severity,
+                    title=candidate.title,
+                    trigger=candidate.trigger,
+                    product_impact=candidate.product_impact,
+                    proposed_fix=candidate.proposed_fix,
+                )
+                for candidate in finding.candidates
+            )
+            hloop_review_policy.validate_disposition(
+                disposition,
+                safety_critical=safety_critical,
+            )
+        except hloop_review_policy.ReviewPolicyError as exc:
+            raise HLoopError(
+                f"review finding {finding.fingerprint} violates disposition policy: {exc}"
+            ) from exc
 
     incomplete = set(manifest.completeness.incomplete_findings)
     by_fingerprint: dict[str, list[Any]] = {}
@@ -6378,6 +6429,16 @@ def _review_manifest_policy_counts(
     actionable: set[str] = set()
     release_blocking: set[str] = set()
     for finding in manifest.findings:
+        if not finding.policy_axes_explicit:
+            if not allow_legacy:
+                raise HLoopError(
+                    "fresh 0.5.2 convergence requires explicit policy axes for "
+                    f"finding {finding.fingerprint}"
+                )
+        else:
+            # Validate all explicit findings, including incomplete ones, before
+            # any convergence state is eligible for mutation.
+            validate_finding_policy(finding)
         if finding.fingerprint in incomplete:
             continue
         records = by_fingerprint.get(finding.fingerprint, [])
@@ -6825,6 +6886,7 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
         raise HLoopError("STATE.json review_convergence must be an object")
     if str(convergence.get("status") or "") == "exhausted":
         raise HLoopError("review convergence is exhausted; use `hloop review reopen` first")
+    current_round = _canonical_review_fix_round(convergence)
     target = snapshot["target_sha"]
     group = _review_plan_for_target(
         state,
@@ -6842,31 +6904,55 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
         "base_sha": snapshot["base_sha"],
         "target_ref": str(state.get("integration_branch") or ""),
         "target_sha": target,
-        "fix_round": normalize_int(convergence.get("fix_round"), 0),
+        "fix_round": current_round,
         "max_fix_rounds": review_max_fix_rounds(state, convergence),
         "review_plan": group.to_record(),
         "readiness": snapshot["checks"],
         "prepared_at": now_iso(),
     }
     if not args.dry_run:
+        # Once a round has been recorded, preserve its manifest when prepare
+        # is retried.  Replacing an actionable manifest with the empty
+        # scaffold here would silently bypass remediation at the same round.
+        recorded_digest = str(convergence.get("recorded_manifest_digest") or "")
+        recorded_round = convergence.get("recorded_round")
+        preserve_manifest = False
+        if recorded_digest:
+            if isinstance(recorded_round, bool) or not isinstance(recorded_round, int):
+                raise HLoopError("recorded convergence round must be a non-negative integer")
+            if recorded_round != current_round:
+                raise HLoopError(
+                    "recorded convergence round does not match canonical fix_round"
+                )
+            if not manifest_path.is_file():
+                raise HLoopError(
+                    "recorded convergence manifest is missing; cannot safely prepare the same round"
+                )
+            existing_manifest = _review_manifest_from_path(manifest_path)
+            if existing_manifest.plan.to_record() != group.to_record():
+                raise HLoopError("recorded convergence manifest does not match the current plan")
+            preserve_manifest = True
         _write_json_artifact(plan_path, plan_record)
-        # A missing-lane manifest is intentionally incomplete.  It gives the
-        # Manager a safe structured starting point and cannot pass by claim.
-        empty_manifest = hloop_review.ReviewManifest(
-            review_id="R001",
-            plan=group,
-            lane_results=(),
-            findings=(),
-            verification_plan=hloop_review.plan_verification(group, ()),
-            verifications=(),
-        )
-        _write_json_artifact(manifest_path, empty_manifest.to_record())
+        if not preserve_manifest:
+            # A missing-lane manifest is intentionally incomplete.  It gives
+            # the Manager a safe structured starting point and cannot pass by
+            # claim.
+            empty_manifest = hloop_review.ReviewManifest(
+                review_id="R001",
+                plan=group,
+                lane_results=(),
+                findings=(),
+                verification_plan=hloop_review.plan_verification(group, ()),
+                verifications=(),
+            )
+            _write_json_artifact(manifest_path, empty_manifest.to_record())
         convergence.update(
             {
                 "status": "prepared",
                 "base_ref": str(state.get("base_branch") or ""),
                 "base_sha": snapshot["base_sha"],
                 "target_sha": target,
+                "fix_round": current_round,
                 "review_plan": group.to_record(),
                 "artifact_refs": [str(plan_path.relative_to(repo)), str(manifest_path.relative_to(repo))],
                 "prepared_at": now_iso(),
@@ -6904,8 +6990,9 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     convergence = state.get("review_convergence")
-    if not isinstance(convergence, dict) or convergence.get("status") != "prepared":
-        raise HLoopError("review convergence must be prepared before record")
+    if not isinstance(convergence, dict):
+        raise HLoopError("STATE.json review_convergence must be an object")
+    current_round = _canonical_review_fix_round(convergence)
     target = str(convergence.get("target_sha") or "")
     current = current_integration_target(repo, state)
     if not target or not current or target != current:
@@ -6922,22 +7009,83 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
     expected_plan = convergence.get("review_plan")
     if isinstance(expected_plan, dict) and manifest.plan.to_record() != expected_plan:
         raise HLoopError("review convergence manifest does not match the prepared plan")
+
+    plan_path = loop_path(repo) / "reviews" / "convergence" / "PLAN.json"
+    try:
+        prepared_plan = json.loads(read_text(plan_path))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HLoopError(f"invalid prepared convergence plan {plan_path}: {exc}") from exc
+    prepared_round = prepared_plan.get("fix_round") if isinstance(prepared_plan, dict) else None
+    if isinstance(prepared_round, bool) or not isinstance(prepared_round, int) or prepared_round < 0:
+        raise HLoopError("prepared convergence plan fix_round must be a non-negative integer")
+    if prepared_round != current_round:
+        raise HLoopError(
+            "prepared convergence plan fix_round does not match canonical fix_round"
+        )
+
     completeness = manifest.completeness
-    actionable, release_blocking = _review_manifest_policy_counts(manifest)
+    scope = release_scope_from_state(state)
+    actionable, release_blocking = _review_manifest_policy_counts(
+        manifest,
+        allow_legacy=scope.status == "legacy-unlocked",
+    )
     max_rounds = review_max_fix_rounds(state, convergence)
-    current_round = normalize_int(convergence.get("fix_round"), 0)
+    if current_round > max_rounds:
+        raise HLoopError(
+            f"canonical fix_round {current_round} exceeds max_fix_rounds {max_rounds}"
+        )
     requested_round = getattr(args, "fix_round", None)
     round_number = current_round if requested_round is None else int(requested_round)
-    if round_number < 0 or round_number > max_rounds:
-        raise HLoopError(f"fix round must be between 0 and {max_rounds}")
-    if not args.dry_run:
+    if round_number != current_round:
+        raise HLoopError(
+            f"fix round {round_number} does not match canonical fix_round {current_round}; "
+            "rounds advance only through review reopen"
+        )
+
+    manifest_digest = hloop_certification.canonical_digest(manifest.to_record())
+    recorded_digest = str(convergence.get("recorded_manifest_digest") or "")
+    recorded_round = convergence.get("recorded_round")
+    if recorded_digest:
+        if isinstance(recorded_round, bool) or not isinstance(recorded_round, int) or recorded_round < 0:
+            raise HLoopError("recorded convergence round must be a non-negative integer")
+        if recorded_round != current_round:
+            raise HLoopError(
+                "recorded convergence round does not match canonical fix_round"
+            )
+        recorded_status = str(convergence.get("recorded_status") or "")
+        if recorded_digest != manifest_digest and recorded_status != "incomplete":
+            raise HLoopError(
+                "same-round convergence record must use the previously recorded manifest; "
+                "use review reopen for a new round"
+            )
+
+    status = str(convergence.get("status") or "")
+    idempotent = False
+    if status != "prepared":
+        if status in {"pending", "converged", "exhausted"} and recorded_digest == manifest_digest:
+            idempotent = True
+        else:
+            raise HLoopError("review convergence must be prepared before record")
+
+    final_status = "incomplete"
+    if completeness.complete:
+        final_status = "exhausted" if actionable > 0 and round_number >= max_rounds else (
+            "remediation-required" if actionable > 0 else "converged"
+        )
+
+    if not args.dry_run and not idempotent:
         _update_review_execution_metrics(state, manifest, round_number)
         convergence["artifact_refs"] = [str(manifest_path.relative_to(repo))]
         convergence["verified_actionable_findings"] = actionable
         convergence["release_blocking_findings"] = release_blocking
         convergence["manifest_completeness"] = completeness.to_record()
         convergence["recorded_at"] = now_iso()
+        # ``fix_round`` is the canonical counter.  ``recorded_round`` is only
+        # an audit echo and may never advance it or override it.
+        convergence["fix_round"] = current_round
         convergence["recorded_round"] = round_number
+        convergence["recorded_manifest_digest"] = manifest_digest
+        convergence["recorded_status"] = final_status
         convergence["last_status"] = "complete" if completeness.complete else "incomplete"
         if not completeness.complete:
             convergence["status"] = "pending"
@@ -6962,8 +7110,13 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
             state["phase"] = "awaiting_manual_final_review"
             state["needs_review"] = False
         save_state(repo, state)
+    payload_status = (
+        str(convergence.get("status") or "")
+        if not args.dry_run or idempotent
+        else ("pending" if not completeness.complete or actionable > 0 else "converged")
+    )
     payload = {
-        "status": str(convergence.get("status") or ("pending" if not completeness.complete else "converged")),
+        "status": payload_status,
         "target_sha": target,
         "manifest": str(manifest_path.relative_to(repo)),
         "manifest_complete": completeness.complete,

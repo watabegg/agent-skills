@@ -24,6 +24,7 @@ from hloop_lib.review_policy import (  # noqa: E402
     build_follow_up_issue_key,
     deduplicate_follow_up_keys,
     follow_up_issue_key,
+    is_safety_critical_finding,
     issue_key_components,
     same_follow_up_issue,
     validate_disposition,
@@ -178,6 +179,29 @@ class FindingDispositionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReviewPolicyError, "security or data-loss"):
             validate_disposition(candidate, safety_critical=True)
+
+    def test_safety_critical_finding_detection_is_conservative(self):
+        self.assertTrue(is_safety_critical_finding(severity="P0"))
+        self.assertTrue(
+            is_safety_critical_finding(
+                severity="P1", product_impact="the path can cause data loss"
+            )
+        )
+        self.assertTrue(
+            is_safety_critical_finding(
+                severity="P1", trigger="an authorization bypass is reachable"
+            )
+        )
+        self.assertFalse(
+            is_safety_critical_finding(
+                severity="P1", product_impact="a slow but recoverable response"
+            )
+        )
+        self.assertFalse(
+            is_safety_critical_finding(
+                severity="P2", product_impact="the path can cause data loss"
+            )
+        )
 
 
 class RuntimeFindingAxisTests(unittest.TestCase):
