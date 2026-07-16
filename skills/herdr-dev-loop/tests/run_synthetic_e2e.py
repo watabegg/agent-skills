@@ -1621,6 +1621,7 @@ def _candidate_for_lane(
     title: str,
     origin: str = "introduced",
     contract_relation: str = "in_scope",
+    decision_requirement: str = "none",
     disposition: str = "fix_now",
     release_effect: str = "blocking",
 ) -> FindingCandidate:
@@ -1642,7 +1643,7 @@ def _candidate_for_lane(
         requires_spec_decision=False,
         fact_status="confirmed",
         contract_relation=contract_relation,
-        decision_requirement="none",
+        decision_requirement=decision_requirement,
         disposition=disposition,
         release_effect=release_effect,
     )
@@ -1732,6 +1733,11 @@ def _write_final_manifest(
     finding_spec: tuple[str, str] | None = None,
     timeout_lane: bool = False,
     patch_verdict: str = "passed",
+    disposition: str = "fix_now",
+    release_effect: str = "blocking",
+    origin: str = "introduced",
+    contract_relation: str = "in_scope",
+    decision_requirement: str = "none",
 ) -> FinalReviewManifest:
     loop = state_path(fixture["repo"], fixture["namespace"]).parent
     plan = CertificationPlan.from_record(
@@ -1749,6 +1755,11 @@ def _write_final_manifest(
                 finding_id=finding_id,
                 severity=severity,
                 title="synthetic final certification finding",
+                origin=origin,
+                contract_relation=contract_relation,
+                decision_requirement=decision_requirement,
+                disposition=disposition,
+                release_effect=release_effect,
             ),
         )
     normalized = normalize_findings(candidates)
@@ -2644,6 +2655,45 @@ def scenario_manual_final_retry_same_sha(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def scenario_manual_final_policy_fail_closed(ctx: dict[str, Any]) -> dict[str, Any]:
+    fixture = _new_synthetic_fixture(ctx, "manual-final-policy-fail-closed")
+    plan = _prepare_convergence(fixture)
+    _write_review_manifest(fixture, plan)
+    require(
+        _record_convergence(fixture, 0)["status"] == "converged",
+        "policy fixture did not converge",
+    )
+    _prepare_final_review(fixture)
+    _write_final_manifest(
+        fixture,
+        finding_spec=("F001", "P1"),
+        disposition="defer_follow_up",
+        release_effect="non_blocking",
+    )
+    before = _fixture_state(fixture)
+    rejected = _fixture_cli(
+        fixture,
+        "final-review",
+        "record",
+        "--json",
+        expected=2,
+    )
+    require(rejected.stdout == "", "unsafe final policy produced a success payload")
+    require(
+        "disposition policy" in rejected.stderr,
+        "unsafe final policy rejection did not identify disposition policy",
+    )
+    require(
+        _fixture_state(fixture) == before,
+        "unsafe final policy mutated manual-final state",
+    )
+    return {
+        "rejected": True,
+        "state_unchanged": True,
+        "policy": "confirmed introduced in_scope P1 defer_follow_up",
+    }
+
+
 def scenario_manual_final_user_authorized_reopen(ctx: dict[str, Any]) -> dict[str, Any]:
     fixture = _new_synthetic_fixture(ctx, "manual-final-authorized-reopen")
     plan = _prepare_convergence(fixture)
@@ -2948,6 +2998,7 @@ SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = 
     ("two-round-exhaustion", scenario_two_round_exhaustion),
     ("user-stop-freeze", scenario_user_stop_freeze),
     ("manual-final-retry-same-sha", scenario_manual_final_retry_same_sha),
+    ("manual-final-policy-fail-closed", scenario_manual_final_policy_fail_closed),
     ("manual-final-authorized-reopen", scenario_manual_final_user_authorized_reopen),
     ("dual-review-and-budget", scenario_review_budget),
     ("final-gate-and-finish", scenario_finish),

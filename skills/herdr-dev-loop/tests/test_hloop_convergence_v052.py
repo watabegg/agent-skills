@@ -285,6 +285,120 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8"
         )
 
+    def write_final_policy_manifest(
+        self,
+        *,
+        disposition: str = "fix_now",
+        release_effect: str = "blocking",
+        severity: str = "P2",
+        decision_requirement: str = "none",
+        origin: str = "introduced",
+        contract_relation: str = "in_scope",
+        legacy: bool = False,
+    ) -> None:
+        self.prepare_convergence()
+        self.complete_convergence_manifest()
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        code, out, err = self.run_cli("final-review", "prepare", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+
+        loop = self.state_path.parent
+        plan = CertificationPlan.from_record(
+            json.loads((loop / "reviews" / "final" / "PLAN.json").read_text(encoding="utf-8"))
+        )
+        group = hloop_review.ReviewGroupPlan.from_record(
+            json.loads((loop / "reviews" / "final" / "MANIFEST.json").read_text(encoding="utf-8"))
+        )
+        finding_candidate = FindingCandidate(
+            finding_id="FND-001",
+            provider="codex",
+            head_sha=plan.target_sha,
+            discovering_agent="codex-reviewer",
+            severity=severity,
+            confidence=0.95,
+            title="manual final policy finding",
+            file_path="src/final.py",
+            line=1,
+            symbol="manual_final",
+            trigger="the final policy path is exercised",
+            product_impact="the final policy gate must classify this finding",
+            origin=origin,
+            proposed_fix="repair the final policy path",
+            fact_status="confirmed",
+            contract_relation=contract_relation,
+            decision_requirement=decision_requirement,
+            disposition=disposition,
+            release_effect=release_effect,
+        )
+        finding = hloop_review.normalize_findings((finding_candidate,))[0]
+        verification_plan = hloop_review.plan_verification(group, (finding,))
+        verifications = tuple(
+            hloop_review.VerificationRecord.from_assignment(
+                assignment,
+                fact_status="confirmed",
+                ignore_status="may_defer" if legacy else "must_not_ignore",
+                decision_status="none",
+                progress_without_decision="yes",
+                severity=severity,
+                recommended_action="discard" if legacy else "fix_task",
+            )
+            for assignment in verification_plan.assignments
+        )
+        review_manifest = hloop_review.ReviewManifest(
+            review_id="R001",
+            plan=group,
+            lane_results=tuple(
+                lane.result(
+                    finding_count=sum(
+                        1
+                        for item in finding.candidates
+                        if item.discovering_agent == lane.agent_label
+                    )
+                )
+                for lane in group.expected_lanes
+            ),
+            findings=(finding,),
+            verification_plan=verification_plan,
+            verifications=verifications,
+        )
+        evidence = FinalReviewManifest.from_review_manifest(
+            plan,
+            review_manifest,
+            verified_actionable_findings=len(
+                review_manifest.verified_actionable_fingerprints
+            ),
+        )
+        manifest_path = loop / "reviews" / "final" / "MANIFEST.json"
+        if legacy:
+            record = evidence.to_record()
+            for finding_record in record["findings"]:
+                for field_name in (
+                    "fact_status",
+                    "contract_relation",
+                    "decision_requirement",
+                    "disposition",
+                    "release_effect",
+                    "policy_axes_explicit",
+                ):
+                    finding_record.pop(field_name, None)
+                for candidate_record in finding_record["candidates"]:
+                    for field_name in (
+                        "fact_status",
+                        "contract_relation",
+                        "decision_requirement",
+                        "disposition",
+                        "release_effect",
+                        "policy_axes_explicit",
+                    ):
+                        candidate_record.pop(field_name, None)
+            manifest_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        else:
+            manifest_path.write_text(
+                json.dumps(evidence.to_record(), indent=2) + "\n", encoding="utf-8"
+            )
+        self.write_complete_final_report(plan, evidence)
+
     def add_follow_up_artifact(self, fingerprint: str) -> None:
         loop = self.state_path.parent
         follow_up_path = loop / "follow-ups" / "F001.md"
@@ -595,6 +709,87 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual((code, err), (0, ""), out)
         self.assertEqual(json.loads(out)["status"], "passed")
         self.assertEqual(self.state()["manual_final_review"]["status"], "passed")
+
+    def _assert_manual_final_policy_rejected(self, **kwargs):
+        self.write_final_policy_manifest(**kwargs)
+        before = self.state()
+        code, out, err = self.run_cli("final-review", "record", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("disposition policy", err)
+        self.assertEqual(before, self.state())
+
+    def test_manual_final_rejects_in_scope_p1_deferred_finding_atomically(self):
+        self._assert_manual_final_policy_rejected(
+            severity="P1",
+            disposition="defer_follow_up",
+            release_effect="non_blocking",
+        )
+
+    def test_manual_final_rejects_discarded_in_scope_finding_atomically(self):
+        self._assert_manual_final_policy_rejected(
+            disposition="discard",
+            release_effect="non_blocking",
+        )
+
+    def test_manual_final_rejects_unauthorized_accepted_risk_atomically(self):
+        self._assert_manual_final_policy_rejected(
+            disposition="accepted_risk",
+            release_effect="non_blocking",
+        )
+
+    def test_manual_final_rejects_blocking_decision_bypass_atomically(self):
+        self._assert_manual_final_policy_rejected(
+            decision_requirement="user",
+            disposition="defer_follow_up",
+            release_effect="non_blocking",
+        )
+
+    def test_manual_final_recomputes_release_blocking_from_explicit_axes(self):
+        self.write_final_policy_manifest(severity="P1")
+        code, out, err = self.run_cli("final-review", "record", "--json")
+        self.assertEqual((code, err), (2, ""), out)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["verified_actionable_findings"], 1)
+        self.assertEqual(payload["release_blocking_findings"], 1)
+        state = self.state()
+        self.assertEqual(state["manual_final_review"]["release_blocking_findings"], 1)
+        self.assertEqual(state["phase"], "manual_final_review_failed")
+
+    def test_manual_final_rejects_legacy_manifest_in_fresh_scope_atomically(self):
+        self._assert_manual_final_policy_rejected(
+            disposition="defer_follow_up",
+            release_effect="non_blocking",
+            origin="unrelated-pre-existing",
+            contract_relation="outside_release",
+            legacy=True,
+        )
+
+    def test_manual_final_legacy_scope_uses_explicit_compatibility_fallback(self):
+        self.write_final_policy_manifest(
+            disposition="defer_follow_up",
+            release_effect="non_blocking",
+            origin="unrelated-pre-existing",
+            contract_relation="outside_release",
+            legacy=True,
+        )
+        state = self.state()
+        state["release_scope"] = {
+            "status": "legacy-unlocked",
+            "source_refs": [],
+            "source_digests": {},
+            "scope_revision": 0,
+            "source_snapshot_revision": 0,
+            "amendment_refs": [],
+        }
+        self.save_state(state)
+        code, out, err = self.run_cli("final-review", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["verified_actionable_findings"], 0)
+        self.assertEqual(payload["release_blocking_findings"], 0)
 
     def test_convergence_record_rejects_stale_target_sha(self):
         self.prepare_convergence()

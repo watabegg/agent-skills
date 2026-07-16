@@ -16,6 +16,8 @@ import re
 import unicodedata
 from typing import Any, Mapping, Sequence
 
+from . import review_policy as hloop_review_policy
+
 
 REVIEW_MODES = frozenset({"single", "swarm", "dual", "dual-swarm"})
 SWARM_MODES = frozenset({"swarm", "dual-swarm"})
@@ -1714,14 +1716,15 @@ class ReviewManifest:
         )
 
     def _verified_fingerprints_for_policy(
-        self, *, blocking_only: bool = False
+        self, *, blocking_only: bool = False, allow_legacy: bool = False
     ) -> tuple[str, ...]:
         """Return fully verified findings classified by the new policy axes.
 
         Legacy manifests do not carry the policy axes and are intentionally
-        excluded here; the CLI applies its pre-0.5.2 recommendation fallback
-        for those records.  This keeps the compatibility path explicit rather
-        than silently mixing old and new semantics.
+        excluded by default; a migrated legacy scope may explicitly request
+        the pre-0.5.2 recommendation fallback for those records.  This keeps
+        the compatibility path explicit rather than silently mixing old and
+        new semantics.
         """
 
         incomplete = set(self.completeness.incomplete_findings)
@@ -1730,17 +1733,26 @@ class ReviewManifest:
             by_fingerprint.setdefault(record.fingerprint, []).append(record)
         result: list[str] = []
         for finding in self.findings:
-            if not finding.policy_axes_explicit:
+            if not finding.policy_axes_explicit and not allow_legacy:
                 continue
             if finding.fingerprint in incomplete:
                 continue
             records = by_fingerprint.get(finding.fingerprint, [])
             if not records or any(record.fact_status != "confirmed" for record in records):
                 continue
-            if blocking_only:
-                eligible = finding.is_release_blocking
+            if finding.policy_axes_explicit:
+                if blocking_only:
+                    eligible = finding.is_release_blocking
+                else:
+                    eligible = finding.is_actionable
             else:
-                eligible = finding.is_actionable
+                eligible = any(
+                    record.recommended_action in {"fix_task", "ask_user"}
+                    and record.ignore_status == "must_not_ignore"
+                    for record in records
+                )
+                if blocking_only:
+                    eligible = eligible and finding.severity in CRITICAL_SEVERITIES
             if eligible:
                 result.append(finding.fingerprint)
         return tuple(sorted(set(result)))
@@ -1752,6 +1764,22 @@ class ReviewManifest:
     @property
     def verified_release_blocking_fingerprints(self) -> tuple[str, ...]:
         return self._verified_fingerprints_for_policy(blocking_only=True)
+
+    def verified_actionable_fingerprints_for_scope(
+        self, *, allow_legacy: bool = False
+    ) -> tuple[str, ...]:
+        """Return verified actionable findings for an explicit scope mode."""
+
+        return self._verified_fingerprints_for_policy(allow_legacy=allow_legacy)
+
+    def verified_release_blocking_fingerprints_for_scope(
+        self, *, allow_legacy: bool = False
+    ) -> tuple[str, ...]:
+        """Return verified release-blocking findings for an explicit scope mode."""
+
+        return self._verified_fingerprints_for_policy(
+            blocking_only=True, allow_legacy=allow_legacy
+        )
 
     @classmethod
     def from_record(cls, value: Any) -> "ReviewManifest":
@@ -1804,6 +1832,94 @@ class ReviewManifest:
                 "manifest completeness does not match deserialized lane and verification data"
             )
         return manifest
+
+
+def validate_manifest_policy(
+    manifest: ReviewManifest,
+    *,
+    allow_legacy: bool = False,
+) -> tuple[str, ...]:
+    """Validate every finding's disposition before a review gate mutates state.
+
+    New-policy manifests must carry every independent policy axis.  Only a
+    migrated ``legacy-unlocked`` scope may use the old verification
+    recommendation fallback.  Explicit findings are always checked with the
+    shared :class:`FindingDisposition` invariants, including incomplete
+    findings that will not contribute to the verified count.
+    """
+
+    if not isinstance(manifest, ReviewManifest):
+        raise ReviewModelError("manifest must be a ReviewManifest")
+    issues: list[str] = []
+    for finding in manifest.findings:
+        if not finding.policy_axes_explicit:
+            if not allow_legacy:
+                issues.append(
+                    "review finding "
+                    f"{finding.fingerprint} requires explicit policy axes in a fresh scope"
+                )
+            continue
+        if not allow_legacy and any(
+            not candidate.policy_axes_explicit for candidate in finding.candidates
+        ):
+            issues.append(
+                "review finding "
+                f"{finding.fingerprint} has candidate records without explicit policy axes"
+            )
+        try:
+            disposition = hloop_review_policy.FindingDisposition(
+                fact_status=finding.fact_status,
+                origin=finding.origin,
+                contract_relation=finding.contract_relation,
+                decision_requirement=finding.decision_requirement,
+                severity=finding.severity,
+                disposition=finding.disposition,
+                release_effect=finding.release_effect,
+                finding_id=finding.fingerprint,
+                fingerprint=finding.fingerprint,
+                target_sha=finding.head_sha,
+                requirement_refs=finding.requirement_refs,
+                why_fix_now=finding.why_fix_now,
+            )
+            safety_critical = any(
+                hloop_review_policy.is_safety_critical_finding(
+                    severity=candidate.severity,
+                    title=candidate.title,
+                    trigger=candidate.trigger,
+                    product_impact=candidate.product_impact,
+                    proposed_fix=candidate.proposed_fix,
+                )
+                for candidate in finding.candidates
+            )
+            hloop_review_policy.validate_disposition(
+                disposition,
+                safety_critical=safety_critical,
+            )
+        except hloop_review_policy.ReviewPolicyError as exc:
+            issues.append(
+                f"review finding {finding.fingerprint} violates disposition policy: {exc}"
+            )
+    return tuple(sorted(set(issues)))
+
+
+def review_manifest_policy_counts(
+    manifest: ReviewManifest,
+    *,
+    allow_legacy: bool = False,
+) -> tuple[int, int]:
+    """Return ``(actionable, release_blocking)`` after policy validation."""
+
+    issues = validate_manifest_policy(manifest, allow_legacy=allow_legacy)
+    if issues:
+        raise ReviewModelError("; ".join(issues))
+    return (
+        len(manifest.verified_actionable_fingerprints_for_scope(allow_legacy=allow_legacy)),
+        len(
+            manifest.verified_release_blocking_fingerprints_for_scope(
+                allow_legacy=allow_legacy
+            )
+        ),
+    )
 
 
 def check_manifest_completeness(manifest: ReviewManifest) -> ManifestCompleteness:
