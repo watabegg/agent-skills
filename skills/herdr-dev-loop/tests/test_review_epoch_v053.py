@@ -689,6 +689,40 @@ class EpochCapacityLeaseTests(unittest.TestCase):
 
 
 class ReviewEpochSchemaTests(unittest.TestCase):
+    def test_plan_top_level_python_and_schema_validation_have_parity(self):
+        valid = epoch_plan().to_record()
+        missing_record_type = dict(valid)
+        del missing_record_type["record_type"]
+        cases = (
+            ("valid", valid, None),
+            ("missing-record-type", missing_record_type, "record_type"),
+            (
+                "invalid-record-type",
+                {**valid, "record_type": "review_epoch_capacity"},
+                "record_type",
+            ),
+            (
+                "unknown-property",
+                {**valid, "unexpected_top_level": True},
+                "unknown fields",
+            ),
+        )
+
+        for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA):
+            validator = offline_validator(schema_path)
+            for case_name, record, error_pattern in cases:
+                with self.subTest(schema=schema_path.name, case=case_name):
+                    schema_errors = list(validator.iter_errors(record))
+                    if error_pattern is None:
+                        self.assertEqual(schema_errors, [])
+                        self.assertEqual(
+                            ReviewEpochPlan.from_record(record), epoch_plan()
+                        )
+                    else:
+                        self.assertTrue(schema_errors)
+                        with self.assertRaisesRegex(ReviewEpochError, error_pattern):
+                            ReviewEpochPlan.from_record(record)
+
     def test_canonical_and_public_schemas_validate_plan_and_capacity_records(self):
         plan = epoch_plan()
         ledger = plan.capacity_ledger().reserve(

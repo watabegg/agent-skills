@@ -33,6 +33,28 @@ LEASE_STATUSES = frozenset(
 
 _DIGEST_RE = re.compile(DIGEST_PATTERN)
 _EPOCH_ID_RE = re.compile(r"^E[0-9]{3,}$")
+_REVIEW_EPOCH_PLAN_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "record_type",
+        "epoch_id",
+        "epoch_revision",
+        "base_sha",
+        "target_sha",
+        "scope_revision",
+        "source_snapshot_revision",
+        "scope_digest",
+        "source_refs",
+        "policy_digest",
+        "topology_digest",
+        "validation_identity",
+        "audit_agent_budget",
+        "required_executions",
+        "parent_plan_digest",
+        "additional_execution_ids",
+        "inherited_artifacts",
+        "plan_digest",
+    }
+)
 
 
 class ReviewEpochError(ValueError):
@@ -709,12 +731,11 @@ class ReviewEpochPlan:
         if isinstance(value, cls):
             return value
         record = _record(value, "review epoch plan")
-        if record.get("record_type", "review_epoch_plan") != "review_epoch_plan":
-            raise ReviewEpochError("review epoch plan record_type is invalid")
         _required_fields(
             record,
             "review epoch plan",
             (
+                "record_type",
                 "epoch_id",
                 "epoch_revision",
                 "base_sha",
@@ -731,6 +752,18 @@ class ReviewEpochPlan:
                 "plan_digest",
             ),
         )
+        unknown_fields = sorted(
+            str(field)
+            for field in record
+            if field not in _REVIEW_EPOCH_PLAN_TOP_LEVEL_FIELDS
+        )
+        if unknown_fields:
+            raise ReviewEpochError(
+                "review epoch plan contains unknown fields: "
+                + ", ".join(unknown_fields)
+            )
+        if record["record_type"] != "review_epoch_plan":
+            raise ReviewEpochError("review epoch plan record_type is invalid")
         plan = cls(
             epoch_id=record["epoch_id"],
             epoch_revision=record["epoch_revision"],
