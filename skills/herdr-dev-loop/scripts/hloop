@@ -47,7 +47,9 @@ from hloop_lib import requirements as hloop_requirements
 from hloop_lib import release_scope as hloop_release_scope
 from hloop_lib import reports as hloop_reports
 from hloop_lib import review as hloop_review
+from hloop_lib import review_epoch as hloop_review_epoch
 from hloop_lib import review_policy as hloop_review_policy
+from hloop_lib import remediation as hloop_remediation
 from hloop_lib import supervisor as hloop_supervisor
 from hloop_lib.decisions import (
     DECISION_ACCEPTED,
@@ -1692,6 +1694,8 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
         return getattr(args, "release_scope_command", "") in {"lock", "amend"}
     if command == "review":
         review_command = getattr(args, "review_command", "")
+        if review_command == "epoch":
+            return getattr(args, "review_epoch_command", "") != "status"
         if review_command in {"readiness", "reopen"}:
             return True
         return review_command == "convergence" and getattr(
@@ -7719,6 +7723,702 @@ def review_max_fix_rounds(state: dict[str, Any], convergence: Mapping[str, Any] 
     return max(base + authorized + consumed, current if consumed else base)
 
 
+def review_epoch_store(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the canonical in-STATE container for immutable epoch revisions."""
+
+    value = state.setdefault(
+        "review_epochs",
+        {
+            "active_epoch_id": "",
+            "records": {},
+            "protocol_capabilities": {},
+        },
+    )
+    if not isinstance(value, dict):
+        raise HLoopError("review_epochs must be an object")
+    records = value.setdefault("records", {})
+    capabilities = value.setdefault("protocol_capabilities", {})
+    if not isinstance(records, dict) or not isinstance(capabilities, dict):
+        raise HLoopError("review_epochs records and protocol_capabilities must be objects")
+    value.setdefault("active_epoch_id", "")
+    return value
+
+
+def require_review_epoch_collection(
+    state: dict[str, Any], epoch_id: str, revision: int | None = None
+) -> hloop_review_epoch.ReviewEpochCollection:
+    store = review_epoch_store(state)
+    epoch_record = store["records"].get(epoch_id)
+    if not isinstance(epoch_record, Mapping):
+        raise HLoopError(f"unknown review epoch: {epoch_id}")
+    selected_revision = revision
+    if selected_revision is None:
+        selected_revision = epoch_record.get("active_revision")
+    if isinstance(selected_revision, bool) or not isinstance(selected_revision, int):
+        raise HLoopError(f"review epoch has no active revision: {epoch_id}")
+    revisions = epoch_record.get("revisions")
+    if not isinstance(revisions, Mapping):
+        raise HLoopError(f"review epoch revisions are invalid: {epoch_id}")
+    record = revisions.get(str(selected_revision))
+    if record is None:
+        raise HLoopError(
+            f"unknown review epoch revision: {epoch_id} revision {selected_revision}"
+        )
+    try:
+        return hloop_review_epoch.ReviewEpochCollection.from_record(record)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(
+            f"stored review epoch {epoch_id} revision {selected_revision} is invalid: {exc}"
+        ) from exc
+
+
+def store_review_epoch_collection(
+    state: dict[str, Any],
+    collection: hloop_review_epoch.ReviewEpochCollection,
+    *,
+    make_active: bool = True,
+) -> None:
+    store = review_epoch_store(state)
+    plan = collection.plan
+    epoch_record = store["records"].setdefault(
+        plan.epoch_id,
+        {"active_revision": plan.epoch_revision, "revisions": {}},
+    )
+    if not isinstance(epoch_record, dict):
+        raise HLoopError(f"review epoch record is invalid: {plan.epoch_id}")
+    revisions = epoch_record.setdefault("revisions", {})
+    if not isinstance(revisions, dict):
+        raise HLoopError(f"review epoch revisions are invalid: {plan.epoch_id}")
+    revisions[str(plan.epoch_revision)] = collection.to_record()
+    if make_active:
+        epoch_record["active_revision"] = plan.epoch_revision
+        store["active_epoch_id"] = plan.epoch_id
+
+
+def require_active_review_epoch_collection(
+    state: dict[str, Any],
+    collection: hloop_review_epoch.ReviewEpochCollection,
+) -> None:
+    store = review_epoch_store(state)
+    epoch_id = str(store.get("active_epoch_id") or "")
+    epoch_record = store["records"].get(epoch_id)
+    active_revision = (
+        epoch_record.get("active_revision")
+        if isinstance(epoch_record, Mapping)
+        else None
+    )
+    if (
+        epoch_id != collection.plan.epoch_id
+        or active_revision != collection.plan.epoch_revision
+    ):
+        raise HLoopError(
+            "review epoch command targets an inactive epoch revision: "
+            f"{collection.plan.epoch_id} revision {collection.plan.epoch_revision}"
+        )
+
+
+def load_json_object(path_value: str, *, label: str) -> dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    try:
+        value = json.loads(read_text(path))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HLoopError(f"cannot load {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HLoopError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def validate_epoch_protocol_capabilities(
+    plan: hloop_review_epoch.ReviewEpochPlan,
+    capability_paths: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    external = [
+        execution
+        for execution in plan.required_executions
+        if execution.protocol == "codex-review-multi-v2"
+    ]
+    if not external:
+        if capability_paths:
+            raise HLoopError(
+                "protocol capability evidence was supplied for a native-only epoch"
+            )
+        return {}
+    adapters: dict[str, dict[str, Any]] = {}
+    for path in capability_paths:
+        try:
+            adapter = hloop_review.ExternalReviewProtocolAdapter.from_record(
+                load_json_object(path, label="external review capability")
+            )
+        except hloop_review.ReviewModelError as exc:
+            raise HLoopError(f"invalid external review capability: {exc}") from exc
+        adapters[adapter.protocol] = adapter.to_record()
+    if "codex-review-multi-v2" not in adapters:
+        raise HLoopError(
+            "codex-review-multi-v2 epoch execution requires externally-planned-v1 capability evidence"
+        )
+    return adapters
+
+
+def cmd_review_epoch_create(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    try:
+        plan = hloop_review_epoch.ReviewEpochPlan.from_record(
+            load_json_object(args.plan, label="review epoch plan")
+        )
+        if plan.epoch_revision != 1:
+            raise hloop_review_epoch.ReviewEpochError(
+                "initial epoch create requires revision 1"
+            )
+        collection = hloop_review_epoch.ReviewEpochCollection.create(plan)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(f"invalid review epoch plan: {exc}") from exc
+    store = review_epoch_store(state)
+    if plan.epoch_id in store["records"]:
+        existing = require_review_epoch_collection(state, plan.epoch_id, 1)
+        if existing == collection:
+            print(f"review epoch already exists: {plan.epoch_id} revision 1")
+            return 0
+        raise HLoopError(
+            f"review epoch already exists with different identity: {plan.epoch_id}"
+        )
+    target = current_integration_target(repo, state)
+    if plan.target_sha != target:
+        raise HLoopError(
+            f"review epoch target SHA mismatch: plan={plan.target_sha} integration={target}"
+        )
+    capabilities = validate_epoch_protocol_capabilities(
+        plan, normalize_list(getattr(args, "protocol_capability", None))
+    )
+    store_review_epoch_collection(state, collection)
+    if capabilities:
+        store["protocol_capabilities"][plan.plan_digest] = capabilities
+    state["phase"] = "reviewing"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Created review epoch `{plan.epoch_id}` revision `{plan.epoch_revision}` for `{plan.target_sha}`.",
+    )
+    print(f"created review epoch {plan.epoch_id} revision {plan.epoch_revision}")
+    return 0
+
+
+def cmd_review_epoch_successor(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    try:
+        plan = hloop_review_epoch.ReviewEpochPlan.from_record(
+            load_json_object(args.plan, label="successor review epoch plan")
+        )
+        parent = require_review_epoch_collection(
+            state, plan.epoch_id, plan.epoch_revision - 1
+        )
+        superseded, successor = hloop_review_epoch.create_successor_collection(
+            parent, plan
+        )
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(f"invalid successor review epoch: {exc}") from exc
+    store = review_epoch_store(state)
+    epoch_record = store["records"].get(plan.epoch_id)
+    revisions = epoch_record.get("revisions") if isinstance(epoch_record, Mapping) else None
+    existing = revisions.get(str(plan.epoch_revision)) if isinstance(revisions, Mapping) else None
+    if existing is not None:
+        try:
+            if hloop_review_epoch.ReviewEpochCollection.from_record(existing) == successor:
+                print(
+                    f"review epoch successor already exists: {plan.epoch_id} revision {plan.epoch_revision}"
+                )
+                return 0
+        except hloop_review_epoch.ReviewEpochError:
+            pass
+        raise HLoopError("successor revision already exists with different identity")
+    target = current_integration_target(repo, state)
+    if plan.target_sha != target:
+        raise HLoopError(
+            "successor review epoch target SHA mismatch: "
+            f"plan={plan.target_sha} integration={target}"
+        )
+    require_active_review_epoch_collection(state, parent)
+    capabilities = validate_epoch_protocol_capabilities(
+        plan, normalize_list(getattr(args, "protocol_capability", None))
+    )
+    store_review_epoch_collection(state, superseded, make_active=False)
+    store_review_epoch_collection(state, successor)
+    if capabilities:
+        store["protocol_capabilities"][plan.plan_digest] = capabilities
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Created successor review epoch `{plan.epoch_id}` revision `{plan.epoch_revision}`.",
+    )
+    print(f"created successor {plan.epoch_id} revision {plan.epoch_revision}")
+    return 0
+
+
+def cmd_review_epoch_reserve(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    collection = require_review_epoch_collection(state, args.epoch_id, args.revision)
+    require_active_review_epoch_collection(state, collection)
+    target = current_integration_target(repo, state)
+    if collection.plan.target_sha != target:
+        raise HLoopError(
+            "cannot reserve capacity for a stale review epoch: "
+            f"epoch={collection.plan.target_sha} integration={target}"
+        )
+    if collection.status != "collecting":
+        raise HLoopError(f"review epoch cannot reserve while {collection.status}")
+    try:
+        capacity = collection.capacity.reserve(
+            collection.plan,
+            lease_id=args.lease_id,
+            execution_id=args.execution_id,
+            process_ids=args.process_id,
+            expires_at=args.expires_at,
+        )
+        collection = collection.with_capacity(capacity)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(f"cannot reserve review epoch capacity: {exc}") from exc
+    store_review_epoch_collection(state, collection, make_active=False)
+    save_state(repo, state)
+    print(
+        f"reserved {len(args.process_id)} slots in {args.epoch_id} revision {collection.plan.epoch_revision}"
+    )
+    return 0
+
+
+def cmd_review_epoch_lease(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    collection = require_review_epoch_collection(state, args.epoch_id, args.revision)
+    require_active_review_epoch_collection(state, collection)
+    try:
+        if args.action == "running":
+            capacity = collection.capacity.mark_running(args.lease_id)
+        elif args.action == "quarantine":
+            if not args.now:
+                raise HLoopError("lease quarantine requires --now")
+            capacity = collection.capacity.mark_expired_quarantined(
+                args.lease_id, now=args.now
+            )
+        else:
+            if not args.reason:
+                raise HLoopError("terminal lease transition requires --reason")
+            capacity = collection.capacity.mark_terminal(
+                args.lease_id,
+                reason=args.reason,
+                process_exit_confirmed=bool(args.process_exit_confirmed),
+                forced_abort_acknowledged=bool(args.forced_abort_acknowledged),
+            )
+        collection = collection.with_capacity(capacity)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(f"invalid review epoch lease transition: {exc}") from exc
+    store_review_epoch_collection(state, collection, make_active=False)
+    save_state(repo, state)
+    print(f"review epoch lease {args.lease_id}: {args.action}")
+    return 0
+
+
+def validate_epoch_outcome_artifact(
+    repo: Path,
+    state: dict[str, Any],
+    collection: hloop_review_epoch.ReviewEpochCollection,
+    outcome: hloop_review_epoch.EpochExecutionOutcome,
+) -> None:
+    if not outcome.artifact_digest and not outcome.artifact_complete:
+        return
+    artifact_path = (loop_path(repo) / outcome.artifact_ref).resolve()
+    loop_root = loop_path(repo).resolve()
+    try:
+        artifact_path.relative_to(loop_root)
+    except ValueError as exc:
+        raise HLoopError("review epoch artifact_ref escapes the loop directory") from exc
+    if not artifact_path.is_file():
+        raise HLoopError(f"review epoch artifact is missing: {artifact_path}")
+    observed_digest = _sha256_labelled(artifact_path.read_bytes())
+    if observed_digest != outcome.artifact_digest:
+        raise HLoopError(
+            "review epoch artifact digest does not match the terminal outcome"
+        )
+    if outcome.source_kind != "reviewer" or not outcome.artifact_ref.endswith(
+        "/MANIFEST.json"
+    ):
+        return
+    role_state = state.get("reviews", {}).get(outcome.execution_id)
+    if not isinstance(role_state, Mapping):
+        raise HLoopError(
+            "manifest Reviewer outcome has no canonical Reviewer state"
+        )
+    expected_plan = role_state.get("review_plan")
+    if expected_plan is None:
+        raise HLoopError("manifest Reviewer outcome lacks its immutable review plan")
+    manifest_record = load_json_object(
+        str(artifact_path), label="review epoch Reviewer manifest"
+    )
+    if outcome.protocol != "codex-review-multi-v2":
+        try:
+            manifest = hloop_review.ReviewManifest.from_record(manifest_record)
+            planned = hloop_review.ReviewGroupPlan.from_record(expected_plan)
+        except hloop_review.ReviewModelError as exc:
+            raise HLoopError(f"invalid Reviewer manifest artifact: {exc}") from exc
+        if (
+            manifest.review_id != outcome.execution_id
+            or manifest.plan != planned
+            or not manifest.completeness.complete
+        ):
+            raise HLoopError(
+                "Reviewer manifest is incomplete or changed its immutable lane plan"
+            )
+        return
+    adapters = (
+        review_epoch_store(state)["protocol_capabilities"].get(
+            collection.plan.plan_digest
+        )
+        or {}
+    )
+    adapter = adapters.get("codex-review-multi-v2") if isinstance(adapters, Mapping) else None
+    if adapter is None:
+        raise HLoopError(
+            "externally planned Reviewer outcome lacks plan or capability evidence"
+        )
+    try:
+        hloop_review.validate_externally_planned_review_manifest(
+            manifest_record,
+            expected_plan=expected_plan,
+            adapter=adapter,
+        )
+    except hloop_review.ReviewModelError as exc:
+        raise HLoopError(f"invalid externally planned Reviewer artifact: {exc}") from exc
+
+
+def cmd_review_epoch_record(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    collection = require_review_epoch_collection(state, args.epoch_id, args.revision)
+    require_active_review_epoch_collection(state, collection)
+    target = current_integration_target(repo, state)
+    if collection.plan.target_sha != target:
+        raise HLoopError(
+            "cannot record a stale review epoch outcome: "
+            f"epoch={collection.plan.target_sha} integration={target}"
+        )
+    try:
+        outcome = hloop_review_epoch.EpochExecutionOutcome.from_record(
+            load_json_object(args.outcome, label="review epoch execution outcome")
+        )
+        validate_epoch_outcome_artifact(repo, state, collection, outcome)
+        updated = collection.record_outcome(outcome)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(f"invalid review epoch execution outcome: {exc}") from exc
+    store_review_epoch_collection(state, updated, make_active=False)
+    role_state = None
+    if outcome.source_kind == "reviewer":
+        role_state = state.get("reviews", {}).get(outcome.execution_id)
+    elif outcome.source_kind == "gap":
+        role_state = state.get("gaps", {}).get(outcome.execution_id)
+    if isinstance(role_state, dict):
+        role_state["review_epoch_identity"] = collection.plan.artifact_identity(
+            outcome.execution_id
+        ).to_record()
+        role_state["review_epoch_outcome"] = outcome.to_record()
+    save_state(repo, state)
+    print(f"recorded {outcome.execution_id}: {outcome.status}; epoch={updated.status}")
+    return 0
+
+
+def cmd_review_epoch_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    collection = require_review_epoch_collection(state, args.epoch_id, args.revision)
+    payload = collection.to_record()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(
+            f"{collection.plan.epoch_id} revision {collection.plan.epoch_revision}: "
+            f"{collection.status}; outcomes={len(collection.execution_outcomes)}/"
+            f"{len(collection.plan.required_executions)}; "
+            f"reserved={collection.capacity.reserved_slots}/"
+            f"{collection.plan.audit_agent_budget}"
+        )
+    return 0
+
+
+def epoch_execution_start_binding(
+    state: dict[str, Any],
+    *,
+    role_id: str,
+    attempt_id: str,
+    source_kind: str,
+    target_sha: str,
+) -> dict[str, Any] | None:
+    """Require a persisted starting lease before a 0.5.3 audit launch."""
+
+    if "review_epochs" not in state:
+        return None
+    store = review_epoch_store(state)
+    epoch_id = str(store.get("active_epoch_id") or "")
+    if not epoch_id:
+        raise HLoopError(
+            f"create a review epoch before starting {source_kind} execution {role_id}"
+        )
+    collection = require_review_epoch_collection(state, epoch_id)
+    try:
+        execution = collection.plan.execution(role_id)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        raise HLoopError(
+            f"active review epoch does not plan execution {role_id}"
+        ) from exc
+    if (
+        execution.source_kind != source_kind
+        or execution.attempt_id != attempt_id
+        or collection.plan.target_sha != target_sha
+    ):
+        raise HLoopError(
+            f"{source_kind} execution identity does not match the active review epoch"
+        )
+    expected_protocol = (
+        state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
+        if source_kind == "reviewer"
+        else "native"
+    )
+    if execution.protocol != expected_protocol:
+        raise HLoopError(
+            f"{source_kind} execution protocol {execution.protocol!r} does not "
+            f"match configured protocol {expected_protocol!r}"
+        )
+    required_start_ids = {process.process_id for process in execution.processes}
+    starting_leases = tuple(
+        lease
+        for lease in collection.capacity.leases
+        if lease.execution_id == execution.execution_id
+        and lease.attempt_id == execution.attempt_id
+        and lease.status == "starting"
+    )
+    reserved = {
+        process_id for lease in starting_leases for process_id in lease.process_ids
+    }
+    if not required_start_ids.issubset(reserved):
+        missing = sorted(required_start_ids - reserved)
+        raise HLoopError(
+            "review epoch starting leases do not cover the complete planned process set: "
+            + ", ".join(missing)
+        )
+    return {
+        "collection": collection,
+        "lease_ids": tuple(lease.lease_id for lease in starting_leases),
+        "identity": collection.plan.artifact_identity(role_id).to_record(),
+    }
+
+
+def validate_reviewer_epoch_capacity_binding(
+    binding: Mapping[str, Any] | None,
+    review_plan: hloop_review.ReviewGroupPlan,
+) -> None:
+    """Bind the existing Reviewer topology to the aggregate epoch budget."""
+
+    if binding is None:
+        return
+    collection = hloop_review_epoch.ReviewEpochCollection.from_record(
+        binding["collection"]
+        if isinstance(binding["collection"], Mapping)
+        else binding["collection"].to_record()
+    )
+    execution_id = str(binding["identity"]["execution_id"])
+    execution = collection.plan.execution(execution_id)
+    planned_by_provider: dict[str, int] = {}
+    for process in execution.processes:
+        planned_by_provider[process.provider] = (
+            planned_by_provider.get(process.provider, 0) + 1
+        )
+    required_by_provider = hloop_review.required_provider_capacity(review_plan)
+    if planned_by_provider != required_by_provider:
+        raise HLoopError(
+            "review epoch process topology does not reserve the exact Reviewer "
+            f"provider capacity: planned={planned_by_provider} "
+            f"required={required_by_provider}"
+        )
+    expected_agents: dict[str, tuple[str, str]] = {}
+    for provider_plan in review_plan.provider_plans:
+        expected_agents[provider_plan.coordinator_label] = (
+            provider_plan.provider,
+            provider_plan.model,
+        )
+        if provider_plan.role == "coordinator":
+            for lane in provider_plan.lanes:
+                expected_agents[lane.agent_label] = (
+                    provider_plan.provider,
+                    provider_plan.model,
+                )
+        for verifier in provider_plan.verifier_agents:
+            expected_agents[verifier] = (
+                provider_plan.provider,
+                provider_plan.model,
+            )
+    planned_agents = {
+        process.agent_label: (process.provider, process.model)
+        for process in execution.processes
+    }
+    if planned_agents != expected_agents:
+        raise HLoopError(
+            "review epoch process identities do not match the immutable Reviewer "
+            "agent labels, providers, and models"
+        )
+    expected_artifact_ref = (
+        f"reviews/{execution_id}.md"
+        if review_plan.mode == "single"
+        else f"reviews/{execution_id}/MANIFEST.json"
+    )
+    if execution.artifact_ref != expected_artifact_ref:
+        raise HLoopError(
+            "review epoch artifact_ref does not match the Reviewer output contract: "
+            f"expected {expected_artifact_ref}"
+        )
+    if execution.protocol == "codex-review-multi-v2" and review_plan.mode == "single":
+        raise HLoopError(
+            "codex-review-multi-v2 epoch execution requires a manifest-producing "
+            "Reviewer mode"
+        )
+
+
+def gap_epoch_execution(
+    binding: Mapping[str, Any] | None,
+    agent_config: Mapping[str, str] | None = None,
+) -> hloop_review_epoch.EpochExecutionPlan | None:
+    if binding is None:
+        return None
+    collection = hloop_review_epoch.ReviewEpochCollection.from_record(
+        binding["collection"]
+        if isinstance(binding["collection"], Mapping)
+        else binding["collection"].to_record()
+    )
+    execution_id = str(binding["identity"]["execution_id"])
+    execution = collection.plan.execution(execution_id)
+    expected_artifact_ref = f"gaps/{execution_id}.md"
+    if execution.artifact_ref != expected_artifact_ref:
+        raise HLoopError(
+            "review epoch artifact_ref does not match the Gap output contract: "
+            f"expected {expected_artifact_ref}"
+        )
+    if agent_config is not None:
+        coordinator = next(
+            process
+            for process in execution.processes
+            if process.process_kind == "coordinator"
+        )
+        if (
+            coordinator.provider != agent_config["provider"]
+            or coordinator.model != agent_config["model"]
+        ):
+            raise HLoopError(
+                "review epoch Gap Coordinator provider/model does not match the "
+                "configured Gap Agent"
+            )
+    return execution
+
+
+def mark_epoch_execution_running(
+    state: dict[str, Any], binding: Mapping[str, Any] | None
+) -> None:
+    if binding is None:
+        return
+    collection = hloop_review_epoch.ReviewEpochCollection.from_record(
+        binding["collection"]
+        if isinstance(binding["collection"], Mapping)
+        else binding["collection"].to_record()
+    )
+    capacity = collection.capacity
+    for lease_id in binding["lease_ids"]:
+        capacity = capacity.mark_running(lease_id)
+    store_review_epoch_collection(
+        state, collection.with_capacity(capacity), make_active=False
+    )
+
+
+def release_failed_epoch_start(
+    state: dict[str, Any],
+    binding: Mapping[str, Any] | None,
+    *,
+    process_exit_confirmed: bool = True,
+) -> None:
+    if binding is None:
+        return
+    collection = hloop_review_epoch.ReviewEpochCollection.from_record(
+        binding["collection"]
+        if isinstance(binding["collection"], Mapping)
+        else binding["collection"].to_record()
+    )
+    capacity = collection.capacity
+    if not process_exit_confirmed:
+        # Keep the reservation held. A Manager must confirm process exit or
+        # forced-abort acknowledgement before this identity can release
+        # capacity; guessing here could overcommit an orphaned Agent.
+        store_review_epoch_collection(state, collection, make_active=False)
+        return
+    for lease_id in binding["lease_ids"]:
+        lease = capacity.lease(lease_id)
+        if lease.status != "terminal":
+            capacity = capacity.mark_terminal(
+                lease_id,
+                reason="provider launch failed before process became live",
+                process_exit_confirmed=process_exit_confirmed,
+            )
+    store_review_epoch_collection(
+        state, collection.with_capacity(capacity), make_active=False
+    )
+
+
+def require_epoch_execution_ready_for_triage(
+    state: dict[str, Any], execution_id: str
+) -> hloop_review_epoch.ReviewEpochCollection | None:
+    """Enforce the epoch-wide collection barrier on legacy role close paths."""
+
+    if "review_epochs" not in state:
+        return None
+    role_state = state.get("reviews", {}).get(execution_id)
+    if not isinstance(role_state, Mapping):
+        role_state = state.get("gaps", {}).get(execution_id)
+    explicitly_bound = isinstance(role_state, Mapping) and isinstance(
+        role_state.get("review_epoch_identity"), Mapping
+    )
+    store = review_epoch_store(state)
+    epoch_id = str(store.get("active_epoch_id") or "")
+    if not epoch_id:
+        if not explicitly_bound:
+            return None
+        raise HLoopError(
+            f"review execution {execution_id} has no active review epoch"
+        )
+    collection = require_review_epoch_collection(state, epoch_id)
+    try:
+        collection.plan.execution(execution_id)
+    except hloop_review_epoch.ReviewEpochError as exc:
+        if not explicitly_bound:
+            return None
+        raise HLoopError(
+            f"active review epoch does not contain execution {execution_id}"
+        ) from exc
+    outcome = next(
+        (
+            item
+            for item in collection.execution_outcomes
+            if item.execution_id == execution_id
+        ),
+        None,
+    )
+    if outcome is None or outcome.status != "succeeded" or not outcome.artifact_complete:
+        raise HLoopError(
+            f"review execution {execution_id} has no complete successful epoch outcome"
+        )
+    if collection.status not in {"ready_to_triage", "closed"}:
+        raise HLoopError(
+            "review epoch collection barrier is not ready: "
+            f"{collection.plan.epoch_id} revision {collection.plan.epoch_revision} "
+            f"is {collection.status}"
+        )
+    return collection
+
+
 def _canonical_review_fix_round(convergence: Mapping[str, Any]) -> int:
     """Read the one durable convergence round counter without coercion."""
 
@@ -10571,12 +11271,26 @@ def render_gap_prompt(
     report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
+    epoch_execution: hloop_review_epoch.EpochExecutionPlan | None = None,
 ) -> str:
     agent_config = agent_config or role_agent_config(state or {}, "gap")
     if spec_sources:
         source_lines = "\n".join(f"- {item}" for item in spec_sources)
     else:
         source_lines = "- No extra spec source was configured; use MISSION.md, PLAN.md, DECISIONS.md, tasks, and results as the implementation contract."
+    if epoch_execution is None:
+        epoch_contract = ""
+    else:
+        epoch_contract = f"""
+Review epoch execution contract:
+- The following process plan is immutable. Run every listed process using its exact process kind, agent_label, provider, model, effort, parent, and lane identity.
+- All child Agents are already charged to the shared epoch budget. Do not add unplanned audit Agents.
+- Only the Coordinator writes the final Gap artifact after every planned child reaches a terminal result.
+
+```json
+{json.dumps(epoch_execution.to_record(), ensure_ascii=False, indent=2)}
+```
+"""
     return f"""You are Gap Auditor {gap_id}.
 
 HLoop skill version: {SKILL_VERSION}
@@ -10602,6 +11316,7 @@ Read:
 
 Spec sources:
 {source_lines}
+{epoch_contract}
 {report_contract_text(gap_id, attempt_id or f"{gap_id}-A001", state or {}, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 
 Rules:
@@ -11908,6 +12623,20 @@ None.
             "artifact_refs": [],
             "attempt_history": [],
         },
+        "review_epochs": {
+            "active_epoch_id": "",
+            "records": {},
+            "protocol_capabilities": {},
+        },
+        "remediation_ledger": hloop_remediation.RemediationLedger(
+            max_fix_rounds=int(
+                (
+                    config_resolution.as_dict().get("review")
+                    or hloop_config.REVIEW_POLICY_DEFAULTS
+                ).get("max_fix_rounds", 2)
+            )
+        ).to_record(),
+        "remediation_source_links": {},
         "manual_final_review": {
             "status": "pending",
             "certification_id": "",
@@ -12089,6 +12818,21 @@ None.
                 "attempt_history": [],
             },
         )
+        old.setdefault(
+            "review_epochs",
+            {
+                "active_epoch_id": "",
+                "records": {},
+                "protocol_capabilities": {},
+            },
+        )
+        old.setdefault(
+            "remediation_ledger",
+            hloop_remediation.RemediationLedger(
+                max_fix_rounds=int(review_policy_record(old)["max_fix_rounds"])
+            ).to_record(),
+        )
+        old.setdefault("remediation_source_links", {})
         old.setdefault(
             "manual_final_review",
             {
@@ -18622,9 +19366,13 @@ def rollback_failed_role_start(
         run_cmd([TRUSTED_GIT_PATH, "-C", str(repo), "branch", "-D", branch], check=False)
 
 
-def close_pane_best_effort(pane_id: str) -> None:
-    if pane_id:
-        run_cmd(["herdr", "pane", "close", pane_id], check=False)
+def close_pane_best_effort(pane_id: str) -> bool:
+    if not pane_id:
+        return True
+    return (
+        run_cmd(["herdr", "pane", "close", pane_id], check=False).returncode
+        == 0
+    )
 
 
 def cleanup_review_worktree(
@@ -21487,6 +22235,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
+    epoch_binding = None
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id, state)
@@ -21502,6 +22251,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         },
     )
     review_plan = build_reviewer_group_plan(mode, head_sha, agent_config, topology=topology)
+    validate_reviewer_epoch_capacity_binding(epoch_binding, review_plan)
     # Numeric-only preview: this runs even for --dry-run, before any provider
     # is required to be installed. The real per-provider capability probe
     # only runs on the actual launch path below, after `--dry-run` returns.
@@ -21558,6 +22308,13 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
+    epoch_binding = epoch_execution_start_binding(
+        state,
+        role_id=review_id,
+        attempt_id=attempt_id,
+        source_kind="reviewer",
+        target_sha=head_sha,
+    )
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_review_worktree(repo, review_id, state)
@@ -21572,6 +22329,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         },
     )
     review_plan = build_reviewer_group_plan(mode, head_sha, agent_config, topology=topology)
+    validate_reviewer_epoch_capacity_binding(epoch_binding, review_plan)
     capacity_check = hloop_providers.check_review_capacity(
         hloop_review.required_provider_capacity(review_plan),
         limits=state.get("review_capacity_limits"),
@@ -21613,6 +22371,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     worktree_preexisting = worktree.exists()
     if not worktree_preexisting:
         git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+    pane_id = ""
     try:
         prepare_role_worktree(repo, worktree, state, role="reviewer", agent_id=review_id)
         ensure_review_visible_in_worktree(worktree)
@@ -21653,18 +22412,26 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
+        mark_epoch_execution_running(state, epoch_binding)
     except (
         HLoopError,
         hloop_broker.BrokerStorageError,
         OSError,
         subprocess.CalledProcessError,
     ):
+        process_exit_confirmed = close_pane_best_effort(pane_id)
         try:
             rollback_failed_role_start(
                 repo, worktree, created_worktree=not worktree_preexisting
             )
         finally:
             revoke_active_role_report_identity(repo, state, review_id)
+            release_failed_epoch_start(
+                state,
+                epoch_binding,
+                process_exit_confirmed=process_exit_confirmed,
+            )
+            save_state(repo, state)
         raise
     state["reviews"][review_id] = {
         "status": "running",
@@ -21695,6 +22462,10 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "started_at": now_iso(),
         "provider_invocation": provider_invocation.as_record(),
     }
+    if epoch_binding is not None:
+        state["reviews"][review_id]["review_epoch_identity"] = dict(
+            epoch_binding["identity"]
+        )
     arm_initial_semantic_ack_barrier(
         state["reviews"][review_id],
         attempt_id=attempt_id,
@@ -21927,6 +22698,7 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
         raise HLoopError(f"unknown review: {review_id}")
     if agent_gate_status(review_state) not in {"reported", "triaged"}:
         raise HLoopError(f"review is not ready for close: {review_id}")
+    epoch_collection = require_epoch_execution_ready_for_triage(state, review_id)
     enforce_review_manifest_gate(repo, review_id, review_state)
     cleanup_completed_agent_pane(
         repo,
@@ -21945,12 +22717,16 @@ def cmd_reviewer_close(args: argparse.Namespace) -> int:
     if args.verdict == "blocked":
         state["needs_review"] = True
         state["phase"] = "blocked_user_decision"
+    elif epoch_collection is not None:
+        # One source cannot dispatch remediation while another required
+        # execution belongs to the same epoch. Epoch triage owns the only
+        # transition to approval, clean close, or materialization.
+        state["needs_review"] = True
+        state["phase"] = "reviewing"
     else:
         state["needs_review"] = False
         state["unreviewed_merge_count"] = 0
-        if args.verdict == "fix-tasks-created":
-            state["phase"] = "dispatching"
-        elif state.get("needs_gap_check"):
+        if state.get("needs_gap_check"):
             state["phase"] = "gap_checking"
         else:
             state["phase"] = "dispatching"
@@ -22070,8 +22846,17 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         },
     )
     attempt_id = f"{gap_id}-A001"
+    epoch_binding = None
+    epoch_execution = None
     prompt_without_identity = render_gap_prompt(
-        gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
+        gap_id,
+        base,
+        head,
+        spec_sources,
+        state,
+        agent_config=agent_config,
+        head_sha=head_sha,
+        epoch_execution=epoch_execution,
     )
     agent_command, preview_invocation = role_agent_command(
         repo,
@@ -22102,6 +22887,13 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     head = args.head or state["integration_branch"]
     base_sha = git(repo, ["rev-parse", base])
     head_sha = git(repo, ["rev-parse", head])
+    epoch_binding = epoch_execution_start_binding(
+        state,
+        role_id=gap_id,
+        attempt_id=attempt_id,
+        source_kind="gap",
+        target_sha=head_sha,
+    )
     worktree_arg = getattr(args, "worktree", None)
     worktree = Path(worktree_arg).resolve() if worktree_arg else default_gap_worktree(repo, gap_id, state)
     spec_sources = normalize_list(getattr(args, "spec_source", None)) or normalize_list(
@@ -22119,8 +22911,16 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             "agent_model": getattr(args, "agent_model", None),
         },
     )
+    epoch_execution = gap_epoch_execution(epoch_binding, agent_config)
     prompt_without_identity = render_gap_prompt(
-        gap_id, base, head, spec_sources, state, agent_config=agent_config, head_sha=head_sha
+        gap_id,
+        base,
+        head,
+        spec_sources,
+        state,
+        agent_config=agent_config,
+        head_sha=head_sha,
+        epoch_execution=epoch_execution,
     )
     task_contract_digest = prompt_contract_digest(prompt_without_identity)
     agent_command, provider_invocation = role_agent_command(
@@ -22138,6 +22938,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     worktree_preexisting = worktree.exists()
     if not worktree_preexisting:
         git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+    pane_id = ""
     try:
         prepare_role_worktree(repo, worktree, state, role="gap", agent_id=gap_id)
         ensure_gap_visible_in_worktree(worktree)
@@ -22160,6 +22961,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
+            epoch_execution=epoch_execution,
         )
         write_text(prompt_path, prompt)
         baseline_dirty = role_scope_paths(worktree)
@@ -22178,18 +22980,26 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
                 cwd=worktree,
                 command=command,
             )
+        mark_epoch_execution_running(state, epoch_binding)
     except (
         HLoopError,
         hloop_broker.BrokerStorageError,
         OSError,
         subprocess.CalledProcessError,
     ):
+        process_exit_confirmed = close_pane_best_effort(pane_id)
         try:
             rollback_failed_role_start(
                 repo, worktree, created_worktree=not worktree_preexisting
             )
         finally:
             revoke_active_role_report_identity(repo, state, gap_id)
+            release_failed_epoch_start(
+                state,
+                epoch_binding,
+                process_exit_confirmed=process_exit_confirmed,
+            )
+            save_state(repo, state)
         raise
     state["gaps"][gap_id] = {
         "status": "running",
@@ -22217,6 +23027,10 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "started_at": now_iso(),
         "provider_invocation": provider_invocation.as_record(),
     }
+    if epoch_binding is not None:
+        state["gaps"][gap_id]["review_epoch_identity"] = dict(
+            epoch_binding["identity"]
+        )
     arm_initial_semantic_ack_barrier(
         state["gaps"][gap_id],
         attempt_id=attempt_id,
@@ -22324,6 +23138,7 @@ def cmd_gap_close(args: argparse.Namespace) -> int:
         raise HLoopError(f"unknown gap audit: {gap_id}")
     if agent_gate_status(gap_state) not in {"reported", "triaged"}:
         raise HLoopError(f"gap audit is not ready for close: {gap_id}")
+    epoch_collection = require_epoch_execution_ready_for_triage(state, gap_id)
     cleanup_completed_agent_pane(
         repo,
         gap_state,
@@ -22341,13 +23156,13 @@ def cmd_gap_close(args: argparse.Namespace) -> int:
     if args.verdict in {"blocked", "decision-needed"}:
         state["needs_gap_check"] = True
         state["phase"] = "blocked_user_decision"
+    elif epoch_collection is not None:
+        state["needs_gap_check"] = True
+        state["phase"] = "reviewing"
     else:
         state["needs_gap_check"] = False
         state["ungapped_merge_count"] = 0
-        if args.verdict == "fix-tasks-created":
-            state["needs_review"] = False
-            state["phase"] = "dispatching"
-        elif last_validation_passed(state) and should_open_review_gate(state):
+        if last_validation_passed(state) and should_open_review_gate(state):
             state["needs_review"] = True
             state["phase"] = "reviewing"
         else:
@@ -23144,6 +23959,543 @@ def render_fix_task_draft(
     return "\n".join(lines)
 
 
+def remediation_ledger_from_state(
+    state: dict[str, Any],
+) -> hloop_remediation.RemediationLedger:
+    value = state.get("remediation_ledger")
+    if value is None:
+        return hloop_remediation.RemediationLedger(
+            max_fix_rounds=int(review_policy_record(state)["max_fix_rounds"])
+        )
+    try:
+        ledger = hloop_remediation.RemediationLedger.from_record(value)
+    except hloop_remediation.RemediationLedgerError as exc:
+        raise HLoopError(f"stored remediation ledger is invalid: {exc}") from exc
+    captured_inputs = state.get("inputs_index") or {}
+    if not isinstance(captured_inputs, Mapping):
+        raise HLoopError("inputs_index must be an object")
+    for batch in ledger.batches:
+        authorization = batch.extra_round_authorization
+        if authorization is None:
+            continue
+        record = captured_inputs.get(authorization.input_id)
+        if not isinstance(record, Mapping):
+            raise HLoopError(
+                "stored remediation ledger references a missing captured "
+                f"authorization input: {authorization.input_id}"
+            )
+        source = str(record.get("source") or "")
+        prompt_digest = str(record.get("prompt_digest") or "")
+        labelled_digest = (
+            prompt_digest
+            if prompt_digest.startswith("sha256:")
+            else f"sha256:{prompt_digest}"
+        )
+        if (
+            source != authorization.source
+            or labelled_digest != authorization.content_digest
+        ):
+            raise HLoopError(
+                "stored remediation authorization no longer matches its canonical "
+                f"captured input: {authorization.input_id}"
+            )
+    return ledger
+
+
+def store_remediation_ledger(
+    state: dict[str, Any], ledger: hloop_remediation.RemediationLedger
+) -> None:
+    # Rehydrate before persistence so malformed write-ahead identity never
+    # reaches STATE as a silently repaired record.
+    restored = hloop_remediation.RemediationLedger.from_record(ledger.to_record())
+    if restored != ledger:
+        raise HLoopError("remediation ledger did not round-trip canonically")
+    state["remediation_ledger"] = restored.to_record()
+
+
+def remediation_candidate_bundle(path_value: str) -> dict[str, Any]:
+    bundle = load_json_object(path_value, label="remediation candidate bundle")
+    candidates = bundle.get("candidates")
+    if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Sequence):
+        raise HLoopError("remediation candidate bundle requires a candidates array")
+    allowed = {
+        "candidates",
+        "canonical_classifications",
+        "canonicalization_ref",
+        "accepted_risk_authorizations",
+    }
+    unknown = sorted(set(bundle) - allowed)
+    if unknown:
+        raise HLoopError(
+            "remediation candidate bundle contains unknown fields: "
+            + ", ".join(unknown)
+        )
+    return bundle
+
+
+def cmd_triage_epoch_record_candidates(
+    repo: Path,
+    state: dict[str, Any],
+    collection: hloop_review_epoch.ReviewEpochCollection,
+    args: argparse.Namespace,
+) -> int:
+    if collection.status != "ready_to_triage":
+        raise HLoopError(
+            f"review epoch is not ready_to_triage: {collection.status}"
+        )
+    if not args.batch_id:
+        raise HLoopError("candidate recording requires --batch-id")
+    bundle = remediation_candidate_bundle(args.record_candidates)
+    ledger = remediation_ledger_from_state(state)
+    try:
+        try:
+            batch = ledger.batch(args.batch_id)
+            if (
+                batch.epoch_id != collection.plan.epoch_id
+                or batch.target_sha != collection.plan.target_sha
+                or batch.required_execution_ids
+                != tuple(
+                    sorted(
+                        execution.execution_id
+                        for execution in collection.plan.required_executions
+                    )
+                )
+            ):
+                raise hloop_remediation.RemediationLedgerError(
+                    "existing remediation batch identity differs from epoch"
+                )
+        except hloop_remediation.RemediationLedgerError as exc:
+            if "unknown remediation batch" not in str(exc):
+                raise
+            ledger = hloop_remediation.create_remediation_batch(
+                ledger,
+                batch_id=args.batch_id,
+                epoch_id=collection.plan.epoch_id,
+                target_sha=collection.plan.target_sha,
+                required_execution_ids=tuple(
+                    execution.execution_id
+                    for execution in collection.plan.required_executions
+                ),
+            )
+        for item in bundle["candidates"]:
+            candidate = hloop_remediation.CandidateObservation.from_record(item)
+            try:
+                execution = collection.plan.execution(candidate.source_execution_id)
+            except hloop_review_epoch.ReviewEpochError as exc:
+                raise HLoopError(
+                    "remediation candidate names an execution outside the immutable epoch: "
+                    f"{candidate.observation_id}"
+                ) from exc
+            if (
+                candidate.source_kind != execution.source_kind
+                or candidate.source_ref != execution.artifact_ref
+            ):
+                raise HLoopError(
+                    "remediation candidate source provenance does not match its "
+                    f"immutable epoch execution: {candidate.observation_id}"
+                )
+            ledger = hloop_remediation.register_candidate(
+                ledger, args.batch_id, candidate
+            )
+        canonical_raw = bundle.get("canonical_classifications") or {}
+        if not isinstance(canonical_raw, Mapping):
+            raise HLoopError("canonical_classifications must be an object")
+        risk_raw = bundle.get("accepted_risk_authorizations") or []
+        if isinstance(risk_raw, (str, bytes)) or not isinstance(risk_raw, Sequence):
+            raise HLoopError("accepted_risk_authorizations must be an array")
+        try:
+            ledger = hloop_remediation.mark_ready_to_triage(
+                ledger,
+                args.batch_id,
+                terminal_execution_ids=tuple(
+                    outcome.execution_id
+                    for outcome in collection.execution_outcomes
+                    if outcome.successful
+                ),
+                canonical_classifications=canonical_raw,
+                canonicalization_ref=str(bundle.get("canonicalization_ref") or ""),
+                accepted_risk_authorizations=tuple(risk_raw),
+            )
+        except hloop_remediation.CandidateClassificationConflict:
+            store_remediation_ledger(state, ledger)
+            state["phase"] = "blocked_conflict"
+            save_state(repo, state)
+            print(
+                f"blocked {args.batch_id}: classification_conflict; canonical Manager classification required"
+            )
+            return 2
+    except hloop_remediation.RemediationLedgerError as exc:
+        raise HLoopError(f"cannot record remediation candidates: {exc}") from exc
+    store_remediation_ledger(state, ledger)
+    state["phase"] = "reviewing"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Recorded canonical remediation candidates for `{args.batch_id}` from epoch `{collection.plan.epoch_id}`.",
+    )
+    print(f"ready to approve remediation batch {args.batch_id}")
+    return 0
+
+
+def remediation_approval_bundle(path_value: str) -> dict[str, Any]:
+    bundle = load_json_object(path_value, label="remediation approval bundle")
+    tasks = bundle.get("task_contracts")
+    if isinstance(tasks, (str, bytes)) or not isinstance(tasks, Sequence) or not tasks:
+        raise HLoopError("remediation approval bundle requires task_contracts")
+    allowed = {
+        "task_contracts",
+        "candidate_groups",
+        "extra_round_authorization",
+    }
+    unknown = sorted(set(bundle) - allowed)
+    if unknown:
+        raise HLoopError(
+            "remediation approval bundle contains unknown fields: "
+            + ", ".join(unknown)
+        )
+    for contract in tasks:
+        if not isinstance(contract, Mapping):
+            raise HLoopError("each remediation task contract must be an object")
+        if contract.get("contract_schema_revision") == 3:
+            validate_revision_three_task(dict(contract), task_id=str(contract.get("id") or ""))
+    return bundle
+
+
+def cmd_triage_epoch_approve(
+    repo: Path,
+    state: dict[str, Any],
+    collection: hloop_review_epoch.ReviewEpochCollection,
+    args: argparse.Namespace,
+) -> int:
+    if not args.batch_id or not args.approval_bundle or not args.approval_ref:
+        raise HLoopError(
+            "approve-batch requires --batch-id, --approval-bundle, and --approval-ref"
+        )
+    ledger = remediation_ledger_from_state(state)
+    bundle = remediation_approval_bundle(args.approval_bundle)
+    task_contracts = tuple(bundle["task_contracts"])
+    first_task_number = args.first_task_number
+    if first_task_number is None:
+        first_task_number = int(next_id("T", state.setdefault("tasks", {}))[1:])
+    scope = assert_release_scope_snapshot(repo, state)
+    extra_raw = bundle.get("extra_round_authorization")
+    extra = None
+    extra_ref = ""
+    if extra_raw is not None:
+        try:
+            extra = hloop_remediation.ExtraRoundAuthorization.from_record(extra_raw)
+            extra_ref = extra.ref_for(args.batch_id)
+        except hloop_remediation.RemediationLedgerError as exc:
+            raise HLoopError(f"invalid extra-round authorization: {exc}") from exc
+    try:
+        approved = hloop_remediation.approve_remediation_batch(
+            ledger,
+            args.batch_id,
+            approval_ref=args.approval_ref,
+            scope_digest=scope.scope_digest,
+            scope_revision=scope.scope_revision,
+            task_contracts=task_contracts,
+            first_task_number=first_task_number,
+            release_scope=scope,
+            candidate_groups=bundle.get("candidate_groups"),
+            extra_round_authorization_ref=extra_ref,
+            extra_round_authorization=extra,
+            captured_input_ids=tuple((state.get("inputs_index") or {}).keys()),
+            captured_inputs=state.get("inputs_index") or {},
+        )
+        closed = collection.close(
+            reason=f"remediation batch {args.batch_id} approved",
+            remediation_batch_id=args.batch_id,
+        )
+    except hloop_remediation.RemediationRoundLimitExceeded as exc:
+        state["phase"] = "blocked_user_decision"
+        save_state(repo, state)
+        raise HLoopError(str(exc)) from exc
+    except (
+        hloop_remediation.RemediationLedgerError,
+        hloop_review_epoch.ReviewEpochError,
+    ) as exc:
+        raise HLoopError(f"cannot approve remediation batch: {exc}") from exc
+    store_remediation_ledger(state, approved)
+    store_review_epoch_collection(state, closed)
+    state["phase"] = "reviewing"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Approved remediation batch `{args.batch_id}` as round `{approved.batch(args.batch_id).remediation_round}` and stored its write-ahead task plan.",
+    )
+    print(
+        f"approved {args.batch_id}; round={approved.batch(args.batch_id).remediation_round}; materialization pending"
+    )
+    return 0
+
+
+def remediation_source_links(state: dict[str, Any]) -> dict[str, list[str]]:
+    links = state.setdefault("remediation_source_links", {})
+    if not isinstance(links, dict):
+        raise HLoopError("remediation_source_links must be an object")
+    return links
+
+
+def remediation_source_role_reference(source: str) -> tuple[str, str] | None:
+    role_match = re.search(
+        r"(?:^|/)(reviewer|reviews|gap|gaps)/(R[0-9]+|G[0-9]+)(?:/|\.md$|$)",
+        source,
+    )
+    if role_match is None:
+        return None
+    source_kind, source_id = role_match.groups()
+    section = "reviews" if source_kind in {"reviewer", "reviews"} else "gaps"
+    return section, source_id
+
+
+def remediation_source_has_task(
+    state: dict[str, Any], links: Mapping[str, Any], source: str, task_id: str
+) -> bool:
+    if task_id not in normalize_list(links.get(source)):
+        return False
+    role_reference = remediation_source_role_reference(source)
+    if role_reference is None:
+        return True
+    section, source_id = role_reference
+    source_state = state.get(section, {}).get(source_id)
+    return isinstance(source_state, Mapping) and task_id in normalize_list(
+        source_state.get("created_fix_tasks")
+    )
+
+
+def materialization_observations(
+    repo: Path,
+    state: dict[str, Any],
+    batch: hloop_remediation.RemediationBatch,
+) -> tuple[hloop_remediation.TaskMaterializationObservation, ...]:
+    links = remediation_source_links(state)
+    observations = []
+    for planned in batch.materialization_plan:
+        task_state = state.get("tasks", {}).get(planned.task_id)
+        state_contract = None
+        if isinstance(task_state, Mapping):
+            state_contract = task_state.get("remediation_task_contract")
+            if state_contract is None:
+                state_contract = {"id": planned.task_id, "unexpected_state": True}
+        path = task_file(repo, planned.task_id)
+        artifact_contract = read_frontmatter(path) if path.is_file() else None
+        if artifact_contract is not None:
+            expected_contract = planned.to_record()["task_contract"]
+            for key, expected in expected_contract.items():
+                observed = artifact_contract.get(key)
+                if (
+                    type(expected) is int
+                    and isinstance(observed, str)
+                    and re.fullmatch(r"[0-9]+", observed)
+                ):
+                    artifact_contract[key] = int(observed)
+        artifact_digest = (
+            _sha256_labelled(path.read_bytes()) if path.is_file() else ""
+        )
+        observed_sources = tuple(
+            sorted(
+                source
+                for source in planned.source_refs
+                if remediation_source_has_task(
+                    state, links, source, planned.task_id
+                )
+            )
+        )
+        observations.append(
+            hloop_remediation.TaskMaterializationObservation(
+                task_id=planned.task_id,
+                state_task_contract=state_contract,
+                artifact_task_contract=artifact_contract,
+                artifact_digest=artifact_digest,
+                source_refs=observed_sources,
+            )
+        )
+    return tuple(observations)
+
+
+def materialize_planned_task(
+    repo: Path,
+    state: dict[str, Any],
+    planned: hloop_remediation.PlannedRemediationTask,
+) -> None:
+    contract = planned.to_record()["task_contract"]
+    task_id = planned.task_id
+    path = task_file(repo, task_id)
+    if not path.exists():
+        title = str(contract.get("title") or f"Remediate {task_id}")
+        acceptance = normalize_list(contract.get("acceptance"))
+        body = f"""# Task {task_id}: {title}
+
+## Goal
+{title}
+
+## Instructions
+Implement only the canonical findings approved in the remediation write-ahead plan.
+
+## Done when
+{chr(10).join(f'- {item}' for item in acceptance)}
+"""
+        write_text(path, frontmatter(dict(contract)) + "\n" + body)
+    task_state = state.setdefault("tasks", {}).get(task_id)
+    if task_state is None:
+        projection = {
+            "status": "queued",
+            "branch": str(contract.get("branch") or f"ai/remediation/{task_id}"),
+            "base_ref": str(contract.get("base_ref") or state.get("integration_branch") or ""),
+            "base_sha": str(contract.get("base_sha") or ""),
+            "write_allow": normalize_list(contract.get("write_allow")),
+            "write_deny": normalize_list(contract.get("write_deny")),
+            "depends_on": normalize_list(contract.get("depends_on")),
+            "worker_protocol": str(contract.get("worker_protocol") or state.get("worker_protocol") or DEFAULT_WORKER_PROTOCOL),
+            "worker_qa_profile": str(contract.get("worker_qa_profile") or state_worker_qa_profile(state)),
+            "agent_provider": str(contract.get("worker_agent_provider") or state.get("worker_agent_provider") or DEFAULT_AGENT_PROVIDER),
+            "agent_model": str(contract.get("worker_agent_model") or state.get("worker_agent_model") or DEFAULT_AGENT_MODEL),
+            "task_contract_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "remediation_task_contract": dict(contract),
+            "created_at": now_iso(),
+        }
+        projection.update(revision_three_projection(dict(contract)))
+        projection.update(
+            {
+                key: contract.get(key)
+                for key in (
+                    "task_origin",
+                    "release_scope_revision",
+                    "plan_item_refs",
+                    "requirement_refs",
+                    "scope_refs",
+                    "source_finding",
+                    "authorization_input_id",
+                    "why_fix_now",
+                    "operational_reason",
+                    "origin",
+                    "contract_relation",
+                    "release_effect",
+                    "remediation_round",
+                    "fact_status",
+                    "disposition",
+                    "severity",
+                    "decision_requirement",
+                    "scope_expanding",
+                )
+                if key in contract
+            }
+        )
+        state["tasks"][task_id] = projection
+    links = remediation_source_links(state)
+    for source in planned.source_refs:
+        links[source] = sorted(
+            dict.fromkeys([*normalize_list(links.get(source)), task_id])
+        )
+        role_reference = remediation_source_role_reference(source)
+        if role_reference is None:
+            continue
+        section, source_id = role_reference
+        source_state = state.get(section, {}).get(source_id)
+        if isinstance(source_state, dict):
+            source_state["created_fix_tasks"] = sorted(
+                dict.fromkeys(
+                    [
+                        *normalize_list(source_state.get("created_fix_tasks")),
+                        task_id,
+                    ]
+                )
+            )
+
+
+def cmd_triage_epoch_materialize(
+    repo: Path,
+    state: dict[str, Any],
+    collection: hloop_review_epoch.ReviewEpochCollection,
+    args: argparse.Namespace,
+) -> int:
+    if not args.batch_id:
+        raise HLoopError("materialize-batch requires --batch-id")
+    ledger = remediation_ledger_from_state(state)
+    try:
+        batch = ledger.batch(args.batch_id)
+        first = hloop_remediation.reconcile_materialization(
+            ledger,
+            args.batch_id,
+            materialization_observations(repo, state, batch),
+        )
+    except hloop_remediation.RemediationLedgerError as exc:
+        raise HLoopError(f"cannot reconcile remediation materialization: {exc}") from exc
+    if first.status == "remediation_reconcile_required":
+        raise HLoopError(
+            "remediation_reconcile_required: " + "; ".join(first.issues)
+        )
+    if first.status == "repair_required":
+        for planned in batch.materialization_plan:
+            materialize_planned_task(repo, state, planned)
+        second = hloop_remediation.reconcile_materialization(
+            ledger,
+            args.batch_id,
+            materialization_observations(repo, state, batch),
+        )
+    else:
+        second = first
+    if second.status != "dispatched":
+        detail = second.issues or tuple(
+            f"{item.action}:{item.task_id}" for item in second.repair_actions
+        )
+        raise HLoopError(
+            "remediation materialization did not converge: " + "; ".join(detail)
+        )
+    store_remediation_ledger(state, second.ledger)
+    invalidate_review_gates_for_change(
+        state,
+        reason=f"remediation batch materialized: {args.batch_id}",
+        target_sha="",
+    )
+    invalidate_planning_evidence(
+        state, reason=f"remediation tasks materialized: {args.batch_id}"
+    )
+    state["phase"] = "dispatching"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Materialized remediation batch `{args.batch_id}` from its exact write-ahead plan.",
+    )
+    print(
+        f"materialized {args.batch_id}: "
+        + ", ".join(item.task_id for item in second.ledger.batch(args.batch_id).materialized_tasks)
+    )
+    return 0
+
+
+def cmd_triage_epoch(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    collection = require_review_epoch_collection(state, args.epoch_id, args.revision)
+    require_active_review_epoch_collection(state, collection)
+    target = current_integration_target(repo, state)
+    if collection.plan.target_sha != target:
+        raise HLoopError(
+            "cannot triage a stale review epoch: "
+            f"epoch={collection.plan.target_sha} integration={target}"
+        )
+    if args.record_candidates:
+        return cmd_triage_epoch_record_candidates(repo, state, collection, args)
+    if args.approve_batch:
+        return cmd_triage_epoch_approve(repo, state, collection, args)
+    if args.materialize_batch:
+        return cmd_triage_epoch_materialize(repo, state, collection, args)
+    if collection.status != "ready_to_triage":
+        raise HLoopError(f"review epoch cannot close clean while {collection.status}")
+    closed = collection.close(reason=args.reason or "epoch triage found no remediation")
+    store_review_epoch_collection(state, closed)
+    state["needs_review"] = False
+    state["needs_gap_check"] = False
+    state["unreviewed_merge_count"] = 0
+    state["ungapped_merge_count"] = 0
+    state["phase"] = "dispatching"
+    save_state(repo, state)
+    print(f"closed clean review epoch {collection.plan.epoch_id}")
+    return 0
+
+
 def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -23215,6 +24567,12 @@ def cmd_triage_source(args: argparse.Namespace, source_type: str) -> int:
         source_state["triage_drafts"].append(str(draft_path))
     created_task_ids: list[str] = []
     if args.create_tasks:
+        if str((state.get("review_epochs") or {}).get("active_epoch_id") or ""):
+            raise HLoopError(
+                "direct source task creation is disabled for review epochs; "
+                "record candidates and use `hloop triage epoch --approve-batch`, "
+                "then `--materialize-batch`"
+            )
         if rejected_candidates and not candidates:
             raise HLoopError(
                 f"no valid fix task candidates for {source_id}; inspect rejected candidates in {draft_path}"
@@ -27203,6 +28561,63 @@ def build_parser() -> argparse.ArgumentParser:
     review_readiness.add_argument("--dry-run", action="store_true")
     review_readiness.set_defaults(func=cmd_review_readiness)
 
+    review_epoch = review_sub.add_parser(
+        "epoch", help="create and collect one immutable review epoch revision"
+    )
+    review_epoch_sub = review_epoch.add_subparsers(
+        dest="review_epoch_command", required=True
+    )
+    review_epoch_create = review_epoch_sub.add_parser(
+        "create", help="persist an initial immutable epoch plan"
+    )
+    review_epoch_create.add_argument("--plan", required=True)
+    review_epoch_create.add_argument("--protocol-capability", action="append")
+    review_epoch_create.set_defaults(func=cmd_review_epoch_create)
+    review_epoch_successor = review_epoch_sub.add_parser(
+        "successor", help="append a same-SHA successor revision"
+    )
+    review_epoch_successor.add_argument("--plan", required=True)
+    review_epoch_successor.add_argument("--protocol-capability", action="append")
+    review_epoch_successor.set_defaults(func=cmd_review_epoch_successor)
+    review_epoch_reserve = review_epoch_sub.add_parser(
+        "reserve", help="reserve epoch-wide capacity before an audit process starts"
+    )
+    review_epoch_reserve.add_argument("epoch_id")
+    review_epoch_reserve.add_argument("--revision", type=int)
+    review_epoch_reserve.add_argument("--lease-id", required=True)
+    review_epoch_reserve.add_argument("--execution-id", required=True)
+    review_epoch_reserve.add_argument("--process-id", action="append", required=True)
+    review_epoch_reserve.add_argument("--expires-at", required=True)
+    review_epoch_reserve.set_defaults(func=cmd_review_epoch_reserve)
+    review_epoch_lease = review_epoch_sub.add_parser(
+        "lease", help="advance a starting, quarantined, or terminal capacity lease"
+    )
+    review_epoch_lease.add_argument("epoch_id")
+    review_epoch_lease.add_argument("--revision", type=int)
+    review_epoch_lease.add_argument("--lease-id", required=True)
+    review_epoch_lease.add_argument(
+        "--action", choices=["running", "quarantine", "terminal"], required=True
+    )
+    review_epoch_lease.add_argument("--now")
+    review_epoch_lease.add_argument("--reason")
+    review_epoch_lease.add_argument("--process-exit-confirmed", action="store_true")
+    review_epoch_lease.add_argument("--forced-abort-acknowledged", action="store_true")
+    review_epoch_lease.set_defaults(func=cmd_review_epoch_lease)
+    review_epoch_record = review_epoch_sub.add_parser(
+        "record", help="record one immutable terminal execution outcome"
+    )
+    review_epoch_record.add_argument("epoch_id")
+    review_epoch_record.add_argument("--revision", type=int)
+    review_epoch_record.add_argument("--outcome", required=True)
+    review_epoch_record.set_defaults(func=cmd_review_epoch_record)
+    review_epoch_status = review_epoch_sub.add_parser(
+        "status", help="show the canonical epoch collection barrier"
+    )
+    review_epoch_status.add_argument("epoch_id")
+    review_epoch_status.add_argument("--revision", type=int)
+    review_epoch_status.add_argument("--json", action="store_true")
+    review_epoch_status.set_defaults(func=cmd_review_epoch_status)
+
     convergence = review_sub.add_parser("convergence", help="prepare or record bounded pre-final review convergence")
     convergence_sub = convergence.add_subparsers(dest="review_convergence_command", required=True)
     for command_name, func, help_text in (
@@ -28440,7 +29855,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_close.add_argument("review_id")
     reviewer_close.add_argument(
         "--verdict",
-        choices=["passed", "accepted-risk", "fix-tasks-created", "blocked"],
+        choices=["passed", "accepted-risk", "candidates-recorded", "blocked"],
         required=True,
     )
     reviewer_close.add_argument("--reason", required=True)
@@ -28514,7 +29929,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "aligned",
             "accepted-risk",
-            "fix-tasks-created",
+            "candidates-recorded",
             "decision-needed",
             "stale-spec-updated",
             "blocked",
@@ -28658,6 +30073,24 @@ def build_parser() -> argparse.ArgumentParser:
     triage_gap.add_argument("--allow-no-write", action="store_true")
     triage_gap.add_argument("--dry-run", action="store_true")
     triage_gap.set_defaults(func=cmd_triage_gap)
+    triage_epoch = triage_sub.add_parser(
+        "epoch", help="record, approve, or materialize one canonical remediation batch"
+    )
+    triage_epoch.add_argument("epoch_id")
+    triage_epoch.add_argument("--revision", type=int)
+    triage_epoch.add_argument("--batch-id")
+    triage_epoch_action = triage_epoch.add_mutually_exclusive_group(required=True)
+    triage_epoch_action.add_argument(
+        "--record-candidates", metavar="BUNDLE_JSON"
+    )
+    triage_epoch_action.add_argument("--approve-batch", action="store_true")
+    triage_epoch_action.add_argument("--materialize-batch", action="store_true")
+    triage_epoch_action.add_argument("--close-clean", action="store_true")
+    triage_epoch.add_argument("--approval-bundle")
+    triage_epoch.add_argument("--approval-ref")
+    triage_epoch.add_argument("--first-task-number", type=int)
+    triage_epoch.add_argument("--reason")
+    triage_epoch.set_defaults(func=cmd_triage_epoch)
 
     tick = sub.add_parser("tick", help="run one bounded loop tick")
     tick.add_argument("--once", action="store_true", help="document intent; tick is always bounded")

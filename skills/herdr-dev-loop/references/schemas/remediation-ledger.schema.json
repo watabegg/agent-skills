@@ -174,11 +174,17 @@
       "type": "object",
       "required": [
         "input_id",
+        "source",
+        "content_digest",
         "authorized_extra_rounds",
         "remediation_batch_ids"
       ],
       "properties": {
-        "input_id": {"type": "string", "minLength": 1},
+        "input_id": {"type": "string", "pattern": "^U[0-9]{4}$"},
+        "source": {
+          "enum": ["user", "user-chat", "manager-chat", "goal"]
+        },
+        "content_digest": {"$ref": "#/$defs/digest"},
         "authorized_extra_rounds": {"type": "integer", "minimum": 1},
         "remediation_batch_ids": {
           "type": "array",
