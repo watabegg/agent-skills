@@ -51,6 +51,98 @@
     "decisions"
   ],
   "$defs": {
+    "planningIdentity": {
+      "type": "object",
+      "required": [
+        "planning_schema_revision",
+        "run_id",
+        "plan_revision",
+        "requirements_revision",
+        "release_scope_revision",
+        "release_scope_digest",
+        "source_revision",
+        "source_digest"
+      ],
+      "properties": {
+        "planning_schema_revision": {"const": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "plan_revision": {"type": "integer", "minimum": 1},
+        "requirements_revision": {"type": "integer", "minimum": 1},
+        "release_scope_revision": {"type": "integer", "minimum": 1},
+        "release_scope_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "source_revision": {"type": "integer", "minimum": 1},
+        "source_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "planningState": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "enum": ["ready", "stale"]},
+        "identity": {"$ref": "#/$defs/planningIdentity"},
+        "artifact_digests": {
+          "type": "object",
+          "required": ["impact", "task_graph", "coverage", "plan_gap"],
+          "properties": {
+            "impact": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "task_graph": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "coverage": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "plan_gap": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
+        },
+        "allowed_scope_refs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "checked_at": {"type": "string"},
+        "stale_at": {"type": "string"},
+        "stale_reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "workerCandidateTaskProjection": {
+      "type": "object",
+      "properties": {
+        "contract_schema_revision": {"type": "integer", "enum": [2, 3]},
+        "preserved_invariants": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "regression_checks": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "risk_class": {"type": "string", "enum": ["mechanical", "normal", "high"]},
+        "required_gates": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["patch_review", "full_suite"]},
+          "uniqueItems": true
+        },
+        "worker_agent_effort": {"type": "string", "minLength": 1},
+        "candidate_revision": {"type": "integer", "minimum": 1},
+        "candidate_lifecycle_status": {
+          "type": "string",
+          "enum": [
+            "running",
+            "implementation_complete",
+            "candidate_sealed",
+            "patch_review_pending",
+            "patch_review_running",
+            "patch_review_passed",
+            "patch_fix_running",
+            "blocked_patch_review"
+          ]
+        },
+        "implementation_candidate": {"type": "object"},
+        "candidate_seal": {"type": "object"},
+        "candidate_artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "candidate_tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "completion_mode": {"type": "string", "enum": ["commit", "handoff"]},
+        "patch_review_history": {"type": "array", "items": {"type": "object"}},
+        "current_patch_review": {"type": "object"},
+        "patch_review_decision": {"type": "object"},
+        "legacy_result_acceptance": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
     "specialVerificationRecord": {
       "type": "object",
       "required": ["target_sha", "status", "references"],
@@ -157,6 +249,7 @@
       "additionalProperties": false
     },
     "resolved_config": {"type": "object"},
+    "planning": {"$ref": "#/$defs/planningState"},
     "release_scope": {
       "type": "object",
       "required": [
@@ -495,7 +588,10 @@
     "attempt_history": {"type": "array", "items": {"type": "object"}},
     "cleanup_history": {"type": "array", "items": {"type": "object"}},
     "lifecycle_diagnostics": {"type": "array", "items": {"type": "object"}},
-    "tasks": {"type": "object"},
+    "tasks": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/workerCandidateTaskProjection"}
+    },
     "batches": {
       "type": "object",
       "additionalProperties": {
@@ -514,6 +610,23 @@
         "type": "object",
         "properties": {
           "mode": {"type": "string", "enum": ["single", "swarm", "dual", "dual-swarm"]}
+        },
+        "additionalProperties": true
+      }
+    },
+    "patch_reviews": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string"},
+          "gate_status": {"type": "string"},
+          "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+          "task_attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
+          "review_attempt_id": {"type": "string", "minLength": 1},
+          "review_round": {"type": "integer", "minimum": 1},
+          "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+          "candidate_artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
         },
         "additionalProperties": true
       }
