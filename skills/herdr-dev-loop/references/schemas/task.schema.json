@@ -2,32 +2,46 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Task Frontmatter",
   "type": "object",
-  "required": ["id", "run_id", "skill_version", "kind", "status", "branch", "base_ref", "base_sha", "write_allow", "acceptance"],
+  "required": ["id", "run_id", "skill_version", "contract_schema_revision", "kind", "status", "branch", "base_ref", "base_sha", "write_allow", "acceptance"],
   "properties": {
     "id": {"type": "string", "pattern": "^T[0-9]{3}$"},
-    "run_id": {"type": "string"},
-    "skill_version": {"type": "string"},
+    "run_id": {"type": "string", "minLength": 1},
+    "skill_version": {"type": "string", "minLength": 1},
+    "contract_schema_revision": {"type": "integer", "enum": [2, 3]},
     "kind": {"type": "string", "enum": ["implementation", "fix", "research"]},
     "status": {"type": "string", "enum": ["queued", "running", "result_reported", "merged", "done", "partial", "blocked", "failed", "abandoned", "failed_validation"]},
-    "branch": {"type": "string"},
-    "base_ref": {"type": "string"},
-    "base_sha": {"type": "string"},
+    "created_from": {"type": "string"},
+    "branch": {"type": "string", "minLength": 1},
+    "base_ref": {"type": "string", "minLength": 1},
+    "base_sha": {"type": "string", "minLength": 1},
     "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+    "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
     "batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
-    "write_allow": {"type": "array", "items": {"type": "string"}},
-    "write_deny": {"type": "array", "items": {"type": "string"}},
-    "acceptance": {"type": "array", "items": {"type": "string"}},
+    "depends_on": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^T[0-9]{3}$"}},
+    "write_allow": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "write_deny": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
     "validation_minimum": {
       "oneOf": [
-        {"type": "string"},
-        {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        {"type": "string", "minLength": 1},
+        {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}
       ]
     },
     "worker_protocol": {"type": "string", "enum": ["native", "codex-impl"]},
     "worker_agent_provider": {"type": "string", "enum": ["codex", "claude"]},
-    "worker_agent_model": {"type": "string"},
+    "worker_agent_model": {"type": "string", "minLength": 1},
+    "worker_agent_effort": {"type": "string", "minLength": 1},
     "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
     "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."},
+    "preserved_invariants": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "regression_checks": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "risk_class": {"type": "string", "enum": ["mechanical", "normal", "high"]},
+    "required_gates": {"type": "array", "uniqueItems": true, "items": {"type": "string", "enum": ["patch_review", "full_suite"]}},
+    "investigation_goal": {"type": "string", "minLength": 1},
+    "implementation_ready_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "exploration_budget_minutes": {"type": "integer", "minimum": 1},
+    "history_search_allowed": {"type": "boolean"},
+    "migration_blocker": {"type": "string", "enum": ["risk-classification-required"]},
     "task_origin": {"type": "string", "enum": ["planned", "finding", "user-amendment", "operational", "legacy-unclassified"]},
     "release_scope_revision": {"type": "integer", "minimum": 0},
     "plan_item_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
@@ -39,6 +53,7 @@
     "operational_reason": {"type": "string"},
     "origin": {"type": "string", "enum": ["", "introduced", "diff-expanded-pre-existing", "unrelated-pre-existing", "unknown"]},
     "contract_relation": {"type": "string", "enum": ["", "in_scope", "outside_release", "ambiguous"]},
+    "decision_requirement": {"type": "string", "enum": ["", "none", "spec", "user"]},
     "release_effect": {"type": "string", "enum": ["", "blocking", "non_blocking"]},
     "remediation_round": {"type": "integer", "minimum": 0},
     "fact_status": {"type": "string", "enum": ["", "confirmed", "refuted", "insufficient_evidence"]},
@@ -55,11 +70,101 @@
       },
       "then": {
         "properties": {
-          "write_allow": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+          "write_allow": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
         },
         "required": ["write_allow"]
       }
     }
   ],
-  "additionalProperties": true
+  "oneOf": [
+    {
+      "title": "0.5.2 legacy task contract",
+      "required": ["contract_schema_revision"],
+      "properties": {
+        "contract_schema_revision": {"const": 2}
+      }
+    },
+    {"$ref": "#/$defs/revision3"}
+  ],
+  "$defs": {
+    "revision3": {
+      "title": "0.5.3 task contract",
+      "type": "object",
+      "required": [
+        "id",
+        "run_id",
+        "skill_version",
+        "contract_schema_revision",
+        "kind",
+        "status",
+        "branch",
+        "base_ref",
+        "base_sha",
+        "write_allow",
+        "acceptance",
+        "preserved_invariants",
+        "regression_checks",
+        "risk_class",
+        "required_gates",
+        "worker_agent_effort"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+        "run_id": {"type": "string", "minLength": 1},
+        "skill_version": {"type": "string", "minLength": 1},
+        "contract_schema_revision": {"const": 3},
+        "kind": {"type": "string", "enum": ["implementation", "fix", "research"]},
+        "status": {"type": "string", "enum": ["queued", "running", "result_reported", "merged", "done", "partial", "blocked", "failed", "abandoned", "failed_validation"]},
+        "created_from": {"type": "string"},
+        "branch": {"type": "string", "minLength": 1},
+        "base_ref": {"type": "string", "minLength": 1},
+        "base_sha": {"type": "string", "minLength": 1},
+        "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+        "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+        "batch_id": {"type": "string", "pattern": "^B[0-9]{3}$"},
+        "depends_on": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^T[0-9]{3}$"}},
+        "write_allow": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "write_deny": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "validation_minimum": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}
+          ]
+        },
+        "worker_protocol": {"type": "string", "enum": ["native", "codex-impl"]},
+        "worker_agent_provider": {"type": "string", "enum": ["codex", "claude"]},
+        "worker_agent_model": {"type": "string", "minLength": 1},
+        "worker_agent_effort": {"type": "string", "minLength": 1},
+        "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
+        "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
+        "preserved_invariants": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "regression_checks": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "risk_class": {"type": "string", "enum": ["mechanical", "normal", "high"]},
+        "required_gates": {"type": "array", "uniqueItems": true, "items": {"type": "string", "enum": ["patch_review", "full_suite"]}},
+        "investigation_goal": {"type": "string", "minLength": 1},
+        "implementation_ready_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "exploration_budget_minutes": {"type": "integer", "minimum": 1},
+        "history_search_allowed": {"type": "boolean"},
+        "task_origin": {"type": "string", "enum": ["planned", "finding", "user-amendment", "operational", "legacy-unclassified"]},
+        "release_scope_revision": {"type": "integer", "minimum": 0},
+        "plan_item_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "requirement_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "scope_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "source_finding": {"type": "string"},
+        "authorization_input_id": {"type": "string", "pattern": "^$|^U[0-9]{4}$"},
+        "why_fix_now": {"type": "string"},
+        "operational_reason": {"type": "string"},
+        "origin": {"type": "string", "enum": ["", "introduced", "diff-expanded-pre-existing", "unrelated-pre-existing", "unknown"]},
+        "contract_relation": {"type": "string", "enum": ["", "in_scope", "outside_release", "ambiguous"]},
+        "decision_requirement": {"type": "string", "enum": ["", "none", "spec", "user"]},
+        "release_effect": {"type": "string", "enum": ["", "blocking", "non_blocking"]},
+        "remediation_round": {"type": "integer", "minimum": 0},
+        "fact_status": {"type": "string", "enum": ["", "confirmed", "refuted", "insufficient_evidence"]},
+        "disposition": {"type": "string", "enum": ["", "fix_now", "defer_follow_up", "disable_feature", "mark_experimental", "user_decision", "accepted_risk", "discard"]},
+        "scope_expanding": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
 }
