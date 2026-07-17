@@ -2,7 +2,7 @@
 
 `herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/herdr-dev-loop/loops/<namespace>` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
 
-このREADMEは0.5.1運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、厳格なreviewは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。
+このREADMEは0.5.2運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、厳格なreviewは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。release checklistは[`docs/RELEASE-0.5.2.md`](docs/RELEASE-0.5.2.md)です。
 
 ## 最初に確認すること
 
@@ -36,14 +36,14 @@ Skillを使うManagerは、ほかの調査や変更より先に `hloop version` 
 新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
 
 ```text
-herdr-dev-loop 0.5.1 / namespace <namespace> を使用します（loop_skill_version: 0.5.1, run_id: 20260714T...-goal）
+herdr-dev-loop 0.5.2 / namespace <namespace> を使用します（loop_skill_version: 0.5.2, run_id: 20260716T...-goal）
 ```
 
 `hloop namespaces` は同居するloopを列挙し、旧 `.ai/loop` が存在する場合は `legacy ignored` と表示します。
 
 ## `config.toml` の設定
 
-0.5.1はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
+0.5.2はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
 
 ```bash
 hloop config path --json
@@ -55,11 +55,13 @@ hloop config explain --repo <repo> --json
 
 `[defaults]`にWorkerとReviewerのprovider、model、effort、同時Worker数、session cleanupを設定できます。`[[scope]]`は既定でcanonicalなrepository rootに一致し、同じrepository内のsubdirectoryから起動しても結果が変わりません。起動directory固有の設定だけ`match = "cwd"`を明示します。設定例は[`examples/config.toml`](examples/config.toml)にあります。
 
+新規loopの`[defaults.review]`は、`cadence = "batch"`、`pre_final_protocol = "codex-review-multi-v2"`、`manual_final_protocol = "codex-review-multi-v2"`、`max_fix_rounds = 2`、`scope_expansion_action = "follow_up"`、`final_required = "complete_zero_verified_actionable_findings"`、`lane_count = "auto"`です。manual-finalは実装済みの`codex-review-multi-v2`だけを受理し、`native`は黙って置換せず拒否します。legacy loopをmigrationしても、保存済みのmerge-count cadenceや既存のfinish semanticsは暗黙に変更されません。
+
 解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、task override、role start overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
 
 ## 永続化とworktree初期化経験
 
-既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。format 2または古いformat 3のstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。0.5.1の現行stateはformat 3、revision 1です。
+既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。format 2、format 3 revision 0/1のstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。0.5.2の新規stateはformat 3、revision 2です。
 
 worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
 
@@ -78,6 +80,85 @@ hloop experience show
 ```
 
 明示的なsetup commandを付けずに次のloopを初期化すると、recommended commandsが引き継がれます。
+
+## 0.5.2のrelease scopeとbounded review
+
+新規loopでは、実装をdispatchする前にrelease scope contractを固定します。scopeはsource fileのdigest、`scope_revision`、`source_snapshot_revision`、plan item、requirement、対応環境、trust boundaryを含む正本です。
+
+```bash
+hloop release-scope lock \
+  --source MISSION.md --source PLAN.md \
+  --plan-item-ref P004d --requirement-ref R001 \
+  --scope-ref release-scope-contract
+hloop release-scope status --json
+```
+
+lock後に意味を変える場合は、`release-scope amend --kind editorial|clarification|scope-change`で理由と参照を記録します。`scope-change`にはuser inputが必要です。source digestの未記録変更はreview readinessを止めます。
+
+lock後のtaskは、作成根拠を`task_origin`として保存します。`planned`はPLANまたはrequirement、`finding`はconfirmedなin-scope finding、`user-amendment`はuser input、`operational`はproduct挙動を変えない調査・validation・artifact整備だけに使います。task作成、triage、pump、conductorは同じauthorization preflightを通るため、CLIの自己申告だけでscope外taskを作成できません。
+
+review収束またはmanual final待ちでは、dispatchを独立してfreezeできます。
+
+```bash
+hloop dispatch freeze --reason 'awaiting manual final review' --user-input-id U0001
+hloop dispatch status --json
+hloop dispatch unfreeze --user-input-id U0002
+```
+
+freeze中もvalidation、harvest、merge、follow-up記録、report、pauseは可能ですが、新しいtaskと新しいWorker/Reviewer/Gap Auditor/Advisorの起動は拒否されます。
+
+### Findingの分類とfollow-up
+
+Reviewerのcandidateは、severityだけで処置しません。`fact_status`（confirmed/refuted/insufficient_evidence）、`severity`（P0–P3）、`origin`（introduced/diff-expanded-pre-existing/unrelated-pre-existing/unknown）、`contract_relation`（in_scope/outside_release/ambiguous）、`decision_requirement`（none/spec/user）、`disposition`（fix_now/defer_follow_up/disable_feature/mark_experimental/user_decision/accepted_risk/discard）、`release_effect`（blocking/non_blocking）を独立して確定します。今回のdiffが導入または拡大したin-scope P0/P1はfollow-upへ隠さず、fix、disable、experimental化、またはblocking user decisionにします。
+
+scope外または今回止めないcandidateは、first-class follow-upとして記録できます。issue keyはcomponent、trigger class、product impact、既知のroot causeだけから生成され、review fingerprint、対象SHA、severity、修正案、タイトルの変化では重複しません。
+
+```bash
+hloop follow-up add \
+  --title '次版で扱う統合改善' \
+  --component 'review pipeline' \
+  --trigger-class 'scope expanding candidate' \
+  --product-impact '次版の運用判断が必要' \
+  --impact '現在のrelease acceptanceには影響しない' \
+  --affected-path 'skills/herdr-dev-loop/scripts/hloop' \
+  --fact-status insufficient_evidence \
+  --origin unknown \
+  --contract-relation outside_release \
+  --decision-requirement none \
+  --release-effect non_blocking \
+  --disposition defer_follow_up \
+  --source-review-fingerprint sha256:<64 hex> \
+  --evidence reviews/R001.md \
+  --deferred-reason '現在のrelease scope外' \
+  --reconsider-condition '次のscope lockで対象化する'
+hloop follow-up list --json
+hloop follow-up export --output docs/follow-ups.md
+```
+
+### Convergence reviewとmanual final
+
+通常のReviewer起動はpre-final convergenceを暗黙に開始しません。統合batchとvalidationが安定したら、固定SHAを準備し、MANIFESTを記録します。
+
+```bash
+hloop review readiness --json
+hloop review convergence prepare --mode swarm --json
+hloop review convergence record --fix-round 0 --json
+```
+
+manifestが不完全、またはverified actionable findingが残る場合は、状態を保存してremediationへ戻ります。新規loopのautomatic fix round上限は2回です。上限後やmanual finalの失敗から再開する場合は、user inputを伴う原子的な`hloop review reopen --action ... --user-input-id U0002`だけを使います。これにより、追加task作成、scope amendment、extra round authorization、certification invalidationを一つの状態遷移で記録します。
+
+convergenceが`converged`になったら、freshなmanual final reviewを準備します。
+
+```bash
+hloop final-review prepare --mode swarm --json
+# 固定SHA、PLAN.json、MANIFEST.json、reportへ手動review結果を記録
+hloop final-review record --json
+hloop final-review status --json
+```
+
+manual finalは、finding数が0という自己申告だけでは合格しません。全lane完了、必要な独立verification、shortfallなし、manifest completeness、PLAN/MANIFESTのidentityとdigest、scope snapshot、固定target SHA、report存在を検証し、verified actionable findingが0件であることを要求します。complete-zeroにならないmanual finalは`finish`を通過できません。
+
+PLAN/MANIFESTの公開schemaは[`schemas/final-review-plan.schema.json`](schemas/final-review-plan.schema.json)と[`schemas/final-review-manifest.schema.json`](schemas/final-review-manifest.schema.json)です。
 
 ## Artifactなしで止まったroleの復旧
 
@@ -177,7 +258,7 @@ hloop decision new \
 
 ## Agent報告とevent-driven Manager
 
-0.5.1のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。invocation IDはASCII英数字で始め、以降もASCII英数字または`.`、`_`、`:`、`/`、`-`だけを使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
+0.5.2のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。invocation IDはASCII英数字で始め、以降もASCII英数字または`.`、`_`、`:`、`/`、`-`だけを使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
 
 Managerはpaneを巡回する前にdurable inboxを処理します。
 
@@ -308,11 +389,21 @@ hloop --repo <repo> init \
 
 `--worktree-root` を指定すると、Worker、Reviewer、Gap Auditor、Advisorのworktreeがすべてその配下へ作られます。相対パスは対象リポジトリを基準に解決されます。`init --force`で再初期化した場合、旧loopは`.ai/herdr-dev-loop/archive/<namespace>/`へ退避され、新しい`run_id`が発行されます。
 
-### 3. batchとtaskを作る
+### 3. Quick Start: 要件からbatchとtaskを作る
 
 ```bash
+hloop --repo <repo> input record --source manager-chat --text '<利用者の指示>'
+hloop --repo <repo> requirement new \
+  --source-input U0001 \
+  --acceptance '<観測可能な完了条件>' \
+  --priority P1
+hloop --repo <repo> release-scope lock \
+  --source MISSION.md --source PLAN.md \
+  --requirement-ref REQ-001 \
+  --scope-ref release-scope-contract
 hloop --repo <repo> batch start "Initial implementation batch"
 hloop --repo <repo> task new "<担当範囲の実装>" \
+  --requirement-ref REQ-001 \
   --write-allow 'src/foo/**' --write-allow 'tests/foo/**'
 ```
 
@@ -396,13 +487,16 @@ Managerがdraftを確認した後、必要なものだけ `--create-tasks` でqu
 ├── inputs/          # redacted raw input。local-only
 ├── inbox/ broker/ broker-spool/ # local-only
 ├── tasks/ results/ reviews/ gaps/ advice/ triage/
+├── release-scope/ follow-ups/   # scope amendments and first-class follow-ups
+├── reviews/convergence/          # fixed-target PLAN/MANIFEST
+├── reviews/final/                # manual-final PLAN/MANIFEST/REPORT
 ├── qa/              # Manager最終QA
 └── reports/         # 最終報告
 ```
 
 Managerは mission、plan、profile、state、decisionを所有します。Workerは自分のブランチと自分のresult artifactだけを書きます。Reviewerは `reviews/`、Gap Auditorは `gaps/`、Advisorは `advice/` の自分のartifactだけを書きます。
 
-Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.1 CLIは`requirements/`、`progress/`、`context/`、`decisions/`の個別directoryを生成しません。
+Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.2 CLIは`requirements/`、`progress/`、`context/`、`decisions/`の個別directoryを生成しません。release scopeとfollow-upは、それぞれ`STATE.json.release_scope`と`STATE.json.follow_ups`、およびnamespaced artifactへ保存されます。
 
 Workerの結果をManagerが書き換えて `done` にすることはできません。`partial`、`blocked`、`failed`、`merge_ready: false` の場合は、原因を記録して再実行またはfix taskへ進みます。
 
@@ -457,7 +551,7 @@ python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
 python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
 ```
 
-通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.1表示を確認します。今回の0.5.1 candidateではfresh Codex discoveryだけをrelease evidenceとして取得し、未実施のfresh Claude discoveryを成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。移行済みnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/RELEASE-0.5.1.md`](docs/RELEASE-0.5.1.md)にあります。
+通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.2表示を確認します。fresh provider discoveryやprovider E2Eを実施していない場合は成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。移行済みnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/RELEASE-0.5.2.md`](docs/RELEASE-0.5.2.md)にあります。なお、今回のrepository taskではinstalled Codex/Claude copyを同期しません。
 
 ## 公開時の注意
 

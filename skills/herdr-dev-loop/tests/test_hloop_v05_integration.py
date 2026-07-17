@@ -113,7 +113,7 @@ effort = "medium"
 
                 state_path = self.init_loop(repo, "config-snapshot")
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                self.assertEqual((state["state_format_version"], state["schema_revision"]), (3, 1))
+                self.assertEqual((state["state_format_version"], state["schema_revision"]), (3, 2))
                 self.assertEqual(state["max_workers"], 5)
                 self.assertEqual(state["session_cleanup"], "delete")
                 self.assertEqual(state["worker_agent_provider"], "claude")
@@ -137,17 +137,17 @@ effort = "medium"
                 code, output, error = self.run_cli([*prefix, "--dry-run"])
                 self.assertEqual((code, error), (0, ""), output)
                 plan = json.loads(output)
-                self.assertEqual((plan["to_format"], plan["to_revision"]), (3, 1))
+                self.assertEqual((plan["to_format"], plan["to_revision"]), (3, 2))
                 self.assertEqual(
                     plan["applied_steps"],
-                    ["format-2-to-3", "format-3-revision-1"],
+                    ["format-2-to-3", "format-3-revision-1", "format-3-revision-2"],
                 )
                 code, output, error = self.run_cli([*prefix, "--apply"])
                 self.assertEqual((code, error), (0, ""), output)
                 migrated = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(
                     (migrated["state_format_version"], migrated["schema_revision"]),
-                    (3, 1),
+                    (3, 2),
                 )
                 self.assertIn("artifact_policy", migrated)
                 self.assertEqual(len(list((state_path.parent / "migration").glob("STATE.v2.r0.*.json"))), 1)
@@ -179,14 +179,17 @@ effort = "medium"
                 self.assertEqual((code, error), (0, ""), output)
                 plan = json.loads(output)
                 self.assertEqual((plan["from_format"], plan["from_revision"]), (3, 0))
-                self.assertEqual(plan["applied_steps"], ["format-3-revision-1"])
+                self.assertEqual(
+                    plan["applied_steps"],
+                    ["format-3-revision-1", "format-3-revision-2"],
+                )
 
                 code, output, error = self.run_cli([*prefix, "--apply"])
                 self.assertEqual((code, error), (0, ""), output)
                 migrated = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(
                     (migrated["state_format_version"], migrated["schema_revision"]),
-                    (3, 1),
+                    (3, 2),
                 )
                 self.assertEqual(
                     len(list((state_path.parent / "migration").glob("STATE.v3.r0.*.json"))),
@@ -233,19 +236,19 @@ effort = "medium"
                     capture_output=True,
                 )
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                state["schema_revision"] = 2
+                state["schema_revision"] = 3
                 state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
                 journal_path = state_path.parent / "JOURNAL.md"
                 prefix = ["--repo", str(repo), "--namespace", "future-state"]
 
                 code, output, error = self.run_cli([*prefix, "status", "--raw-state"])
                 self.assertEqual((code, error), (0, ""), output)
-                self.assertEqual(json.loads(output)["schema_revision"], 2)
+                self.assertEqual(json.loads(output)["schema_revision"], 3)
                 before_migrate = (state_path.read_bytes(), journal_path.read_bytes())
                 code, _, error = self.run_cli([*prefix, "migrate", "--dry-run"])
                 self.assertEqual(code, 2)
                 self.assertIn(
-                    "state format-3.revision-2 is newer than runtime format-3.revision-1",
+                    "state format-3.revision-3 is newer than runtime format-3.revision-2",
                     error,
                 )
                 self.assertEqual(
@@ -324,8 +327,8 @@ effort = "medium"
                             code, _, error = self.run_cli([*prefix, *command])
                             self.assertEqual(code, 2)
                             self.assertIn(
-                                "state format-3.revision-2 is newer than runtime "
-                                "format-3.revision-1",
+                                "state format-3.revision-3 is newer than runtime "
+                                "format-3.revision-2",
                                 error,
                             )
                             self.assertEqual(snapshot(), before)
@@ -439,20 +442,39 @@ effort = "medium"
             repo = self.make_repo(root)
             with self.isolated_config_env(root):
                 state_path = self.init_loop(repo, "final-gate")
+                (state_path.parent / "PLAN.md").write_text(
+                    "# Plan\n\n- P001: final gate fixture\n",
+                    encoding="utf-8",
+                )
+                prefix = ["--repo", str(repo), "--namespace", "final-gate"]
+                code, output, error = self.run_cli(
+                    [*prefix, "release-scope", "lock", "--plan-item-ref", "P001"]
+                )
+                self.assertEqual((code, error), (0, ""), output)
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 state["batches"] = {
                     "B001": {"id": "B001", "status": "closed", "task_ids": []}
                 }
                 state["tasks"] = {"T000": {"status": "merged", "batch_id": "B001"}}
                 state_path.write_text(json.dumps(state), encoding="utf-8")
-                prefix = ["--repo", str(repo), "--namespace", "final-gate"]
                 code, output, error = self.run_cli([*prefix, "final-gates", "arm"])
                 self.assertEqual((code, error), (0, ""), output)
                 armed = json.loads(state_path.read_text(encoding="utf-8"))["final_gate"]
                 self.assertEqual(armed["status"], "armed")
 
                 code, output, error = self.run_cli(
-                    [*prefix, "task", "new", "follow-up", "--write-allow", "src/**"]
+                    [
+                        *prefix,
+                        "task",
+                        "new",
+                        "follow-up",
+                        "--write-allow",
+                        "src/**",
+                        "--task-origin",
+                        "planned",
+                        "--plan-item-ref",
+                        "P001",
+                    ]
                 )
                 self.assertEqual((code, error), (0, ""), output)
                 disarmed = json.loads(state_path.read_text(encoding="utf-8"))["final_gate"]

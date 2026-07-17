@@ -1,5 +1,8 @@
-# herdr-dev-loop 0.5.1 configuration example.
+# herdr-dev-loop 0.5.2 configuration example.
 # Copy to one of the locations shown by `hloop config path --json`.
+# New loops use batch review cadence and complete-zero manual-final
+# certification by default. Legacy loops retain their stored cadence after
+# migration.
 version = 1
 
 [defaults]
@@ -17,6 +20,16 @@ provider = "codex"
 model = "auto"
 effort = "auto"
 probe_count = 6
+
+[defaults.review]
+cadence = "batch"
+pre_final_protocol = "codex-review-multi-v2"
+# Manual-final certification currently has no native implementation.
+manual_final_protocol = "codex-review-multi-v2"
+max_fix_rounds = 2
+scope_expansion_action = "follow_up"
+final_required = "complete_zero_verified_actionable_findings"
+lane_count = "auto"
 
 # `match = "repo"` is the default. The canonical repository root is matched,
 # so running hloop from a nested directory does not change the result.
