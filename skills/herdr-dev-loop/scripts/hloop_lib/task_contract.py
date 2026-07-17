@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+import re
 from typing import Any
 
 
@@ -67,6 +68,40 @@ RISK_CLASSES = frozenset({"mechanical", "normal", "high"})
 REQUIRED_GATES = frozenset({"patch_review", "full_suite"})
 RESULT_STATUSES = frozenset({"done", "partial", "blocked", "failed", "abandoned"})
 VALIDATION_RESULTS = frozenset({"passed", "failed", "blocked"})
+PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
+WORKER_PROTOCOLS = frozenset({"native", "codex-impl"})
+AGENT_PROVIDERS = frozenset({"codex", "claude"})
+WORKER_QA_PROFILES = frozenset(
+    {"repo-default", "local", "staging", "preview", "none", "custom"}
+)
+TASK_ORIGINS = frozenset(
+    {"planned", "finding", "user-amendment", "operational", "legacy-unclassified"}
+)
+FINDING_ORIGINS = frozenset(
+    {
+        "",
+        "introduced",
+        "diff-expanded-pre-existing",
+        "unrelated-pre-existing",
+        "unknown",
+    }
+)
+CONTRACT_RELATIONS = frozenset({"", "in_scope", "outside_release", "ambiguous"})
+DECISION_REQUIREMENTS = frozenset({"", "none", "spec", "user"})
+RELEASE_EFFECTS = frozenset({"", "blocking", "non_blocking"})
+FACT_STATUSES = frozenset({"", "confirmed", "refuted", "insufficient_evidence"})
+DISPOSITIONS = frozenset(
+    {
+        "",
+        "fix_now",
+        "defer_follow_up",
+        "disable_feature",
+        "mark_experimental",
+        "user_decision",
+        "accepted_risk",
+        "discard",
+    }
+)
 
 V053_TASK_TOP_LEVEL_FIELDS = frozenset(
     {
@@ -351,6 +386,324 @@ def _string_list_issues(
     return issues
 
 
+def _schema_string_issues(
+    record: Mapping[str, Any],
+    field: str,
+    *,
+    min_length: int = 0,
+    pattern: str | None = None,
+    allowed: frozenset[str] | None = None,
+) -> list[ContractIssue]:
+    """Mirror one canonical JSON Schema string property without I/O."""
+
+    if field not in record:
+        return []
+    value = record.get(field)
+    if not isinstance(value, str):
+        return [
+            _issue(
+                "contract-field-invalid",
+                f"{field} must be a string",
+                field,
+            )
+        ]
+    issues: list[ContractIssue] = []
+    if len(value) < min_length:
+        issues.append(
+            _issue(
+                "contract-field-invalid",
+                f"{field} must contain at least {min_length} character(s)",
+                field,
+            )
+        )
+    if pattern is not None and re.fullmatch(pattern, value) is None:
+        issues.append(
+            _issue(
+                "contract-field-invalid",
+                f"{field} does not match the canonical pattern",
+                field,
+            )
+        )
+    if allowed is not None and value not in allowed:
+        issues.append(
+            _issue(
+                "contract-field-unsupported",
+                f"unsupported {field} value: {value!r}",
+                field,
+            )
+        )
+    return issues
+
+
+def _schema_integer_issues(
+    record: Mapping[str, Any], field: str, *, minimum: int
+) -> list[ContractIssue]:
+    if field not in record:
+        return []
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        return [
+            _issue(
+                "contract-field-invalid",
+                f"{field} must be an integer >= {minimum}",
+                field,
+            )
+        ]
+    return []
+
+
+def _schema_boolean_issues(
+    record: Mapping[str, Any], field: str
+) -> list[ContractIssue]:
+    if field in record and not isinstance(record.get(field), bool):
+        return [
+            _issue(
+                "contract-field-invalid",
+                f"{field} must be a boolean",
+                field,
+            )
+        ]
+    return []
+
+
+def _schema_string_array_issues(
+    record: Mapping[str, Any],
+    field: str,
+    *,
+    min_items: int = 0,
+    item_min_length: int = 0,
+    item_pattern: str | None = None,
+    allowed: frozenset[str] | None = None,
+    unique: bool = False,
+) -> list[ContractIssue]:
+    """Mirror an array-of-strings property from the canonical schema."""
+
+    if field not in record:
+        return []
+    value = record.get(field)
+    if not isinstance(value, list):
+        return [
+            _issue(
+                "contract-field-invalid",
+                f"{field} must be an array of strings",
+                field,
+            )
+        ]
+    issues: list[ContractIssue] = []
+    if len(value) < min_items:
+        issues.append(
+            _issue(
+                "contract-field-empty",
+                f"{field} must contain at least {min_items} item(s)",
+                field,
+            )
+        )
+    all_strings = True
+    for item in value:
+        if not isinstance(item, str):
+            all_strings = False
+            issues.append(
+                _issue(
+                    "contract-field-invalid",
+                    f"{field} items must be strings",
+                    field,
+                )
+            )
+            continue
+        if len(item) < item_min_length:
+            issues.append(
+                _issue(
+                    "contract-field-invalid",
+                    f"{field} items must contain at least {item_min_length} character(s)",
+                    field,
+                )
+            )
+        if item_pattern is not None and re.fullmatch(item_pattern, item) is None:
+            issues.append(
+                _issue(
+                    "contract-field-invalid",
+                    f"{field} item does not match the canonical pattern",
+                    field,
+                )
+            )
+        if allowed is not None and item not in allowed:
+            issues.append(
+                _issue(
+                    "contract-field-unsupported",
+                    f"unsupported {field} value: {item!r}",
+                    field,
+                )
+            )
+    if unique and all_strings and len(set(value)) != len(value):
+        issues.append(
+            _issue(
+                "contract-field-duplicated",
+                f"{field} must not contain duplicates",
+                field,
+            )
+        )
+    return issues
+
+
+def _validation_minimum_schema_issues(
+    record: Mapping[str, Any],
+) -> list[ContractIssue]:
+    field = "validation_minimum"
+    if field not in record:
+        return []
+    value = record.get(field)
+    if isinstance(value, str) and len(value) >= 1:
+        return []
+    if (
+        isinstance(value, list)
+        and len(value) >= 1
+        and all(isinstance(item, str) and len(item) >= 1 for item in value)
+    ):
+        return []
+    return [
+        _issue(
+            "contract-field-invalid",
+            "validation_minimum must be a non-empty string or non-empty array of non-empty strings",
+            field,
+        )
+    ]
+
+
+def _revision_three_task_schema_issues(
+    record: Mapping[str, Any],
+) -> list[ContractIssue]:
+    """Validate every value constraint in task.schema.json revision 3."""
+
+    issues: list[ContractIssue] = []
+    string_specs = (
+        ("id", 1, r"T[0-9]{3}", None),
+        ("run_id", 1, None, None),
+        ("skill_version", 1, None, None),
+        ("kind", 0, None, TASK_KINDS),
+        ("status", 0, None, TASK_STATUSES),
+        ("created_from", 0, None, None),
+        ("branch", 1, None, None),
+        ("base_ref", 1, None, None),
+        ("base_sha", 1, None, None),
+        ("priority", 0, None, PRIORITIES),
+        ("severity", 0, None, PRIORITIES),
+        ("batch_id", 0, r"B[0-9]{3}", None),
+        ("worker_protocol", 0, None, WORKER_PROTOCOLS),
+        ("worker_agent_provider", 0, None, AGENT_PROVIDERS),
+        ("worker_agent_model", 1, None, None),
+        ("worker_agent_effort", 1, None, None),
+        ("worker_qa_profile", 0, None, WORKER_QA_PROFILES),
+        ("qa_profile", 0, None, WORKER_QA_PROFILES),
+        ("risk_class", 0, None, RISK_CLASSES),
+        ("investigation_goal", 1, None, None),
+        ("task_origin", 0, None, TASK_ORIGINS),
+        ("source_finding", 0, None, None),
+        ("authorization_input_id", 0, r"(?:|U[0-9]{4})", None),
+        ("why_fix_now", 0, None, None),
+        ("operational_reason", 0, None, None),
+        ("origin", 0, None, FINDING_ORIGINS),
+        ("contract_relation", 0, None, CONTRACT_RELATIONS),
+        ("decision_requirement", 0, None, DECISION_REQUIREMENTS),
+        ("release_effect", 0, None, RELEASE_EFFECTS),
+        ("fact_status", 0, None, FACT_STATUSES),
+        ("disposition", 0, None, DISPOSITIONS),
+    )
+    for field, min_length, pattern, allowed in string_specs:
+        issues.extend(
+            _schema_string_issues(
+                record,
+                field,
+                min_length=min_length,
+                pattern=pattern,
+                allowed=allowed,
+            )
+        )
+
+    array_specs = (
+        ("depends_on", 0, 0, r"T[0-9]{3}", None, True),
+        ("write_allow", 0, 1, None, None, False),
+        ("write_deny", 0, 1, None, None, False),
+        ("acceptance", 1, 1, None, None, False),
+        ("preserved_invariants", 1, 1, None, None, False),
+        ("regression_checks", 1, 1, None, None, False),
+        ("required_gates", 0, 0, None, REQUIRED_GATES, True),
+        ("implementation_ready_evidence", 0, 1, None, None, False),
+        ("plan_item_refs", 0, 0, None, None, True),
+        ("requirement_refs", 0, 0, None, None, True),
+        ("scope_refs", 0, 0, None, None, True),
+    )
+    for field, min_items, item_min_length, pattern, allowed, unique in array_specs:
+        issues.extend(
+            _schema_string_array_issues(
+                record,
+                field,
+                min_items=min_items,
+                item_min_length=item_min_length,
+                item_pattern=pattern,
+                allowed=allowed,
+                unique=unique,
+            )
+        )
+
+    issues.extend(_validation_minimum_schema_issues(record))
+    for field, minimum in (
+        ("exploration_budget_minutes", 1),
+        ("release_scope_revision", 0),
+        ("remediation_round", 0),
+    ):
+        issues.extend(_schema_integer_issues(record, field, minimum=minimum))
+    for field in ("history_search_allowed", "scope_expanding"):
+        issues.extend(_schema_boolean_issues(record, field))
+    return issues
+
+
+def _revision_three_result_schema_issues(
+    record: Mapping[str, Any],
+) -> list[ContractIssue]:
+    """Validate every value constraint in result.schema.json revision 3."""
+
+    issues: list[ContractIssue] = []
+    for field, min_length, pattern in (
+        ("task_id", 1, r"T[0-9]{3}"),
+        ("run_id", 1, None),
+        ("skill_version", 1, None),
+        ("attempt_id", 1, r"T[0-9]{3}-A[0-9]{3}"),
+        ("branch", 1, None),
+        ("head_sha", 1, None),
+        ("base_sha", 1, None),
+        ("validation_summary", 0, None),
+        ("self_review_summary", 1, None),
+    ):
+        issues.extend(
+            _schema_string_issues(
+                record, field, min_length=min_length, pattern=pattern
+            )
+        )
+    issues.extend(_schema_string_issues(record, "status", allowed=RESULT_STATUSES))
+    for field in ("merge_ready", "validation_recorded", "handoff"):
+        issues.extend(_schema_boolean_issues(record, field))
+    for field, min_items, item_min_length, allowed in (
+        ("changed_files", 0, 0, None),
+        ("validation_commands", 0, 1, None),
+        ("validation_results", 0, 0, VALIDATION_RESULTS),
+        ("blocking_questions", 0, 0, None),
+        ("invariant_evidence", 1 if record.get("status") == "done" else 0, 1, None),
+        ("regression_evidence", 1 if record.get("status") == "done" else 0, 1, None),
+        ("residual_risks", 0, 1, None),
+        ("unrun_checks", 0, 1, None),
+    ):
+        issues.extend(
+            _schema_string_array_issues(
+                record,
+                field,
+                min_items=min_items,
+                item_min_length=item_min_length,
+                allowed=allowed,
+            )
+        )
+    return issues
+
+
 def _revision_issues(record: Mapping[str, Any]) -> tuple[int | None, list[ContractIssue]]:
     try:
         return contract_schema_revision_of(record), []
@@ -372,12 +725,12 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
             issues.append(problem)
 
     kind = record.get("kind")
-    if kind not in TASK_KINDS:
+    if not isinstance(kind, str) or kind not in TASK_KINDS:
         issues.append(
             _issue("contract-field-unsupported", f"unsupported task kind: {kind!r}", "kind")
         )
     status = record.get("status")
-    if status not in TASK_STATUSES:
+    if not isinstance(status, str) or status not in TASK_STATUSES:
         issues.append(
             _issue(
                 "contract-field-unsupported",
@@ -390,7 +743,7 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
             record,
             "write_allow",
             required=True,
-            min_items=1 if kind in {"implementation", "fix"} else 0,
+            min_items=1 if kind == "implementation" or kind == "fix" else 0,
         )
     )
     issues.extend(
@@ -399,6 +752,7 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
 
     if revision == V053_CONTRACT_SCHEMA_REVISION:
         issues.extend(_unknown_field_issues(record, V053_TASK_TOP_LEVEL_FIELDS))
+        issues.extend(_revision_three_task_schema_issues(record))
         issues.extend(
             _string_list_issues(
                 record, "preserved_invariants", required=True, min_items=1
@@ -408,7 +762,7 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
             _string_list_issues(record, "regression_checks", required=True, min_items=1)
         )
         risk_class = record.get("risk_class")
-        if risk_class not in RISK_CLASSES:
+        if not isinstance(risk_class, str) or risk_class not in RISK_CLASSES:
             issues.append(
                 _issue(
                     "contract-field-unsupported",
@@ -428,7 +782,8 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
         problem = _required_text(record, "worker_agent_effort")
         if problem:
             issues.append(problem)
-        if record.get("migration_blocker") not in {None, ""}:
+        migration_blocker = record.get("migration_blocker")
+        if migration_blocker is not None and migration_blocker != "":
             issues.append(
                 _issue(
                     "revision-3-legacy-blocker",
@@ -491,7 +846,7 @@ def validate_result_contract(record: Mapping[str, Any]) -> ContractValidation:
         if problem:
             issues.append(problem)
     status = record.get("status")
-    if status not in RESULT_STATUSES:
+    if not isinstance(status, str) or status not in RESULT_STATUSES:
         issues.append(
             _issue(
                 "contract-field-unsupported",
@@ -595,7 +950,7 @@ def validate_result_contract(record: Mapping[str, Any]) -> ContractValidation:
                     "validation_recorded",
                 )
             )
-        if not results or any(result != "passed" for result in results):
+        if not results_present or any(result != "passed" for result in results):
             issues.append(
                 _issue(
                     "merge-ready-validation-failed",
@@ -606,6 +961,7 @@ def validate_result_contract(record: Mapping[str, Any]) -> ContractValidation:
 
     if revision == V053_CONTRACT_SCHEMA_REVISION:
         issues.extend(_unknown_field_issues(record, V053_RESULT_TOP_LEVEL_FIELDS))
+        issues.extend(_revision_three_result_schema_issues(record))
         completion_evidence_items = 1 if status == "done" else 0
         issues.extend(
             _string_list_issues(
