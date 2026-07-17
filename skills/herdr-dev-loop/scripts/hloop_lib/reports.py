@@ -1,9 +1,16 @@
-"""Pure DRAFT, FINAL, and BLOCKED outcome report gates for HLoop 0.5."""
+"""Pure outcome gates and bounded-convergence projections for HLoop 0.5.2.
+
+The report model deliberately keeps the v0.5.0/v0.5.1 outcome fields stable.
+The bounded-convergence fields are optional projections: legacy records can be
+read and written without knowing about them, while enabled runs can expose the
+execution evidence needed by a final report and postmortem.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+import math
 from typing import Any, Mapping, Sequence
 
 from .requirements import EvidenceRef, RequirementProgress
@@ -25,6 +32,14 @@ def _required_text(value: Any, field_name: str) -> str:
     return value.strip()
 
 
+def _optional_text(value: Any, field_name: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise OutcomeModelError(f"{field_name} must be a string")
+    return value.strip()
+
+
 def _rfc3339(value: str, field_name: str) -> str:
     text = _required_text(value, field_name)
     candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
@@ -38,12 +53,59 @@ def _rfc3339(value: str, field_name: str) -> str:
 
 
 def _unique_texts(values: Sequence[str], field_name: str) -> tuple[str, ...]:
+    if values is None:
+        return ()
     if isinstance(values, (str, bytes)):
         raise OutcomeModelError(f"{field_name} must be a sequence of strings")
     normalized = tuple(_required_text(value, field_name) for value in values)
     if len(set(normalized)) != len(normalized):
         raise OutcomeModelError(f"{field_name} must not contain duplicates")
     return normalized
+
+
+def _nonnegative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise OutcomeModelError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _nullable_nonnegative_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _nonnegative_int(value, field_name)
+
+
+def _nonnegative_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OutcomeModelError(f"{field_name} must be a non-negative number")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized < 0:
+        raise OutcomeModelError(f"{field_name} must be a non-negative finite number")
+    return normalized
+
+
+def _nullable_nonnegative_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    return _nonnegative_float(value, field_name)
+
+
+def _count_map(value: Any, field_name: str) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise OutcomeModelError(f"{field_name} must be an object of counts")
+    result: dict[str, int] = {}
+    for key, count in value.items():
+        normalized_key = _required_text(key, f"{field_name} key")
+        result[normalized_key] = _nonnegative_int(count, f"{field_name}.{normalized_key}")
+    return dict(sorted(result.items()))
+
+
+def _record(value: Any, field_name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OutcomeModelError(f"{field_name} must be an object")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +169,942 @@ class OutcomeGate:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagerInvocation:
+    """The Manager backend identity captured for postmortem comparison."""
+
+    provider: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
+    recorded_at: str = ""
+    unavailable_reason: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "provider",
+            "model",
+            "reasoning_effort",
+            "recorded_at",
+            "unavailable_reason",
+        ):
+            object.__setattr__(
+                self, field_name, _optional_text(getattr(self, field_name), field_name)
+            )
+        if self.recorded_at:
+            _rfc3339(self.recorded_at, "recorded_at")
+
+    def to_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "provider": self.provider,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "recorded_at": self.recorded_at,
+            "unavailable_reason": self.unavailable_reason,
+        }
+        return record
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "ManagerInvocation":
+        record = _record(value, "manager_invocation")
+        return cls(
+            provider=record.get("provider", ""),
+            model=record.get("model", ""),
+            reasoning_effort=record.get("reasoning_effort", ""),
+            recorded_at=record.get("recorded_at", ""),
+            unavailable_reason=record.get("unavailable_reason", ""),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BatchPerformance:
+    """Observed execution evidence for one closed implementation batch."""
+
+    batch_id: str = ""
+    worker_count: int = 0
+    wall_time_seconds: float = 0.0
+    worker_runtime_seconds: float = 0.0
+    effective_parallelism: float | None = None
+    longest_worker_seconds: float = 0.0
+    validation_time_seconds: float = 0.0
+    review_wait_time_seconds: float = 0.0
+    warnings: tuple[str, ...] = ()
+    replan_required: bool = False
+    conflict_graph_digest: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "batch_id", _optional_text(self.batch_id, "batch_id"))
+        object.__setattr__(
+            self, "worker_count", _nonnegative_int(self.worker_count, "worker_count")
+        )
+        for field_name in (
+            "wall_time_seconds",
+            "worker_runtime_seconds",
+            "longest_worker_seconds",
+            "validation_time_seconds",
+            "review_wait_time_seconds",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _nonnegative_float(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "effective_parallelism",
+            _nullable_nonnegative_float(
+                self.effective_parallelism, "effective_parallelism"
+            ),
+        )
+        object.__setattr__(
+            self, "warnings", _unique_texts(self.warnings, "batch warnings")
+        )
+        if not isinstance(self.replan_required, bool):
+            raise OutcomeModelError("replan_required must be a boolean")
+        object.__setattr__(
+            self,
+            "conflict_graph_digest",
+            _optional_text(self.conflict_graph_digest, "conflict_graph_digest"),
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        record = {
+            "batch_id": self.batch_id,
+            "worker_count": self.worker_count,
+            "wall_time_seconds": self.wall_time_seconds,
+            "worker_runtime_seconds": self.worker_runtime_seconds,
+            "effective_parallelism": self.effective_parallelism,
+            "longest_worker_seconds": self.longest_worker_seconds,
+            "validation_time_seconds": self.validation_time_seconds,
+            "review_wait_time_seconds": self.review_wait_time_seconds,
+            "warnings": list(self.warnings),
+            "replan_required": self.replan_required,
+            "conflict_graph_digest": self.conflict_graph_digest,
+        }
+        return record
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "BatchPerformance":
+        record = _record(value, "batch_metrics")
+        return cls(
+            batch_id=record.get("batch_id", ""),
+            worker_count=record.get("worker_count", 0),
+            wall_time_seconds=record.get("wall_time_seconds", 0.0),
+            worker_runtime_seconds=record.get("worker_runtime_seconds", 0.0),
+            effective_parallelism=record.get("effective_parallelism"),
+            longest_worker_seconds=record.get("longest_worker_seconds", 0.0),
+            validation_time_seconds=record.get("validation_time_seconds", 0.0),
+            review_wait_time_seconds=record.get("review_wait_time_seconds", 0.0),
+            warnings=tuple(record.get("warnings") or ()),
+            replan_required=record.get("replan_required", False),
+            conflict_graph_digest=record.get("conflict_graph_digest", ""),
+        )
+
+
+# The shorter name is useful to callers that treat the record as a metrics
+# value, while keeping ``BatchPerformance`` descriptive in rendered reports.
+BatchMetrics = BatchPerformance
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionMetrics:
+    """Deterministic counts and timings projected into an outcome report.
+
+    The first fields mirror the state contract in the bounded-convergence plan.
+    The additional counters make the final report useful without requiring the
+    renderer to inspect raw state.  All counters are optional at the state
+    boundary and default to zero, which keeps legacy records unaffected.
+    """
+
+    planned_task_count: int = 0
+    remediation_task_count: int = 0
+    task_origin_counts: Mapping[str, int] = field(default_factory=dict)
+    scope_revision_counts: Mapping[str, int] = field(default_factory=dict)
+    review_fix_rounds: int = 0
+    candidate_count: int = 0
+    confirmed_count: int = 0
+    finding_origin_counts: Mapping[str, int] = field(default_factory=dict)
+    finding_contract_relation_counts: Mapping[str, int] = field(default_factory=dict)
+    finding_decision_requirement_counts: Mapping[str, int] = field(default_factory=dict)
+    finding_disposition_counts: Mapping[str, int] = field(default_factory=dict)
+    review_completed_count: int = 0
+    stale_review_count: int = 0
+    aborted_review_count: int = 0
+    timeout_review_count: int = 0
+    gap_completed_count: int = 0
+    stale_gap_count: int = 0
+    aborted_gap_count: int = 0
+    timeout_gap_count: int = 0
+    worker_count: int = 0
+    planned_task_completed: bool = False
+    scope_expansion_started_at: str = ""
+    scope_expansion_user_input_id: str = ""
+    effective_parallelism: float | None = None
+    phase_wall_time_seconds: float = 0.0
+    validation_time_seconds: float = 0.0
+    review_wait_time_seconds: float = 0.0
+    longest_worker_seconds: float = 0.0
+    worker_runtime_seconds: float = 0.0
+    batch_id: str = ""
+    batch_metrics: tuple[BatchPerformance, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "planned_task_count",
+            "remediation_task_count",
+            "review_fix_rounds",
+            "candidate_count",
+            "confirmed_count",
+            "review_completed_count",
+            "stale_review_count",
+            "aborted_review_count",
+            "timeout_review_count",
+            "gap_completed_count",
+            "stale_gap_count",
+            "aborted_gap_count",
+            "timeout_gap_count",
+            "worker_count",
+        ):
+            object.__setattr__(
+                self, field_name, _nonnegative_int(getattr(self, field_name), field_name)
+            )
+        if not isinstance(self.planned_task_completed, bool):
+            raise OutcomeModelError("planned_task_completed must be a boolean")
+        for field_name in (
+            "task_origin_counts",
+            "scope_revision_counts",
+            "finding_origin_counts",
+            "finding_contract_relation_counts",
+            "finding_decision_requirement_counts",
+            "finding_disposition_counts",
+        ):
+            object.__setattr__(
+                self, field_name, _count_map(getattr(self, field_name), field_name)
+            )
+        if self.scope_expansion_started_at:
+            _rfc3339(self.scope_expansion_started_at, "scope_expansion_started_at")
+        object.__setattr__(
+            self,
+            "scope_expansion_started_at",
+            _optional_text(self.scope_expansion_started_at, "scope_expansion_started_at"),
+        )
+        object.__setattr__(
+            self,
+            "scope_expansion_user_input_id",
+            _optional_text(
+                self.scope_expansion_user_input_id, "scope_expansion_user_input_id"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "effective_parallelism",
+            _nullable_nonnegative_float(
+                self.effective_parallelism, "effective_parallelism"
+            ),
+        )
+        for field_name in (
+            "phase_wall_time_seconds",
+            "validation_time_seconds",
+            "review_wait_time_seconds",
+            "longest_worker_seconds",
+            "worker_runtime_seconds",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _nonnegative_float(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(self, "batch_id", _optional_text(self.batch_id, "batch_id"))
+        raw_batch_metrics = self.batch_metrics
+        if isinstance(raw_batch_metrics, (str, bytes)):
+            raise OutcomeModelError("batch_metrics must be a sequence of objects")
+        normalized_batch_metrics: list[BatchPerformance] = []
+        for value in raw_batch_metrics or ():
+            normalized_batch_metrics.append(
+                value
+                if isinstance(value, BatchPerformance)
+                else BatchPerformance.from_record(_record(value, "batch_metrics item"))
+            )
+        object.__setattr__(self, "batch_metrics", tuple(normalized_batch_metrics))
+
+    @property
+    def review_attempt_count(self) -> int:
+        return (
+            self.review_completed_count
+            + self.stale_review_count
+            + self.aborted_review_count
+            + self.timeout_review_count
+        )
+
+    @property
+    def gap_attempt_count(self) -> int:
+        return (
+            self.gap_completed_count
+            + self.stale_gap_count
+            + self.aborted_gap_count
+            + self.timeout_gap_count
+        )
+
+    def postmortem_warnings(self) -> tuple[str, ...]:
+        """Return stable warning codes without changing execution state.
+
+        These are intentionally advisory.  Dispatch freezes and round limits
+        remain state-machine responsibilities; this method only projects
+        evidence for a report or postmortem.
+        """
+
+        warnings: list[str] = []
+        if self.remediation_task_count > 0 and (
+            self.planned_task_completed
+            or self.remediation_task_count > self.planned_task_count
+        ):
+            warnings.append(
+                "remediation-task-growth: "
+                f"{self.remediation_task_count} remediation tasks after "
+                f"{self.planned_task_count} planned tasks"
+            )
+
+        review_attempts = self.review_attempt_count
+        review_shortfalls = self.stale_review_count + self.aborted_review_count
+        if review_attempts and review_shortfalls * 2 >= review_attempts:
+            warnings.append(
+                "review-shortfall-ratio-high: "
+                f"{review_shortfalls}/{review_attempts} stale-or-aborted reviews"
+            )
+
+        if (
+            self.worker_count >= 2
+            and self.effective_parallelism is not None
+            and self.effective_parallelism < 1.5
+        ):
+            warnings.append(
+                "effective-parallelism-low: "
+                f"{self.effective_parallelism:g} with {self.worker_count} workers"
+            )
+        for batch in self.batch_metrics:
+            warnings.extend(batch.warnings)
+        return tuple(dict.fromkeys(warnings))
+
+    def to_record(self) -> dict[str, Any]:
+        record = {
+            "planned_task_count": self.planned_task_count,
+            "remediation_task_count": self.remediation_task_count,
+            "task_origin_counts": dict(self.task_origin_counts),
+            "scope_revision_counts": dict(self.scope_revision_counts),
+            "review_fix_rounds": self.review_fix_rounds,
+            "candidate_count": self.candidate_count,
+            "confirmed_count": self.confirmed_count,
+            "finding_origin_counts": dict(self.finding_origin_counts),
+            "finding_contract_relation_counts": dict(
+                self.finding_contract_relation_counts
+            ),
+            "finding_decision_requirement_counts": dict(
+                self.finding_decision_requirement_counts
+            ),
+            "finding_disposition_counts": dict(self.finding_disposition_counts),
+            "review_completed_count": self.review_completed_count,
+            "stale_review_count": self.stale_review_count,
+            "aborted_review_count": self.aborted_review_count,
+            "timeout_review_count": self.timeout_review_count,
+            "gap_completed_count": self.gap_completed_count,
+            "stale_gap_count": self.stale_gap_count,
+            "aborted_gap_count": self.aborted_gap_count,
+            "timeout_gap_count": self.timeout_gap_count,
+            "worker_count": self.worker_count,
+            "planned_task_completed": self.planned_task_completed,
+            "scope_expansion_started_at": self.scope_expansion_started_at,
+            "scope_expansion_user_input_id": self.scope_expansion_user_input_id,
+            "effective_parallelism": self.effective_parallelism,
+            "phase_wall_time_seconds": self.phase_wall_time_seconds,
+            "validation_time_seconds": self.validation_time_seconds,
+            "review_wait_time_seconds": self.review_wait_time_seconds,
+            "longest_worker_seconds": self.longest_worker_seconds,
+        }
+        # Preserve the legacy outcome schema when no GAP8 batch evidence was
+        # observed. New fields become visible as one coherent projection once
+        # a runtime or batch record is present.
+        if self.worker_runtime_seconds or self.batch_id or self.batch_metrics:
+            record.update(
+                {
+                    "worker_runtime_seconds": self.worker_runtime_seconds,
+                    "batch_id": self.batch_id,
+                    "batch_metrics": [item.to_record() for item in self.batch_metrics],
+                }
+            )
+        return record
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "ExecutionMetrics":
+        record = _record(value, "execution_metrics")
+        return cls(
+            planned_task_count=record.get("planned_task_count", 0),
+            remediation_task_count=record.get("remediation_task_count", 0),
+            task_origin_counts=record.get("task_origin_counts", {}),
+            scope_revision_counts=record.get(
+                "scope_revision_counts", record.get("task_scope_revision_counts", {})
+            ),
+            review_fix_rounds=record.get("review_fix_rounds", 0),
+            candidate_count=record.get("candidate_count", record.get("finding_candidate_count", 0)),
+            confirmed_count=record.get("confirmed_count", record.get("finding_confirmed_count", 0)),
+            finding_origin_counts=record.get("finding_origin_counts", {}),
+            finding_contract_relation_counts=record.get(
+                "finding_contract_relation_counts", {}
+            ),
+            finding_decision_requirement_counts=record.get(
+                "finding_decision_requirement_counts", {}
+            ),
+            finding_disposition_counts=record.get("finding_disposition_counts", {}),
+            review_completed_count=record.get("review_completed_count", 0),
+            stale_review_count=record.get("stale_review_count", 0),
+            aborted_review_count=record.get("aborted_review_count", 0),
+            timeout_review_count=record.get("timeout_review_count", 0),
+            gap_completed_count=record.get("gap_completed_count", 0),
+            stale_gap_count=record.get("stale_gap_count", 0),
+            aborted_gap_count=record.get("aborted_gap_count", 0),
+            timeout_gap_count=record.get("timeout_gap_count", 0),
+            worker_count=record.get("worker_count", 0),
+            planned_task_completed=record.get("planned_task_completed", False),
+            scope_expansion_started_at=record.get("scope_expansion_started_at", ""),
+            scope_expansion_user_input_id=record.get(
+                "scope_expansion_user_input_id", ""
+            ),
+            effective_parallelism=record.get("effective_parallelism"),
+            phase_wall_time_seconds=record.get("phase_wall_time_seconds", 0.0),
+            validation_time_seconds=record.get("validation_time_seconds", 0.0),
+            review_wait_time_seconds=record.get("review_wait_time_seconds", 0.0),
+            longest_worker_seconds=record.get("longest_worker_seconds", 0.0),
+            worker_runtime_seconds=record.get("worker_runtime_seconds", 0.0),
+            batch_id=record.get("batch_id", ""),
+            batch_metrics=tuple(record.get("batch_metrics") or ()),
+        )
+
+    @classmethod
+    def from_finding_dispositions(
+        cls,
+        values: Sequence[Any],
+        **kwargs: Any,
+    ) -> "ExecutionMetrics":
+        """Build finding counters from disposition records or model objects."""
+
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise OutcomeModelError("finding dispositions must be a sequence")
+        origin_counts: dict[str, int] = {}
+        relation_counts: dict[str, int] = {}
+        decision_counts: dict[str, int] = {}
+        disposition_counts: dict[str, int] = {}
+        confirmed_count = 0
+        for value in values:
+            record = value.to_record() if hasattr(value, "to_record") else _record(
+                value, "finding disposition"
+            )
+            for field_name, counts in (
+                ("origin", origin_counts),
+                ("contract_relation", relation_counts),
+                ("decision_requirement", decision_counts),
+                ("disposition", disposition_counts),
+            ):
+                key = _required_text(record.get(field_name), field_name)
+                counts[key] = counts.get(key, 0) + 1
+            if record.get("fact_status") == "confirmed":
+                confirmed_count += 1
+        return cls(
+            candidate_count=len(values),
+            confirmed_count=confirmed_count,
+            finding_origin_counts=origin_counts,
+            finding_contract_relation_counts=relation_counts,
+            finding_decision_requirement_counts=decision_counts,
+            finding_disposition_counts=disposition_counts,
+            **kwargs,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpProjection:
+    """The namespaced follow-up count and references shown in a report."""
+
+    count: int = 0
+    references: tuple[str, ...] = ()
+    issue_keys: tuple[str, ...] = ()
+    issue_key_aliases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "count", _nonnegative_int(self.count, "follow-ups count"))
+        for field_name in ("references", "issue_keys", "issue_key_aliases"):
+            object.__setattr__(
+                self, field_name, _unique_texts(getattr(self, field_name), field_name)
+            )
+
+    @property
+    def open_count(self) -> int:
+        return self.count
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "count": self.count,
+            "references": list(self.references),
+            "issue_keys": list(self.issue_keys),
+            "issue_key_aliases": list(self.issue_key_aliases),
+        }
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "FollowUpProjection":
+        record = _record(value, "follow_ups")
+        issue_keys = record.get("issue_keys", ())
+        if isinstance(issue_keys, Mapping):
+            issue_keys = tuple(issue_keys)
+        aliases = record.get("issue_key_aliases", ())
+        if isinstance(aliases, Mapping):
+            aliases = tuple(aliases)
+        references = record.get("references", record.get("artifact_refs", ()))
+        if isinstance(references, (str, bytes)):
+            references = (references,)
+        if isinstance(issue_keys, (str, bytes)):
+            issue_keys = (issue_keys,)
+        if isinstance(aliases, (str, bytes)):
+            aliases = (aliases,)
+        count = record.get(
+            "count", record.get("open_count", len(issue_keys or references or ()))
+        )
+        return cls(
+            count=count,
+            references=tuple(references or ()),
+            issue_keys=tuple(issue_keys or ()),
+            issue_key_aliases=tuple(aliases or ()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewConvergenceProjection:
+    """Review-round evidence used by the bounded convergence report."""
+
+    status: str = "pending"
+    target_sha: str = ""
+    fix_round: int = 0
+    max_fix_rounds: int = 2
+    authorized_extra_rounds: int = 0
+    verified_actionable_findings: int | None = None
+    artifact_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _required_text(self.status, "convergence status"))
+        object.__setattr__(self, "target_sha", _optional_text(self.target_sha, "target_sha"))
+        for field_name in ("fix_round", "max_fix_rounds", "authorized_extra_rounds"):
+            object.__setattr__(
+                self, field_name, _nonnegative_int(getattr(self, field_name), field_name)
+            )
+        if self.max_fix_rounds == 0:
+            raise OutcomeModelError("max_fix_rounds must be positive")
+        object.__setattr__(
+            self,
+            "verified_actionable_findings",
+            _nullable_nonnegative_int(
+                self.verified_actionable_findings, "verified_actionable_findings"
+            ),
+        )
+        object.__setattr__(
+            self, "artifact_refs", _unique_texts(self.artifact_refs, "artifact_refs")
+        )
+
+    @property
+    def rounds(self) -> int:
+        return self.fix_round
+
+    @property
+    def qualifies_for_final(self) -> bool:
+        return self.status in {"converged", "passed"} and (
+            self.verified_actionable_findings in {None, 0}
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "target_sha": self.target_sha,
+            "fix_round": self.fix_round,
+            "max_fix_rounds": self.max_fix_rounds,
+            "authorized_extra_rounds": self.authorized_extra_rounds,
+            "verified_actionable_findings": self.verified_actionable_findings,
+            "artifact_refs": list(self.artifact_refs),
+        }
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "ReviewConvergenceProjection":
+        record = _record(value, "review_convergence")
+        return cls(
+            status=record.get("status", "pending"),
+            target_sha=record.get("target_sha", ""),
+            fix_round=record.get("fix_round", record.get("rounds", 0)),
+            max_fix_rounds=record.get("max_fix_rounds", 2),
+            authorized_extra_rounds=record.get("authorized_extra_rounds", 0),
+            verified_actionable_findings=record.get("verified_actionable_findings"),
+            artifact_refs=record.get("artifact_refs", ()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedRiskProjection:
+    """Decision-backed residual-risk evidence projected into an outcome."""
+
+    decision_id: str
+    status: str
+    finding_fingerprint: str
+    target_sha: str
+    authorized_by: str
+    risk: str
+    reason: str
+    expires_at: str = ""
+    reconsider_condition: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "decision_id",
+            "status",
+            "finding_fingerprint",
+            "target_sha",
+            "authorized_by",
+            "risk",
+            "reason",
+            "expires_at",
+            "reconsider_condition",
+        ):
+            object.__setattr__(
+                self, field_name, _optional_text(getattr(self, field_name), field_name)
+            )
+        if not self.decision_id or self.status != "accepted":
+            raise OutcomeModelError(
+                "accepted-risk projection requires an accepted decision id"
+            )
+        if not self.finding_fingerprint or not self.target_sha:
+            raise OutcomeModelError(
+                "accepted-risk projection requires finding fingerprint and target SHA"
+            )
+        if not self.authorized_by or not self.risk or not self.reason:
+            raise OutcomeModelError(
+                "accepted-risk projection requires authority, risk, and reason"
+            )
+        if not self.expires_at and not self.reconsider_condition:
+            raise OutcomeModelError(
+                "accepted-risk projection requires expiry or reconsider condition"
+            )
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "AcceptedRiskProjection":
+        record = _record(value, "accepted_risk_authorization")
+        return cls(
+            decision_id=record.get("decision_id", ""),
+            status=record.get("status", ""),
+            finding_fingerprint=record.get(
+                "finding_fingerprint", record.get("fingerprint", "")
+            ),
+            target_sha=record.get("target_sha", ""),
+            authorized_by=record.get("authorized_by", record.get("principal", "")),
+            risk=record.get("risk", ""),
+            reason=record.get("reason", record.get("rationale", "")),
+            expires_at=record.get("expires_at", ""),
+            reconsider_condition=record.get("reconsider_condition", ""),
+        )
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "decision_id": self.decision_id,
+            "status": self.status,
+            "finding_fingerprint": self.finding_fingerprint,
+            "target_sha": self.target_sha,
+            "authorized_by": self.authorized_by,
+            "risk": self.risk,
+            "reason": self.reason,
+            "expires_at": self.expires_at,
+            "reconsider_condition": self.reconsider_condition,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ManualFinalReviewProjection:
+    """Certification completeness evidence projected into the final report."""
+
+    status: str = "pending"
+    certification_id: str = ""
+    target_sha: str = ""
+    prepared_plan: str = ""
+    prepared_plan_digest: str = ""
+    manifest: str = ""
+    report: str = ""
+    manifest_complete: bool | None = None
+    shortfall_count: int | None = None
+    verified_actionable_findings: int | None = None
+    lane_completed_count: int = 0
+    lane_count: int = 0
+    incomplete_attempt_count: int = 0
+    residual_risks: tuple[str, ...] = ()
+    follow_up_refs: tuple[str, ...] = ()
+    accepted_risk_authorizations: tuple[AcceptedRiskProjection, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _required_text(self.status, "manual final status"))
+        for field_name in (
+            "certification_id",
+            "target_sha",
+            "prepared_plan",
+            "prepared_plan_digest",
+            "manifest",
+            "report",
+        ):
+            object.__setattr__(
+                self, field_name, _optional_text(getattr(self, field_name), field_name)
+            )
+        if self.manifest_complete is not None and not isinstance(
+            self.manifest_complete, bool
+        ):
+            raise OutcomeModelError("manifest_complete must be a boolean or null")
+        for field_name in (
+            "shortfall_count",
+            "verified_actionable_findings",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _nullable_nonnegative_int(getattr(self, field_name), field_name),
+            )
+        for field_name in (
+            "lane_completed_count",
+            "lane_count",
+            "incomplete_attempt_count",
+        ):
+            object.__setattr__(
+                self, field_name, _nonnegative_int(getattr(self, field_name), field_name)
+            )
+        if self.lane_completed_count > self.lane_count and self.lane_count:
+            raise OutcomeModelError("lane_completed_count cannot exceed lane_count")
+        for field_name in ("residual_risks", "follow_up_refs"):
+            object.__setattr__(
+                self, field_name, _unique_texts(getattr(self, field_name), field_name)
+            )
+        authorizations = tuple(
+            item
+            if isinstance(item, AcceptedRiskProjection)
+            else AcceptedRiskProjection.from_record(item)
+            for item in (self.accepted_risk_authorizations or ())
+        )
+        if len({item.decision_id for item in authorizations}) != len(authorizations):
+            raise OutcomeModelError(
+                "accepted-risk decision ids must be unique in manual final projection"
+            )
+        object.__setattr__(self, "accepted_risk_authorizations", authorizations)
+
+    @property
+    def complete(self) -> bool:
+        if self.status == "not-required-for-legacy-run":
+            return True
+        return (
+            self.status == "passed"
+            and self.manifest_complete is True
+            and self.shortfall_count in {None, 0}
+            and self.verified_actionable_findings in {None, 0}
+        )
+
+    @property
+    def qualifies_for_final(self) -> bool:
+        return self.complete
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "certification_id": self.certification_id,
+            "target_sha": self.target_sha,
+            "prepared_plan": self.prepared_plan,
+            "prepared_plan_digest": self.prepared_plan_digest,
+            "manifest": self.manifest,
+            "report": self.report,
+            "manifest_complete": self.manifest_complete,
+            "shortfall_count": self.shortfall_count,
+            "verified_actionable_findings": self.verified_actionable_findings,
+            "lane_completed_count": self.lane_completed_count,
+            "lane_count": self.lane_count,
+            "incomplete_attempt_count": self.incomplete_attempt_count,
+            "residual_risks": list(self.residual_risks),
+            "follow_up_refs": list(self.follow_up_refs),
+            "accepted_risk_authorizations": [
+                item.to_record() for item in self.accepted_risk_authorizations
+            ],
+        }
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "ManualFinalReviewProjection":
+        record = _record(value, "manual_final_review")
+        raw_authorizations = record.get("accepted_risk_authorizations") or ()
+        if isinstance(raw_authorizations, Mapping):
+            raw_authorizations = tuple(raw_authorizations.values())
+        return cls(
+            status=record.get("status", "pending"),
+            certification_id=record.get("certification_id", ""),
+            target_sha=record.get("target_sha", ""),
+            prepared_plan=record.get("prepared_plan", ""),
+            prepared_plan_digest=record.get("prepared_plan_digest", ""),
+            manifest=record.get("manifest", ""),
+            report=record.get("report", ""),
+            manifest_complete=record.get("manifest_complete", record.get("complete")),
+            shortfall_count=record.get("shortfall_count"),
+            verified_actionable_findings=record.get("verified_actionable_findings"),
+            lane_completed_count=record.get("lane_completed_count", 0),
+            lane_count=record.get("lane_count", 0),
+            incomplete_attempt_count=record.get("incomplete_attempt_count", 0),
+            residual_risks=record.get("residual_risks", ()),
+            follow_up_refs=record.get("follow_up_refs", ()),
+            accepted_risk_authorizations=tuple(
+                AcceptedRiskProjection.from_record(item)
+                for item in raw_authorizations
+            ),
+        )
+
+
+# Short aliases make the projection types convenient for command-layer callers
+# while keeping the persisted field names explicit.
+ManagerInvocationProjection = ManagerInvocation
+FollowUpSummary = FollowUpProjection
+ConvergenceProjection = ReviewConvergenceProjection
+ManualFinalProjection = ManualFinalReviewProjection
+
+
+def compute_postmortem_warnings(
+    metrics: ExecutionMetrics | Mapping[str, Any] | None,
+    *,
+    convergence: ReviewConvergenceProjection | Mapping[str, Any] | None = None,
+    manual_final_review: ManualFinalReviewProjection
+    | Mapping[str, Any]
+    | None = None,
+) -> tuple[str, ...]:
+    """Project deterministic warnings without mutating state or stopping a run."""
+
+    normalized_metrics = (
+        metrics
+        if isinstance(metrics, ExecutionMetrics)
+        else ExecutionMetrics.from_record(metrics)
+        if metrics is not None
+        else None
+    )
+    warnings = list(normalized_metrics.postmortem_warnings() if normalized_metrics else ())
+    normalized_convergence = (
+        convergence
+        if isinstance(convergence, ReviewConvergenceProjection)
+        else ReviewConvergenceProjection.from_record(convergence)
+        if convergence is not None
+        else None
+    )
+    if normalized_convergence and normalized_convergence.status == "exhausted":
+        warnings.append(
+            "review-convergence-exhausted: "
+            f"round {normalized_convergence.fix_round}/{normalized_convergence.max_fix_rounds}"
+        )
+    normalized_manual = (
+        manual_final_review
+        if isinstance(manual_final_review, ManualFinalReviewProjection)
+        else ManualFinalReviewProjection.from_record(manual_final_review)
+        if manual_final_review is not None
+        else None
+    )
+    if normalized_manual and normalized_manual.status in {"incomplete", "failed"}:
+        shortfalls = normalized_manual.shortfall_count
+        suffix = f": {shortfalls} shortfalls" if shortfalls is not None else ""
+        warnings.append(f"manual-final-{normalized_manual.status}{suffix}")
+    return tuple(dict.fromkeys(warnings))
+
+
+def _projection_from_state(
+    state: Mapping[str, Any], key: str, model: Any
+) -> Any | None:
+    value = state.get(key)
+    if value is None:
+        return None
+    if isinstance(value, model):
+        return value
+    return model.from_record(_record(value, key))
+
+
+def report_projections_from_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Build optional outcome fields from a format-3 state snapshot.
+
+    Legacy state has none of these keys, so the returned mapping is empty and
+    callers can pass it directly into an existing outcome constructor.
+    """
+
+    if not isinstance(state, Mapping):
+        raise OutcomeModelError("state must be an object")
+    manager_invocation = _projection_from_state(state, "manager_invocation", ManagerInvocation)
+    execution_metrics = _projection_from_state(state, "execution_metrics", ExecutionMetrics)
+    follow_ups = _projection_from_state(state, "follow_ups", FollowUpProjection)
+    convergence = _projection_from_state(
+        state, "review_convergence", ReviewConvergenceProjection
+    )
+    manual_final_review = _projection_from_state(
+        state, "manual_final_review", ManualFinalReviewProjection
+    )
+    raw_authorizations = state.get("accepted_risk_authorizations")
+    if raw_authorizations is None and isinstance(state.get("manual_final_review"), Mapping):
+        raw_authorizations = state["manual_final_review"].get(
+            "accepted_risk_authorizations"
+        )
+    if isinstance(raw_authorizations, Mapping):
+        raw_authorizations = tuple(raw_authorizations.values())
+    accepted_risk_authorizations = tuple(
+        AcceptedRiskProjection.from_record(item)
+        for item in (raw_authorizations or ())
+    )
+    if manual_final_review is not None and accepted_risk_authorizations:
+        manual_final_review = replace(
+            manual_final_review,
+            accepted_risk_authorizations=accepted_risk_authorizations,
+        )
+    warnings = compute_postmortem_warnings(
+        execution_metrics,
+        convergence=convergence,
+        manual_final_review=manual_final_review,
+    )
+    projections: dict[str, Any] = {}
+    for key, value in (
+        ("manager_invocation", manager_invocation),
+        ("execution_metrics", execution_metrics),
+        ("follow_ups", follow_ups),
+        ("review_convergence", convergence),
+        ("manual_final_review", manual_final_review),
+    ):
+        if value is not None:
+            projections[key] = value
+    if warnings:
+        projections["postmortem_warnings"] = warnings
+    return projections
+
+
+# Explicit names are useful to the CLI wiring task and make the state-to-report
+# boundary easy to test independently.
+project_report_observability = report_projections_from_state
+
+
+def manager_invocation_from_state(state: Mapping[str, Any]) -> ManagerInvocation | None:
+    return _projection_from_state(state, "manager_invocation", ManagerInvocation)
+
+
+def execution_metrics_from_state(state: Mapping[str, Any]) -> ExecutionMetrics | None:
+    return _projection_from_state(state, "execution_metrics", ExecutionMetrics)
+
+
+def follow_ups_from_state(state: Mapping[str, Any]) -> FollowUpProjection | None:
+    return _projection_from_state(state, "follow_ups", FollowUpProjection)
+
+
+def review_convergence_from_state(
+    state: Mapping[str, Any],
+) -> ReviewConvergenceProjection | None:
+    return _projection_from_state(state, "review_convergence", ReviewConvergenceProjection)
+
+
+def manual_final_review_from_state(
+    state: Mapping[str, Any],
+) -> ManualFinalReviewProjection | None:
+    return _projection_from_state(state, "manual_final_review", ManualFinalReviewProjection)
+
+
+def postmortem_warnings_from_state(state: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(report_projections_from_state(state).get("postmortem_warnings", ()))
+
+
+@dataclass(frozen=True, slots=True)
 class OutcomeReport:
     """A report whose terminal kind is inseparable from its proof gate."""
 
@@ -123,6 +1121,8 @@ class OutcomeReport:
     review_findings: tuple[str, ...] = ()
     review_fixes: tuple[str, ...] = ()
     accepted_risks: tuple[str, ...] = ()
+    accepted_risk_authorizations: tuple[AcceptedRiskProjection, ...] = ()
+    residual_risks: tuple[str, ...] = ()
     decisions: tuple[str, ...] = ()
     unresolved_items: tuple[str, ...] = ()
     cleanup_status: str = ""
@@ -131,6 +1131,12 @@ class OutcomeReport:
     blocking_reason: str = ""
     external_goal_blocked: bool = False
     finalized: bool = False
+    manager_invocation: ManagerInvocation | None = None
+    execution_metrics: ExecutionMetrics | None = None
+    follow_ups: FollowUpProjection | None = None
+    review_convergence: ReviewConvergenceProjection | None = None
+    manual_final_review: ManualFinalReviewProjection | None = None
+    postmortem_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind not in OUTCOME_KINDS:
@@ -163,6 +1169,7 @@ class OutcomeReport:
             "review_findings",
             "review_fixes",
             "accepted_risks",
+            "residual_risks",
             "decisions",
             "unresolved_items",
             "next_user_actions",
@@ -170,6 +1177,67 @@ class OutcomeReport:
             object.__setattr__(
                 self, field_name, _unique_texts(getattr(self, field_name), field_name)
             )
+        authorizations = tuple(
+            item
+            if isinstance(item, AcceptedRiskProjection)
+            else AcceptedRiskProjection.from_record(item)
+            for item in (self.accepted_risk_authorizations or ())
+        )
+        if len({item.decision_id for item in authorizations}) != len(authorizations):
+            raise OutcomeModelError(
+                "accepted-risk decision ids must be unique in outcome report"
+            )
+        object.__setattr__(self, "accepted_risk_authorizations", authorizations)
+        for field_name, model in (
+            ("manager_invocation", ManagerInvocation),
+            ("execution_metrics", ExecutionMetrics),
+            ("follow_ups", FollowUpProjection),
+            ("review_convergence", ReviewConvergenceProjection),
+            ("manual_final_review", ManualFinalReviewProjection),
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, Mapping):
+                value = model.from_record(value)
+            elif not isinstance(value, model):
+                raise OutcomeModelError(f"{field_name} must be a {model.__name__}")
+            object.__setattr__(self, field_name, value)
+        projected_residual_risks = tuple(
+            f"{item.decision_id}: {item.risk}"
+            for item in self.accepted_risk_authorizations
+        )
+        if self.manual_final_review is not None:
+            object.__setattr__(
+                self,
+                "residual_risks",
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *self.residual_risks,
+                            *self.manual_final_review.residual_risks,
+                            *projected_residual_risks,
+                        )
+                    )
+                ),
+            )
+        elif not self.residual_risks and projected_residual_risks:
+            object.__setattr__(self, "residual_risks", projected_residual_risks)
+        warnings = _unique_texts(self.postmortem_warnings, "postmortem_warnings")
+        if not warnings and any(
+            value is not None
+            for value in (
+                self.execution_metrics,
+                self.review_convergence,
+                self.manual_final_review,
+            )
+        ):
+            warnings = compute_postmortem_warnings(
+                self.execution_metrics,
+                convergence=self.review_convergence,
+                manual_final_review=self.manual_final_review,
+            )
+        object.__setattr__(self, "postmortem_warnings", warnings)
         if self.kind == "DRAFT":
             if self.finalized:
                 raise OutcomeModelError("DRAFT outcome must not be finalized")
@@ -218,6 +1286,14 @@ class OutcomeReport:
                 "FINAL outcome has gates for a different target SHA: "
                 + ", ".join(stale_gates)
             )
+        if self.review_convergence is not None and not self.review_convergence.qualifies_for_final:
+            raise OutcomeModelError(
+                "FINAL outcome requires converged review with zero verified actionable findings"
+            )
+        if self.manual_final_review is not None and not self.manual_final_review.qualifies_for_final:
+            raise OutcomeModelError(
+                "FINAL outcome requires complete manual final review"
+            )
 
     def _validate_blocked(self) -> None:
         if not self.external_goal_blocked:
@@ -229,7 +1305,7 @@ class OutcomeReport:
             raise OutcomeModelError("BLOCKED outcome requires a blocked required gate")
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             "kind": self.kind,
             "run_id": self.run_id,
             "goal": self.goal,
@@ -244,6 +1320,9 @@ class OutcomeReport:
                 "confirmed_findings": list(self.review_findings),
                 "fixes": list(self.review_fixes),
                 "accepted_risks": list(self.accepted_risks),
+                "accepted_risk_authorizations": [
+                    item.to_record() for item in self.accepted_risk_authorizations
+                ],
             },
             "decisions": list(self.decisions),
             "unresolved_items": list(self.unresolved_items),
@@ -254,6 +1333,21 @@ class OutcomeReport:
             "external_goal_blocked": self.external_goal_blocked,
             "finalized": self.finalized,
         }
+        if self.residual_risks:
+            record["review"]["residual_risks"] = list(self.residual_risks)
+        optional_projections = (
+            ("manager_invocation", self.manager_invocation),
+            ("execution_metrics", self.execution_metrics),
+            ("follow_ups", self.follow_ups),
+            ("review_convergence", self.review_convergence),
+            ("manual_final_review", self.manual_final_review),
+        )
+        for key, value in optional_projections:
+            if value is not None:
+                record[key] = value.to_record()
+        if self.postmortem_warnings:
+            record["postmortem_warnings"] = list(self.postmortem_warnings)
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "OutcomeReport":
@@ -288,6 +1382,11 @@ class OutcomeReport:
             review_findings=tuple(review.get("confirmed_findings") or ()),
             review_fixes=tuple(review.get("fixes") or ()),
             accepted_risks=tuple(review.get("accepted_risks") or ()),
+            accepted_risk_authorizations=tuple(
+                AcceptedRiskProjection.from_record(item)
+                for item in (review.get("accepted_risk_authorizations") or ())
+            ),
+            residual_risks=review.get("residual_risks", ()),
             decisions=tuple(record.get("decisions") or ()),
             unresolved_items=tuple(record.get("unresolved_items") or ()),
             cleanup_status=str(record.get("cleanup_status") or ""),
@@ -296,6 +1395,42 @@ class OutcomeReport:
             blocking_reason=str(record.get("blocking_reason") or ""),
             external_goal_blocked=record.get("external_goal_blocked", False),
             finalized=record.get("finalized", False),
+            manager_invocation=(
+                record["manager_invocation"]
+                if isinstance(record.get("manager_invocation"), ManagerInvocation)
+                else ManagerInvocation.from_record(record["manager_invocation"])
+                if record.get("manager_invocation") is not None
+                else None
+            ),
+            execution_metrics=(
+                record["execution_metrics"]
+                if isinstance(record.get("execution_metrics"), ExecutionMetrics)
+                else ExecutionMetrics.from_record(record["execution_metrics"])
+                if record.get("execution_metrics") is not None
+                else None
+            ),
+            follow_ups=(
+                record["follow_ups"]
+                if isinstance(record.get("follow_ups"), FollowUpProjection)
+                else FollowUpProjection.from_record(record["follow_ups"])
+                if record.get("follow_ups") is not None
+                else None
+            ),
+            review_convergence=(
+                record["review_convergence"]
+                if isinstance(record.get("review_convergence"), ReviewConvergenceProjection)
+                else ReviewConvergenceProjection.from_record(record["review_convergence"])
+                if record.get("review_convergence") is not None
+                else None
+            ),
+            manual_final_review=(
+                record["manual_final_review"]
+                if isinstance(record.get("manual_final_review"), ManualFinalReviewProjection)
+                else ManualFinalReviewProjection.from_record(record["manual_final_review"])
+                if record.get("manual_final_review") is not None
+                else None
+            ),
+            postmortem_warnings=tuple(record.get("postmortem_warnings") or ()),
         )
 
 
@@ -373,6 +1508,18 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
     lines.append(
         "- Accepted risks: " + ("; ".join(report.accepted_risks) or "none")
     )
+    if report.accepted_risk_authorizations:
+        lines.append(
+            "- Accepted-risk decisions: "
+            + "; ".join(
+                f"{item.decision_id} ({item.finding_fingerprint}): {item.risk}; "
+                f"authority={item.authorized_by}; reason={item.reason}"
+                for item in report.accepted_risk_authorizations
+            )
+        )
+    lines.append(
+        "- Residual risks: " + ("; ".join(report.residual_risks) or "none")
+    )
 
     lines.extend(["", "## Decisions and Unresolved Items", ""])
     lines.append("- Decisions: " + ("; ".join(report.decisions) or "none"))
@@ -397,4 +1544,181 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
     lines.extend(f"- {item}" for item in report.next_user_actions)
     if not report.next_user_actions:
         lines.append("- No user action is required.")
+
+    has_bounded_projection = any(
+        value is not None
+        for value in (
+            report.manager_invocation,
+            report.execution_metrics,
+            report.follow_ups,
+            report.review_convergence,
+            report.manual_final_review,
+        )
+    )
+    if has_bounded_projection:
+        lines.extend(["", "## Bounded Review Convergence", ""])
+        if report.manager_invocation is not None:
+            invocation = report.manager_invocation
+            identity = "/".join(
+                (
+                    invocation.provider or "unknown-provider",
+                    invocation.model or "unknown-model",
+                    invocation.reasoning_effort or "unknown-effort",
+                )
+            )
+            lines.append(f"- Manager invocation: {identity}")
+            if invocation.recorded_at:
+                lines.append(f"- Manager invocation recorded at: `{invocation.recorded_at}`")
+            if invocation.unavailable_reason:
+                lines.append(
+                    f"- Manager invocation unavailable reason: {invocation.unavailable_reason}"
+                )
+        if report.execution_metrics is not None:
+            metrics = report.execution_metrics
+            lines.append(
+                f"- Tasks: {metrics.planned_task_count} planned, "
+                f"{metrics.remediation_task_count} remediation"
+            )
+            task_origins = ", ".join(
+                f"{key}={count}" for key, count in metrics.task_origin_counts.items()
+            ) or "none"
+            scope_revisions = ", ".join(
+                f"{key}={count}" for key, count in metrics.scope_revision_counts.items()
+            ) or "none"
+            lines.append(f"- Task origins: {task_origins}")
+            lines.append(f"- Scope revisions: {scope_revisions}")
+            lines.append(
+                f"- Findings: {metrics.candidate_count} candidates, "
+                f"{metrics.confirmed_count} confirmed"
+            )
+            finding_origins = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_origin_counts.items()
+            ) or "none"
+            contract_relations = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_contract_relation_counts.items()
+            ) or "none"
+            decision_requirements = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_decision_requirement_counts.items()
+            ) or "none"
+            dispositions = ", ".join(
+                f"{key}={count}"
+                for key, count in metrics.finding_disposition_counts.items()
+            ) or "none"
+            lines.append(f"- Finding origin counts: {finding_origins}")
+            lines.append(f"- Finding contract relation counts: {contract_relations}")
+            lines.append(f"- Finding decision requirement counts: {decision_requirements}")
+            lines.append(f"- Finding disposition counts: {dispositions}")
+            lines.append(f"- Review fix rounds: {metrics.review_fix_rounds}")
+            lines.append(
+                "- Review attempts: "
+                f"{metrics.review_completed_count} completed, "
+                f"{metrics.stale_review_count} stale, "
+                f"{metrics.aborted_review_count} aborted, "
+                f"{metrics.timeout_review_count} timeout"
+            )
+            lines.append(
+                "- Gap attempts: "
+                f"{metrics.gap_completed_count} completed, "
+                f"{metrics.stale_gap_count} stale, "
+                f"{metrics.aborted_gap_count} aborted, "
+                f"{metrics.timeout_gap_count} timeout"
+            )
+            lines.append(
+                "- Timings (seconds): "
+                f"phase={metrics.phase_wall_time_seconds:.3f}, "
+                f"validation={metrics.validation_time_seconds:.3f}, "
+                f"review-wait={metrics.review_wait_time_seconds:.3f}, "
+                f"longest-worker={metrics.longest_worker_seconds:.3f}, "
+                f"worker-runtime={metrics.worker_runtime_seconds:.3f}"
+            )
+            lines.append(
+                f"- Workers: {metrics.worker_count}; planned tasks complete: "
+                f"{str(metrics.planned_task_completed).lower()}"
+            )
+            if metrics.batch_metrics:
+                lines.append(
+                    f"- Batch performance records: {len(metrics.batch_metrics)}"
+                )
+                for batch in metrics.batch_metrics:
+                    parallelism = (
+                        "unknown"
+                        if batch.effective_parallelism is None
+                        else f"{batch.effective_parallelism:.3f}"
+                    )
+                    lines.append(
+                        f"  - {batch.batch_id or 'batch'}: "
+                        f"wall={batch.wall_time_seconds:.3f}, "
+                        f"worker-runtime={batch.worker_runtime_seconds:.3f}, "
+                        f"effective-parallelism={parallelism}, "
+                        f"longest-worker={batch.longest_worker_seconds:.3f}, "
+                        f"validation={batch.validation_time_seconds:.3f}, "
+                        f"review-wait={batch.review_wait_time_seconds:.3f}"
+                    )
+                    for warning in batch.warnings:
+                        lines.append(f"    - Warning: {warning}")
+            if metrics.scope_expansion_started_at:
+                lines.append(
+                    "- Scope expansion started at: "
+                    f"`{metrics.scope_expansion_started_at}`"
+                )
+            if metrics.scope_expansion_user_input_id:
+                lines.append(
+                    "- Scope expansion user input: "
+                    f"`{metrics.scope_expansion_user_input_id}`"
+                )
+        if report.review_convergence is not None:
+            convergence = report.review_convergence
+            lines.append(
+                f"- Review convergence: {convergence.status}, "
+                f"round {convergence.fix_round}/{convergence.max_fix_rounds}, "
+                f"user-authorized extra {convergence.authorized_extra_rounds}"
+            )
+            if convergence.verified_actionable_findings is not None:
+                lines.append(
+                    "- Verified actionable findings: "
+                    f"{convergence.verified_actionable_findings}"
+                )
+        if report.follow_ups is not None:
+            follow_ups = report.follow_ups
+            lines.append(f"- Follow-ups: {follow_ups.count}")
+            if follow_ups.references:
+                lines.append("- Follow-up references: " + ", ".join(follow_ups.references))
+        if report.manual_final_review is not None:
+            manual = report.manual_final_review
+            completeness = "complete" if manual.complete else "incomplete"
+            shortfalls = manual.shortfall_count
+            lines.append(
+                f"- Manual review completeness: {completeness}, "
+                f"shortfalls {shortfalls if shortfalls is not None else 'not recorded'}"
+            )
+            lines.append(f"- Manual final status: {manual.status}")
+            lines.append(f"- Manual final target SHA: `{manual.target_sha or '-'}`")
+            if manual.lane_count:
+                lines.append(
+                    f"- Manual final lanes: {manual.lane_completed_count}/{manual.lane_count}"
+                )
+            lines.append(
+                "- Manual final residual risks: "
+                + ("; ".join(manual.residual_risks) or "none")
+            )
+            if manual.accepted_risk_authorizations:
+                lines.append(
+                    "- Manual final accepted-risk decisions: "
+                    + ", ".join(
+                        item.decision_id
+                        for item in manual.accepted_risk_authorizations
+                    )
+                )
+            lines.append(
+                "- Manual final follow-up references: "
+                + (", ".join(manual.follow_up_refs) or "none")
+            )
+
+        lines.extend(["", "## Postmortem Warnings", ""])
+        lines.extend(f"- {item}" for item in report.postmortem_warnings)
+        if not report.postmortem_warnings:
+            lines.append("- None")
     return "\n".join(lines) + "\n"

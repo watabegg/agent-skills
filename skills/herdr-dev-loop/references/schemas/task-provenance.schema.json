@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/task-provenance.schema.json",
+  "title": "Herdr Dev Loop Task Provenance",
+  "type": "object",
+  "required": [
+    "task_origin",
+    "release_scope_revision",
+    "plan_item_refs",
+    "requirement_refs",
+    "scope_refs",
+    "source_finding",
+    "authorization_input_id",
+    "why_fix_now",
+    "operational_reason",
+    "origin",
+    "contract_relation",
+    "release_effect",
+    "remediation_round",
+    "fact_status",
+    "disposition",
+    "scope_expanding"
+  ],
+  "properties": {
+    "task_origin": {
+      "enum": [
+        "planned",
+        "finding",
+        "user-amendment",
+        "operational",
+        "legacy-unclassified"
+      ]
+    },
+    "release_scope_revision": {"type": "integer", "minimum": 0},
+    "plan_item_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "requirement_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "scope_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "source_finding": {"type": "string"},
+    "authorization_input_id": {
+      "anyOf": [
+        {"const": ""},
+        {"type": "string", "pattern": "^U[0-9]{4}$"}
+      ]
+    },
+    "why_fix_now": {"type": "string"},
+    "operational_reason": {"type": "string"},
+    "origin": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": [
+          "introduced",
+          "diff-expanded-pre-existing",
+          "unrelated-pre-existing",
+          "unknown"
+        ]}
+      ]
+    },
+    "contract_relation": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["in_scope", "outside_release", "ambiguous"]}
+      ]
+    },
+    "release_effect": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["blocking", "non_blocking"]}
+      ]
+    },
+    "remediation_round": {"type": "integer", "minimum": 0},
+    "fact_status": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["confirmed", "refuted", "insufficient_evidence"]}
+      ]
+    },
+    "disposition": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": [
+          "fix_now",
+          "defer_follow_up",
+          "disable_feature",
+          "mark_experimental",
+          "user_decision",
+          "accepted_risk",
+          "discard"
+        ]}
+      ]
+    },
+    "severity": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["P0", "P1", "P2", "P3"]}
+      ]
+    },
+    "decision_requirement": {
+      "anyOf": [
+        {"const": ""},
+        {"enum": ["none", "spec", "user"]}
+      ]
+    },
+    "scope_expanding": {"type": "boolean"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"task_origin": {"const": "planned"}},
+        "required": ["task_origin"]
+      },
+      "then": {
+        "anyOf": [
+          {"properties": {"plan_item_refs": {"minItems": 1}}},
+          {"properties": {"requirement_refs": {"minItems": 1}}}
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {"task_origin": {"const": "finding"}},
+        "required": ["task_origin"]
+      },
+      "then": {
+        "required": [
+          "source_finding",
+          "why_fix_now",
+          "origin",
+          "contract_relation",
+          "release_effect",
+          "remediation_round",
+          "fact_status",
+          "disposition"
+        ],
+        "properties": {
+          "source_finding": {"minLength": 1},
+          "why_fix_now": {"minLength": 1},
+          "origin": {"enum": ["introduced", "diff-expanded-pre-existing"]},
+          "contract_relation": {"const": "in_scope"},
+          "release_effect": {"enum": ["blocking", "non_blocking"]},
+          "remediation_round": {"minimum": 1},
+          "fact_status": {"const": "confirmed"},
+          "disposition": {"const": "fix_now"}
+        },
+        "anyOf": [
+          {"properties": {"requirement_refs": {"minItems": 1}}},
+          {"properties": {"scope_refs": {"minItems": 1}}}
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {"task_origin": {"const": "user-amendment"}},
+        "required": ["task_origin"]
+      },
+      "then": {
+        "properties": {
+          "release_scope_revision": {"minimum": 1},
+          "authorization_input_id": {"pattern": "^U[0-9]{4}$"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"task_origin": {"const": "operational"}},
+        "required": ["task_origin"]
+      },
+      "then": {
+        "properties": {
+          "operational_reason": {"minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"task_origin": {"const": "legacy-unclassified"}},
+        "required": ["task_origin"]
+      },
+      "then": {
+        "properties": {
+          "release_scope_revision": {"const": 0}
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}
