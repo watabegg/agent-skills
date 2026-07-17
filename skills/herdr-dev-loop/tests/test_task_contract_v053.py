@@ -20,6 +20,8 @@ from hloop_lib.task_contract import (  # noqa: E402
     LEGACY_CONTRACT_SCHEMA_REVISION,
     LEGACY_QUEUED_BLOCKER,
     V053_CONTRACT_SCHEMA_REVISION,
+    V053_RESULT_TOP_LEVEL_FIELDS,
+    V053_TASK_TOP_LEVEL_FIELDS,
     ContractValidationError,
     contract_schema_revision_of,
     migrate_legacy_result_contract,
@@ -155,6 +157,32 @@ class ContractPrimitiveTests(unittest.TestCase):
         self.assertIn(
             "revision-3-legacy-blocker", {issue.code for issue in validation.issues}
         )
+
+    def test_revision_three_rejects_unknown_top_level_properties(self):
+        for name, record, validator in (
+            (
+                "task",
+                task_contract(revision=V053_CONTRACT_SCHEMA_REVISION),
+                validate_task_contract,
+            ),
+            (
+                "result",
+                result_contract(revision=V053_CONTRACT_SCHEMA_REVISION),
+                validate_result_contract,
+            ),
+        ):
+            with self.subTest(contract=name):
+                record["unknown_top_level_property"] = True
+                validation = validator(record)
+                self.assertFalse(validation.ok)
+                self.assertIn(
+                    "contract-field-unknown",
+                    {issue.code for issue in validation.issues},
+                )
+                self.assertIn(
+                    "unknown_top_level_property",
+                    {issue.field for issue in validation.issues},
+                )
 
     def test_unknown_or_missing_revision_fails_closed(self):
         missing = task_contract(revision=V053_CONTRACT_SCHEMA_REVISION)
@@ -379,6 +407,43 @@ class ContractSchemaTests(unittest.TestCase):
         current = result_contract(revision=V053_CONTRACT_SCHEMA_REVISION)
         current["validation_results"] = ["failed"]
         self.assertFalse(self.result_validator.is_valid(current))
+
+    def test_revision_three_python_and_json_schema_property_parity(self):
+        contracts = (
+            (
+                "task",
+                task_contract,
+                validate_task_contract,
+                self.task_validator,
+                self.task_schema,
+                V053_TASK_TOP_LEVEL_FIELDS,
+            ),
+            (
+                "result",
+                result_contract,
+                validate_result_contract,
+                self.result_validator,
+                self.result_schema,
+                V053_RESULT_TOP_LEVEL_FIELDS,
+            ),
+        )
+        for name, builder, python_validator, schema_validator, schema, fields in contracts:
+            with self.subTest(contract=name, case="property-set"):
+                self.assertEqual(
+                    fields,
+                    frozenset(schema["$defs"]["revision3"]["properties"]),
+                )
+
+            valid = builder(revision=V053_CONTRACT_SCHEMA_REVISION)
+            invalid = copy.deepcopy(valid)
+            invalid["unknown_top_level_property"] = True
+            for case, record, expected in (
+                ("valid", valid, True),
+                ("unknown-property", invalid, False),
+            ):
+                with self.subTest(contract=name, case=case):
+                    self.assertEqual(python_validator(record).ok, expected)
+                    self.assertEqual(schema_validator.is_valid(record), expected)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,86 @@ REQUIRED_GATES = frozenset({"patch_review", "full_suite"})
 RESULT_STATUSES = frozenset({"done", "partial", "blocked", "failed", "abandoned"})
 VALIDATION_RESULTS = frozenset({"passed", "failed", "blocked"})
 
+V053_TASK_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "id",
+        "run_id",
+        "skill_version",
+        "contract_schema_revision",
+        "kind",
+        "status",
+        "created_from",
+        "branch",
+        "base_ref",
+        "base_sha",
+        "priority",
+        "severity",
+        "batch_id",
+        "depends_on",
+        "write_allow",
+        "write_deny",
+        "acceptance",
+        "validation_minimum",
+        "worker_protocol",
+        "worker_agent_provider",
+        "worker_agent_model",
+        "worker_agent_effort",
+        "worker_qa_profile",
+        "qa_profile",
+        "preserved_invariants",
+        "regression_checks",
+        "risk_class",
+        "required_gates",
+        "investigation_goal",
+        "implementation_ready_evidence",
+        "exploration_budget_minutes",
+        "history_search_allowed",
+        "task_origin",
+        "release_scope_revision",
+        "plan_item_refs",
+        "requirement_refs",
+        "scope_refs",
+        "source_finding",
+        "authorization_input_id",
+        "why_fix_now",
+        "operational_reason",
+        "origin",
+        "contract_relation",
+        "decision_requirement",
+        "release_effect",
+        "remediation_round",
+        "fact_status",
+        "disposition",
+        "scope_expanding",
+    }
+)
+V053_RESULT_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "task_id",
+        "run_id",
+        "skill_version",
+        "contract_schema_revision",
+        "attempt_id",
+        "status",
+        "merge_ready",
+        "branch",
+        "head_sha",
+        "base_sha",
+        "changed_files",
+        "validation_recorded",
+        "validation_commands",
+        "validation_results",
+        "validation_summary",
+        "blocking_questions",
+        "handoff",
+        "invariant_evidence",
+        "regression_evidence",
+        "self_review_summary",
+        "residual_risks",
+        "unrun_checks",
+    }
+)
+
 LEGACY_QUEUED_BLOCKER = "risk-classification-required"
 LEGACY_TASK_ACTIONS = frozenset(
     {
@@ -134,6 +214,20 @@ class LegacyTaskMigration:
 
 def _issue(code: str, message: str, field: str = "") -> ContractIssue:
     return ContractIssue(code=code, message=message, field=field)
+
+
+def _unknown_field_issues(
+    record: Mapping[str, Any], allowed_fields: frozenset[str]
+) -> list[ContractIssue]:
+    return [
+        _issue(
+            "contract-field-unknown",
+            f"unknown revision-3 top-level property: {field!r}",
+            field if isinstance(field, str) else repr(field),
+        )
+        for field in record
+        if field not in allowed_fields
+    ]
 
 
 def contract_schema_revision_of(record: Mapping[str, Any]) -> int:
@@ -294,6 +388,7 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
     )
 
     if revision == V053_CONTRACT_SCHEMA_REVISION:
+        issues.extend(_unknown_field_issues(record, V053_TASK_TOP_LEVEL_FIELDS))
         issues.extend(
             _string_list_issues(
                 record, "preserved_invariants", required=True, min_items=1
@@ -500,6 +595,7 @@ def validate_result_contract(record: Mapping[str, Any]) -> ContractValidation:
             )
 
     if revision == V053_CONTRACT_SCHEMA_REVISION:
+        issues.extend(_unknown_field_issues(record, V053_RESULT_TOP_LEVEL_FIELDS))
         completion_evidence_items = 1 if status == "done" else 0
         issues.extend(
             _string_list_issues(
