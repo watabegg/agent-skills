@@ -489,6 +489,29 @@ class MigrationTransactionPlanningTests(unittest.TestCase):
         )
         self.assertEqual(mutation.action, "record-first-v053-mutation")
 
+    def test_committed_marker_requires_complete_mutation_boundary(self):
+        plan = transaction_plan()
+
+        for missing_field in (
+            "first_v053_mutation_at",
+            "first_v053_mutation_command",
+        ):
+            with self.subTest(missing_field=missing_field):
+                marker = plan.committed_marker
+                del marker[missing_field]
+
+                rollback = decide_migration_recovery(
+                    plan,
+                    marker=marker,
+                    archive_digest=plan.archive_digest,
+                    current_artifact_digests=output_digests(plan),
+                    requested_action="rollback",
+                )
+
+                self.assertTrue(rollback.blocked)
+                self.assertFalse(rollback.rollback_eligible)
+                self.assertIn(missing_field, " ".join(rollback.issues))
+
     def test_first_mutation_marker_permanently_disables_rollback(self):
         plan = transaction_plan()
         marker = plan.committed_marker
