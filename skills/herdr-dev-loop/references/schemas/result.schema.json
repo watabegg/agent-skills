@@ -2,24 +2,30 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Worker Result Frontmatter",
   "type": "object",
-  "required": ["task_id", "run_id", "skill_version", "attempt_id", "status", "merge_ready", "branch", "head_sha", "base_sha", "changed_files", "validation_recorded", "blocking_questions"],
+  "required": ["task_id", "run_id", "skill_version", "contract_schema_revision", "attempt_id", "status", "merge_ready", "branch", "head_sha", "base_sha", "changed_files", "validation_recorded", "blocking_questions"],
   "properties": {
     "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
-    "run_id": {"type": "string"},
-    "skill_version": {"type": "string"},
+    "run_id": {"type": "string", "minLength": 1},
+    "skill_version": {"type": "string", "minLength": 1},
+    "contract_schema_revision": {"type": "integer", "enum": [2, 3]},
     "attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
     "status": {"enum": ["done", "partial", "blocked", "failed", "abandoned"]},
     "merge_ready": {"type": "boolean"},
-    "branch": {"type": "string"},
-    "head_sha": {"type": "string"},
-    "base_sha": {"type": "string"},
+    "branch": {"type": "string", "minLength": 1},
+    "head_sha": {"type": "string", "minLength": 1},
+    "base_sha": {"type": "string", "minLength": 1},
     "changed_files": {"type": "array", "items": {"type": "string"}},
     "validation_recorded": {"type": "boolean"},
-    "validation_commands": {"type": "array", "items": {"type": "string"}},
+    "validation_commands": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "validation_results": {"type": "array", "items": {"enum": ["passed", "failed", "blocked"]}},
     "validation_summary": {"type": "string"},
     "blocking_questions": {"type": "array", "items": {"type": "string"}},
-    "handoff": {"type": "boolean"}
+    "handoff": {"type": "boolean"},
+    "invariant_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "regression_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "self_review_summary": {"type": "string", "minLength": 1},
+    "residual_risks": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "unrun_checks": {"type": "array", "items": {"type": "string", "minLength": 1}}
   },
   "allOf": [
     {
@@ -34,11 +40,86 @@
         "properties": {
           "status": {"const": "done"},
           "validation_recorded": {"const": true},
-          "validation_commands": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "validation_commands": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
           "validation_results": {"type": "array", "minItems": 1, "items": {"const": "passed"}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "contract_schema_revision": {"const": 3},
+          "status": {"const": "done"}
+        },
+        "required": ["contract_schema_revision", "status"]
+      },
+      "then": {
+        "properties": {
+          "invariant_evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "regression_evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
         }
       }
     }
   ],
-  "additionalProperties": true
+  "oneOf": [
+    {
+      "title": "0.5.2 legacy Worker result",
+      "required": ["contract_schema_revision"],
+      "properties": {
+        "contract_schema_revision": {"const": 2}
+      }
+    },
+    {"$ref": "#/$defs/revision3"}
+  ],
+  "$defs": {
+    "revision3": {
+      "title": "0.5.3 Worker result",
+      "type": "object",
+      "required": [
+        "task_id",
+        "run_id",
+        "skill_version",
+        "contract_schema_revision",
+        "attempt_id",
+        "status",
+        "merge_ready",
+        "branch",
+        "head_sha",
+        "base_sha",
+        "changed_files",
+        "validation_recorded",
+        "blocking_questions",
+        "invariant_evidence",
+        "regression_evidence",
+        "self_review_summary",
+        "residual_risks",
+        "unrun_checks"
+      ],
+      "properties": {
+        "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+        "run_id": {"type": "string", "minLength": 1},
+        "skill_version": {"type": "string", "minLength": 1},
+        "contract_schema_revision": {"const": 3},
+        "attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
+        "status": {"enum": ["done", "partial", "blocked", "failed", "abandoned"]},
+        "merge_ready": {"type": "boolean"},
+        "branch": {"type": "string", "minLength": 1},
+        "head_sha": {"type": "string", "minLength": 1},
+        "base_sha": {"type": "string", "minLength": 1},
+        "changed_files": {"type": "array", "items": {"type": "string"}},
+        "validation_recorded": {"type": "boolean"},
+        "validation_commands": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "validation_results": {"type": "array", "items": {"enum": ["passed", "failed", "blocked"]}},
+        "validation_summary": {"type": "string"},
+        "blocking_questions": {"type": "array", "items": {"type": "string"}},
+        "handoff": {"type": "boolean"},
+        "invariant_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "regression_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "self_review_summary": {"type": "string", "minLength": 1},
+        "residual_risks": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "unrun_checks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      },
+      "additionalProperties": false
+    }
+  }
 }
