@@ -19,6 +19,8 @@ sys.path.insert(0, str(SCRIPTS))
 from hloop_lib.task_contract import (  # noqa: E402
     LEGACY_CONTRACT_SCHEMA_REVISION,
     LEGACY_QUEUED_BLOCKER,
+    LEGACY_RUNTIME_TASK_STATUSES,
+    LEGACY_TASK_STATUS_ACTIONS,
     V053_CONTRACT_SCHEMA_REVISION,
     V053_RESULT_TOP_LEVEL_FIELDS,
     V053_TASK_TOP_LEVEL_FIELDS,
@@ -122,6 +124,83 @@ def result_contract(*, revision: int) -> dict:
 
 
 class ContractPrimitiveTests(unittest.TestCase):
+    def test_every_v052_runtime_task_status_has_an_explicit_migration_action(self):
+        expected_actions = {
+            "queued": "reclassify-to-revision-3",
+            "running": "legacy-complete-or-rebind",
+            "result_reported": "accept-legacy-result-or-add-gates",
+            "merged": "preserve-history",
+            "done": "preserve-history",
+            "partial": "preserve-history",
+            "blocked": "preserve-history",
+            "failed": "preserve-history",
+            "abandoned": "preserve-history",
+            "aborted": "requeue-after-manager-recovery",
+            "failed_validation": "retry-legacy-attempt",
+            "blocked_merge_conflict": "resume-or-abort-legacy-merge",
+            "blocked_environment": "resume-or-abort-legacy-merge",
+            "blocked_head_mismatch": "requeue-after-manager-recovery",
+            "blocked_base_mismatch": "requeue-after-manager-recovery",
+            "blocked_write_scope": "requeue-after-manager-recovery",
+        }
+
+        self.assertEqual(LEGACY_TASK_STATUS_ACTIONS, expected_actions)
+        self.assertEqual(LEGACY_RUNTIME_TASK_STATUSES, frozenset(expected_actions))
+        for status, action in expected_actions.items():
+            with self.subTest(status=status):
+                legacy = task_contract(
+                    revision=LEGACY_CONTRACT_SCHEMA_REVISION,
+                    status=status,
+                )
+                legacy.pop("contract_schema_revision")
+
+                migration = migrate_legacy_task_contract(legacy)
+
+                self.assertEqual(migration.status, status)
+                self.assertEqual(migration.record["status"], status)
+                self.assertEqual(migration.action, action)
+
+    def test_recoverable_legacy_statuses_keep_their_retry_boundary(self):
+        failed_validation = task_contract(
+            revision=LEGACY_CONTRACT_SCHEMA_REVISION,
+            status="failed_validation",
+        )
+        failed_validation.pop("contract_schema_revision")
+        retry = migrate_legacy_task_contract(failed_validation)
+
+        self.assertEqual(retry.action, "retry-legacy-attempt")
+        self.assertTrue(retry.may_start_new_attempt)
+        self.assertFalse(retry.requires_requeue_before_start)
+
+        for status in ("blocked_merge_conflict", "blocked_environment"):
+            with self.subTest(status=status):
+                legacy = task_contract(
+                    revision=LEGACY_CONTRACT_SCHEMA_REVISION,
+                    status=status,
+                )
+                legacy.pop("contract_schema_revision")
+                recovery = migrate_legacy_task_contract(legacy)
+
+                self.assertTrue(recovery.may_resume_legacy_merge)
+                self.assertFalse(recovery.may_start_new_attempt)
+
+        for status in (
+            "aborted",
+            "blocked_head_mismatch",
+            "blocked_base_mismatch",
+            "blocked_write_scope",
+        ):
+            with self.subTest(status=status):
+                legacy = task_contract(
+                    revision=LEGACY_CONTRACT_SCHEMA_REVISION,
+                    status=status,
+                )
+                legacy.pop("contract_schema_revision")
+                recovery = migrate_legacy_task_contract(legacy)
+
+                self.assertTrue(recovery.requires_requeue_before_start)
+                self.assertFalse(recovery.may_start_new_attempt)
+
     def test_revision_three_task_requires_quality_gate_fields(self):
         record = task_contract(revision=V053_CONTRACT_SCHEMA_REVISION)
         self.assertTrue(validate_task_contract(record).ok)

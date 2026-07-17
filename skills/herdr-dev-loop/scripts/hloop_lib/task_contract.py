@@ -38,17 +38,30 @@ TASK_STATUSES = frozenset(
         "failed_validation",
     }
 )
-LEGACY_TERMINAL_TASK_STATUSES = frozenset(
-    {
-        "merged",
-        "done",
-        "partial",
-        "blocked",
-        "failed",
-        "abandoned",
-        "failed_validation",
-    }
-)
+# Exhaustive 0.5.2 runtime and compatibility task outcomes: task
+# creation/start/harvest, merge recovery and preflight blockers, generic
+# abort/requeue, historical task-artifact outcomes, plus failed_validation,
+# which worker start explicitly treats as retryable. Keep this separate from
+# TASK_STATUSES, which is the task-artifact schema.
+LEGACY_TASK_STATUS_ACTIONS = {
+    "queued": "reclassify-to-revision-3",
+    "running": "legacy-complete-or-rebind",
+    "result_reported": "accept-legacy-result-or-add-gates",
+    "merged": "preserve-history",
+    "done": "preserve-history",
+    "partial": "preserve-history",
+    "blocked": "preserve-history",
+    "failed": "preserve-history",
+    "abandoned": "preserve-history",
+    "aborted": "requeue-after-manager-recovery",
+    "failed_validation": "retry-legacy-attempt",
+    "blocked_merge_conflict": "resume-or-abort-legacy-merge",
+    "blocked_environment": "resume-or-abort-legacy-merge",
+    "blocked_head_mismatch": "requeue-after-manager-recovery",
+    "blocked_base_mismatch": "requeue-after-manager-recovery",
+    "blocked_write_scope": "requeue-after-manager-recovery",
+}
+LEGACY_RUNTIME_TASK_STATUSES = frozenset(LEGACY_TASK_STATUS_ACTIONS)
 TASK_KINDS = frozenset({"implementation", "fix", "research"})
 RISK_CLASSES = frozenset({"mechanical", "normal", "high"})
 REQUIRED_GATES = frozenset({"patch_review", "full_suite"})
@@ -136,14 +149,7 @@ V053_RESULT_TOP_LEVEL_FIELDS = frozenset(
 )
 
 LEGACY_QUEUED_BLOCKER = "risk-classification-required"
-LEGACY_TASK_ACTIONS = frozenset(
-    {
-        "reclassify-to-revision-3",
-        "legacy-complete-or-rebind",
-        "accept-legacy-result-or-add-gates",
-        "preserve-history",
-    }
-)
+LEGACY_TASK_ACTIONS = frozenset(LEGACY_TASK_STATUS_ACTIONS.values())
 
 
 class ContractValidationError(ValueError):
@@ -197,6 +203,8 @@ class LegacyTaskMigration:
     requires_fresh_ack_on_rebind: bool = False
     may_start_new_attempt: bool = False
     may_merge_reported_result: bool = False
+    may_resume_legacy_merge: bool = False
+    requires_requeue_before_start: bool = False
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -209,6 +217,8 @@ class LegacyTaskMigration:
             "requires_fresh_ack_on_rebind": self.requires_fresh_ack_on_rebind,
             "may_start_new_attempt": self.may_start_new_attempt,
             "may_merge_reported_result": self.may_merge_reported_result,
+            "may_resume_legacy_merge": self.may_resume_legacy_merge,
+            "requires_requeue_before_start": self.requires_requeue_before_start,
         }
 
 
@@ -649,7 +659,10 @@ def migrate_legacy_task_contract(record: Mapping[str, Any]) -> LegacyTaskMigrati
             )
         )
     status = record.get("status")
-    if status not in TASK_STATUSES:
+    action = (
+        LEGACY_TASK_STATUS_ACTIONS.get(status) if isinstance(status, str) else None
+    )
+    if action is None:
         raise ContractValidationError(
             (
                 _issue(
@@ -687,36 +700,57 @@ def migrate_legacy_task_contract(record: Mapping[str, Any]) -> LegacyTaskMigrati
     migrated = deepcopy(dict(record))
     migrated["contract_schema_revision"] = LEGACY_CONTRACT_SCHEMA_REVISION
 
-    if status == "queued":
+    if action == "reclassify-to-revision-3":
         migrated["migration_blocker"] = LEGACY_QUEUED_BLOCKER
         return LegacyTaskMigration(
             record=migrated,
             status=status,
-            action="reclassify-to-revision-3",
+            action=action,
             migration_blocker=LEGACY_QUEUED_BLOCKER,
         )
-    if status == "running":
+    if action == "legacy-complete-or-rebind":
         return LegacyTaskMigration(
             record=migrated,
             status=status,
-            action="legacy-complete-or-rebind",
+            action=action,
             may_finish_legacy_attempt=True,
             requires_fresh_ack_on_rebind=True,
         )
-    if status == "result_reported":
+    if action == "accept-legacy-result-or-add-gates":
         return LegacyTaskMigration(
             record=migrated,
             status=status,
-            action="accept-legacy-result-or-add-gates",
+            action=action,
             may_accept_legacy_result=True,
         )
-    if status in LEGACY_TERMINAL_TASK_STATUSES:
+    if action == "preserve-history":
         return LegacyTaskMigration(
             record=migrated,
             status=status,
-            action="preserve-history",
+            action=action,
         )
-    raise AssertionError(f"unhandled task status: {status}")
+    if action == "retry-legacy-attempt":
+        return LegacyTaskMigration(
+            record=migrated,
+            status=status,
+            action=action,
+            may_start_new_attempt=True,
+        )
+    if action == "resume-or-abort-legacy-merge":
+        return LegacyTaskMigration(
+            record=migrated,
+            status=status,
+            action=action,
+            may_resume_legacy_merge=True,
+        )
+    if action == "requeue-after-manager-recovery":
+        return LegacyTaskMigration(
+            record=migrated,
+            status=status,
+            action=action,
+            requires_requeue_before_start=True,
+        )
+    raise AssertionError(f"unhandled legacy task migration action: {action}")
 
 
 def migrate_legacy_result_contract(record: Mapping[str, Any]) -> dict[str, Any]:

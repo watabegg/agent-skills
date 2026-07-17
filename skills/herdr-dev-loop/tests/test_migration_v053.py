@@ -24,6 +24,7 @@ from hloop_lib.migration import (  # noqa: E402
     recover_legacy_remediation_history,
     sha256_digest,
 )
+from hloop_lib.task_contract import LEGACY_TASK_STATUS_ACTIONS  # noqa: E402
 
 
 def legacy_task(status: str, **updates) -> dict:
@@ -86,6 +87,42 @@ def output_digests(plan) -> dict[str, str]:
 
 
 class StateMigrationV053Tests(unittest.TestCase):
+    def test_all_v052_runtime_task_statuses_project_into_state(self):
+        tasks = {
+            f"T{index:03d}": legacy_task(status, id=f"T{index:03d}")
+            for index, status in enumerate(LEGACY_TASK_STATUS_ACTIONS, start=1)
+        }
+
+        plan = plan_format_three_revision_three(legacy_state(tasks=tasks))
+
+        self.assertTrue(plan.applicable)
+        self.assertEqual(set(plan.task_migrations), set(tasks))
+        for task_id, source in tasks.items():
+            with self.subTest(task_id=task_id, status=source["status"]):
+                status = source["status"]
+                migration = plan.task_migrations[task_id]
+                projected = plan.state["migration_v053"]["task_contracts"][task_id]
+                self.assertEqual(migration.action, LEGACY_TASK_STATUS_ACTIONS[status])
+                self.assertEqual(plan.state["tasks"][task_id]["status"], status)
+                self.assertEqual(projected, migration.to_record())
+
+        blocked_environment_id = next(
+            task_id
+            for task_id, source in tasks.items()
+            if source["status"] == "blocked_environment"
+        )
+        failed_validation_id = next(
+            task_id
+            for task_id, source in tasks.items()
+            if source["status"] == "failed_validation"
+        )
+        self.assertTrue(
+            plan.task_migrations[blocked_environment_id].may_resume_legacy_merge
+        )
+        self.assertTrue(
+            plan.task_migrations[failed_validation_id].may_start_new_attempt
+        )
+
     def test_status_sensitive_legacy_task_projection_is_side_effect_free(self):
         state = legacy_state(
             tasks={
