@@ -35,6 +35,13 @@ SUPPORTED_REVIEW_PROTOCOLS = ("native", "codex-review-multi-v2")
 SUPPORTED_MANUAL_FINAL_PROTOCOLS = ("codex-review-multi-v2",)
 SUPPORTED_MANUAL_FINAL_EXECUTIONS = ("independent", "reuse_epoch_reviewer")
 SUPPORTED_MANAGER_IDENTITY_POLICIES = ("strict", "warn-unavailable")
+AGENT_IDENTITY_FIELDS = ("provider", "model", "effort")
+AGENT_IDENTITY_STATUSES = (
+    "attested",
+    "requested-only",
+    "unavailable",
+    "mismatch",
+)
 SUPPORTED_SCOPE_EXPANSION_ACTIONS = (
     "follow_up",
     "disable_feature",
@@ -244,6 +251,148 @@ class ConfigCapabilityError(ConfigError):
 
 class ConfigValidationError(ConfigError):
     """Raised when parsed config content fails schema/type validation."""
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentIdentityProjection:
+    """Requested, observed, and attested identity without invented evidence.
+
+    Provider launch configuration is a request, not an observation.  Callers
+    must pass independently observed or provider-attested values explicitly;
+    omitted values remain ``unavailable`` instead of being copied from the
+    requested mapping.
+    """
+
+    requested: Mapping[str, str]
+    observed: Mapping[str, str]
+    attested: Mapping[str, str]
+    status: str
+    issues: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status not in AGENT_IDENTITY_STATUSES:
+            raise ConfigValidationError(
+                f"unsupported agent identity status: {self.status!r}"
+            )
+
+    @property
+    def verified(self) -> bool:
+        return self.status == "attested" and not self.issues
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "requested": dict(self.requested),
+            "observed": dict(self.observed),
+            "attested": dict(self.attested),
+            "status": self.status,
+            "verified": self.verified,
+            "issues": list(self.issues),
+        }
+
+
+def _identity_mapping(value: Mapping[str, Any] | None, *, label: str) -> dict[str, str]:
+    """Normalize only identity values actually supplied by one evidence source."""
+
+    if value is None:
+        return {field: "unavailable" for field in AGENT_IDENTITY_FIELDS}
+    if not isinstance(value, Mapping):
+        raise ConfigValidationError(f"{label} identity must be a mapping")
+    unknown = sorted(set(value) - set(AGENT_IDENTITY_FIELDS))
+    if unknown:
+        raise ConfigValidationError(
+            f"{label} identity has unknown field(s): {', '.join(unknown)}"
+        )
+    normalized: dict[str, str] = {}
+    for field in AGENT_IDENTITY_FIELDS:
+        raw = value.get(field)
+        if raw is None or str(raw).strip() == "":
+            normalized[field] = "unavailable"
+            continue
+        text = str(raw).strip()
+        if "\n" in text or "\r" in text or "\0" in text:
+            raise ConfigValidationError(
+                f"{label} identity {field} must be a single-line string"
+            )
+        normalized[field] = text
+    return normalized
+
+
+def project_agent_identity(
+    requested: Mapping[str, Any],
+    *,
+    observed: Mapping[str, Any] | None = None,
+    attested: Mapping[str, Any] | None = None,
+) -> AgentIdentityProjection:
+    """Separate requested/observed/attested model identity fail-closed.
+
+    An attestation is verified only when every attested field agrees with both
+    the requested value and an independently observed value.  Partial or
+    absent evidence stays explicit and can never be mistaken for a match.
+    """
+
+    requested_identity = _identity_mapping(requested, label="requested")
+    if any(value == "unavailable" for value in requested_identity.values()):
+        raise ConfigValidationError(
+            "requested identity requires provider, model, and effort"
+        )
+    observed_identity = _identity_mapping(observed, label="observed")
+    attested_identity = _identity_mapping(attested, label="attested")
+    issues: list[str] = []
+    for field in AGENT_IDENTITY_FIELDS:
+        observed_value = observed_identity[field]
+        attested_value = attested_identity[field]
+        requested_value = requested_identity[field]
+        request_constrains_value = requested_value != "auto"
+        if (
+            request_constrains_value
+            and observed_value != "unavailable"
+            and observed_value != requested_value
+        ):
+            issues.append(
+                f"observed-{field}-mismatch:requested={requested_value!r}:"
+                f"observed={observed_value!r}"
+            )
+        if (
+            request_constrains_value
+            and attested_value != "unavailable"
+            and attested_value != requested_value
+        ):
+            issues.append(
+                f"attested-{field}-mismatch:requested={requested_value!r}:"
+                f"attested={attested_value!r}"
+            )
+        if (
+            observed_value != "unavailable"
+            and attested_value != "unavailable"
+            and observed_value != attested_value
+        ):
+            issues.append(
+                f"observed-attested-{field}-mismatch:observed={observed_value!r}:"
+                f"attested={attested_value!r}"
+            )
+    if issues:
+        status = "mismatch"
+    elif all(value != "unavailable" for value in attested_identity.values()) and all(
+        value != "unavailable" for value in observed_identity.values()
+    ):
+        status = "attested"
+    elif all(value == "unavailable" for value in observed_identity.values()) and all(
+        value == "unavailable" for value in attested_identity.values()
+    ):
+        status = "requested-only"
+    else:
+        status = "unavailable"
+    return AgentIdentityProjection(
+        requested=requested_identity,
+        observed=observed_identity,
+        attested=attested_identity,
+        status=status,
+        issues=tuple(issues),
+    )
+
+
+# Concise compatibility spelling for central runtime callers.
+agent_identity_projection = project_agent_identity
 
 
 def check_python_capability(version_info: Any = None) -> None:
