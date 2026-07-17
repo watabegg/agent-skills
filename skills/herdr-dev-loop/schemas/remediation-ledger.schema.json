@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Remediation Ledger Contract",
+  "$ref": "../references/schemas/remediation-ledger.schema.json"
+}
