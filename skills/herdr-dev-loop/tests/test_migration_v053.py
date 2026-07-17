@@ -321,6 +321,28 @@ class StateMigrationV053Tests(unittest.TestCase):
         self.assertIsNone(recovery.consumed_rounds)
         self.assertEqual(recovery.decision_candidates, (1, 2))
 
+    def test_positive_legacy_counters_without_provenance_require_a_decision(self):
+        for fix_round, metric_rounds in ((1, 0), (0, 1), (1, 1)):
+            with self.subTest(
+                fix_round=fix_round,
+                metric_rounds=metric_rounds,
+            ):
+                state = legacy_state()
+                state["review_convergence"]["fix_round"] = fix_round
+                state["execution_metrics"]["review_fix_rounds"] = metric_rounds
+
+                recovery = recover_legacy_remediation_history(state)
+
+                self.assertEqual(recovery.status, "migration_decision_required")
+                self.assertTrue(recovery.decision_required)
+                self.assertIsNone(recovery.consumed_rounds)
+                self.assertEqual(recovery.batches, ())
+                self.assertEqual(recovery.decision_candidates, (1,))
+                self.assertIn(
+                    "no reconstructible remediation provenance",
+                    " ".join(recovery.issues),
+                )
+
     def test_partial_forward_mutation_marker_in_revision_two_is_rejected(self):
         state = legacy_state()
         state["first_v053_mutation_at"] = "2026-07-17T00:00:00Z"
