@@ -319,6 +319,7 @@
         "epoch_id",
         "epoch_revision",
         "plan_digest",
+        "ancestor_plan_digests",
         "audit_agent_budget",
         "leases",
         "reserved_slots",
@@ -331,6 +332,11 @@
         "epoch_id": {"type": "string", "pattern": "^E[0-9]{3,}$"},
         "epoch_revision": {"type": "integer", "minimum": 1},
         "plan_digest": {"$ref": "#/$defs/digest"},
+        "ancestor_plan_digests": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/digest"}
+        },
         "audit_agent_budget": {"type": "integer", "minimum": 1},
         "leases": {
           "type": "array",
@@ -342,6 +348,17 @@
         "available_slots": {"type": "integer", "minimum": 0},
         "blocks_new_starts": {"type": "boolean"}
       },
+      "allOf": [
+        {
+          "if": {"properties": {"epoch_revision": {"const": 1}}},
+          "then": {
+            "properties": {"ancestor_plan_digests": {"maxItems": 0}}
+          },
+          "else": {
+            "properties": {"ancestor_plan_digests": {"minItems": 1}}
+          }
+        }
+      ],
       "additionalProperties": false
     }
   }

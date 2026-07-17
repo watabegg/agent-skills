@@ -650,13 +650,58 @@ class ReviewEpochPlan:
             artifact_ref=execution.artifact_ref,
         )
 
-    def capacity_ledger(self) -> "EpochCapacityLedger":
-        return EpochCapacityLedger(
+    def capacity_ledger(
+        self,
+        predecessor: "EpochCapacityLedger | Mapping[str, Any] | None" = None,
+    ) -> "EpochCapacityLedger":
+        """Create the epoch-wide capacity ledger for this revision.
+
+        A successor must advance the predecessor ledger rather than creating an
+        independent empty ledger.  This preserves every capacity-holding lease
+        in the revision lineage, including quarantined leases that block starts.
+        """
+
+        if self.epoch_revision == 1:
+            if predecessor is not None:
+                raise ReviewEpochError(
+                    "initial epoch capacity ledger cannot have a predecessor"
+                )
+            return EpochCapacityLedger(
+                epoch_id=self.epoch_id,
+                epoch_revision=self.epoch_revision,
+                plan_digest=self.plan_digest,
+                audit_agent_budget=self.audit_agent_budget,
+            )
+
+        if predecessor is None:
+            raise ReviewEpochError(
+                "successor epoch capacity ledger requires predecessor ledger"
+            )
+        previous = EpochCapacityLedger.from_record(predecessor)
+        if (
+            previous.epoch_id != self.epoch_id
+            or previous.epoch_revision != self.epoch_revision - 1
+            or not hmac.compare_digest(
+                previous.plan_digest, self.parent_plan_digest
+            )
+            or previous.audit_agent_budget != self.audit_agent_budget
+        ):
+            raise ReviewEpochError(
+                "predecessor capacity ledger does not match successor lineage"
+            )
+        ledger = EpochCapacityLedger(
             epoch_id=self.epoch_id,
             epoch_revision=self.epoch_revision,
             plan_digest=self.plan_digest,
+            ancestor_plan_digests=(
+                *previous.ancestor_plan_digests,
+                previous.plan_digest,
+            ),
             audit_agent_budget=self.audit_agent_budget,
+            leases=previous.leases,
         )
+        ledger.validate_for_plan(self)
+        return ledger
 
     @classmethod
     def from_record(cls, value: Any) -> "ReviewEpochPlan":
@@ -1134,13 +1179,14 @@ class CapacityLease:
 
 @dataclass(frozen=True, slots=True)
 class EpochCapacityLedger:
-    """Aggregate capacity ledger shared by every process in one epoch revision."""
+    """Aggregate capacity ledger shared by an epoch's full revision lineage."""
 
     epoch_id: str
     epoch_revision: int
     plan_digest: str
     audit_agent_budget: int
     leases: tuple[CapacityLease, ...] = ()
+    ancestor_plan_digests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         epoch_id = _required_text(self.epoch_id, "epoch_id")
@@ -1155,6 +1201,24 @@ class EpochCapacityLedger:
         object.__setattr__(
             self, "plan_digest", _digest(self.plan_digest, "plan_digest")
         )
+        ancestor_plan_digests = tuple(
+            _digest(item, "ancestor_plan_digests")
+            for item in _items(
+                self.ancestor_plan_digests, "ancestor_plan_digests"
+            )
+        )
+        if len(ancestor_plan_digests) != self.epoch_revision - 1:
+            raise ReviewEpochError(
+                "ancestor_plan_digests must identify every prior epoch revision"
+            )
+        lineage_plan_digests = (*ancestor_plan_digests, self.plan_digest)
+        if len(set(lineage_plan_digests)) != len(lineage_plan_digests):
+            raise ReviewEpochError(
+                "epoch lineage plan digests must be unique by revision"
+            )
+        object.__setattr__(
+            self, "ancestor_plan_digests", ancestor_plan_digests
+        )
         object.__setattr__(
             self,
             "audit_agent_budget",
@@ -1167,10 +1231,15 @@ class EpochCapacityLedger:
         for lease in leases:
             if (
                 lease.epoch_id != self.epoch_id
-                or lease.epoch_revision != self.epoch_revision
-                or not hmac.compare_digest(lease.plan_digest, self.plan_digest)
+                or lease.epoch_revision > self.epoch_revision
+                or not hmac.compare_digest(
+                    lease.plan_digest,
+                    lineage_plan_digests[lease.epoch_revision - 1],
+                )
             ):
-                raise ReviewEpochError("capacity lease identity does not match ledger")
+                raise ReviewEpochError(
+                    "capacity lease identity does not match epoch lineage"
+                )
         active_process_ids = [
             process_id
             for lease in leases
@@ -1220,6 +1289,12 @@ class EpochCapacityLedger:
             or epoch.audit_agent_budget != self.audit_agent_budget
         ):
             raise ReviewEpochError("capacity ledger does not match epoch plan")
+        if epoch.epoch_revision > 1 and not hmac.compare_digest(
+            epoch.parent_plan_digest, self.ancestor_plan_digests[-1]
+        ):
+            raise ReviewEpochError(
+                "capacity ledger predecessor does not match epoch plan"
+            )
         for lease in self.leases:
             execution = epoch.execution(lease.execution_id)
             if lease.attempt_id != execution.attempt_id:
@@ -1324,6 +1399,7 @@ class EpochCapacityLedger:
             "epoch_id": self.epoch_id,
             "epoch_revision": self.epoch_revision,
             "plan_digest": self.plan_digest,
+            "ancestor_plan_digests": list(self.ancestor_plan_digests),
             "audit_agent_budget": self.audit_agent_budget,
             "leases": [lease.to_record() for lease in self.leases],
             "reserved_slots": self.reserved_slots,
@@ -1349,6 +1425,7 @@ class EpochCapacityLedger:
                 "epoch_id",
                 "epoch_revision",
                 "plan_digest",
+                "ancestor_plan_digests",
                 "audit_agent_budget",
                 "leases",
             ),
@@ -1357,6 +1434,12 @@ class EpochCapacityLedger:
             epoch_id=record["epoch_id"],
             epoch_revision=record["epoch_revision"],
             plan_digest=record["plan_digest"],
+            ancestor_plan_digests=tuple(
+                _items(
+                    record["ancestor_plan_digests"],
+                    "ancestor_plan_digests",
+                )
+            ),
             audit_agent_budget=record["audit_agent_budget"],
             leases=tuple(
                 CapacityLease.from_record(item)

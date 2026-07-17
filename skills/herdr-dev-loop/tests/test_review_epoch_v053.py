@@ -378,6 +378,127 @@ class ReviewEpochSuccessorTests(unittest.TestCase):
 
 
 class EpochCapacityLeaseTests(unittest.TestCase):
+    def test_successor_capacity_ledger_requires_exact_predecessor(self):
+        parent = epoch_plan(budget=1)
+        successor = create_successor_revision(
+            parent, additional_executions=(reviewer_execution("R002"),)
+        )
+
+        with self.assertRaisesRegex(ReviewEpochError, "requires predecessor"):
+            successor.capacity_ledger()
+        with self.assertRaisesRegex(ReviewEpochError, "successor lineage"):
+            successor.capacity_ledger(
+                replace(parent.capacity_ledger(), plan_digest=digest("unrelated"))
+            )
+        predecessor = parent.capacity_ledger().reserve(
+            parent,
+            lease_id="lease-parent",
+            execution_id="R001",
+            process_ids=("R001-coordinator",),
+            expires_at="2026-07-17T10:00:00Z",
+        )
+        ledger = successor.capacity_ledger(predecessor)
+        self.assertEqual(ledger.available_slots, 0)
+        with self.assertRaisesRegex(ReviewEpochError, "audit_agent_budget"):
+            ledger.reserve(
+                successor,
+                lease_id="lease-successor",
+                execution_id="R002",
+                process_ids=("R002-coordinator",),
+                expires_at="2026-07-17T10:00:00Z",
+            )
+
+    def test_successor_shares_every_ancestor_lease_and_quarantine(self):
+        revision_one = epoch_plan(budget=3)
+        ledger = revision_one.capacity_ledger().reserve(
+            revision_one,
+            lease_id="lease-starting",
+            execution_id="R001",
+            process_ids=("R001-coordinator",),
+            expires_at="2026-07-17T10:00:00Z",
+        )
+
+        revision_two = create_successor_revision(
+            revision_one,
+            additional_executions=(reviewer_execution("R002"),),
+        )
+        ledger = revision_two.capacity_ledger(ledger).reserve(
+            revision_two,
+            lease_id="lease-running",
+            execution_id="R002",
+            process_ids=("R002-coordinator",),
+            expires_at="2026-07-17T10:00:00Z",
+        ).mark_running("lease-running")
+
+        revision_three = create_successor_revision(
+            revision_two,
+            additional_executions=(reviewer_execution("R003"),),
+        )
+        ledger = revision_three.capacity_ledger(ledger).reserve(
+            revision_three,
+            lease_id="lease-quarantined",
+            execution_id="R003",
+            process_ids=("R003-coordinator",),
+            expires_at="2026-07-17T08:00:00Z",
+        ).mark_running("lease-quarantined").mark_expired_quarantined(
+            "lease-quarantined", now="2026-07-17T08:00:00Z"
+        )
+
+        revision_four = create_successor_revision(
+            revision_three,
+            additional_executions=(reviewer_execution("R004"),),
+        )
+        ledger = revision_four.capacity_ledger(ledger)
+
+        self.assertEqual(
+            ledger.ancestor_plan_digests,
+            (
+                revision_one.plan_digest,
+                revision_two.plan_digest,
+                revision_three.plan_digest,
+            ),
+        )
+        self.assertEqual(
+            {lease.epoch_revision: lease.status for lease in ledger.leases},
+            {1: "starting", 2: "running", 3: "expired_quarantined"},
+        )
+        self.assertEqual(ledger.reserved_slots, 3)
+        self.assertEqual(ledger.live_slots, 2)
+        self.assertEqual(ledger.available_slots, 0)
+        self.assertTrue(ledger.blocks_new_starts)
+        restored = EpochCapacityLedger.from_record(
+            json.loads(json.dumps(ledger.to_record()))
+        )
+        restored.validate_for_plan(revision_four)
+        self.assertEqual(restored, ledger)
+        tampered = ledger.to_record()
+        tampered["ancestor_plan_digests"][-1] = digest("wrong-ancestor")
+        with self.assertRaisesRegex(ReviewEpochError, "epoch lineage"):
+            EpochCapacityLedger.from_record(tampered)
+        with self.assertRaisesRegex(ReviewEpochError, "blocks every new start"):
+            ledger.reserve(
+                revision_four,
+                lease_id="lease-successor",
+                execution_id="R004",
+                process_ids=("R004-coordinator",),
+                expires_at="2026-07-17T11:00:00Z",
+            )
+
+        ledger = ledger.mark_terminal(
+            "lease-quarantined",
+            reason="forced abort acknowledged",
+            forced_abort_acknowledged=True,
+        )
+        self.assertFalse(ledger.blocks_new_starts)
+        ledger = ledger.reserve(
+            revision_four,
+            lease_id="lease-successor",
+            execution_id="R004",
+            process_ids=("R004-coordinator",),
+            expires_at="2026-07-17T11:00:00Z",
+        )
+        self.assertEqual(ledger.reserved_slots, 3)
+
     def test_one_aggregate_budget_counts_every_audit_process_kind(self):
         plan = epoch_plan(budget=6)
         ledger = plan.capacity_ledger()
@@ -564,9 +685,18 @@ class ReviewEpochSchemaTests(unittest.TestCase):
             process_ids=("R001-coordinator", "R001-verifier"),
             expires_at="2026-07-17T08:00:00Z",
         )
+        successor = create_successor_revision(
+            plan, additional_executions=(reviewer_execution("R002"),)
+        )
+        successor_ledger = successor.capacity_ledger(ledger)
         for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA):
             validator = offline_validator(schema_path)
-            for record in (plan.to_record(), ledger.to_record()):
+            for record in (
+                plan.to_record(),
+                ledger.to_record(),
+                successor.to_record(),
+                successor_ledger.to_record(),
+            ):
                 with self.subTest(schema=schema_path.name, record=record["record_type"]):
                     self.assertEqual(list(validator.iter_errors(record)), [])
 
