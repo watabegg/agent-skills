@@ -9520,10 +9520,11 @@ def resolved_reviewer_topology(
 
     Explicit CLI values always win. Anything left unset falls back to
     ``resolved_config.reviewer`` (the full hierarchical config precedence
-    chain already applied by ``config apply``), with the new
-    ``resolved_config.review.lane_count`` taking precedence over legacy swarm
-    probe knobs. The legacy reviewer probe fields remain a compatibility
-    fallback when lane_count is ``auto`` or absent.
+    chain already applied by ``config apply``), with canonical
+    ``resolved_config.reviewer.lane_count`` taking precedence over legacy
+    review-policy and swarm-probe knobs. An absent canonical value can fall
+    back to the legacy policy count; legacy probe fields remain a
+    compatibility fallback when the selected lane count is ``auto`` or absent.
     """
 
     resolved_config = state.get("resolved_config", {})
@@ -9539,14 +9540,15 @@ def resolved_reviewer_topology(
     resolved_probe_count = probe_count
     resolved_probes_per_provider = probes_per_provider
     if resolved_probe_count is None and resolved_probes_per_provider is None:
-        review_config = resolved_config.get("review", {})
-        if not isinstance(review_config, dict):
-            review_config = {}
-        lane_count = review_config.get("lane_count")
+        lane_count = reviewer_config.get("lane_count")
         if lane_count is None:
-            policy = state.get("review_policy", {})
-            if isinstance(policy, dict):
-                lane_count = policy.get("lane_count")
+            review_config = resolved_config.get("review", {})
+            if isinstance(review_config, dict):
+                lane_count = review_config.get("lane_count")
+            if lane_count is None:
+                policy = state.get("review_policy", {})
+                if isinstance(policy, dict):
+                    lane_count = policy.get("lane_count")
         if resolved_mode in hloop_review.SWARM_MODES and lane_count not in (None, "auto"):
             resolved_probe_count = lane_count
         else:
