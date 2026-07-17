@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/patch-review.schema.json",
+  "title": "Herdr Dev Loop Task-local Patch Review",
+  "type": "object",
+  "required": [
+    "record_type",
+    "run_id",
+    "skill_version",
+    "contract_schema_revision",
+    "task_id",
+    "attempt_id",
+    "task_contract_digest",
+    "semantic_ack_event_id",
+    "base_sha",
+    "candidate_revision",
+    "candidate_sha",
+    "candidate_artifact_ref",
+    "candidate_artifact_digest",
+    "review_attempt_id",
+    "review_round",
+    "reviewer_provider",
+    "reviewer_model",
+    "reviewer_effort",
+    "verdict",
+    "unresolved_finding_fingerprints",
+    "follow_up_finding_fingerprints",
+    "automatic_task_ids"
+  ],
+  "properties": {
+    "record_type": {"const": "patch_review"},
+    "run_id": {"type": "string", "minLength": 1},
+    "skill_version": {"type": "string", "minLength": 1},
+    "contract_schema_revision": {"const": 3},
+    "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^T[0-9]{3}-A[0-9]{3}$"
+    },
+    "task_contract_digest": {"$ref": "#/$defs/digest"},
+    "semantic_ack_event_id": {"type": "string", "minLength": 1},
+    "base_sha": {"$ref": "#/$defs/gitObject"},
+    "candidate_revision": {"type": "integer", "minimum": 1},
+    "candidate_sha": {"$ref": "#/$defs/gitObject"},
+    "candidate_artifact_ref": {
+      "type": "string",
+      "pattern": "^implementation-candidates/T[0-9]{3}/T[0-9]{3}-A[0-9]{3}/[1-9][0-9]*\\.json$"
+    },
+    "candidate_artifact_digest": {"$ref": "#/$defs/digest"},
+    "review_attempt_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "review_round": {"type": "integer", "minimum": 1},
+    "reviewer_provider": {"enum": ["codex", "claude"]},
+    "reviewer_model": {"type": "string", "minLength": 1},
+    "reviewer_effort": {"type": "string", "minLength": 1},
+    "verdict": {"enum": ["passed", "fix_required"]},
+    "unresolved_finding_fingerprints": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/digest"}
+    },
+    "follow_up_finding_fingerprints": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/digest"}
+    },
+    "automatic_task_ids": {
+      "type": "array",
+      "maxItems": 0
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"verdict": {"const": "passed"}},
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": {
+          "unresolved_finding_fingerprints": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"verdict": {"const": "fix_required"}},
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": {
+          "unresolved_finding_fingerprints": {"minItems": 1}
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "gitObject": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    }
+  }
+}
