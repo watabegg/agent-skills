@@ -1,0 +1,455 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/remediation-ledger.schema.json",
+  "title": "Herdr Dev Loop Remediation Ledger Contract",
+  "$ref": "#/$defs/ledger",
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "optionalDigest": {
+      "oneOf": [
+        {"const": ""},
+        {"$ref": "#/$defs/digest"}
+      ]
+    },
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "classification": {
+      "type": "object",
+      "required": [
+        "finding_id",
+        "source_artifact",
+        "source_candidate_id",
+        "fingerprint",
+        "target_sha",
+        "fact_status",
+        "severity",
+        "origin",
+        "contract_relation",
+        "decision_requirement",
+        "disposition",
+        "release_effect",
+        "requirement_refs",
+        "why_fix_now",
+        "remediation_round",
+        "duplicate_of",
+        "accepted_risk_decision_id"
+      ],
+      "properties": {
+        "finding_id": {"type": "string"},
+        "source_artifact": {"type": "string"},
+        "source_candidate_id": {"type": "string"},
+        "fingerprint": {"$ref": "#/$defs/optionalDigest"},
+        "target_sha": {"type": "string"},
+        "fact_status": {
+          "enum": ["confirmed", "refuted", "insufficient_evidence"]
+        },
+        "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+        "origin": {
+          "enum": [
+            "introduced",
+            "diff-expanded-pre-existing",
+            "unrelated-pre-existing",
+            "unknown"
+          ]
+        },
+        "contract_relation": {
+          "enum": ["in_scope", "outside_release", "ambiguous"]
+        },
+        "decision_requirement": {"enum": ["none", "spec", "user"]},
+        "disposition": {
+          "enum": [
+            "fix_now",
+            "defer_follow_up",
+            "disable_feature",
+            "mark_experimental",
+            "user_decision",
+            "accepted_risk",
+            "discard"
+          ]
+        },
+        "release_effect": {"enum": ["blocking", "non_blocking"]},
+        "requirement_refs": {"$ref": "#/$defs/stringArray"},
+        "why_fix_now": {"type": "string"},
+        "remediation_round": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 1}
+          ]
+        },
+        "duplicate_of": {"type": "string"},
+        "accepted_risk_decision_id": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "observation": {
+      "type": "object",
+      "required": [
+        "observation_id",
+        "source_kind",
+        "source_ref",
+        "source_execution_id",
+        "source_candidate_id",
+        "fingerprint",
+        "target_sha",
+        "classification",
+        "requirement_refs",
+        "scope_refs",
+        "why_fix_now"
+      ],
+      "properties": {
+        "observation_id": {"type": "string", "minLength": 1},
+        "source_kind": {
+          "enum": ["reviewer", "gap", "convergence", "manual-final"]
+        },
+        "source_ref": {"type": "string", "minLength": 1},
+        "source_execution_id": {"type": "string", "minLength": 1},
+        "source_candidate_id": {"type": "string", "minLength": 1},
+        "fingerprint": {"$ref": "#/$defs/digest"},
+        "target_sha": {"type": "string", "minLength": 1},
+        "classification": {"$ref": "#/$defs/classification"},
+        "requirement_refs": {"$ref": "#/$defs/stringArray"},
+        "scope_refs": {"$ref": "#/$defs/stringArray"},
+        "why_fix_now": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "canonicalCandidate": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "target_sha",
+        "classification",
+        "observation_ids",
+        "source_refs",
+        "source_execution_ids",
+        "requirement_refs",
+        "scope_refs",
+        "why_fix_now"
+      ],
+      "properties": {
+        "fingerprint": {"$ref": "#/$defs/digest"},
+        "target_sha": {"type": "string", "minLength": 1},
+        "classification": {"$ref": "#/$defs/classification"},
+        "observation_ids": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1}
+          ]
+        },
+        "source_refs": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1}
+          ]
+        },
+        "source_execution_ids": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1}
+          ]
+        },
+        "requirement_refs": {"$ref": "#/$defs/stringArray"},
+        "scope_refs": {"$ref": "#/$defs/stringArray"},
+        "why_fix_now": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "plannedTask": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "candidate_fingerprints",
+        "task_contract",
+        "task_contract_digest",
+        "source_refs",
+        "artifact_ref"
+      ],
+      "properties": {
+        "task_id": {"type": "string", "pattern": "^T[0-9]{3,}$"},
+        "candidate_fingerprints": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/digest"}
+        },
+        "task_contract": {
+          "type": "object",
+          "required": ["id", "task_origin", "source_finding", "remediation_round"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^T[0-9]{3,}$"},
+            "task_origin": {"const": "finding"},
+            "source_finding": {"type": "string", "minLength": 1},
+            "remediation_round": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": true
+        },
+        "task_contract_digest": {"$ref": "#/$defs/digest"},
+        "source_refs": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1}
+          ]
+        },
+        "artifact_ref": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "materializedTask": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "state_contract_digest",
+        "artifact_contract_digest",
+        "artifact_digest",
+        "source_refs"
+      ],
+      "properties": {
+        "task_id": {"type": "string", "pattern": "^T[0-9]{3,}$"},
+        "state_contract_digest": {"$ref": "#/$defs/digest"},
+        "artifact_contract_digest": {"$ref": "#/$defs/digest"},
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "source_refs": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "batch": {
+      "type": "object",
+      "required": [
+        "batch_id",
+        "epoch_id",
+        "target_sha",
+        "required_execution_ids",
+        "terminal_execution_ids",
+        "status",
+        "observations",
+        "canonical_candidates",
+        "classification_conflicts",
+        "canonicalization_ref",
+        "candidate_set_digest",
+        "scope_digest",
+        "scope_revision",
+        "approval_ref",
+        "approval_digest",
+        "remediation_round",
+        "round_consumed",
+        "extra_round_authorization_ref",
+        "materialization_plan",
+        "materialized_tasks",
+        "completion_outcome"
+      ],
+      "properties": {
+        "batch_id": {"type": "string", "pattern": "^RB[0-9]{3,}$"},
+        "epoch_id": {"type": "string", "minLength": 1},
+        "target_sha": {"type": "string", "minLength": 1},
+        "required_execution_ids": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1}
+          ]
+        },
+        "terminal_execution_ids": {"$ref": "#/$defs/stringArray"},
+        "status": {
+          "enum": [
+            "candidate_registered",
+            "classification_conflict",
+            "ready_to_triage",
+            "materializing",
+            "dispatched",
+            "completed",
+            "aborted"
+          ]
+        },
+        "observations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/observation"}
+        },
+        "canonical_candidates": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/canonicalCandidate"}
+        },
+        "classification_conflicts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/digest"}
+        },
+        "canonicalization_ref": {"type": "string"},
+        "candidate_set_digest": {"$ref": "#/$defs/optionalDigest"},
+        "scope_digest": {"$ref": "#/$defs/optionalDigest"},
+        "scope_revision": {"type": "integer", "minimum": 0},
+        "approval_ref": {"type": "string"},
+        "approval_digest": {"$ref": "#/$defs/optionalDigest"},
+        "remediation_round": {"type": "integer", "minimum": 0},
+        "round_consumed": {"type": "boolean"},
+        "extra_round_authorization_ref": {"type": "string"},
+        "materialization_plan": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/plannedTask"}
+        },
+        "materialized_tasks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/materializedTask"}
+        },
+        "completion_outcome": {
+          "enum": ["", "product_changed", "no_change", "aborted"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "candidate_registered",
+                  "classification_conflict",
+                  "ready_to_triage"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "scope_digest": {"const": ""},
+              "scope_revision": {"const": 0},
+              "approval_ref": {"const": ""},
+              "approval_digest": {"const": ""},
+              "remediation_round": {"const": 0},
+              "round_consumed": {"const": false},
+              "extra_round_authorization_ref": {"const": ""},
+              "materialization_plan": {"maxItems": 0},
+              "materialized_tasks": {"maxItems": 0},
+              "completion_outcome": {"const": ""}
+            }
+          },
+          "else": {
+            "properties": {
+              "scope_digest": {"$ref": "#/$defs/digest"},
+              "scope_revision": {"minimum": 1},
+              "approval_ref": {"minLength": 1},
+              "approval_digest": {"$ref": "#/$defs/digest"},
+              "remediation_round": {"minimum": 1},
+              "round_consumed": {"const": true},
+              "materialization_plan": {"minItems": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "ready_to_triage",
+                  "materializing",
+                  "dispatched",
+                  "completed",
+                  "aborted"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "terminal_execution_ids": {"minItems": 1},
+              "canonical_candidates": {"minItems": 1},
+              "candidate_set_digest": {"$ref": "#/$defs/digest"},
+              "classification_conflicts": {"maxItems": 0}
+            }
+          },
+          "else": {
+            "properties": {
+              "canonical_candidates": {"maxItems": 0},
+              "candidate_set_digest": {"const": ""},
+              "canonicalization_ref": {"const": ""}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "classification_conflict"}}},
+          "then": {"properties": {"classification_conflicts": {"minItems": 1}}},
+          "else": {"properties": {"classification_conflicts": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "materializing"}}},
+          "then": {"properties": {"materialized_tasks": {"maxItems": 0}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {"enum": ["dispatched", "completed", "aborted"]}
+            }
+          },
+          "then": {"properties": {"materialized_tasks": {"minItems": 1}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "completed"}}},
+          "then": {
+            "properties": {
+              "completion_outcome": {"enum": ["product_changed", "no_change"]}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "aborted"}}},
+          "then": {"properties": {"completion_outcome": {"const": "aborted"}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "candidate_registered",
+                  "classification_conflict",
+                  "ready_to_triage",
+                  "materializing",
+                  "dispatched"
+                ]
+              }
+            }
+          },
+          "then": {"properties": {"completion_outcome": {"const": ""}}}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "ledger": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "schema_revision",
+        "max_fix_rounds",
+        "consumed_rounds",
+        "consumed_extra_round_authorization_refs",
+        "batches"
+      ],
+      "properties": {
+        "record_type": {"const": "remediation_ledger"},
+        "schema_revision": {"const": 1},
+        "max_fix_rounds": {"type": "integer", "minimum": 1, "maximum": 2},
+        "consumed_rounds": {"type": "integer", "minimum": 0},
+        "consumed_extra_round_authorization_refs": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "batches": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/batch"}
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
