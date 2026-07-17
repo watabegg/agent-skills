@@ -101,13 +101,17 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
     def test_review_lane_count_resolves_swarm_topology_without_changing_holistic_modes(self):
         state = {
             "resolved_config": {
-                "reviewer": {"mode": "swarm", "provider": "codex"},
-                "review": {"lane_count": "auto"},
+                "reviewer": {
+                    "mode": "swarm",
+                    "provider": "codex",
+                    "lane_count": "auto",
+                },
+                "review": {"lane_count": 4},
             },
-            "review_policy": {"cadence": "batch", "lane_count": "auto"},
+            "review_policy": {"cadence": "batch", "lane_count": 4},
         }
         for lane_count in (4, 6, 8):
-            state["resolved_config"]["review"]["lane_count"] = lane_count
+            state["resolved_config"]["reviewer"]["lane_count"] = lane_count
             topology = hloop.resolved_reviewer_topology(state)
             self.assertEqual(topology["probe_count"], lane_count)
             plan = hloop.build_reviewer_group_plan(
@@ -134,6 +138,66 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         }
         legacy_topology = hloop.resolved_reviewer_topology(legacy)
         self.assertEqual(legacy_topology["probe_count"], 4)
+
+        legacy_policy = {
+            "resolved_config": {
+                "reviewer": {"mode": "swarm"},
+                "review": {"lane_count": 6},
+            },
+            "review_policy": {"cadence": "batch", "lane_count": "auto"},
+        }
+        self.assertEqual(
+            hloop.resolved_reviewer_topology(legacy_policy)["probe_count"], 6
+        )
+
+        default_policy = {
+            "resolved_config": {"reviewer": {"mode": "dual-swarm"}},
+            "review_policy": {"cadence": "batch", "lane_count": 8},
+        }
+        self.assertEqual(
+            hloop.resolved_reviewer_topology(default_policy)["probe_count"], 8
+        )
+
+    def test_canonical_config_lane_count_reaches_reviewer_startup_plan(self):
+        lane_count = 7
+        for index, mode in enumerate(("swarm", "dual-swarm"), start=1):
+            with self.subTest(mode=mode):
+                state = self.state()
+                resolved = hloop.hloop_config.resolve_config(
+                    hloop.hloop_config.V053_BUILT_IN_CONFIG_DEFAULTS,
+                    task_override={
+                        "reviewer": {"mode": mode, "lane_count": lane_count}
+                    },
+                    target_dir=self.repo,
+                )
+                state["resolved_config"] = resolved.as_dict()
+                self.save_state(state)
+
+                plans = []
+                original_builder = hloop.build_reviewer_group_plan
+
+                def capture_plan(*args, **kwargs):
+                    plan = original_builder(*args, **kwargs)
+                    plans.append(plan)
+                    return plan
+
+                with mock.patch.object(
+                    hloop, "build_reviewer_group_plan", side_effect=capture_plan
+                ):
+                    code, out, err = self.run_cli(
+                        "reviewer",
+                        "start",
+                        "--review-id",
+                        f"R9{index:02d}",
+                        "--dry-run",
+                    )
+
+                self.assertEqual((code, err), (0, ""), out)
+                self.assertEqual(len(plans), 1)
+                self.assertEqual(
+                    [len(provider.lanes) for provider in plans[0].provider_plans],
+                    [lane_count] * len(plans[0].providers),
+                )
 
     def _make_ready_state(self) -> None:
         state = self.state()
