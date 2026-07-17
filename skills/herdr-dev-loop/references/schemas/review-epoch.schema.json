@@ -1,0 +1,348 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/review-epoch.schema.json",
+  "title": "Herdr Dev Loop Review Epoch Contracts",
+  "oneOf": [
+    {"$ref": "#/$defs/epochPlan"},
+    {"$ref": "#/$defs/capacityLedger"}
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "auditProcess": {
+      "type": "object",
+      "required": [
+        "process_id",
+        "process_kind",
+        "agent_label",
+        "provider",
+        "model",
+        "effort",
+        "parent_process_id",
+        "lane_id"
+      ],
+      "properties": {
+        "process_id": {"type": "string", "minLength": 1},
+        "process_kind": {
+          "enum": ["coordinator", "discovery", "verifier", "challenge"]
+        },
+        "agent_label": {"type": "string", "minLength": 1},
+        "provider": {"enum": ["codex", "claude"]},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1},
+        "parent_process_id": {"type": "string"},
+        "lane_id": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"process_kind": {"const": "coordinator"}}},
+          "then": {
+            "properties": {
+              "parent_process_id": {"const": ""},
+              "lane_id": {"const": ""}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "process_kind": {"enum": ["discovery", "challenge"]}
+            }
+          },
+          "then": {
+            "properties": {
+              "parent_process_id": {"minLength": 1},
+              "lane_id": {"minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"process_kind": {"const": "verifier"}}},
+          "then": {
+            "properties": {"parent_process_id": {"minLength": 1}}
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "required": [
+        "execution_id",
+        "attempt_id",
+        "source_kind",
+        "protocol",
+        "independence_key",
+        "artifact_ref",
+        "processes",
+        "execution_digest"
+      ],
+      "properties": {
+        "execution_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "source_kind": {
+          "enum": [
+            "reviewer",
+            "gap",
+            "convergence",
+            "pre_final",
+            "manual_final"
+          ]
+        },
+        "protocol": {"type": "string", "minLength": 1},
+        "independence_key": {"type": "string", "minLength": 1},
+        "artifact_ref": {"type": "string", "minLength": 1},
+        "processes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/auditProcess"}
+        },
+        "execution_digest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "inheritedArtifact": {
+      "type": "object",
+      "required": [
+        "execution_id",
+        "execution_digest",
+        "artifact_ref",
+        "artifact_digest",
+        "source_plan_digest"
+      ],
+      "properties": {
+        "execution_id": {"type": "string", "minLength": 1},
+        "execution_digest": {"$ref": "#/$defs/digest"},
+        "artifact_ref": {"type": "string", "minLength": 1},
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "source_plan_digest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "epochPlan": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "epoch_id",
+        "epoch_revision",
+        "base_sha",
+        "target_sha",
+        "scope_revision",
+        "source_snapshot_revision",
+        "scope_digest",
+        "source_refs",
+        "policy_digest",
+        "topology_digest",
+        "validation_identity",
+        "audit_agent_budget",
+        "required_executions",
+        "parent_plan_digest",
+        "additional_execution_ids",
+        "inherited_artifacts",
+        "plan_digest"
+      ],
+      "properties": {
+        "record_type": {"const": "review_epoch_plan"},
+        "epoch_id": {"type": "string", "pattern": "^E[0-9]{3,}$"},
+        "epoch_revision": {"type": "integer", "minimum": 1},
+        "base_sha": {"type": "string", "minLength": 1},
+        "target_sha": {"type": "string", "minLength": 1},
+        "scope_revision": {"type": "integer", "minimum": 0},
+        "source_snapshot_revision": {"type": "integer", "minimum": 0},
+        "scope_digest": {"$ref": "#/$defs/digest"},
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "policy_digest": {"$ref": "#/$defs/digest"},
+        "topology_digest": {"$ref": "#/$defs/digest"},
+        "validation_identity": {"$ref": "#/$defs/digest"},
+        "audit_agent_budget": {"type": "integer", "minimum": 1},
+        "required_executions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/execution"}
+        },
+        "parent_plan_digest": {
+          "oneOf": [
+            {"const": ""},
+            {"$ref": "#/$defs/digest"}
+          ]
+        },
+        "additional_execution_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "inherited_artifacts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/inheritedArtifact"}
+        },
+        "plan_digest": {"$ref": "#/$defs/digest"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"epoch_revision": {"const": 1}}},
+          "then": {
+            "properties": {
+              "parent_plan_digest": {"const": ""},
+              "additional_execution_ids": {"maxItems": 0},
+              "inherited_artifacts": {"maxItems": 0}
+            }
+          },
+          "else": {
+            "properties": {
+              "parent_plan_digest": {"$ref": "#/$defs/digest"},
+              "additional_execution_ids": {"minItems": 1}
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "leaseReservation": {
+      "type": "object",
+      "required": ["process_id", "process_kind"],
+      "properties": {
+        "process_id": {"type": "string", "minLength": 1},
+        "process_kind": {
+          "enum": ["coordinator", "discovery", "verifier", "challenge"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "capacityLease": {
+      "type": "object",
+      "required": [
+        "lease_id",
+        "epoch_id",
+        "epoch_revision",
+        "execution_id",
+        "attempt_id",
+        "plan_digest",
+        "reservations",
+        "reserved_slots",
+        "expires_at",
+        "status",
+        "credential_revoked",
+        "process_exit_confirmed",
+        "forced_abort_acknowledged",
+        "terminal_reason"
+      ],
+      "properties": {
+        "lease_id": {"type": "string", "minLength": 1},
+        "epoch_id": {"type": "string", "pattern": "^E[0-9]{3,}$"},
+        "epoch_revision": {"type": "integer", "minimum": 1},
+        "execution_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "plan_digest": {"$ref": "#/$defs/digest"},
+        "reservations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/leaseReservation"}
+        },
+        "reserved_slots": {"type": "integer", "minimum": 1},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "status": {
+          "enum": ["starting", "running", "expired_quarantined", "terminal"]
+        },
+        "credential_revoked": {"type": "boolean"},
+        "process_exit_confirmed": {"type": "boolean"},
+        "forced_abort_acknowledged": {"type": "boolean"},
+        "terminal_reason": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"enum": ["starting", "running"]}}
+          },
+          "then": {
+            "properties": {
+              "credential_revoked": {"const": false},
+              "process_exit_confirmed": {"const": false},
+              "forced_abort_acknowledged": {"const": false},
+              "terminal_reason": {"const": ""}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"status": {"const": "expired_quarantined"}}
+          },
+          "then": {
+            "properties": {
+              "credential_revoked": {"const": true},
+              "process_exit_confirmed": {"const": false},
+              "forced_abort_acknowledged": {"const": false},
+              "terminal_reason": {"const": ""}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "terminal"}}},
+          "then": {
+            "properties": {"terminal_reason": {"minLength": 1}},
+            "anyOf": [
+              {"properties": {"process_exit_confirmed": {"const": true}}},
+              {
+                "properties": {
+                  "forced_abort_acknowledged": {"const": true},
+                  "credential_revoked": {"const": true}
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {"forced_abort_acknowledged": {"const": true}}
+          },
+          "then": {
+            "properties": {"credential_revoked": {"const": true}}
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "capacityLedger": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "epoch_id",
+        "epoch_revision",
+        "plan_digest",
+        "audit_agent_budget",
+        "leases",
+        "reserved_slots",
+        "live_slots",
+        "available_slots",
+        "blocks_new_starts"
+      ],
+      "properties": {
+        "record_type": {"const": "review_epoch_capacity"},
+        "epoch_id": {"type": "string", "pattern": "^E[0-9]{3,}$"},
+        "epoch_revision": {"type": "integer", "minimum": 1},
+        "plan_digest": {"$ref": "#/$defs/digest"},
+        "audit_agent_budget": {"type": "integer", "minimum": 1},
+        "leases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/capacityLease"}
+        },
+        "reserved_slots": {"type": "integer", "minimum": 0},
+        "live_slots": {"type": "integer", "minimum": 0},
+        "available_slots": {"type": "integer", "minimum": 0},
+        "blocks_new_starts": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
