@@ -51,6 +51,31 @@
     "decisions"
   ],
   "$defs": {
+    "agentIdentityValues": {
+      "type": "object",
+      "required": ["provider", "model", "effort"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "agentIdentityProjection": {
+      "type": "object",
+      "required": ["requested", "observed", "attested", "status", "verified", "issues"],
+      "properties": {
+        "requested": {"$ref": "#/$defs/agentIdentityValues"},
+        "observed": {"$ref": "#/$defs/agentIdentityValues"},
+        "attested": {"$ref": "#/$defs/agentIdentityValues"},
+        "status": {"enum": ["attested", "requested-only", "unavailable", "mismatch"]},
+        "verified": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "policy": {"enum": ["strict", "warn-unavailable"]},
+        "assertion": {"enum": ["unavailable-warning", "matched-observation"]}
+      },
+      "additionalProperties": false
+    },
     "reviewEpochStore": {
       "type": "object",
       "required": ["active_epoch_id", "records", "protocol_capabilities"],
@@ -153,6 +178,7 @@
           "uniqueItems": true
         },
         "worker_agent_effort": {"type": "string", "minLength": 1},
+        "agent_identity": {"$ref": "#/$defs/agentIdentityProjection"},
         "candidate_revision": {"type": "integer", "minimum": 1},
         "candidate_lifecycle_status": {
           "type": "string",
@@ -269,7 +295,23 @@
   },
   "properties": {
     "state_format_version": {"const": 3},
-    "schema_revision": {"type": "integer", "minimum": 1},
+    "schema_revision": {"type": "integer", "enum": [2, 3]},
+    "first_v053_mutation_at": {"type": "string"},
+    "first_v053_mutation_command": {"type": "string"},
+    "migration_v053": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["native", "ready-to-commit", "migration_decision_required", "committed"]},
+        "migration_generation": {"type": "integer", "minimum": 0},
+        "rollback_eligible": {"type": "boolean"},
+        "first_mutation_recorded": {"type": "boolean"},
+        "task_contracts": {"type": "object"},
+        "remediation_history": {"type": "object"},
+        "blocking_reasons": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": true
+    },
     "goal_id": {"type": "string"},
     "run_id": {"type": "string"},
     "skill_version": {"type": "string"},
@@ -286,6 +328,10 @@
       "additionalProperties": false
     },
     "resolved_config": {"type": "object"},
+    "config_identity_projection": {"type": "object", "additionalProperties": true},
+    "manager_identity": {"$ref": "#/$defs/agentIdentityProjection"},
+    "review_protocol_selection": {"type": "object", "additionalProperties": true},
+    "review_epoch_runtime_identity": {"type": "object", "additionalProperties": true},
     "planning": {"$ref": "#/$defs/planningState"},
     "release_scope": {
       "type": "object",
@@ -394,13 +440,13 @@
         "manual_final_protocol",
         "max_fix_rounds",
         "scope_expansion_action",
-        "final_required",
-        "lane_count"
+        "final_required"
       ],
       "properties": {
         "cadence": {"type": "string", "enum": ["batch", "merge-count"]},
         "pre_final_protocol": {"type": "string", "enum": ["native", "codex-review-multi-v2"]},
         "manual_final_protocol": {"type": "string", "enum": ["codex-review-multi-v2"]},
+        "manual_final_execution": {"enum": ["independent", "reuse_epoch_reviewer"]},
         "max_fix_rounds": {"type": "integer", "minimum": 0, "maximum": 2},
         "scope_expansion_action": {
           "type": "string",
@@ -688,5 +734,28 @@
       "additionalProperties": {"$ref": "#/$defs/acceptedRiskAuthorization"}
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_revision": {"const": 3}},
+        "required": ["schema_revision"]
+      },
+      "then": {
+        "required": [
+          "first_v053_mutation_at",
+          "first_v053_mutation_command",
+          "migration_v053",
+          "resolved_config",
+          "config_identity_projection",
+          "manager_identity",
+          "review_protocol_selection",
+          "review_policy"
+        ],
+        "properties": {
+          "review_policy": {"required": ["manual_final_execution"]}
+        }
+      }
+    }
+  ],
   "additionalProperties": true
 }

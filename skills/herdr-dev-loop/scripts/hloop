@@ -99,6 +99,7 @@ from hloop_lib.migration import (
 from hloop_lib import migration as hloop_migration
 from hloop_lib import planning as hloop_planning
 from hloop_lib import task_contract as hloop_task_contract
+from hloop_lib import validation_identity as hloop_validation_identity
 from hloop_lib import worker_candidate as hloop_worker_candidate
 
 
@@ -138,8 +139,8 @@ DEFAULT_AGENT_MODEL = "auto"
 DEFAULT_AGENT_EFFORT = "auto"
 DEFAULT_CLAUDE_PERMISSION_MODE = "auto"
 STATE_FORMAT_VERSION = 3
-STATE_SCHEMA_REVISION = hloop_migration.V052_STATE_SCHEMA_VERSION.revision
-RUNTIME_SCHEMA_VERSION = hloop_migration.V052_STATE_SCHEMA_VERSION
+STATE_SCHEMA_REVISION = hloop_migration.V053_STATE_SCHEMA_VERSION.revision
+RUNTIME_SCHEMA_VERSION = hloop_migration.V053_STATE_SCHEMA_VERSION
 LEGACY_STATE_FORMAT_VERSION = 2
 DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MIN_FREE_INODES = 50_000
@@ -306,22 +307,9 @@ CHECKPOINT_TRAILER_BATCH = "HLoop-Batch"
 CHECKPOINT_KIND_LOOP_STATE = "loop-state"
 LOOP_ARCHIVE_ROOT = LOOP_HOME / "archive"
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-BUILT_IN_CONFIG_DEFAULTS = {
-    "max_workers": DEFAULT_MAX_WORKERS,
-    "session_cleanup": "archive",
-    "specification_scout": DEFAULT_SPECIFICATION_SCOUT,
-    "worker": {
-        "provider": DEFAULT_AGENT_PROVIDER,
-        "model": DEFAULT_AGENT_MODEL,
-        "effort": DEFAULT_AGENT_EFFORT,
-    },
-    "reviewer": {
-        "provider": DEFAULT_AGENT_PROVIDER,
-        "model": DEFAULT_AGENT_MODEL,
-        "effort": DEFAULT_AGENT_EFFORT,
-    },
-    "review": dict(hloop_config.REVIEW_POLICY_DEFAULTS),
-}
+BUILT_IN_CONFIG_DEFAULTS = json.loads(
+    json.dumps(hloop_config.V053_BUILT_IN_CONFIG_DEFAULTS, ensure_ascii=False)
+)
 CONFIG_TEMPLATE = """version = 1
 
 [defaults]
@@ -329,24 +317,95 @@ max_workers = 3
 session_cleanup = "archive"
 specification_scout = "auto"
 
+[defaults.manager]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "max"
+identity_policy = "warn-unavailable"
+
 [defaults.worker]
 provider = "codex"
-model = "auto"
-effort = "auto"
+model = "gpt-5.6-terra"
+effort = "max"
 
 [defaults.reviewer]
 provider = "codex"
-model = "auto"
-effort = "auto"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "swarm"
+lane_count = 6
+protocol = "codex-review-multi-v2"
+required_capabilities = ["externally-planned-v1"]
+
+[defaults.reviewer.coordinator]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.reviewer.lane]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.reviewer.verifier]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.gap]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "swarm"
+lane_count = 4
+
+[defaults.gap.coordinator]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.gap.lane]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.gap.verifier]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.plan_gap]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.patch_reviewer]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.final_coordinator]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "max"
+
+[defaults.advisor]
+provider = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
 
 [defaults.review]
 cadence = "batch"
 pre_final_protocol = "codex-review-multi-v2"
 manual_final_protocol = "codex-review-multi-v2"
+manual_final_execution = "independent"
 max_fix_rounds = 2
 scope_expansion_action = "follow_up"
 final_required = "complete_zero_verified_actionable_findings"
-lane_count = "auto"
+
+[defaults.audit]
+agent_budget = 12
+max_patch_review_rounds_per_task = 2
 """
 
 
@@ -882,16 +941,28 @@ def cmd_namespace_list(args: argparse.Namespace) -> int:
 
 
 def assert_migration_safe(repo: Path, state: dict[str, Any]) -> None:
-    running = running_agent_ids(state)
+    running = [
+        role_id
+        for role_kind, role_id, role_state in iter_all_roles(state)
+        if role_kind != "worker"
+        and agent_gate_status(role_state)
+        in {"starting", "running", "waiting", "waiting-agent", "waiting-manager", "reported"}
+    ]
     if running:
         raise HLoopError(
-            "cannot migrate while role agents are running; abort them first: " + ", ".join(running)
+            "cannot migrate while audit/advisory roles are running; harvest or abort them first: "
+            + ", ".join(running)
         )
     if state.get("active_merge"):
         raise HLoopError("cannot migrate while a merge transaction is active")
     for role_kind, role_id, role_state in iter_all_roles(state):
         worktree_raw = str(role_state.get("worktree") or "")
-        if worktree_raw and Path(worktree_raw).exists() and product_dirty_paths_for_agent(Path(worktree_raw)):
+        if (
+            role_kind != "worker"
+            and worktree_raw
+            and Path(worktree_raw).exists()
+            and product_dirty_paths_for_agent(Path(worktree_raw))
+        ):
             raise HLoopError(f"cannot migrate dirty role worktree: {role_kind} {role_id}")
 
 
@@ -1076,7 +1147,89 @@ RUNTIME_MIGRATION_STEPS = (
         migrate_format_three_revision_one,
     ),
     hloop_migration.FORMAT_3_REVISION_2_MIGRATION,
+    hloop_migration.FORMAT_3_REVISION_3_MIGRATION,
 )
+
+
+def legacy_v053_config_snapshot(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Build one canonicalizable loop layer from a 0.5.2 runtime snapshot."""
+
+    raw = state.get("resolved_config")
+    snapshot = json.loads(
+        json.dumps(raw if isinstance(raw, Mapping) else {}, ensure_ascii=False)
+    )
+    for role in ("worker", "reviewer", "gap", "advisor"):
+        role_config = snapshot.setdefault(role, {})
+        if not isinstance(role_config, dict):
+            raise HLoopError(f"legacy resolved_config.{role} must be an object")
+        for key in ("provider", "model", "effort"):
+            state_key = f"{role}_agent_{key}"
+            if state.get(state_key) not in {None, ""}:
+                role_config[key] = state[state_key]
+    reviewer = snapshot.setdefault("reviewer", {})
+    if not isinstance(reviewer, dict):
+        raise HLoopError("legacy resolved_config.reviewer must be an object")
+    reviewer["protocol"] = str(
+        state.get("review_protocol") or DEFAULT_REVIEW_PROTOCOL
+    )
+    review = snapshot.setdefault("review", {})
+    if not isinstance(review, dict):
+        raise HLoopError("legacy resolved_config.review must be an object")
+    policy = state.get("review_policy")
+    if isinstance(policy, Mapping):
+        for key in (
+            "cadence",
+            "pre_final_protocol",
+            "manual_final_protocol",
+            "max_fix_rounds",
+            "scope_expansion_action",
+            "final_required",
+        ):
+            if policy.get(key) not in {None, ""}:
+                review[key] = policy[key]
+    review.setdefault("manual_final_execution", "independent")
+    return snapshot
+
+
+def project_v053_runtime_state(
+    state: dict[str, Any],
+    *,
+    source_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Connect migrated state to canonical config, identity, and ledger views."""
+
+    try:
+        resolution = hloop_config.resolve_config(
+            BUILT_IN_CONFIG_DEFAULTS,
+            loop_snapshot=legacy_v053_config_snapshot(source_state),
+        )
+    except hloop_config.ConfigError as exc:
+        raise HLoopError(f"cannot migrate legacy config snapshot: {exc}") from exc
+    previous_source = state.get("config_source")
+    apply_resolved_config_to_state(state, resolution.as_dict(), None)
+    assert_manager_identity(state)
+    if isinstance(previous_source, Mapping):
+        state["config_source"] = dict(previous_source)
+    migration_record = state.get("migration_v053")
+    if not isinstance(migration_record, dict):
+        migration_record = {}
+        state["migration_v053"] = migration_record
+    remediation = migration_record.get("remediation_history")
+    consumed_rounds = 0
+    if isinstance(remediation, Mapping):
+        raw_rounds = remediation.get("consumed_rounds")
+        if isinstance(raw_rounds, int) and not isinstance(raw_rounds, bool):
+            consumed_rounds = raw_rounds
+    state["legacy_remediation_round_offset"] = consumed_rounds
+    if not isinstance(state.get("remediation_ledger"), Mapping):
+        max_rounds = int((state.get("review_policy") or {}).get("max_fix_rounds", 2))
+        state["remediation_ledger"] = hloop_remediation.RemediationLedger(
+            max_fix_rounds=max(0, max_rounds - consumed_rounds)
+        ).to_record()
+    migration_record["status"] = "committed"
+    migration_record["rollback_eligible"] = True
+    state["skill_version"] = SKILL_VERSION
+    return state
 
 
 def migrated_runtime_state(repo: Path, state: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
@@ -1090,6 +1243,8 @@ def migrated_runtime_state(repo: Path, state: dict[str, Any]) -> tuple[dict[str,
     except MigrationError as exc:
         raise HLoopError(str(exc)) from exc
     result = dict(migration.state)
+    if schema_version_of(result) == hloop_migration.V053_STATE_SCHEMA_VERSION:
+        result = project_v053_runtime_state(result, source_state=state)
     result.setdefault(
         "review_readiness",
         {"status": "pending", "target_sha": "", "errors": [], "checks": {}, "updated_at": ""},
@@ -1120,47 +1275,511 @@ def migrated_state(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     return migrated_runtime_state(repo, state)[0]
 
 
+def migration_runtime_root(repo: Path) -> Path:
+    return loop_path(repo) / "migration" / "v053"
+
+
+def migration_active_marker_path(repo: Path) -> Path:
+    return migration_runtime_root(repo) / "ACTIVE.json"
+
+
+def migration_generation_root(repo: Path, generation: int) -> Path:
+    return migration_runtime_root(repo) / "generations" / f"{generation:06d}"
+
+
+def migration_repository_path(repo: Path, relative: str) -> Path:
+    path = (repo / relative).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError as exc:
+        raise HLoopError(f"migration artifact escapes repository: {relative}") from exc
+    return path
+
+
+def migration_json_bytes(value: Mapping[str, Any]) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def write_bytes_durable(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with tmp.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        fsync_directory(path.parent)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def migration_frontmatter_bytes(source: bytes, meta: Mapping[str, Any]) -> bytes:
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HLoopError("migration artifact frontmatter is not UTF-8") from exc
+    if not text.startswith("---\n"):
+        raise HLoopError("migration artifact is missing frontmatter")
+    end = text.find("\n---", 4)
+    if end == -1:
+        raise HLoopError("migration artifact has unterminated frontmatter")
+    rest = text[end + 4 :]
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    return (frontmatter(dict(meta)) + "\n" + rest).encode("utf-8")
+
+
+def migration_frontmatter_metadata(source: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HLoopError(f"{label} migration artifact frontmatter is not UTF-8") from exc
+    return parse_frontmatter_text(text)
+
+
+def next_migration_generation(repo: Path) -> int:
+    root = migration_runtime_root(repo) / "generations"
+    used = [
+        int(path.name)
+        for path in root.iterdir()
+        if path.is_dir() and re.fullmatch(r"[0-9]{6}", path.name)
+    ] if root.is_dir() else []
+    return max(used, default=0) + 1
+
+
+def migration_artifact_pairs(
+    repo: Path,
+    source_state: Mapping[str, Any],
+    updated_state: dict[str, Any],
+    *,
+    generation: int,
+) -> dict[str, tuple[bytes, bytes]]:
+    """Return every namespaced artifact whose contract participates in 3.3."""
+
+    migration_record = updated_state.setdefault("migration_v053", {})
+    if not isinstance(migration_record, dict):
+        raise HLoopError("migrated state migration_v053 must be an object")
+    migration_record.update(
+        {
+            "status": "committed",
+            "migration_generation": generation,
+            "rollback_eligible": True,
+        }
+    )
+    pairs: dict[str, tuple[bytes, bytes]] = {}
+    state_rel = state_path(repo).relative_to(repo).as_posix()
+    pairs[state_rel] = (
+        state_path(repo).read_bytes(),
+        migration_json_bytes(updated_state),
+    )
+    tasks = source_state.get("tasks")
+    if not isinstance(tasks, Mapping):
+        raise HLoopError("legacy state tasks must be an object")
+    state_task_ids = {str(task_id) for task_id in tasks}
+    task_root = loop_path(repo) / "tasks"
+    result_root = loop_path(repo) / "results"
+    orphan_task_ids = sorted(
+        path.stem
+        for path in task_root.glob("T*.md")
+        if path.stem not in state_task_ids
+    ) if task_root.is_dir() else []
+    orphan_result_ids = sorted(
+        path.parent.name
+        for path in result_root.glob("T*/result.md")
+        if path.parent.name not in state_task_ids
+    ) if result_root.is_dir() else []
+    if orphan_task_ids or orphan_result_ids:
+        details = []
+        if orphan_task_ids:
+            details.append("task artifacts=" + ",".join(orphan_task_ids))
+        if orphan_result_ids:
+            details.append("result artifacts=" + ",".join(orphan_result_ids))
+        raise HLoopError(
+            "orphan legacy contract artifacts require reconciliation before migration: "
+            + "; ".join(details)
+        )
+    for task_id, task_record in sorted(tasks.items(), key=lambda item: str(item[0])):
+        task_id = str(task_id)
+        path = task_file(repo, task_id)
+        if path.is_file():
+            source = path.read_bytes()
+            meta = migration_frontmatter_metadata(source, label=f"task {task_id}")
+            if str(meta.get("id") or task_id) != task_id:
+                raise HLoopError(f"task artifact identity mismatch during migration: {task_id}")
+            if isinstance(task_record, Mapping) and str(task_record.get("status") or "") != str(
+                meta.get("status") or ""
+            ):
+                raise HLoopError(f"task state/artifact status mismatch during migration: {task_id}")
+            try:
+                migrated_meta = hloop_task_contract.migrate_legacy_task_contract(meta).record
+            except hloop_task_contract.ContractValidationError as exc:
+                raise HLoopError(f"cannot migrate task artifact {task_id}: {exc}") from exc
+            rel = path.relative_to(repo).as_posix()
+            pairs[rel] = (source, migration_frontmatter_bytes(source, migrated_meta))
+
+        result_path = result_file(repo, task_id)
+        if not result_path.is_file():
+            continue
+        result_source = result_path.read_bytes()
+        result_meta = migration_frontmatter_metadata(
+            result_source, label=f"result {task_id}"
+        )
+        if str(result_meta.get("task_id") or "") != task_id:
+            raise HLoopError(
+                f"result artifact task identity mismatch during migration: {task_id}"
+            )
+        try:
+            migrated_result = hloop_task_contract.migrate_legacy_result_contract(
+                result_meta
+            )
+        except hloop_task_contract.ContractValidationError as exc:
+            raise HLoopError(f"cannot migrate result artifact {task_id}: {exc}") from exc
+        result_rel = result_path.relative_to(repo).as_posix()
+        pairs[result_rel] = (
+            result_source,
+            migration_frontmatter_bytes(result_source, migrated_result),
+        )
+    return pairs
+
+
+def prepare_migration_transaction(
+    repo: Path, state: dict[str, Any]
+) -> tuple[hloop_migration.MigrationTransactionPlan, dict[str, tuple[bytes, bytes]], tuple[str, ...]]:
+    updated, applied_steps = migrated_runtime_state(repo, state)
+    generation = next_migration_generation(repo)
+    pairs = migration_artifact_pairs(
+        repo,
+        state,
+        updated,
+        generation=generation,
+    )
+    try:
+        plan = hloop_migration.plan_migration_transaction(
+            migration_generation=generation,
+            source=schema_version_of(state),
+            target=RUNTIME_SCHEMA_VERSION,
+            artifacts=pairs,
+        )
+    except hloop_migration.MigrationError as exc:
+        raise HLoopError(f"cannot plan migration transaction: {exc}") from exc
+    return plan, pairs, applied_steps
+
+
+def persist_prepared_migration(
+    repo: Path,
+    plan: hloop_migration.MigrationTransactionPlan,
+    pairs: Mapping[str, tuple[bytes, bytes]],
+) -> None:
+    root = migration_generation_root(repo, plan.migration_generation)
+    if root.exists():
+        raise HLoopError(f"migration generation already exists: {root}")
+    for relative, (source, output) in sorted(pairs.items()):
+        write_bytes_durable(root / "archive" / relative, source)
+        write_bytes_durable(root / "planned" / relative, output)
+    write_bytes_durable(root / "ARTIFACTS.json", migration_json_bytes(plan.to_record()))
+    write_bytes_durable(
+        migration_active_marker_path(repo),
+        migration_json_bytes(plan.prepared_marker),
+    )
+
+
+def load_migration_marker(repo: Path) -> dict[str, Any] | None:
+    path = migration_active_marker_path(repo)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HLoopError(f"invalid active migration marker {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HLoopError("active migration marker must be an object")
+    return value
+
+
+def load_prepared_migration(
+    repo: Path, marker: Mapping[str, Any]
+) -> tuple[hloop_migration.MigrationTransactionPlan, dict[str, tuple[bytes, bytes]]]:
+    generation = marker.get("migration_generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise HLoopError("active migration marker has invalid migration_generation")
+    root = migration_generation_root(repo, generation)
+    artifacts = marker.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise HLoopError("active migration marker has no artifact index")
+    pairs: dict[str, tuple[bytes, bytes]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            raise HLoopError("active migration artifact index is invalid")
+        relative = str(artifact.get("path") or "")
+        migration_repository_path(repo, relative)
+        try:
+            pairs[relative] = (
+                (root / "archive" / relative).read_bytes(),
+                (root / "planned" / relative).read_bytes(),
+            )
+        except OSError as exc:
+            raise HLoopError(f"migration archive/planned bytes are missing: {relative}") from exc
+    source_record = marker.get("source_schema")
+    target_record = marker.get("target_schema")
+    if not isinstance(source_record, Mapping) or not isinstance(target_record, Mapping):
+        raise HLoopError("active migration marker has invalid schema identity")
+    try:
+        source = SchemaVersion(
+            int(source_record["state_format_version"]), int(source_record["schema_revision"])
+        )
+        target = SchemaVersion(
+            int(target_record["state_format_version"]), int(target_record["schema_revision"])
+        )
+        plan = hloop_migration.plan_migration_transaction(
+            migration_generation=generation,
+            source=source,
+            target=target,
+            artifacts=pairs,
+        )
+    except (KeyError, TypeError, ValueError, hloop_migration.MigrationError) as exc:
+        raise HLoopError(f"cannot restore active migration plan: {exc}") from exc
+    manifest_path = root / "ARTIFACTS.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HLoopError(f"invalid persisted migration plan {manifest_path}: {exc}") from exc
+    if manifest != plan.to_record():
+        raise HLoopError("persisted migration plan does not match marker/archive identity")
+    return plan, pairs
+
+
+def current_migration_artifact_digests(
+    repo: Path, plan: hloop_migration.MigrationTransactionPlan
+) -> dict[str, str]:
+    observed: dict[str, bytes] = {}
+    for artifact in plan.artifacts:
+        path = migration_repository_path(repo, artifact.path)
+        try:
+            observed[artifact.path] = path.read_bytes()
+        except OSError as exc:
+            raise HLoopError(f"migration artifact is missing: {artifact.path}") from exc
+    return hloop_migration.artifact_digests_from_bytes(observed)
+
+
+def migration_write_set(
+    repo: Path,
+    plan: hloop_migration.MigrationTransactionPlan,
+    pairs: Mapping[str, tuple[bytes, bytes]],
+    *,
+    output_index: int,
+) -> None:
+    state_rel = state_path(repo).relative_to(repo).as_posix()
+    ordered = sorted(pairs, key=lambda path: (path == state_rel, path))
+    for relative in ordered:
+        write_bytes_durable(
+            migration_repository_path(repo, relative),
+            pairs[relative][output_index],
+        )
+
+
+def planned_migration_state(
+    repo: Path, pairs: Mapping[str, tuple[bytes, bytes]]
+) -> dict[str, Any]:
+    state_rel = state_path(repo).relative_to(repo).as_posix()
+    pair = pairs.get(state_rel)
+    if pair is None:
+        raise HLoopError("migration plan is missing the STATE.json artifact")
+    try:
+        value = json.loads(pair[1].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HLoopError(f"planned migration STATE.json is invalid: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HLoopError("planned migration STATE.json must be an object")
+    return value
+
+
+def migration_dry_run_payload(
+    state: Mapping[str, Any],
+    *,
+    plan: hloop_migration.MigrationTransactionPlan | None,
+    projected_state: Mapping[str, Any] | None = None,
+    applied_steps: Sequence[str] = (),
+    decision: hloop_migration.MigrationRecoveryDecision | None = None,
+    blocking_reasons: Sequence[str] = (),
+) -> dict[str, Any]:
+    source = schema_version_of(state)
+    remediation = None
+    migration_record = (projected_state or state).get("migration_v053")
+    if isinstance(migration_record, Mapping):
+        remediation = migration_record.get("remediation_history")
+    return {
+        "mode": "dry-run",
+        "from_format": source.format_version,
+        "from_revision": source.revision,
+        "to_format": RUNTIME_SCHEMA_VERSION.format_version,
+        "to_revision": RUNTIME_SCHEMA_VERSION.revision,
+        "applied_steps": list(applied_steps),
+        "migration_generation": plan.migration_generation if plan else None,
+        "changed_paths": list(plan.changed_paths) if plan else [],
+        "transaction_action": decision.action if decision else "blocked" if blocking_reasons else "none",
+        "rollback_eligible": bool(decision and decision.rollback_eligible),
+        "recovery_rollback_eligible": bool(
+            decision and decision.recovery_rollback_eligible
+        ),
+        "first_v053_mutation_eligible": bool(
+            decision and decision.first_v053_mutation_eligible
+        ),
+        "remediation_history": remediation,
+        "blocking_reasons": list(blocking_reasons),
+    }
+
+
+def first_v053_mutation_boundary(
+    record: Mapping[str, Any], *, label: str
+) -> tuple[str, str]:
+    at_raw = record.get("first_v053_mutation_at", "")
+    command_raw = record.get("first_v053_mutation_command", "")
+    if not isinstance(at_raw, str) or not isinstance(command_raw, str):
+        raise HLoopError(f"{label} first-v0.5.3 mutation boundary must use strings")
+    if at_raw != at_raw.strip() or command_raw != command_raw.strip():
+        raise HLoopError(f"{label} first-v0.5.3 mutation boundary must be canonical")
+    if bool(at_raw) != bool(command_raw):
+        raise HLoopError(f"{label} has a partial first-v0.5.3 mutation marker")
+    return at_raw, command_raw
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = load_state(repo)
-    updated, applied_steps = migrated_runtime_state(repo, state)
+    marker = load_migration_marker(repo)
     source_version = schema_version_of(state)
-    target_version = schema_version_of(updated)
-    if not args.apply:
+    state_mutation_at, state_mutation_command = first_v053_mutation_boundary(
+        state, label="STATE.json"
+    )
+    mode = "rollback" if args.rollback else "resume" if args.resume else "apply" if args.apply else "dry-run"
+
+    if (
+        marker is not None
+        and marker.get("status") == "rolled-back"
+        and not (args.resume or args.rollback)
+    ):
+        marker = None
+    if marker is None and (args.rollback or args.resume):
+        raise HLoopError(f"migrate --{mode} requires an active migration marker")
+    if marker is None and source_version == RUNTIME_SCHEMA_VERSION:
+        payload = migration_dry_run_payload(state, plan=None)
+        payload.update({"mode": mode, "transaction_action": "none", "already_current": True})
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    applied_steps: tuple[str, ...] = ()
+    pairs: dict[str, tuple[bytes, bytes]]
+    if marker is None:
+        try:
+            plan, pairs, applied_steps = prepare_migration_transaction(repo, state)
+        except HLoopError as exc:
+            if not args.apply:
+                payload = migration_dry_run_payload(
+                    state, plan=None, blocking_reasons=(str(exc),)
+                )
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                return 2
+            raise
+        decision = hloop_migration.decide_migration_recovery(
+            plan,
+            marker=None,
+            current_artifact_digests=current_migration_artifact_digests(repo, plan),
+        )
+    else:
+        plan, pairs = load_prepared_migration(repo, marker)
+        marker_has_first_mutation = bool(
+            str(marker.get("first_v053_mutation_at") or "")
+            and str(marker.get("first_v053_mutation_command") or "")
+        )
+        observed_digests = (
+            {artifact.path: artifact.output_digest for artifact in plan.artifacts}
+            if marker_has_first_mutation
+            else current_migration_artifact_digests(repo, plan)
+        )
+        decision = hloop_migration.decide_migration_recovery(
+            plan,
+            marker=marker,
+            archive_digest=plan.archive_digest,
+            current_artifact_digests=observed_digests,
+            requested_action="rollback" if args.rollback else "resume" if args.resume else "auto",
+            first_v053_mutation_at=state_mutation_at,
+            first_v053_mutation_command=state_mutation_command,
+        )
+    if decision.blocked:
+        payload = migration_dry_run_payload(
+            state,
+            plan=plan,
+            projected_state=planned_migration_state(repo, pairs),
+            applied_steps=applied_steps,
+            decision=decision,
+            blocking_reasons=decision.issues,
+        )
+        if not (args.apply or args.resume or args.rollback):
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 2
+        raise HLoopError("migration recovery blocked: " + "; ".join(decision.issues))
+    if not (args.apply or args.resume or args.rollback):
         print(
             json.dumps(
-                {
-                    "from_format": source_version.format_version,
-                    "from_revision": source_version.revision,
-                    "to_format": target_version.format_version,
-                    "to_revision": target_version.revision,
-                    "applied_steps": list(applied_steps),
-                    "from_skill_version": state.get("skill_version", "unversioned"),
-                    "to_skill_version": updated.get("skill_version"),
-                    "run_id_preserved": state.get("run_id") == updated.get("run_id"),
-                },
+                migration_dry_run_payload(
+                    state,
+                    plan=plan,
+                    projected_state=planned_migration_state(repo, pairs),
+                    applied_steps=applied_steps,
+                    decision=decision,
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
         )
         return 0
-    backup = (
-        loop_path(repo)
-        / "migration"
-        / f"STATE.v{source_version.format_version}.r{source_version.revision}.{filename_timestamp()}.json"
-    )
-    write_text(backup, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-    save_state(repo, updated)
-    journal(
-        repo,
-        f"Migrated state to format `{STATE_FORMAT_VERSION}` revision `{STATE_SCHEMA_REVISION}` "
-        f"with backup `{backup.relative_to(repo)}`.",
-    )
-    print(
-        f"migrated state to format {STATE_FORMAT_VERSION} revision {STATE_SCHEMA_REVISION}; "
-        f"backup: {backup}"
-    )
-    return 0
+
+    action = decision.action
+    if action == "prepare":
+        persist_prepared_migration(repo, plan, pairs)
+        marker = plan.prepared_marker
+        action = "resume-apply"
+    if action in {"resume-apply", "write-committed-marker"}:
+        if action == "resume-apply":
+            migration_write_set(repo, plan, pairs, output_index=1)
+        write_bytes_durable(
+            migration_active_marker_path(repo),
+            migration_json_bytes(plan.committed_marker),
+        )
+        print(
+            f"migrated state to format {STATE_FORMAT_VERSION} revision {STATE_SCHEMA_REVISION}; "
+            f"generation={plan.migration_generation}; status=committed"
+        )
+        return 0
+    if action == "begin-rollback":
+        write_bytes_durable(
+            migration_active_marker_path(repo),
+            migration_json_bytes(plan.rollback_prepared_marker),
+        )
+        action = "resume-rollback"
+    if action in {"resume-rollback", "write-rolled-back-marker"}:
+        if action == "resume-rollback":
+            migration_write_set(repo, plan, pairs, output_index=0)
+        write_bytes_durable(
+            migration_active_marker_path(repo),
+            migration_json_bytes(plan.rolled_back_marker),
+        )
+        print(
+            f"rolled back migration generation {plan.migration_generation} to "
+            f"format {plan.source.format_version} revision {plan.source.revision}"
+        )
+        return 0
+    if action == "complete":
+        print(
+            f"migration generation {plan.migration_generation} already {marker.get('status') if marker else 'complete'}"
+        )
+        return 0
+    raise HLoopError(f"unsupported migration recovery action: {action}")
 
 
 def config_candidates_payload() -> tuple[list[hloop_config.ConfigCandidate], hloop_config.ConfigCandidate | None]:
@@ -1366,13 +1985,17 @@ def apply_resolved_config_to_state(
     state["specification_scout"] = str(
         resolved.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT
     )
-    review_policy = dict(hloop_config.REVIEW_POLICY_DEFAULTS)
+    review_policy = dict(hloop_config.V053_REVIEW_POLICY_DEFAULTS)
     configured_review_policy = resolved.get("review")
     if isinstance(configured_review_policy, dict):
         review_policy.update(configured_review_policy)
     state["review_policy"] = review_policy
-    for role in ("worker", "reviewer"):
+    for role in hloop_config.CONFIG_ROLE_NAMES:
         role_config = resolved.get(role) or {}
+        if not isinstance(role_config, Mapping):
+            raise HLoopError(f"resolved config role {role} must be an object")
+        if role == "manager":
+            continue
         state[f"{role}_agent_provider"] = normalize_agent_provider(
             role_config.get("provider")
         )
@@ -1380,6 +2003,46 @@ def apply_resolved_config_to_state(
         state[f"{role}_agent_effort"] = normalize_agent_effort(
             role_config.get("effort")
         )
+    ordinary = hloop_config.select_review_protocol(resolved, "ordinary")
+    pre_final = hloop_config.select_review_protocol(resolved, "pre-final")
+    manual_final = hloop_config.select_review_protocol(resolved, "manual-final")
+    if ordinary.protocol is None or pre_final.protocol is None or manual_final.protocol is None:
+        raise HLoopError("resolved config is missing one or more canonical review protocols")
+    state["review_protocol"] = str(ordinary.protocol)
+    state["review_protocol_selection"] = {
+        "ordinary": {
+            "execution_kind": ordinary.execution_kind,
+            "key": ordinary.key,
+            "protocol": ordinary.protocol,
+            "source": ordinary.source or "resolved-config",
+        },
+        "pre-final": {
+            "execution_kind": pre_final.execution_kind,
+            "key": pre_final.key,
+            "protocol": pre_final.protocol,
+            "source": pre_final.source or "resolved-config",
+        },
+        "manual-final": {
+            "execution_kind": manual_final.execution_kind,
+            "key": manual_final.key,
+            "protocol": manual_final.protocol,
+            "source": manual_final.source or "resolved-config",
+        },
+    }
+    audit = resolved.get("audit") or {}
+    if isinstance(audit, Mapping):
+        state["audit_agent_budget"] = int(audit.get("agent_budget") or 0)
+        state["max_patch_review_rounds_per_task"] = int(
+            audit.get("max_patch_review_rounds_per_task") or 0
+        )
+    try:
+        projection = hloop_validation_identity.project_config_identities(
+            resolved,
+            schema_revision=STATE_SCHEMA_REVISION,
+        )
+    except hloop_validation_identity.ConfigIdentityError as exc:
+        raise HLoopError(f"cannot project resolved config identity: {exc}") from exc
+    state["config_identity_projection"] = projection.as_dict()
 
 
 def cmd_config_apply(args: argparse.Namespace) -> int:
@@ -1403,7 +2066,7 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
     resolved = resolution.as_dict()
     changes = config_apply_changes(state.get("resolved_config") or {}, resolved)
     previous_review_policy = review_policy_record(state)
-    next_review_policy = dict(hloop_config.REVIEW_POLICY_DEFAULTS)
+    next_review_policy = dict(hloop_config.V053_REVIEW_POLICY_DEFAULTS)
     configured_review_policy = resolved.get("review")
     if isinstance(configured_review_policy, dict):
         next_review_policy.update(configured_review_policy)
@@ -1439,6 +2102,7 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
         raise HLoopError(f"cannot apply config to a terminal run: {state.get('phase')}")
     if changes or source_changed or review_policy_changed:
         apply_resolved_config_to_state(state, resolved, candidate)
+        assert_manager_identity(state)
         if review_policy_changed:
             # Review plans, convergence manifests, and manual-final
             # certification are all identified by the active policy.  A
@@ -1469,7 +2133,7 @@ def init_config_override(args: argparse.Namespace) -> dict[str, Any]:
         override["session_cleanup"] = args.session_cleanup
     if getattr(args, "specification_scout", None) is not None:
         override["specification_scout"] = args.specification_scout
-    for role in ("worker", "reviewer"):
+    for role in ("worker", "reviewer", "gap", "advisor"):
         role_values: dict[str, Any] = {}
         for key in ("provider", "model", "effort"):
             value = getattr(args, f"{role}_agent_{key}", None)
@@ -1477,6 +2141,9 @@ def init_config_override(args: argparse.Namespace) -> dict[str, Any]:
                 role_values[key] = value
         if role_values:
             override[role] = role_values
+    review_protocol = getattr(args, "review_protocol", None)
+    if review_protocol is not None:
+        override.setdefault("reviewer", {})["protocol"] = review_protocol
     return override
 
 
@@ -1514,7 +2181,7 @@ def resolve_init_config(
     args.max_workers = max_workers
     args.session_cleanup = session_cleanup
     args.specification_scout = specification_scout
-    for role in ("worker", "reviewer"):
+    for role in ("worker", "reviewer", "gap", "advisor"):
         setattr(
             args,
             f"{role}_agent_provider",
@@ -1777,6 +2444,11 @@ def command_requires_state_schema_guard(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", "")
     if command == "migrate":
         return False
+    if command == "worker" and getattr(args, "worker_command", "") == "finalize":
+        # A Worker dispatched before Manager migration retains a revision-3.2
+        # local snapshot and is explicitly allowed to finish its revision-2
+        # contract.  cmd_worker_finalize performs the narrower two-state gate.
+        return False
     if command == "wait":
         return bool(getattr(args, "harvest", False))
     return command_requires_loop_lock(args)
@@ -1825,6 +2497,185 @@ def assert_mutating_state_schema_compatible(repo: Path) -> None:
             f"state {state_schema.label()} is newer than runtime "
             f"{RUNTIME_SCHEMA_VERSION.label()}; mutating commands are disabled"
         )
+
+
+def assert_worker_finalize_schema_compatible(
+    local_state: Mapping[str, Any],
+    contract_state: Mapping[str, Any],
+    contract_revision: int | None,
+) -> int:
+    """Allow only an in-flight revision-2 Worker to finish from schema 3.2."""
+
+    try:
+        local_schema = schema_version_of(local_state)
+        manager_schema = schema_version_of(contract_state)
+    except MigrationError as exc:
+        raise HLoopError(f"invalid Worker finalize schema marker: {exc}") from exc
+    for label, observed in (("Worker", local_schema), ("Manager", manager_schema)):
+        if observed > RUNTIME_SCHEMA_VERSION:
+            raise HLoopError(
+                f"{label} state {observed.label()} is newer than runtime "
+                f"{RUNTIME_SCHEMA_VERSION.label()}"
+            )
+    if contract_revision is None:
+        if (
+            manager_schema > hloop_migration.V052_STATE_SCHEMA_VERSION
+            and isinstance(contract_state.get("migration_v053"), Mapping)
+        ):
+            raise HLoopError(
+                "schema-3.3 Manager task contracts require contract_schema_revision"
+            )
+        contract_revision = hloop_task_contract.LEGACY_CONTRACT_SCHEMA_REVISION
+    if contract_revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        if local_schema != RUNTIME_SCHEMA_VERSION or manager_schema != RUNTIME_SCHEMA_VERSION:
+            raise HLoopError(
+                "revision-3 Worker finalization requires schema-3.3 Worker and Manager state"
+            )
+        return contract_revision
+    if contract_revision != hloop_task_contract.LEGACY_CONTRACT_SCHEMA_REVISION:
+        raise HLoopError(
+            f"unsupported Worker finalize contract schema revision: {contract_revision}"
+        )
+    if (
+        local_schema < hloop_migration.V052_STATE_SCHEMA_VERSION
+        or manager_schema < hloop_migration.V052_STATE_SCHEMA_VERSION
+    ):
+        raise HLoopError(
+            "legacy Worker finalization requires at least schema-3.2 Worker and Manager state"
+        )
+    return contract_revision
+
+
+def material_command_identity(args: argparse.Namespace) -> str:
+    """Return a stable non-secret identity for the selected mutation surface."""
+
+    values: list[str] = []
+    command = str(getattr(args, "command", "") or "").strip()
+    if command:
+        values.append(command)
+    for key in (
+        "config_command",
+        "review_command",
+        "review_epoch_command",
+        "review_convergence_command",
+        "final_review_command",
+        "worker_command",
+        "patch_review_command",
+        "reviewer_command",
+        "gap_command",
+        "advisor_command",
+        "agent_command",
+        "message_command",
+        "triage_command",
+        "planning_command",
+        "task_command",
+        "batch_command",
+        "release_scope_command",
+        "validation_command_name",
+    ):
+        value = str(getattr(args, key, "") or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return " ".join(values) or "unknown-material-command"
+
+
+def should_record_first_v053_mutation(args: argparse.Namespace) -> bool:
+    if getattr(args, "command", "") in {"init", "migrate"}:
+        return False
+    if bool(getattr(args, "dry_run", False)):
+        return False
+    return command_requires_loop_lock(args)
+
+
+def record_first_v053_mutation(repo: Path, args: argparse.Namespace) -> None:
+    """Close rollback before the first schema-3.3 material command executes."""
+
+    if not should_record_first_v053_mutation(args) or not state_path(repo).exists():
+        return
+    state = load_state(repo)
+    try:
+        state_schema = schema_version_of(state)
+    except MigrationError as exc:
+        raise HLoopError(f"invalid state schema marker: {exc}") from exc
+    if state_schema != RUNTIME_SCHEMA_VERSION:
+        return
+    state_at, state_command = first_v053_mutation_boundary(
+        state, label="STATE.json"
+    )
+    marker = load_migration_marker(repo)
+    if marker is None:
+        if state_at:
+            return
+        recorded_at = now_iso()
+        command_identity = material_command_identity(args)
+        state["first_v053_mutation_at"] = recorded_at
+        state["first_v053_mutation_command"] = command_identity
+        migration_record = state.get("migration_v053")
+        if isinstance(migration_record, dict):
+            migration_record["rollback_eligible"] = False
+            migration_record["first_mutation_recorded"] = True
+        save_state(repo, state)
+        return
+    status = str(marker.get("status") or "")
+    if status != "committed":
+        raise HLoopError(
+            f"migration recovery required before material commands: marker={status or 'invalid'}"
+        )
+    plan, _pairs = load_prepared_migration(repo, marker)
+    marker_at, marker_command = first_v053_mutation_boundary(
+        marker, label="migration marker"
+    )
+    if marker_at:
+        if state_at and (state_at != marker_at or state_command != marker_command):
+            raise HLoopError("state and migration mutation boundaries disagree")
+        repaired = False
+        if not state_at:
+            state["first_v053_mutation_at"] = marker_at
+            state["first_v053_mutation_command"] = marker_command
+            repaired = True
+        migration_record = state.get("migration_v053")
+        if isinstance(migration_record, dict) and (
+            migration_record.get("rollback_eligible") is not False
+            or migration_record.get("first_mutation_recorded") is not True
+        ):
+            migration_record["rollback_eligible"] = False
+            migration_record["first_mutation_recorded"] = True
+            repaired = True
+        if repaired:
+            save_state(repo, state)
+        return
+    if state_at:
+        raise HLoopError(
+            "state mutation boundary exists without the committed migration marker"
+        )
+    command_identity = material_command_identity(args)
+    recorded_at = now_iso()
+    decision = hloop_migration.decide_migration_recovery(
+        plan,
+        marker=marker,
+        archive_digest=plan.archive_digest,
+        current_artifact_digests=current_migration_artifact_digests(repo, plan),
+        requested_action="first-mutation",
+        requested_command=command_identity,
+    )
+    if decision.action != "record-first-v053-mutation":
+        detail = "; ".join(decision.issues) or decision.action
+        raise HLoopError(f"cannot record first-v0.5.3 mutation: {detail}")
+    updated_marker = dict(plan.committed_marker)
+    updated_marker["first_v053_mutation_at"] = recorded_at
+    updated_marker["first_v053_mutation_command"] = command_identity
+    # Marker first: a crash can only make rollback more conservative.  The
+    # next invocation repairs the state projection from this durable boundary.
+    write_bytes_durable(
+        migration_active_marker_path(repo), migration_json_bytes(updated_marker)
+    )
+    state["first_v053_mutation_at"] = recorded_at
+    state["first_v053_mutation_command"] = command_identity
+    migration_record = state.get("migration_v053")
+    if isinstance(migration_record, dict):
+        migration_record["rollback_eligible"] = False
+        migration_record["first_mutation_recorded"] = True
+    save_state(repo, state)
 
 
 def save_state(repo: Path, state: dict[str, Any]) -> None:
@@ -1958,15 +2809,44 @@ def _validation_dependency_identity(repo: Path, state: Mapping[str, Any]) -> dic
     }
     toolchain_snapshot["digest"] = _canonical_digest(toolchain_snapshot)
     resolved_config = state.get("resolved_config")
+    try:
+        config_projection = hloop_validation_identity.project_config_identities(
+            resolved_config if isinstance(resolved_config, Mapping) else {},
+            schema_revision=state.get("schema_revision", STATE_SCHEMA_REVISION),
+            registry_version=(
+                (state.get("config_identity_projection") or {}).get(
+                    "registry_version",
+                    hloop_validation_identity.CLASSIFICATION_REGISTRY_VERSION,
+                )
+                if isinstance(state.get("config_identity_projection"), Mapping)
+                else hloop_validation_identity.CLASSIFICATION_REGISTRY_VERSION
+            ),
+        )
+    except hloop_validation_identity.ConfigIdentityError as exc:
+        raise HLoopError(f"cannot build config validation identity: {exc}") from exc
     resolved_config_snapshot = {
-        "digest": _canonical_digest(resolved_config if resolved_config is not None else {}),
-        "value": resolved_config if isinstance(resolved_config, Mapping) else {},
+        "digest": config_projection.validation_digest,
+        "value": dict(config_projection.validation_config),
+        "registry_version": config_projection.registry_version,
+        "classification_registry_version": (
+            hloop_validation_identity.CLASSIFICATION_REGISTRY_VERSION
+        ),
+        "stale": config_projection.stale,
+        "stale_reasons": list(config_projection.stale_reasons),
     }
+    setup_command_snapshot = {
+        "worker": normalize_list(
+            state.get("worker_setup_commands")
+            or state.get("worktree_setup_commands")
+        )
+    }
+    setup_command_snapshot["digest"] = _canonical_digest(setup_command_snapshot)
     dependency_identity = _canonical_digest(
         {
             "lockfiles": lockfile_snapshot,
             "toolchain": toolchain_snapshot,
             "resolved_config": resolved_config_snapshot,
+            "setup_commands": setup_command_snapshot,
         }
     )
     return {
@@ -1975,6 +2855,9 @@ def _validation_dependency_identity(repo: Path, state: Mapping[str, Any]) -> dic
         "lockfile_snapshot": lockfile_snapshot,
         "toolchain_snapshot": toolchain_snapshot,
         "resolved_config_snapshot": resolved_config_snapshot,
+        "setup_command_snapshot": setup_command_snapshot,
+        "stale": config_projection.stale,
+        "stale_reasons": list(config_projection.stale_reasons),
     }
 
 
@@ -1999,6 +2882,47 @@ def build_validation_identity(
 
 # Keep a concise public spelling for tests and repository integrations.
 validation_identity = build_validation_identity
+
+
+def build_audit_identity(
+    state: Mapping[str, Any],
+    *,
+    target_sha: str = "",
+    epoch_plan_digest: str = "",
+) -> dict[str, Any]:
+    """Return role/policy/topology identity separate from product validation."""
+
+    resolved = state.get("resolved_config")
+    try:
+        projection = hloop_validation_identity.project_config_identities(
+            resolved if isinstance(resolved, Mapping) else {},
+            schema_revision=state.get("schema_revision", STATE_SCHEMA_REVISION),
+            registry_version=(
+                (state.get("config_identity_projection") or {}).get(
+                    "registry_version",
+                    hloop_validation_identity.CLASSIFICATION_REGISTRY_VERSION,
+                )
+                if isinstance(state.get("config_identity_projection"), Mapping)
+                else hloop_validation_identity.CLASSIFICATION_REGISTRY_VERSION
+            ),
+        )
+    except hloop_validation_identity.ConfigIdentityError as exc:
+        raise HLoopError(f"cannot build audit identity: {exc}") from exc
+    payload = {
+        "version": 1,
+        "target_sha": str(target_sha),
+        "epoch_plan_digest": str(epoch_plan_digest),
+        "review_policy": review_policy_record(dict(state)),
+        "audit_config_digest": projection.audit_digest,
+        "audit_config": dict(projection.audit_config),
+        "registry_version": projection.registry_version,
+        "stale": projection.stale,
+        "stale_reasons": list(projection.stale_reasons),
+    }
+    return {**payload, "digest": f"sha256:{_canonical_digest(payload)}"}
+
+
+audit_identity = build_audit_identity
 
 
 def _validation_identity_matches(
@@ -2030,7 +2954,11 @@ def _validation_reusable(
     state: Mapping[str, Any], identity: Mapping[str, Any]
 ) -> bool:
     last = state.get("last_validation")
-    if not isinstance(last, Mapping) or normalize_bool(state.get("validation_stale")):
+    if (
+        not isinstance(last, Mapping)
+        or normalize_bool(state.get("validation_stale"))
+        or normalize_bool(identity.get("stale"))
+    ):
         return False
     results = last.get("results")
     return bool(results) and all(
@@ -2056,14 +2984,22 @@ def _refresh_validation_staleness(repo: Path, state: dict[str, Any]) -> None:
         last.get("commands")
     )
     current = build_validation_identity(repo, state, target, commands)
+    stale_reasons = normalize_list(current.get("stale_reasons"))
+    if normalize_bool(current.get("stale")):
+        state["validation_stale"] = True
+        state["validation_stale_reason"] = (
+            "validation config projection is stale: " + "; ".join(stale_reasons)
+        )
+        return
     if _validation_identity_matches(last, current):
         state["validation_stale"] = False
         state.pop("validation_stale_reason", None)
         return
     state["validation_stale"] = True
     state["validation_stale_reason"] = (
-        "validation identity changed: target SHA, command set, lockfile, "
-        "toolchain, or resolved-config snapshot"
+        "validation config projection is stale: " + "; ".join(stale_reasons)
+        if stale_reasons
+        else "validation identity changed: target SHA, ordered command set, lockfile, toolchain, setup command, or validation-affecting config"
     )
 
 
@@ -2598,6 +3534,65 @@ def _manager_invocation_record() -> dict[str, str]:
         "recorded_at": now_iso() if provider or model or effort else "",
         "unavailable_reason": unavailable,
     }
+
+
+def agent_identity_record(
+    requested: Mapping[str, Any],
+    *,
+    observed: Mapping[str, Any] | None = None,
+    attested: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project role identity without treating launch arguments as observation."""
+
+    try:
+        return hloop_config.project_agent_identity(
+            {
+                "provider": requested.get("provider"),
+                "model": requested.get("model"),
+                "effort": requested.get("effort"),
+            },
+            observed=observed,
+            attested=attested,
+        ).as_dict()
+    except hloop_config.ConfigValidationError as exc:
+        raise HLoopError(f"invalid agent identity projection: {exc}") from exc
+
+
+def assert_manager_identity(state: dict[str, Any]) -> dict[str, Any]:
+    """Assert configured Manager identity against independently exposed values."""
+
+    resolved = state.get("resolved_config")
+    manager = resolved.get("manager") if isinstance(resolved, Mapping) else None
+    if not isinstance(manager, Mapping):
+        manager = hloop_config.V053_BUILT_IN_CONFIG_DEFAULTS["manager"]
+    invocation = _manager_invocation_record()
+    observed = {
+        "provider": invocation.get("provider") or None,
+        "model": invocation.get("model") or None,
+        "effort": invocation.get("reasoning_effort") or None,
+    }
+    projection = agent_identity_record(manager, observed=observed)
+    policy = str(manager.get("identity_policy") or "warn-unavailable")
+    if projection["status"] == "mismatch":
+        raise HLoopError(
+            "Manager identity does not match resolved config: "
+            + "; ".join(projection.get("issues") or [])
+        )
+    observed_unavailable = any(
+        value == "unavailable"
+        for value in (projection.get("observed") or {}).values()
+    )
+    if observed_unavailable and policy == "strict":
+        raise HLoopError(
+            "Manager identity is unavailable under strict identity_policy"
+        )
+    projection["policy"] = policy
+    projection["assertion"] = (
+        "unavailable-warning" if observed_unavailable else "matched-observation"
+    )
+    state["manager_identity"] = projection
+    state["manager_invocation"] = invocation
+    return projection
 
 
 def _record_scope_expansion_metric(
@@ -5621,13 +6616,7 @@ def normalize_agent_effort(value: Any) -> str:
 
 
 def role_state_prefix(role: str) -> str:
-    if role == "reviewer":
-        return "reviewer"
-    if role == "gap":
-        return "gap"
-    if role == "advisor":
-        return "advisor"
-    return "worker"
+    return role if role in hloop_config.CONFIG_ROLE_NAMES else "worker"
 
 
 def role_agent_config(
@@ -5638,11 +6627,19 @@ def role_agent_config(
 ) -> dict[str, str]:
     overrides = overrides or {}
     prefix = role_state_prefix(role)
+    resolved = state.get("resolved_config")
+    configured = (
+        resolved.get(prefix)
+        if isinstance(resolved, Mapping)
+        and isinstance(resolved.get(prefix), Mapping)
+        else {}
+    )
     provider = normalize_agent_provider(
         overrides.get("agent_provider")
         or overrides.get("provider")
         or overrides.get(f"{prefix}_agent_provider")
         or overrides.get(f"{prefix}_provider")
+        or configured.get("provider")
         or state.get(f"{prefix}_agent_provider")
         or state.get(f"{prefix}_provider")
         or DEFAULT_AGENT_PROVIDER
@@ -5652,6 +6649,7 @@ def role_agent_config(
         or overrides.get("model")
         or overrides.get(f"{prefix}_agent_model")
         or overrides.get(f"{prefix}_model")
+        or configured.get("model")
         or state.get(f"{prefix}_agent_model")
         or state.get(f"{prefix}_model")
         or DEFAULT_AGENT_MODEL
@@ -5668,6 +6666,7 @@ def role_agent_config(
     effort = normalize_agent_effort(
         overrides.get("agent_effort")
         or overrides.get(f"{prefix}_agent_effort")
+        or configured.get("effort")
         or state.get(f"{prefix}_agent_effort")
     )
     permission_mode = str(
@@ -6232,6 +7231,8 @@ def preflight_loop(
             f"{RUNTIME_SCHEMA_VERSION.label()}; mutating commands are disabled",
             persist=False,
         )
+
+    assert_manager_identity(state)
 
     if not command_exists("git"):
         fail("git command not found")
@@ -7685,7 +8686,7 @@ def review_policy_record(state: dict[str, Any]) -> dict[str, Any]:
     """Return the normalized review policy without mutating persisted state."""
 
     value = state.get("review_policy")
-    policy = dict(hloop_config.REVIEW_POLICY_DEFAULTS)
+    policy = dict(hloop_config.V053_REVIEW_POLICY_DEFAULTS)
     if isinstance(value, dict):
         policy.update(value)
     cadence = str(policy.get("cadence") or "batch")
@@ -7709,6 +8710,34 @@ def review_policy_record(state: dict[str, Any]) -> dict[str, Any]:
     policy["cadence"] = cadence
     policy["max_fix_rounds"] = max_fix_rounds
     return policy
+
+
+def canonical_review_protocol(
+    state: Mapping[str, Any], execution_kind: str
+) -> hloop_config.ProtocolSelection:
+    resolved = state.get("resolved_config")
+    if not isinstance(resolved, Mapping):
+        # Compatibility for direct callers and legacy hand-built state.  Fresh
+        # and migrated schema-3.3 state persist this same canonical mapping;
+        # the fallback still routes every execution through its distinct key.
+        resolved = json.loads(
+            json.dumps(hloop_config.V053_BUILT_IN_CONFIG_DEFAULTS)
+        )
+        resolved["reviewer"]["protocol"] = str(
+            state.get("review_protocol") or DEFAULT_REVIEW_PROTOCOL
+        )
+        policy = state.get("review_policy")
+        if isinstance(policy, Mapping):
+            resolved["review"].update(policy)
+    try:
+        selection = hloop_config.select_review_protocol(resolved, execution_kind)
+    except hloop_config.ConfigValidationError as exc:
+        raise HLoopError(str(exc)) from exc
+    if not isinstance(selection.protocol, str) or not selection.protocol:
+        raise HLoopError(
+            f"canonical protocol key {selection.key} is missing for {execution_kind}"
+        )
+    return selection
 
 
 def review_max_fix_rounds(state: dict[str, Any], convergence: Mapping[str, Any] | None = None) -> int:
@@ -7887,10 +8916,45 @@ def cmd_review_epoch_create(args: argparse.Namespace) -> int:
         raise HLoopError(
             f"review epoch target SHA mismatch: plan={plan.target_sha} integration={target}"
         )
+    protocol_selection = canonical_review_protocol(state, "ordinary")
+    mismatched_protocols = sorted(
+        execution.execution_id
+        for execution in plan.required_executions
+        if execution.source_kind == "reviewer"
+        and execution.protocol != protocol_selection.protocol
+    )
+    if mismatched_protocols:
+        raise HLoopError(
+            f"review epoch Reviewer protocol must come from {protocol_selection.key}: "
+            + ", ".join(mismatched_protocols)
+        )
+    last_validation = state.get("last_validation")
+    if isinstance(last_validation, Mapping) and isinstance(
+        last_validation.get("validation_identity"), Mapping
+    ):
+        expected_validation = (
+            f"sha256:{_canonical_digest(last_validation['validation_identity'])}"
+        )
+        if plan.validation_identity != expected_validation:
+            raise HLoopError(
+                "review epoch validation_identity does not reference current Manager validation"
+            )
     capabilities = validate_epoch_protocol_capabilities(
         plan, normalize_list(getattr(args, "protocol_capability", None))
     )
     store_review_epoch_collection(state, collection)
+    state.setdefault("review_epoch_runtime_identity", {})[plan.plan_digest] = {
+        "execution_kind": protocol_selection.execution_kind,
+        "protocol_key": protocol_selection.key,
+        "protocol": protocol_selection.protocol,
+        "protocol_source": protocol_selection.source or "resolved-config",
+        "validation_identity": plan.validation_identity,
+        "audit_identity": build_audit_identity(
+            state,
+            target_sha=plan.target_sha,
+            epoch_plan_digest=plan.plan_digest,
+        ),
+    }
     if capabilities:
         store["protocol_capabilities"][plan.plan_digest] = capabilities
     state["phase"] = "reviewing"
@@ -7938,12 +9002,36 @@ def cmd_review_epoch_successor(args: argparse.Namespace) -> int:
             "successor review epoch target SHA mismatch: "
             f"plan={plan.target_sha} integration={target}"
         )
+    protocol_selection = canonical_review_protocol(state, "ordinary")
+    mismatched_protocols = sorted(
+        execution.execution_id
+        for execution in plan.required_executions
+        if execution.source_kind == "reviewer"
+        and execution.protocol != protocol_selection.protocol
+    )
+    if mismatched_protocols:
+        raise HLoopError(
+            f"successor Reviewer protocol must come from {protocol_selection.key}: "
+            + ", ".join(mismatched_protocols)
+        )
     require_active_review_epoch_collection(state, parent)
     capabilities = validate_epoch_protocol_capabilities(
         plan, normalize_list(getattr(args, "protocol_capability", None))
     )
     store_review_epoch_collection(state, superseded, make_active=False)
     store_review_epoch_collection(state, successor)
+    state.setdefault("review_epoch_runtime_identity", {})[plan.plan_digest] = {
+        "execution_kind": protocol_selection.execution_kind,
+        "protocol_key": protocol_selection.key,
+        "protocol": protocol_selection.protocol,
+        "protocol_source": protocol_selection.source or "resolved-config",
+        "validation_identity": plan.validation_identity,
+        "audit_identity": build_audit_identity(
+            state,
+            target_sha=plan.target_sha,
+            epoch_plan_digest=plan.plan_digest,
+        ),
+    }
     if capabilities:
         store["protocol_capabilities"][plan.plan_digest] = capabilities
     save_state(repo, state)
@@ -8178,7 +9266,7 @@ def epoch_execution_start_binding(
             f"{source_kind} execution identity does not match the active review epoch"
         )
     expected_protocol = (
-        state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
+        canonical_review_protocol(state, "ordinary").protocol
         if source_kind == "reviewer"
         else "native"
     )
@@ -9037,8 +10125,8 @@ def _final_certification_plan(
     probe_count: int | None = None,
     probes_per_provider: int | None = None,
 ) -> tuple[hloop_certification.CertificationPlan, hloop_review.ReviewGroupPlan]:
-    review_policy = review_policy_record(state)
-    manual_final_protocol = str(review_policy.get("manual_final_protocol") or "")
+    protocol_selection = canonical_review_protocol(state, "manual-final")
+    manual_final_protocol = str(protocol_selection.protocol or "")
     if manual_final_protocol != hloop_certification.MANUAL_FINAL_PROTOCOL:
         # Do not silently substitute the one implemented protocol when a
         # persisted/configured policy names an unsupported manual-final
@@ -9428,10 +10516,20 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
         probe_count=getattr(args, "probe_count", None),
         probes_per_provider=getattr(args, "probes_per_provider", None),
     )
+    protocol_selection = canonical_review_protocol(state, "pre-final")
+    audit_projection = build_audit_identity(
+        state,
+        target_sha=target,
+        epoch_plan_digest=_canonical_digest(group.to_record()),
+    )
     plan_path = loop_path(repo) / "reviews" / "convergence" / "PLAN.json"
     manifest_path = loop_path(repo) / "reviews" / "convergence" / "MANIFEST.json"
     plan_record = {
-        "protocol": str(policy.get("pre_final_protocol") or hloop_certification.MANUAL_FINAL_PROTOCOL),
+        "protocol": protocol_selection.protocol,
+        "execution_kind": protocol_selection.execution_kind,
+        "protocol_key": protocol_selection.key,
+        "protocol_source": protocol_selection.source or "resolved-config",
+        "audit_identity": audit_projection,
         "base_ref": str(state.get("base_branch") or ""),
         "base_sha": snapshot["base_sha"],
         "target_ref": str(state.get("integration_branch") or ""),
@@ -9486,6 +10584,13 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
                 "target_sha": target,
                 "fix_round": current_round,
                 "review_plan": group.to_record(),
+                "protocol_selection": {
+                    "execution_kind": protocol_selection.execution_kind,
+                    "key": protocol_selection.key,
+                    "protocol": protocol_selection.protocol,
+                    "source": protocol_selection.source or "resolved-config",
+                },
+                "audit_identity": audit_projection,
                 "artifact_refs": [str(plan_path.relative_to(repo)), str(manifest_path.relative_to(repo))],
                 "prepared_at": now_iso(),
                 "last_status": "prepared",
@@ -9971,6 +11076,12 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
             "follow-up, verdict, and timestamp evidence before running `hloop final-review record`.\n",
         )
         manual = state.setdefault("manual_final_review", {})
+        protocol_selection = canonical_review_protocol(state, "manual-final")
+        audit_projection = build_audit_identity(
+            state,
+            target_sha=target,
+            epoch_plan_digest=plan.digest,
+        )
         manual.update(
             {
                 "status": "prepared",
@@ -9987,6 +11098,13 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                 "lane_completed_count": 0,
                 "lane_count": len(plan.lane_plan),
                 "prepared_at": now_iso(),
+                "protocol_selection": {
+                    "execution_kind": protocol_selection.execution_kind,
+                    "key": protocol_selection.key,
+                    "protocol": protocol_selection.protocol,
+                    "source": protocol_selection.source or "resolved-config",
+                },
+                "audit_identity": audit_projection,
             }
         )
         _review_freeze(state, reason="manual-final-review-prepared")
@@ -11151,9 +12269,7 @@ def render_reviewer_prompt(
     task_contract_digest: str = "",
     attempt_id: str = "",
 ) -> str:
-    review_protocol = state_value(state, "review_protocol", DEFAULT_REVIEW_PROTOCOL)
-    if review_protocol not in REVIEW_PROTOCOLS:
-        review_protocol = DEFAULT_REVIEW_PROTOCOL
+    review_protocol = canonical_review_protocol(state, "ordinary").protocol
     worker_qa_profile = state_worker_qa_profile(state)
     manager_qa_profile = state_manager_qa_profile(state)
     branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
@@ -12663,7 +13779,7 @@ None.
         "max_gap_auditors": args.max_gap_auditors,
         "spec_sources": args.spec_source or [],
         "validation_commands": args.validation or [],
-        # A fresh 0.5.2 loop is intentionally fail-closed until the Manager
+        # A fresh schema-3.3 loop is intentionally fail-closed until the Manager
         # records the source snapshot with ``release-scope lock``.  Migration
         # of an older loop takes a separate ``legacy-unlocked`` path in the
         # format-3 revision-2 transform, so it can retain its old cadence.
@@ -12727,10 +13843,24 @@ None.
         },
         "git_identity": git_executable_identity(),
         "manager_invocation": _manager_invocation_record(),
+        "first_v053_mutation_at": now_iso(),
+        "first_v053_mutation_command": "init",
+        "migration_v053": {
+            "status": "native",
+            "migration_generation": 0,
+            "rollback_eligible": False,
+            "blocking_reasons": [],
+        },
         "execution_metrics": _empty_execution_metrics(),
         "created_at": now_iso(),
         "phase_started_at": now_iso(),
     }
+    apply_resolved_config_to_state(
+        state,
+        config_resolution.as_dict(),
+        config_candidate,
+    )
+    assert_manager_identity(state)
     if state_path(repo).exists() and not args.force:
         old = load_state(repo)
         old.setdefault("validation_commands", args.validation or [])
@@ -12871,6 +14001,7 @@ None.
         old.setdefault("progress_sequence", 0)
         old.setdefault("git_identity", git_executable_identity())
         old.setdefault("manager_invocation", _manager_invocation_record())
+        assert_manager_identity(old)
         old.setdefault("execution_metrics", _empty_execution_metrics())
         write_requirement_artifacts(repo, old)
         write_manager_context_artifact(repo, old)
@@ -14879,6 +16010,8 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
             "baseline_dirty_files": baseline,
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
+            "agent_effort": agent_config["effort"],
+            "agent_identity": agent_identity_record(agent_config),
             "attempt_no": attempt_no,
             "attempt_id": attempt_id,
             "skill_version": SKILL_VERSION,
@@ -15163,6 +16296,8 @@ def start_decision_liaison(
             "baseline_dirty_files": baseline,
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
+            "agent_effort": agent_config["effort"],
+            "agent_identity": agent_identity_record(agent_config),
             "attempt_no": attempt_no,
             "attempt_id": attempt_id,
             "skill_version": SKILL_VERSION,
@@ -16899,6 +18034,7 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
         "agent_provider": agent_config["provider"],
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
+        "agent_identity": agent_identity_record(agent_config),
         "runner": runner,
         "provider_invocation": preview_invocation.as_record(),
         "started_at": now_iso(),
@@ -17502,7 +18638,10 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     meta = read_frontmatter(task_file(contract_repo, task_id))
     if str(meta.get("id") or "") != task_id:
         raise HLoopError(f"task file mismatch for {task_id}")
-    if task_contract_revision(meta) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+    contract_revision = assert_worker_finalize_schema_compatible(
+        local_state, state, task_contract_revision(meta)
+    )
+    if contract_revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
         return cmd_worker_finalize_v053(
             args, repo, contract_repo, state, task_id, task_state, meta
         )
@@ -19851,6 +20990,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
+            "agent_identity": agent_identity_record(agent_config),
             "claude_permission_mode": agent_config["claude_permission_mode"],
             "attempt_id": attempt_id,
             "worker_base_sha": worker_base_sha,
@@ -22449,6 +23589,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "agent_provider": agent_config["provider"],
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
+        "agent_identity": agent_identity_record(agent_config),
         "claude_permission_mode": agent_config["claude_permission_mode"],
         "attempt_id": attempt_id,
         "fallback_provider": agent_config["fallback_provider"],
@@ -23014,6 +24155,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "agent_provider": agent_config["provider"],
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
+        "agent_identity": agent_identity_record(agent_config),
         "claude_permission_mode": agent_config["claude_permission_mode"],
         "attempt_id": attempt_id,
         "fallback_provider": agent_config["fallback_provider"],
@@ -23565,6 +24707,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             "agent_provider": agent_config["provider"],
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
+            "agent_identity": agent_identity_record(agent_config),
             "claude_permission_mode": agent_config["claude_permission_mode"],
             "attempt_id": attempt_id,
             "fallback_provider": agent_config["fallback_provider"],
@@ -28402,7 +29545,17 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_mode.add_argument(
         "--apply",
         action="store_true",
-        help="write the migrated state after creating a backup",
+        help="prepare and atomically apply the schema 3.3 transaction",
+    )
+    migrate_mode.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a prepared apply or rollback transaction after interruption",
+    )
+    migrate_mode.add_argument(
+        "--rollback",
+        action="store_true",
+        help="rollback a committed migration before the first 0.5.3 mutation",
     )
     migrate.set_defaults(func=cmd_migrate)
 
@@ -30183,6 +31336,7 @@ def main(argv: list[str] | None = None) -> int:
             with loop_lock(repo):
                 if command_requires_state_schema_guard(args):
                     assert_mutating_state_schema_compatible(repo)
+                record_first_v053_mutation(repo, args)
                 return int(args.func(args))
         return int(args.func(args))
     except HLoopError as exc:
