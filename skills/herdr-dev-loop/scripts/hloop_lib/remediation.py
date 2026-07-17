@@ -32,7 +32,12 @@ from hloop_lib.release_scope import (
     TaskAuthorizationError,
     authorize_task_creation,
 )
-from hloop_lib.review_policy import FindingDisposition, ReviewPolicyError, validate_disposition
+from hloop_lib.review_policy import (
+    NON_BLOCKING_DISPOSITIONS,
+    FindingDisposition,
+    ReviewPolicyError,
+    validate_disposition,
+)
 
 
 REMEDIATION_LEDGER_SCHEMA_REVISION = 1
@@ -251,9 +256,114 @@ def _normalize_disposition(value: FindingDisposition | Mapping[str, Any]) -> Fin
             if isinstance(value, FindingDisposition)
             else FindingDisposition.from_record(value)
         )
-        return validate_disposition(disposition)
+        return validate_disposition(
+            disposition,
+            # Candidate registration is nonterminal.  The exact Manager
+            # authorization is resolved and persisted only after canonical
+            # classification in ``mark_ready_to_triage``.
+            accepted_risk_authorized=(
+                disposition.disposition == "accepted_risk"
+            ),
+        )
     except ReviewPolicyError as exc:
         raise RemediationLedgerError(str(exc)) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedRiskAuthorization:
+    """Manager authorization resolved against one canonical finding identity."""
+
+    decision_id: str
+    fingerprint: str
+    target_sha: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "decision_id", _required_text(self.decision_id, "decision_id")
+        )
+        object.__setattr__(
+            self, "fingerprint", _digest(self.fingerprint, "fingerprint")
+        )
+        object.__setattr__(
+            self, "target_sha", _required_text(self.target_sha, "target_sha")
+        )
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "decision_id": self.decision_id,
+            "fingerprint": self.fingerprint,
+            "target_sha": self.target_sha,
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "AcceptedRiskAuthorization":
+        return cls(
+            **_closed_record(
+                value,
+                "accepted-risk authorization",
+                required=("decision_id", "fingerprint", "target_sha"),
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExtraRoundAuthorization:
+    """Captured user authorization for an exact set of remediation batches."""
+
+    input_id: str
+    authorized_extra_rounds: int
+    remediation_batch_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "input_id", _required_text(self.input_id, "input_id")
+        )
+        count = _positive_int(
+            self.authorized_extra_rounds, "authorized_extra_rounds"
+        )
+        batch_ids = _text_tuple(
+            self.remediation_batch_ids, "remediation_batch_ids", sort=True
+        )
+        if len(batch_ids) != count:
+            raise RemediationLedgerError(
+                "authorized_extra_rounds must exactly match remediation_batch_ids"
+            )
+        for batch_id in batch_ids:
+            if _BATCH_ID_RE.fullmatch(batch_id) is None:
+                raise RemediationLedgerError(
+                    "remediation_batch_ids must use RB<digits>"
+                )
+        object.__setattr__(self, "authorized_extra_rounds", count)
+        object.__setattr__(self, "remediation_batch_ids", batch_ids)
+
+    def ref_for(self, batch_id: str) -> str:
+        normalized = _required_text(batch_id, "batch_id")
+        if normalized not in self.remediation_batch_ids:
+            raise RemediationLedgerError(
+                "extra-round authorization is bound to other remediation batches"
+            )
+        return f"{self.input_id}:{normalized}"
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "input_id": self.input_id,
+            "authorized_extra_rounds": self.authorized_extra_rounds,
+            "remediation_batch_ids": list(self.remediation_batch_ids),
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ExtraRoundAuthorization":
+        return cls(
+            **_closed_record(
+                value,
+                "extra-round authorization",
+                required=(
+                    "input_id",
+                    "authorized_extra_rounds",
+                    "remediation_batch_ids",
+                ),
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,7 +606,12 @@ class PlannedRemediationTask:
         if not self.source_refs:
             raise RemediationLedgerError("source_refs must not be empty")
         artifact_ref = self.artifact_ref or f"tasks/{task_id}.md"
-        object.__setattr__(self, "artifact_ref", _required_text(artifact_ref, "artifact_ref"))
+        artifact_ref = _required_text(artifact_ref, "artifact_ref")
+        if artifact_ref != f"tasks/{task_id}.md":
+            raise RemediationLedgerError(
+                "artifact_ref must be the canonical tasks/<task_id>.md path"
+            )
+        object.__setattr__(self, "artifact_ref", artifact_ref)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -626,6 +741,51 @@ class TaskMaterializationObservation:
         return cls(**record)
 
 
+def _is_materializable_candidate(candidate: CanonicalCandidate) -> bool:
+    classification = candidate.classification
+    return bool(
+        classification.fact_status == "confirmed"
+        and classification.contract_relation == "in_scope"
+        and classification.disposition == "fix_now"
+        and classification.release_effect == "blocking"
+    )
+
+
+def _approval_payload(
+    *,
+    approval_ref: str,
+    batch_id: str,
+    candidate_set_digest: str,
+    accepted_risk_authorizations: Sequence[AcceptedRiskAuthorization],
+    extra_round_authorization_ref: str,
+    extra_round_authorization: ExtraRoundAuthorization | None,
+    materialization_plan: Sequence[PlannedRemediationTask],
+    remediation_round: int,
+    scope_digest: str,
+    scope_revision: int,
+) -> dict[str, Any]:
+    """Return the one canonical Manager approval payload used on every path."""
+
+    return {
+        "approval_ref": approval_ref,
+        "batch_id": batch_id,
+        "candidate_set_digest": candidate_set_digest,
+        "accepted_risk_authorizations": [
+            item.to_record() for item in accepted_risk_authorizations
+        ],
+        "extra_round_authorization_ref": extra_round_authorization_ref,
+        "extra_round_authorization": (
+            extra_round_authorization.to_record()
+            if extra_round_authorization is not None
+            else None
+        ),
+        "materialization_plan": [item.to_record() for item in materialization_plan],
+        "remediation_round": remediation_round,
+        "scope_digest": scope_digest,
+        "scope_revision": scope_revision,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class RemediationBatch:
     batch_id: str
@@ -639,6 +799,7 @@ class RemediationBatch:
     classification_conflicts: tuple[str, ...] = ()
     canonicalization_ref: str = ""
     candidate_set_digest: str = ""
+    accepted_risk_authorizations: tuple[AcceptedRiskAuthorization, ...] = ()
     scope_digest: str = ""
     scope_revision: int = 0
     approval_ref: str = ""
@@ -646,6 +807,7 @@ class RemediationBatch:
     remediation_round: int = 0
     round_consumed: bool = False
     extra_round_authorization_ref: str = ""
+    extra_round_authorization: ExtraRoundAuthorization | None = None
     materialization_plan: tuple[PlannedRemediationTask, ...] = ()
     materialized_tasks: tuple[MaterializedTask, ...] = ()
     completion_outcome: str = ""
@@ -709,6 +871,34 @@ class RemediationBatch:
             "candidate_set_digest",
             _optional_digest(self.candidate_set_digest, "candidate_set_digest"),
         )
+        accepted_risk_authorizations = tuple(self.accepted_risk_authorizations)
+        if any(
+            not isinstance(item, AcceptedRiskAuthorization)
+            for item in accepted_risk_authorizations
+        ):
+            raise RemediationLedgerError(
+                "accepted_risk_authorizations contain invalid records"
+            )
+        accepted_risk_authorizations = tuple(
+            sorted(
+                accepted_risk_authorizations,
+                key=lambda item: (item.fingerprint, item.decision_id),
+            )
+        )
+        if len(
+            {
+                (item.decision_id, item.fingerprint, item.target_sha)
+                for item in accepted_risk_authorizations
+            }
+        ) != len(accepted_risk_authorizations):
+            raise RemediationLedgerError(
+                "accepted_risk_authorizations must not contain duplicates"
+            )
+        object.__setattr__(
+            self,
+            "accepted_risk_authorizations",
+            accepted_risk_authorizations,
+        )
         object.__setattr__(
             self, "scope_digest", _optional_digest(self.scope_digest, "scope_digest")
         )
@@ -729,6 +919,24 @@ class RemediationBatch:
             "approval_digest",
             _optional_digest(self.approval_digest, "approval_digest"),
         )
+        extra_authorization = self.extra_round_authorization
+        if extra_authorization is not None and not isinstance(
+            extra_authorization, ExtraRoundAuthorization
+        ):
+            raise RemediationLedgerError(
+                "extra_round_authorization must be an authorization record or null"
+            )
+        if bool(self.extra_round_authorization_ref) != bool(extra_authorization):
+            raise RemediationLedgerError(
+                "extra_round_authorization_ref and record must be stored together"
+            )
+        if extra_authorization is not None and (
+            extra_authorization.ref_for(batch_id)
+            != self.extra_round_authorization_ref
+        ):
+            raise RemediationLedgerError(
+                "extra_round_authorization_ref does not match its captured input and batch"
+            )
         plan = tuple(sorted(self.materialization_plan, key=lambda item: item.task_id))
         if len({item.task_id for item in plan}) != len(plan):
             raise RemediationLedgerError("planned task ids must be unique")
@@ -749,6 +957,7 @@ class RemediationBatch:
                     remediation_round,
                     self.round_consumed,
                     self.extra_round_authorization_ref,
+                    self.extra_round_authorization,
                     plan,
                     materialized,
                     self.completion_outcome,
@@ -788,9 +997,16 @@ class RemediationBatch:
                 raise RemediationLedgerError(
                     "candidate_set_digest does not match canonical candidates"
                 )
+            _accepted_risk_authorizations(
+                canonical, accepted_risk_authorizations
+            )
         elif canonical or self.candidate_set_digest or self.canonicalization_ref:
             raise RemediationLedgerError(
                 "unready batch must not contain canonical candidate state"
+            )
+        elif accepted_risk_authorizations:
+            raise RemediationLedgerError(
+                "unready batch must not consume accepted-risk authorizations"
             )
 
         approved_or_later = status in {
@@ -811,6 +1027,114 @@ class RemediationBatch:
             ):
                 raise RemediationLedgerError(
                     "approved batch requires scope, approval, round, and write-ahead plan"
+                )
+            actionable_fingerprints = {
+                item.fingerprint
+                for item in canonical
+                if _is_materializable_candidate(item)
+            }
+            unresolved = tuple(
+                item.fingerprint
+                for item in canonical
+                if item.fingerprint not in actionable_fingerprints
+                and item.classification.disposition not in NON_BLOCKING_DISPOSITIONS
+            )
+            if unresolved:
+                raise RemediationLedgerError(
+                    "approved batch contains unresolved non-fix candidates: "
+                    + ", ".join(unresolved)
+                )
+            planned_fingerprint_list = [
+                fingerprint
+                for item in plan
+                for fingerprint in item.candidate_fingerprints
+            ]
+            planned_fingerprints = set(planned_fingerprint_list)
+            if len(planned_fingerprint_list) != len(planned_fingerprints):
+                raise RemediationLedgerError(
+                    "actionable candidate fingerprints must be planned exactly once"
+                )
+            if planned_fingerprints != actionable_fingerprints:
+                raise RemediationLedgerError(
+                    "materialization plan must exactly cover actionable canonical candidates"
+                )
+            canonical_by_fingerprint = {
+                item.fingerprint: item for item in canonical
+            }
+            for planned_task in plan:
+                grouped_candidates = [
+                    canonical_by_fingerprint[fingerprint]
+                    for fingerprint in planned_task.candidate_fingerprints
+                ]
+                if len(
+                    {
+                        _canonical_json(item.policy_axes)
+                        for item in grouped_candidates
+                    }
+                ) != 1:
+                    raise RemediationLedgerError(
+                        "one planned task cannot combine different canonical policy axes"
+                    )
+                expected_sources = tuple(
+                    sorted(
+                        {
+                            source_ref
+                            for candidate in grouped_candidates
+                            for source_ref in candidate.source_refs
+                        }
+                    )
+                )
+                if planned_task.source_refs != expected_sources:
+                    raise RemediationLedgerError(
+                        "planned task source_refs do not match canonical candidates"
+                    )
+                contract = planned_task.task_contract
+                if contract.get("remediation_round") != remediation_round:
+                    raise RemediationLedgerError(
+                        "planned task remediation_round does not match approved round"
+                    )
+                source_finding = _required_text(
+                    contract.get("source_finding"), "task source_finding"
+                )
+                source_candidate = next(
+                    (
+                        candidate
+                        for candidate in grouped_candidates
+                        if source_finding
+                        in {
+                            candidate.fingerprint,
+                            candidate.classification.finding_id,
+                            *candidate.observation_ids,
+                        }
+                    ),
+                    None,
+                )
+                if source_candidate is None:
+                    raise RemediationLedgerError(
+                        "planned task source_finding is not bound to its canonical candidates"
+                    )
+                for axis, expected in source_candidate.policy_axes.items():
+                    if contract.get(axis) != expected:
+                        raise RemediationLedgerError(
+                            f"planned task {axis} does not match canonical classification"
+                        )
+            expected_approval_digest = canonical_digest(
+                _approval_payload(
+                    approval_ref=self.approval_ref,
+                    batch_id=batch_id,
+                    candidate_set_digest=self.candidate_set_digest,
+                    accepted_risk_authorizations=accepted_risk_authorizations,
+                    extra_round_authorization_ref=self.extra_round_authorization_ref,
+                    extra_round_authorization=extra_authorization,
+                    materialization_plan=plan,
+                    remediation_round=remediation_round,
+                    scope_digest=self.scope_digest,
+                    scope_revision=scope_revision,
+                )
+            )
+            if self.approval_digest != expected_approval_digest:
+                raise RemediationLedgerError(
+                    "approval_digest does not match canonical approval payload"
                 )
         if status == "materializing" and materialized:
             raise RemediationLedgerError(
@@ -850,6 +1174,9 @@ class RemediationBatch:
             "classification_conflicts": list(self.classification_conflicts),
             "canonicalization_ref": self.canonicalization_ref,
             "candidate_set_digest": self.candidate_set_digest,
+            "accepted_risk_authorizations": [
+                item.to_record() for item in self.accepted_risk_authorizations
+            ],
             "scope_digest": self.scope_digest,
             "scope_revision": self.scope_revision,
             "approval_ref": self.approval_ref,
@@ -857,6 +1184,11 @@ class RemediationBatch:
             "remediation_round": self.remediation_round,
             "round_consumed": self.round_consumed,
             "extra_round_authorization_ref": self.extra_round_authorization_ref,
+            "extra_round_authorization": (
+                self.extra_round_authorization.to_record()
+                if self.extra_round_authorization is not None
+                else None
+            ),
             "materialization_plan": [item.to_record() for item in self.materialization_plan],
             "materialized_tasks": [item.to_record() for item in self.materialized_tasks],
             "completion_outcome": self.completion_outcome,
@@ -876,6 +1208,17 @@ class RemediationBatch:
                 "canonical_candidates": tuple(
                     CanonicalCandidate.from_record(item)
                     for item in record["canonical_candidates"]
+                ),
+                "accepted_risk_authorizations": tuple(
+                    AcceptedRiskAuthorization.from_record(item)
+                    for item in record["accepted_risk_authorizations"]
+                ),
+                "extra_round_authorization": (
+                    ExtraRoundAuthorization.from_record(
+                        record["extra_round_authorization"]
+                    )
+                    if record["extra_round_authorization"] is not None
+                    else None
                 ),
                 "materialization_plan": tuple(
                     PlannedRemediationTask.from_record(item)
@@ -898,7 +1241,7 @@ class RemediationLedger:
     schema_revision: int = REMEDIATION_LEDGER_SCHEMA_REVISION
 
     def __post_init__(self) -> None:
-        max_fix_rounds = _positive_int(self.max_fix_rounds, "max_fix_rounds")
+        max_fix_rounds = _nonnegative_int(self.max_fix_rounds, "max_fix_rounds")
         if max_fix_rounds > MAX_FIX_ROUNDS:
             raise RemediationLedgerError(
                 f"max_fix_rounds must not exceed {MAX_FIX_ROUNDS}"
@@ -932,6 +1275,32 @@ class RemediationLedger:
             raise RemediationLedgerError(
                 "consumed extra-round authorization refs must match approved batches"
             )
+        authorizations_by_input: dict[str, ExtraRoundAuthorization] = {}
+        consumed_batches_by_input: dict[str, set[str]] = {}
+        for batch in consumed_batches:
+            authorization = batch.extra_round_authorization
+            if authorization is None:
+                continue
+            previous = authorizations_by_input.setdefault(
+                authorization.input_id, authorization
+            )
+            if previous != authorization:
+                raise RemediationLedgerError(
+                    "one captured input must resolve to one exact extra-round authorization"
+                )
+            consumed_batches_by_input.setdefault(
+                authorization.input_id, set()
+            ).add(batch.batch_id)
+        for input_id, authorization in authorizations_by_input.items():
+            consumed = consumed_batches_by_input[input_id]
+            if not consumed.issubset(set(authorization.remediation_batch_ids)):
+                raise RemediationLedgerError(
+                    "extra-round authorization was consumed by another batch"
+                )
+            if len(consumed) > authorization.authorized_extra_rounds:
+                raise RemediationLedgerError(
+                    "extra-round authorization was consumed over its count"
+                )
         extra_round_count = max(0, consumed_rounds - max_fix_rounds)
         if len(refs) != extra_round_count:
             raise RemediationLedgerError(
@@ -1220,6 +1589,47 @@ def _canonical_candidates(
     return tuple(canonical), tuple(unresolved)
 
 
+def _accepted_risk_authorizations(
+    canonical_candidates: Sequence[CanonicalCandidate],
+    authorizations: Sequence[AcceptedRiskAuthorization | Mapping[str, Any]],
+) -> tuple[AcceptedRiskAuthorization, ...]:
+    normalized = tuple(
+        sorted(
+            (
+                item
+                if isinstance(item, AcceptedRiskAuthorization)
+                else AcceptedRiskAuthorization.from_record(item)
+                for item in authorizations
+            ),
+            key=lambda item: (item.fingerprint, item.decision_id),
+        )
+    )
+    risk_candidates = tuple(
+        item
+        for item in canonical_candidates
+        if item.classification.disposition == "accepted_risk"
+    )
+    if len(normalized) != len(risk_candidates):
+        raise RemediationLedgerError(
+            "accepted-risk authorizations must exactly match decision, fingerprint, and target"
+        )
+    for candidate in risk_candidates:
+        matches = tuple(
+            authorization
+            for authorization in normalized
+            if authorization.fingerprint == candidate.fingerprint
+            and authorization.target_sha == candidate.target_sha
+        )
+        expected_decision = candidate.classification.accepted_risk_decision_id
+        if len(matches) != 1 or (
+            expected_decision and matches[0].decision_id != expected_decision
+        ):
+            raise RemediationLedgerError(
+                "accepted-risk authorizations must exactly match decision, fingerprint, and target"
+            )
+    return normalized
+
+
 def mark_ready_to_triage(
     ledger: RemediationLedger,
     batch_id: str,
@@ -1229,6 +1639,9 @@ def mark_ready_to_triage(
         str, FindingDisposition | Mapping[str, Any]
     ] | None = None,
     canonicalization_ref: str = "",
+    accepted_risk_authorizations: Sequence[
+        AcceptedRiskAuthorization | Mapping[str, Any]
+    ] = (),
 ) -> RemediationLedger:
     batch = ledger.batch(batch_id)
     if batch.status == "ready_to_triage":
@@ -1240,11 +1653,15 @@ def mark_ready_to_triage(
             raise CandidateClassificationConflict(
                 "unresolved classification conflicts: " + ", ".join(unresolved)
             )
+        risk_authorizations = _accepted_risk_authorizations(
+            proposed, accepted_risk_authorizations
+        )
         if (
             tuple(sorted(terminal_execution_ids)) == batch.terminal_execution_ids
             and proposed == batch.canonical_candidates
             and _optional_text(canonicalization_ref, "canonicalization_ref")
             == batch.canonicalization_ref
+            and risk_authorizations == batch.accepted_risk_authorizations
         ):
             return ledger
         raise RemediationLedgerError("ready-to-triage retry changed canonical batch state")
@@ -1271,6 +1688,9 @@ def mark_ready_to_triage(
         raise CandidateClassificationConflict(
             "unresolved classification conflicts: " + ", ".join(unresolved)
         )
+    risk_authorizations = _accepted_risk_authorizations(
+        canonical, accepted_risk_authorizations
+    )
     original_conflicts = classification_conflicts(batch.observations)
     grouped = _group_observations(batch.observations)
     classification_overridden = any(
@@ -1294,6 +1714,7 @@ def mark_ready_to_triage(
         classification_conflicts=(),
         canonicalization_ref=canonical_ref,
         candidate_set_digest=canonical_digest([item.to_record() for item in canonical]),
+        accepted_risk_authorizations=risk_authorizations,
     )
     return _replace_batch(ledger, updated)
 
@@ -1371,17 +1792,36 @@ def _plan_tasks(
     scope_revision: int,
     release_scope: ReleaseScope | Mapping[str, Any],
 ) -> tuple[PlannedRemediationTask, ...]:
-    candidates = {item.fingerprint: item for item in batch.canonical_candidates}
-    for candidate in candidates.values():
-        classification = candidate.classification
-        if not (
-            classification.fact_status == "confirmed"
-            and classification.contract_relation == "in_scope"
-            and classification.disposition == "fix_now"
-            and classification.release_effect == "blocking"
+    all_candidates = {
+        item.fingerprint: item for item in batch.canonical_candidates
+    }
+    unresolved = tuple(
+        candidate.fingerprint
+        for candidate in all_candidates.values()
+        if not _is_materializable_candidate(candidate)
+        and candidate.classification.disposition not in NON_BLOCKING_DISPOSITIONS
+    )
+    if unresolved:
+        raise RemediationLedgerError(
+            "only terminal non-blocking outcomes may be excluded from materialization: "
+            + ", ".join(unresolved)
+        )
+    candidates = {
+        fingerprint: candidate
+        for fingerprint, candidate in all_candidates.items()
+        if _is_materializable_candidate(candidate)
+    }
+    if not candidates:
+        raise RemediationLedgerError(
+            "remediation approval requires at least one actionable fix_now candidate"
+        )
+    for candidate in all_candidates.values():
+        if (
+            not _is_materializable_candidate(candidate)
+            and candidate.classification.release_effect != "non_blocking"
         ):
             raise RemediationLedgerError(
-                "only confirmed in-scope blocking fix_now candidates may be materialized"
+                "non-materialized remediation candidates must be terminal and non-blocking"
             )
     groups = candidate_groups or tuple((fingerprint,) for fingerprint in candidates)
     allocations = deterministic_task_ids(groups, first_task_number=first_task_number)
@@ -1487,6 +1927,8 @@ def approve_remediation_batch(
     release_scope: ReleaseScope | Mapping[str, Any],
     candidate_groups: Sequence[Sequence[str]] | None = None,
     extra_round_authorization_ref: str = "",
+    extra_round_authorization: ExtraRoundAuthorization | Mapping[str, Any] | None = None,
+    captured_input_ids: Sequence[str] = (),
 ) -> RemediationLedger:
     batch = ledger.batch(batch_id)
     approval_ref = _required_text(approval_ref, "approval_ref")
@@ -1495,6 +1937,40 @@ def approve_remediation_batch(
     extra_ref = _optional_text(
         extra_round_authorization_ref, "extra_round_authorization_ref"
     )
+    if extra_round_authorization is None:
+        extra_authorization = None
+    elif isinstance(extra_round_authorization, ExtraRoundAuthorization):
+        extra_authorization = extra_round_authorization
+    else:
+        extra_authorization = ExtraRoundAuthorization.from_record(
+            extra_round_authorization
+        )
+    captured_inputs = _text_tuple(
+        captured_input_ids, "captured_input_ids", sort=True
+    )
+    if bool(extra_ref) != bool(extra_authorization):
+        raise RemediationLedgerError(
+            "extra-round authorization ref and record must be supplied together"
+        )
+    if extra_authorization is not None:
+        if extra_authorization.ref_for(batch.batch_id) != extra_ref:
+            raise RemediationLedgerError(
+                "extra-round authorization ref is not exact for this batch"
+            )
+        if extra_authorization.input_id not in captured_inputs:
+            raise RemediationLedgerError(
+                "extra-round authorization input is not a captured input"
+            )
+        for approved_batch in ledger.batches:
+            approved_authorization = approved_batch.extra_round_authorization
+            if (
+                approved_authorization is not None
+                and approved_authorization.input_id == extra_authorization.input_id
+                and approved_authorization != extra_authorization
+            ):
+                raise RemediationLedgerError(
+                    "captured extra-round authorization changed across batches"
+                )
 
     if isinstance(release_scope, ReleaseScope):
         normalized_scope = release_scope
@@ -1541,16 +2017,18 @@ def approve_remediation_batch(
         scope_revision=scope_revision,
         release_scope=normalized_scope,
     )
-    approval_payload = {
-        "approval_ref": approval_ref,
-        "batch_id": batch.batch_id,
-        "candidate_set_digest": batch.candidate_set_digest,
-        "extra_round_authorization_ref": extra_ref,
-        "materialization_plan": [item.to_record() for item in plan],
-        "remediation_round": round_number,
-        "scope_digest": scope_digest,
-        "scope_revision": scope_revision,
-    }
+    approval_payload = _approval_payload(
+        approval_ref=approval_ref,
+        batch_id=batch.batch_id,
+        candidate_set_digest=batch.candidate_set_digest,
+        accepted_risk_authorizations=batch.accepted_risk_authorizations,
+        extra_round_authorization_ref=extra_ref,
+        extra_round_authorization=extra_authorization,
+        materialization_plan=plan,
+        remediation_round=round_number,
+        scope_digest=scope_digest,
+        scope_revision=scope_revision,
+    )
     approval_digest = canonical_digest(approval_payload)
     if retry:
         if (
@@ -1560,6 +2038,7 @@ def approve_remediation_batch(
             and batch.scope_revision == scope_revision
             and batch.remediation_round == round_number
             and batch.extra_round_authorization_ref == extra_ref
+            and batch.extra_round_authorization == extra_authorization
             and batch.materialization_plan == plan
         ):
             return ledger
@@ -1577,6 +2056,7 @@ def approve_remediation_batch(
         remediation_round=round_number,
         round_consumed=True,
         extra_round_authorization_ref=extra_ref,
+        extra_round_authorization=extra_authorization,
         materialization_plan=plan,
     )
     refs = ledger.consumed_extra_round_authorization_refs
@@ -1603,6 +2083,14 @@ def reconcile_materialization(
     observations: Sequence[TaskMaterializationObservation | Mapping[str, Any]],
 ) -> MaterializationReconcileResult:
     batch = ledger.batch(batch_id)
+    # Rehydrate through the strict parser on every recovery entry.  This
+    # recomputes candidate, authorization, plan, path, and approval bindings
+    # instead of trusting an object retained across a crash boundary.
+    restored_batch = RemediationBatch.from_record(batch.to_record())
+    if restored_batch != batch:
+        raise RemediationLedgerError(
+            "persisted remediation batch changed during approval revalidation"
+        )
     if batch.status not in {"materializing", "dispatched"}:
         raise RemediationLedgerError(
             f"cannot reconcile materialization while batch is {batch.status}"
@@ -1763,12 +2251,14 @@ materialize_or_reconcile = reconcile_materialization
 
 
 __all__ = [
+    "AcceptedRiskAuthorization",
     "BATCH_STATUSES",
     "COMPLETION_OUTCOMES",
     "CandidateClassificationConflict",
     "CandidateObservation",
     "CanonicalCandidate",
     "DEFAULT_MAX_FIX_ROUNDS",
+    "ExtraRoundAuthorization",
     "MAX_FIX_ROUNDS",
     "MaterializationReconcileResult",
     "MaterializedTask",

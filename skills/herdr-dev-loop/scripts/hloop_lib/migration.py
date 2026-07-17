@@ -879,12 +879,27 @@ def plan_format_three_revision_three(state: State) -> V053StateMigrationPlan:
             "0.5.3 state migration planning requires format-3.revision-2 input"
         )
     result = deepcopy(dict(state))
-    if str(result.get("first_v053_mutation_at") or "").strip() or str(
-        result.get("first_v053_mutation_command") or ""
-    ).strip():
-        raise MigrationError(
-            "revision-2 state contains a partial first-v0.5.3 mutation marker"
-        )
+    mutation_fields = (
+        "first_v053_mutation_at",
+        "first_v053_mutation_command",
+    )
+    if any(field_name in result for field_name in mutation_fields):
+        if not all(field_name in result for field_name in mutation_fields):
+            raise MigrationError(
+                "revision-2 state contains a partial first-v0.5.3 mutation marker"
+            )
+        mutation_at = result["first_v053_mutation_at"]
+        mutation_command = result["first_v053_mutation_command"]
+        if not isinstance(mutation_at, str) or not isinstance(
+            mutation_command, str
+        ):
+            raise MigrationError(
+                "revision-2 first-v0.5.3 mutation fields must be strings"
+            )
+        if mutation_at or mutation_command:
+            raise MigrationError(
+                "revision-2 state contains a partial first-v0.5.3 mutation marker"
+            )
     tasks = result.get("tasks", {})
     if not isinstance(tasks, Mapping):
         raise MigrationError("tasks must be an object")
@@ -972,13 +987,14 @@ def _marker_identity_issues(
         "prepared_marker_digest"
     ) != plan.prepared_marker_digest:
         issues.append("migration marker prepared digest does not match the plan")
+    mutation_fields = (
+        "first_v053_mutation_at",
+        "first_v053_mutation_command",
+    )
     if status == "committed":
         missing_mutation_fields = tuple(
             field_name
-            for field_name in (
-                "first_v053_mutation_at",
-                "first_v053_mutation_command",
-            )
+            for field_name in mutation_fields
             if field_name not in marker
         )
         if missing_mutation_fields:
@@ -986,6 +1002,25 @@ def _marker_identity_issues(
                 "committed migration marker is missing mutation boundary fields: "
                 + ", ".join(missing_mutation_fields)
             )
+        else:
+            marker_at = marker["first_v053_mutation_at"]
+            marker_command = marker["first_v053_mutation_command"]
+            if not isinstance(marker_at, str) or not isinstance(marker_command, str):
+                issues.append(
+                    "first-v0.5.3 mutation boundary fields must be strings"
+                )
+            elif (
+                marker_at != marker_at.strip()
+                or marker_command != marker_command.strip()
+                or bool(marker_at) != bool(marker_command)
+            ):
+                issues.append(
+                    "first-v0.5.3 mutation boundary must be a canonical paired string state"
+                )
+    elif any(field_name in marker for field_name in mutation_fields):
+        issues.append(
+            "first-v0.5.3 mutation marker is only valid after migration commit"
+        )
     return issues
 
 
@@ -1064,10 +1099,24 @@ def decide_migration_recovery(
     if archive_digest != plan.archive_digest:
         return _failed_recovery("archive digest does not match the prepared migration")
 
-    marker_at = str(marker.get("first_v053_mutation_at") or "").strip()
-    marker_command = str(marker.get("first_v053_mutation_command") or "").strip()
-    explicit_at = str(first_v053_mutation_at or "").strip()
-    explicit_command = str(first_v053_mutation_command or "").strip()
+    marker_at = marker.get("first_v053_mutation_at", "")
+    marker_command = marker.get("first_v053_mutation_command", "")
+    if not isinstance(first_v053_mutation_at, str) or not isinstance(
+        first_v053_mutation_command, str
+    ):
+        return _failed_recovery(
+            "first-v0.5.3 mutation observations must be strings"
+        )
+    explicit_at = first_v053_mutation_at
+    explicit_command = first_v053_mutation_command
+    if (
+        explicit_at != explicit_at.strip()
+        or explicit_command != explicit_command.strip()
+        or bool(explicit_at) != bool(explicit_command)
+    ):
+        return _failed_recovery(
+            "first-v0.5.3 mutation observations must be a canonical paired string state"
+        )
     if explicit_at and marker_at and explicit_at != marker_at:
         return _failed_recovery(
             "first-v0.5.3 mutation timestamp observations disagree"
