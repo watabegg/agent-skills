@@ -927,7 +927,37 @@ def plan_format_three_revision_three(state: State) -> V053StateMigrationPlan:
     result["tasks"] = migrated_tasks
 
     remediation = recover_legacy_remediation_history(state)
-    blocking_reasons = tuple(remediation.issues) if remediation.decision_required else ()
+    blocking_reasons = list(remediation.issues) if remediation.decision_required else []
+    active_statuses = {
+        "starting",
+        "running",
+        "waiting",
+        "waiting-agent",
+        "reported",
+        "prepared",
+    }
+    for collection_name in ("reviews", "gaps"):
+        collection = state.get(collection_name)
+        if not isinstance(collection, Mapping):
+            continue
+        for role_id, record in sorted(collection.items(), key=lambda item: str(item[0])):
+            if not isinstance(record, Mapping):
+                continue
+            status = str(record.get("status") or record.get("gate_status") or "")
+            if status in active_statuses:
+                blocking_reasons.append(
+                    f"active legacy {collection_name[:-1]} {role_id} must be harvested or aborted before migration"
+                )
+    for field_name in ("review_convergence", "manual_final_review"):
+        record = state.get(field_name)
+        if not isinstance(record, Mapping):
+            continue
+        status = str(record.get("status") or "")
+        if status in {"prepared", "running"}:
+            blocking_reasons.append(
+                f"active legacy {field_name} must be closed or aborted before migration"
+            )
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
     result["contract_schema_compatibility"] = {
         "state_schema_revision": V053_STATE_SCHEMA_VERSION.revision,
         "legacy_contract_schema_revision": LEGACY_CONTRACT_SCHEMA_REVISION,
@@ -952,7 +982,7 @@ def plan_format_three_revision_three(state: State) -> V053StateMigrationPlan:
         state=result,
         task_migrations=task_migrations,
         remediation=remediation,
-        blocking_reasons=blocking_reasons,
+        blocking_reasons=tuple(blocking_reasons),
     )
 
 
@@ -1066,6 +1096,39 @@ def decide_migration_recovery(
     output_by_path = {
         artifact.path: artifact.output_digest for artifact in plan.artifacts
     }
+    # Once the first 0.5.3 material mutation is durably recorded, migration
+    # rollback is permanently closed and ordinary runtime writes may change
+    # STATE/task bytes beyond the original planned output.  Validate the
+    # immutable marker identity and paired mutation evidence before classifying
+    # those post-migration bytes as an interrupted mixed tree.
+    if isinstance(marker, Mapping) and marker.get("status") == "committed":
+        marker_issues = _marker_identity_issues(plan, marker)
+        marker_at = marker.get("first_v053_mutation_at", "")
+        marker_command = marker.get("first_v053_mutation_command", "")
+        if (
+            not marker_issues
+            and archive_digest == plan.archive_digest
+            and isinstance(marker_at, str)
+            and isinstance(marker_command, str)
+            and marker_at
+            and marker_command
+        ):
+            if first_v053_mutation_at and first_v053_mutation_at != marker_at:
+                return _failed_recovery(
+                    "first-v0.5.3 mutation timestamp observations disagree"
+                )
+            if (
+                first_v053_mutation_command
+                and first_v053_mutation_command != marker_command
+            ):
+                return _failed_recovery(
+                    "first-v0.5.3 mutation command observations disagree"
+                )
+            if requested_action == "rollback":
+                return _failed_recovery(
+                    "rollback is forbidden after first-v0.5.3 mutation was recorded"
+                )
+            return MigrationRecoveryDecision(action="complete")
     unknown_paths = tuple(
         sorted(
             path
