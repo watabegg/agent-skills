@@ -10,7 +10,7 @@
     "contract_schema_revision": {"type": "integer", "enum": [2, 3]},
     "attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
     "status": {"enum": ["done", "partial", "blocked", "failed", "abandoned"]},
-    "merge_ready": {"type": "boolean"},
+    "merge_ready": {"type": "boolean", "description": "Terminal readiness; implementation candidates and candidate seals always keep this false."},
     "branch": {"type": "string", "minLength": 1},
     "head_sha": {"type": "string", "minLength": 1},
     "base_sha": {"type": "string", "minLength": 1},
@@ -21,11 +21,11 @@
     "validation_summary": {"type": "string"},
     "blocking_questions": {"type": "array", "items": {"type": "string"}},
     "handoff": {"type": "boolean"},
-    "invariant_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "regression_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "self_review_summary": {"type": "string", "minLength": 1},
-    "residual_risks": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "unrun_checks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+    "invariant_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Evidence projected from the exact sealed implementation candidate."},
+    "regression_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Evidence projected from the exact sealed implementation candidate."},
+    "self_review_summary": {"type": "string", "minLength": 1, "description": "Self-review projected from the exact sealed implementation candidate."},
+    "residual_risks": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Residual risks projected from the exact sealed implementation candidate."},
+    "unrun_checks": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Unrun checks projected from the exact sealed implementation candidate."}
   },
   "allOf": [
     {
@@ -102,7 +102,7 @@
         "contract_schema_revision": {"const": 3},
         "attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
         "status": {"enum": ["done", "partial", "blocked", "failed", "abandoned"]},
-        "merge_ready": {"type": "boolean"},
+        "merge_ready": {"type": "boolean", "description": "Terminal readiness; implementation candidates and candidate seals always keep this false."},
         "branch": {"type": "string", "minLength": 1},
         "head_sha": {"type": "string", "minLength": 1},
         "base_sha": {"type": "string", "minLength": 1},
@@ -113,11 +113,11 @@
         "validation_summary": {"type": "string"},
         "blocking_questions": {"type": "array", "items": {"type": "string"}},
         "handoff": {"type": "boolean"},
-        "invariant_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "regression_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "self_review_summary": {"type": "string", "minLength": 1},
-        "residual_risks": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "unrun_checks": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        "invariant_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Evidence projected from the exact sealed implementation candidate."},
+        "regression_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Evidence projected from the exact sealed implementation candidate."},
+        "self_review_summary": {"type": "string", "minLength": 1, "description": "Self-review projected from the exact sealed implementation candidate."},
+        "residual_risks": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Residual risks projected from the exact sealed implementation candidate."},
+        "unrun_checks": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Unrun checks projected from the exact sealed implementation candidate."}
       },
       "additionalProperties": false
     }
