@@ -48,6 +48,16 @@ from hloop_lib.review_policy import FindingDisposition  # noqa: E402
 
 NOW = "2026-07-17T00:00:00+00:00"
 TARGET_SHA = "target-remediation-v053"
+EXTRA_INPUT_DIGEST = canonical_digest({"input": "extra remediation round"})
+
+
+def captured_input(input_id: str) -> dict[str, dict[str, str]]:
+    return {
+        input_id: {
+            "source": "manager-chat",
+            "prompt_digest": EXTRA_INPUT_DIGEST.removeprefix("sha256:"),
+        }
+    }
 
 
 def locked_scope() -> ReleaseScope:
@@ -226,6 +236,7 @@ def approve(
     extra_round_authorization_ref: str = "",
     extra_round_authorization: ExtraRoundAuthorization | None = None,
     captured_input_ids: tuple[str, ...] = (),
+    captured_inputs_override: dict[str, dict[str, str]] | None = None,
 ) -> RemediationLedger:
     batch = ledger.batch(batch_id)
     task_id = f"T{task_number:03d}"
@@ -247,6 +258,14 @@ def approve(
         extra_round_authorization_ref=extra_round_authorization_ref,
         extra_round_authorization=extra_round_authorization,
         captured_input_ids=captured_input_ids,
+        captured_inputs=(
+            captured_inputs_override
+            if captured_inputs_override is not None
+            else {
+                input_id: captured_input(input_id)[input_id]
+                for input_id in captured_input_ids
+            }
+        ),
     )
 
 
@@ -724,6 +743,8 @@ class ApprovalAndRoundTests(unittest.TestCase):
             approve(ledger, "RB002", task_number=21, remediation_round=2)
         authorization = ExtraRoundAuthorization(
             input_id="U0007",
+            source="manager-chat",
+            content_digest=EXTRA_INPUT_DIGEST,
             authorized_extra_rounds=1,
             remediation_batch_ids=("RB002",),
         )
@@ -758,6 +779,7 @@ class ApprovalAndRoundTests(unittest.TestCase):
             extra_round_authorization_ref="U0007:RB002",
             extra_round_authorization=authorization,
             captured_input_ids=("U0007",),
+            captured_inputs=captured_input("U0007"),
         )
         self.assertIs(replay, ledger)
         self.assertEqual(replay.consumed_rounds, 2)
@@ -774,6 +796,8 @@ class ApprovalAndRoundTests(unittest.TestCase):
 
         authorization = ExtraRoundAuthorization(
             input_id="U0008",
+            source="manager-chat",
+            content_digest=EXTRA_INPUT_DIGEST,
             authorized_extra_rounds=1,
             remediation_batch_ids=("RB001",),
         )
@@ -801,6 +825,8 @@ class ApprovalAndRoundTests(unittest.TestCase):
         ledger = candidate_batch(ledger=RemediationLedger(max_fix_rounds=0))
         exact = ExtraRoundAuthorization(
             input_id="U0009",
+            source="manager-chat",
+            content_digest=EXTRA_INPUT_DIGEST,
             authorized_extra_rounds=1,
             remediation_batch_ids=("RB001",),
         )
@@ -827,6 +853,8 @@ class ApprovalAndRoundTests(unittest.TestCase):
                     "extra_round_authorization_ref": "U0009:RB001",
                     "extra_round_authorization": ExtraRoundAuthorization(
                         input_id="U0009",
+                        source="manager-chat",
+                        content_digest=EXTRA_INPUT_DIGEST,
                         authorized_extra_rounds=1,
                         remediation_batch_ids=("RB002",),
                     ),
@@ -850,13 +878,57 @@ class ApprovalAndRoundTests(unittest.TestCase):
         ):
             ExtraRoundAuthorization(
                 input_id="U0009",
+                source="manager-chat",
+                content_digest=EXTRA_INPUT_DIGEST,
                 authorized_extra_rounds=1,
                 remediation_batch_ids=("RB001", "RB002"),
+            )
+
+        for label, source, content_digest in (
+            ("non-user-origin", "reviewer", EXTRA_INPUT_DIGEST),
+            ("unlabelled-content", "manager-chat", "0" * 64),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(RemediationLedgerError):
+                    ExtraRoundAuthorization(
+                        input_id="U0009",
+                        source=source,
+                        content_digest=content_digest,
+                        authorized_extra_rounds=1,
+                        remediation_batch_ids=("RB001",),
+                    )
+
+        with self.assertRaisesRegex(RemediationLedgerError, "input_id"):
+            ExtraRoundAuthorization(
+                input_id="manager-latest-message",
+                source="manager-chat",
+                content_digest=EXTRA_INPUT_DIGEST,
+                authorized_extra_rounds=1,
+                remediation_batch_ids=("RB001",),
+            )
+
+        with self.assertRaisesRegex(RemediationLedgerError, "provenance"):
+            approve(
+                ledger,
+                "RB001",
+                task_number=20,
+                remediation_round=1,
+                extra_round_authorization_ref="U0009:RB001",
+                extra_round_authorization=exact,
+                captured_input_ids=("U0009",),
+                captured_inputs_override={
+                    "U0009": {
+                        "source": "manager-chat",
+                        "prompt_digest": "1" * 64,
+                    }
+                },
             )
 
     def test_captured_input_authorization_cannot_be_redefined_for_reuse(self):
         first_authorization = ExtraRoundAuthorization(
             input_id="U0012",
+            source="manager-chat",
+            content_digest=EXTRA_INPUT_DIGEST,
             authorized_extra_rounds=1,
             remediation_batch_ids=("RB001",),
         )
@@ -876,6 +948,8 @@ class ApprovalAndRoundTests(unittest.TestCase):
         )
         redefined = ExtraRoundAuthorization(
             input_id="U0012",
+            source="manager-chat",
+            content_digest=EXTRA_INPUT_DIGEST,
             authorized_extra_rounds=1,
             remediation_batch_ids=("RB002",),
         )
@@ -1088,6 +1162,8 @@ class PersistenceAndSchemaTests(unittest.TestCase):
         ledger = candidate_batch(ledger=RemediationLedger(max_fix_rounds=0))
         authorization = ExtraRoundAuthorization(
             input_id="U0010",
+            source="manager-chat",
+            content_digest=EXTRA_INPUT_DIGEST,
             authorized_extra_rounds=1,
             remediation_batch_ids=("RB001",),
         )
@@ -1117,6 +1193,29 @@ class PersistenceAndSchemaTests(unittest.TestCase):
         ] = "tasks/T999.md"
         with self.assertRaisesRegex(RemediationLedgerError, "canonical"):
             RemediationLedger.from_record(changed_path)
+
+    def test_restore_rejects_missing_or_noncanonical_write_ahead_identity(self):
+        valid = approve(
+            candidate_batch(), "RB001", task_number=20, remediation_round=1
+        ).to_record()
+        cases = (
+            ("null-digest", "task_contract_digest", None),
+            ("empty-digest", "task_contract_digest", ""),
+            ("unlabelled-digest", "task_contract_digest", "0" * 64),
+            ("null-artifact", "artifact_ref", None),
+            ("empty-artifact", "artifact_ref", ""),
+            ("noncanonical-artifact", "artifact_ref", "./tasks/T020.md"),
+        )
+        for label, field, value in cases:
+            record = json.loads(json.dumps(valid))
+            record["batches"][0]["materialization_plan"][0][field] = value
+            with self.subTest(label=label):
+                with self.assertRaises(RemediationLedgerError):
+                    RemediationLedger.from_record(record)
+                for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA):
+                    self.assertTrue(
+                        list(offline_validator(schema_path).iter_errors(record))
+                    )
 
     def test_reconcile_revalidates_approval_digest(self):
         approved = approve(

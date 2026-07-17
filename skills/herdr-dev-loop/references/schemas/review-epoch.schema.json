@@ -4,7 +4,9 @@
   "title": "Herdr Dev Loop Review Epoch Contracts",
   "oneOf": [
     {"$ref": "#/$defs/epochPlan"},
-    {"$ref": "#/$defs/capacityLedger"}
+    {"$ref": "#/$defs/capacityLedger"},
+    {"$ref": "#/$defs/executionOutcome"},
+    {"$ref": "#/$defs/epochCollection"}
   ],
   "$defs": {
     "digest": {
@@ -357,6 +359,145 @@
           "else": {
             "properties": {"ancestor_plan_digests": {"minItems": 1}}
           }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "executionOutcome": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "epoch_id",
+        "epoch_revision",
+        "execution_id",
+        "attempt_id",
+        "plan_digest",
+        "execution_digest",
+        "source_kind",
+        "protocol",
+        "independence_key",
+        "artifact_ref",
+        "artifact_digest",
+        "artifact_complete",
+        "completed_process_ids",
+        "status",
+        "terminal_at"
+      ],
+      "properties": {
+        "record_type": {"const": "review_epoch_execution_outcome"},
+        "epoch_id": {"type": "string", "pattern": "^E[0-9]{3,}$"},
+        "epoch_revision": {"type": "integer", "minimum": 1},
+        "execution_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "plan_digest": {"$ref": "#/$defs/digest"},
+        "execution_digest": {"$ref": "#/$defs/digest"},
+        "source_kind": {
+          "enum": [
+            "reviewer",
+            "gap",
+            "convergence",
+            "pre_final",
+            "manual_final"
+          ]
+        },
+        "protocol": {"type": "string", "minLength": 1},
+        "independence_key": {"type": "string", "minLength": 1},
+        "artifact_ref": {"type": "string", "minLength": 1},
+        "artifact_digest": {
+          "oneOf": [{"const": ""}, {"$ref": "#/$defs/digest"}]
+        },
+        "artifact_complete": {"type": "boolean"},
+        "completed_process_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "timeout",
+            "cancelled",
+            "artifact_incomplete"
+          ]
+        },
+        "terminal_at": {"type": "string", "format": "date-time"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "succeeded"}}},
+          "then": {
+            "properties": {
+              "artifact_digest": {"$ref": "#/$defs/digest"},
+              "artifact_complete": {"const": true},
+              "completed_process_ids": {"minItems": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"status": {"const": "artifact_incomplete"}}
+          },
+          "then": {"properties": {"artifact_complete": {"const": false}}}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "epochCollection": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "plan",
+        "capacity",
+        "execution_outcomes",
+        "status",
+        "status_reason",
+        "remediation_batch_id"
+      ],
+      "properties": {
+        "record_type": {"const": "review_epoch_collection"},
+        "plan": {"$ref": "#/$defs/epochPlan"},
+        "capacity": {"$ref": "#/$defs/capacityLedger"},
+        "execution_outcomes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/executionOutcome"}
+        },
+        "status": {
+          "enum": [
+            "collecting",
+            "ready_to_triage",
+            "incomplete",
+            "closed",
+            "superseded_for_completion"
+          ]
+        },
+        "status_reason": {"type": "string"},
+        "remediation_batch_id": {
+          "oneOf": [
+            {"const": ""},
+            {"type": "string", "pattern": "^RB[0-9]{3,}$"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["collecting", "ready_to_triage", "incomplete"]
+              }
+            }
+          },
+          "then": {"properties": {"remediation_batch_id": {"const": ""}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {"enum": ["closed", "superseded_for_completion"]}
+            }
+          },
+          "then": {"properties": {"status_reason": {"minLength": 1}}}
         }
       ],
       "additionalProperties": false

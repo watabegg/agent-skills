@@ -51,6 +51,43 @@
     "decisions"
   ],
   "$defs": {
+    "reviewEpochStore": {
+      "type": "object",
+      "required": ["active_epoch_id", "records", "protocol_capabilities"],
+      "properties": {
+        "active_epoch_id": {
+          "oneOf": [
+            {"const": ""},
+            {"type": "string", "pattern": "^E[0-9]{3,}$"}
+          ]
+        },
+        "records": {
+          "type": "object",
+          "propertyNames": {"pattern": "^E[0-9]{3,}$"},
+          "additionalProperties": {
+            "type": "object",
+            "required": ["active_revision", "revisions"],
+            "properties": {
+              "active_revision": {"type": "integer", "minimum": 1},
+              "revisions": {
+                "type": "object",
+                "propertyNames": {"pattern": "^[1-9][0-9]*$"},
+                "additionalProperties": {
+                  "$ref": "review-epoch.schema.json#/$defs/epochCollection"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "protocol_capabilities": {
+          "type": "object",
+          "propertyNames": {"pattern": "^sha256:[0-9a-f]{64}$"},
+          "additionalProperties": {"type": "object"}
+        }
+      },
+      "additionalProperties": false
+    },
     "planningIdentity": {
       "type": "object",
       "required": [
@@ -612,6 +649,18 @@
           "mode": {"type": "string", "enum": ["single", "swarm", "dual", "dual-swarm"]}
         },
         "additionalProperties": true
+      }
+    },
+    "review_epochs": {"$ref": "#/$defs/reviewEpochStore"},
+    "remediation_ledger": {
+      "$ref": "remediation-ledger.schema.json#/$defs/ledger"
+    },
+    "remediation_source_links": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"type": "string", "pattern": "^T[0-9]{3,}$"},
+        "uniqueItems": true
       }
     },
     "patch_reviews": {

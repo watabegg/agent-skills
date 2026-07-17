@@ -30,10 +30,13 @@ from hloop_lib.review_epoch import (  # noqa: E402
     AuditProcessPlan,
     CapacityLease,
     EpochCapacityLedger,
+    EpochExecutionOutcome,
     EpochExecutionPlan,
     ReviewEpochError,
+    ReviewEpochCollection,
     ReviewEpochPlan,
     canonical_digest,
+    create_successor_collection,
     create_successor_revision,
     inherit_artifact,
     validate_successor_revision,
@@ -153,6 +156,39 @@ def epoch_plan(
         audit_agent_budget=budget,
         required_executions=executions or (reviewer_execution(), gap_execution()),
     )
+
+
+def completed_epoch_collection() -> ReviewEpochCollection:
+    plan = epoch_plan()
+    collection = ReviewEpochCollection.create(plan)
+    for execution in plan.required_executions:
+        process_ids = tuple(item.process_id for item in execution.processes)
+        capacity = collection.capacity.reserve(
+            plan,
+            lease_id=f"lease-{execution.execution_id}",
+            execution_id=execution.execution_id,
+            process_ids=process_ids,
+            expires_at="2026-07-17T08:00:00Z",
+        ).mark_running(
+            f"lease-{execution.execution_id}"
+        ).mark_terminal(
+            f"lease-{execution.execution_id}",
+            reason="process tree exited",
+            process_exit_confirmed=True,
+        )
+        collection = collection.with_capacity(capacity)
+        collection = collection.record_outcome(
+            EpochExecutionOutcome.for_plan(
+                plan,
+                execution.execution_id,
+                artifact_digest=digest(f"artifact-{execution.execution_id}"),
+                artifact_complete=True,
+                completed_process_ids=process_ids,
+                status="succeeded",
+                terminal_at="2026-07-17T08:01:00Z",
+            )
+        )
+    return collection
 
 
 def offline_validator(schema_path: Path):
@@ -688,6 +724,133 @@ class EpochCapacityLeaseTests(unittest.TestCase):
                 expires_at="2026-07-17T08:00:00Z",
             )
 
+    def test_terminal_process_identity_cannot_be_reserved_again(self):
+        plan = epoch_plan()
+        ledger = plan.capacity_ledger().reserve(
+            plan,
+            lease_id="lease-one",
+            execution_id="R001",
+            process_ids=("R001-coordinator",),
+            expires_at="2026-07-17T08:00:00Z",
+        ).mark_terminal(
+            "lease-one",
+            reason="process exited",
+            process_exit_confirmed=True,
+        )
+
+        with self.assertRaisesRegex(ReviewEpochError, "terminal lease history"):
+            ledger.reserve(
+                plan,
+                lease_id="lease-retry",
+                execution_id="R001",
+                process_ids=("R001-coordinator",),
+                expires_at="2026-07-17T09:00:00Z",
+            )
+
+
+class ReviewEpochCollectionTests(unittest.TestCase):
+    def completed_collection(self) -> ReviewEpochCollection:
+        return completed_epoch_collection()
+
+    def test_all_successful_complete_executions_are_ready_and_round_trip(self):
+        collection = self.completed_collection()
+        self.assertEqual(collection.status, "ready_to_triage")
+        restored = ReviewEpochCollection.from_record(
+            json.loads(json.dumps(collection.to_record()))
+        )
+        self.assertEqual(restored, collection)
+        self.assertEqual(
+            {item.independence_key for item in restored.execution_outcomes},
+            {"reviewer:R001", "gap:G001"},
+        )
+
+    def test_failed_or_artifact_incomplete_execution_never_reaches_triage(self):
+        plan = epoch_plan()
+        execution = plan.execution("R001")
+        process_ids = tuple(item.process_id for item in execution.processes)
+        collection = ReviewEpochCollection.create(plan)
+        capacity = collection.capacity.reserve(
+            plan,
+            lease_id="lease-R001",
+            execution_id="R001",
+            process_ids=process_ids,
+            expires_at="2026-07-17T08:00:00Z",
+        ).mark_terminal(
+            "lease-R001",
+            reason="failed",
+            process_exit_confirmed=True,
+        )
+        collection = collection.with_capacity(capacity).record_outcome(
+            EpochExecutionOutcome.for_plan(
+                plan,
+                "R001",
+                artifact_complete=False,
+                completed_process_ids=process_ids,
+                status="failed",
+                terminal_at="2026-07-17T08:01:00Z",
+            )
+        )
+        self.assertEqual(collection.status, "incomplete")
+        with self.assertRaisesRegex(ReviewEpochError, "before ready_to_triage"):
+            collection.close(reason="incorrect clean close")
+
+    def test_terminal_outcome_rejects_nonterminal_or_missing_process_leases(self):
+        plan = epoch_plan()
+        execution = plan.execution("R001")
+        process_ids = tuple(item.process_id for item in execution.processes)
+        collection = ReviewEpochCollection.create(plan)
+        capacity = collection.capacity.reserve(
+            plan,
+            lease_id="lease-R001",
+            execution_id="R001",
+            process_ids=process_ids,
+            expires_at="2026-07-17T08:00:00Z",
+        ).mark_running("lease-R001")
+        collection = collection.with_capacity(capacity)
+        with self.assertRaisesRegex(ReviewEpochError, "nonterminal or missing"):
+            collection.record_outcome(
+                EpochExecutionOutcome.for_plan(
+                    plan,
+                    "R001",
+                    artifact_complete=False,
+                    completed_process_ids=(),
+                    status="timeout",
+                    terminal_at="2026-07-17T08:01:00Z",
+                )
+            )
+
+    def test_terminal_outcome_retry_is_exact_and_changed_retry_fails(self):
+        collection = self.completed_collection()
+        first = collection.execution_outcomes[0]
+        self.assertIs(collection.record_outcome(first), collection)
+        with self.assertRaisesRegex(ReviewEpochError, "changed on retry"):
+            collection.record_outcome(replace(first, terminal_at="2026-07-17T09:00:00Z"))
+
+    def test_successor_collection_retry_restores_exact_same_state(self):
+        parent = self.completed_collection()
+        outcomes = {
+            item.execution_id: item for item in parent.execution_outcomes
+        }
+        inherited = tuple(
+            inherit_artifact(
+                parent.plan,
+                execution.execution_id,
+                artifact_digest=outcomes[execution.execution_id].artifact_digest,
+            )
+            for execution in parent.plan.required_executions
+        )
+        successor_plan = create_successor_revision(
+            parent.plan,
+            additional_executions=(reviewer_execution("R002", attempt="R002-A001"),),
+            inherited_artifacts=inherited,
+        )
+        superseded, successor = create_successor_collection(parent, successor_plan)
+        retried_parent, retried_successor = create_successor_collection(
+            superseded, successor_plan
+        )
+        self.assertEqual(retried_parent, superseded)
+        self.assertEqual(retried_successor, successor)
+
 
 class ReviewEpochSchemaTests(unittest.TestCase):
     def assert_schema_and_python_reject(
@@ -899,7 +1062,7 @@ class ReviewEpochSchemaTests(unittest.TestCase):
                 case_name=case_name,
             )
 
-    def test_canonical_and_public_schemas_validate_plan_and_capacity_records(self):
+    def test_canonical_and_public_schemas_validate_all_epoch_records(self):
         plan = epoch_plan()
         ledger = plan.capacity_ledger().reserve(
             plan,
@@ -912,6 +1075,7 @@ class ReviewEpochSchemaTests(unittest.TestCase):
             plan, additional_executions=(reviewer_execution("R002"),)
         )
         successor_ledger = successor.capacity_ledger(ledger)
+        completed = completed_epoch_collection()
         for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA):
             validator = offline_validator(schema_path)
             for record in (
@@ -919,6 +1083,8 @@ class ReviewEpochSchemaTests(unittest.TestCase):
                 ledger.to_record(),
                 successor.to_record(),
                 successor_ledger.to_record(),
+                completed.execution_outcomes[0].to_record(),
+                completed.to_record(),
             ):
                 with self.subTest(schema=schema_path.name, record=record["record_type"]):
                     self.assertEqual(list(validator.iter_errors(record)), [])

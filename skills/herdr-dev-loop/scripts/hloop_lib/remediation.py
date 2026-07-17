@@ -87,6 +87,7 @@ _CLASSIFICATION_FIELDS = frozenset(
         "decision_id",
     }
 )
+_INPUT_ID_RE = re.compile(r"^U[0-9]{4}$")
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FINGERPRINT_RE = _DIGEST_RE
@@ -311,12 +312,28 @@ class ExtraRoundAuthorization:
     """Captured user authorization for an exact set of remediation batches."""
 
     input_id: str
+    source: str
+    content_digest: str
     authorized_extra_rounds: int
     remediation_batch_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        input_id = _required_text(self.input_id, "input_id")
+        if _INPUT_ID_RE.fullmatch(input_id) is None:
+            raise RemediationLedgerError(
+                "extra-round authorization input_id must use U<four digits>"
+            )
+        object.__setattr__(self, "input_id", input_id)
+        source = _required_text(self.source, "source")
+        if source not in {"user", "user-chat", "manager-chat", "goal"}:
+            raise RemediationLedgerError(
+                "extra-round authorization must have canonical user-origin provenance"
+            )
+        object.__setattr__(self, "source", source)
         object.__setattr__(
-            self, "input_id", _required_text(self.input_id, "input_id")
+            self,
+            "content_digest",
+            _digest(self.content_digest, "content_digest"),
         )
         count = _positive_int(
             self.authorized_extra_rounds, "authorized_extra_rounds"
@@ -347,6 +364,8 @@ class ExtraRoundAuthorization:
     def to_record(self) -> dict[str, Any]:
         return {
             "input_id": self.input_id,
+            "source": self.source,
+            "content_digest": self.content_digest,
             "authorized_extra_rounds": self.authorized_extra_rounds,
             "remediation_batch_ids": list(self.remediation_batch_ids),
         }
@@ -359,6 +378,8 @@ class ExtraRoundAuthorization:
                 "extra-round authorization",
                 required=(
                     "input_id",
+                    "source",
+                    "content_digest",
                     "authorized_extra_rounds",
                     "remediation_batch_ids",
                 ),
@@ -637,13 +658,18 @@ class PlannedRemediationTask:
                 "artifact_ref",
             ),
         )
+        # A persisted write-ahead plan must carry its exact canonical
+        # identities.  Constructor defaults are only for creating a new plan;
+        # restore must never fill null, empty, or noncanonical values.
+        _digest(record["task_contract_digest"], "task_contract_digest")
+        artifact_ref = _required_text(record["artifact_ref"], "artifact_ref")
         return cls(
             task_id=record["task_id"],
             candidate_fingerprints=record["candidate_fingerprints"],
             task_contract=record["task_contract"],
             task_contract_digest=record["task_contract_digest"],
             source_refs=record["source_refs"],
-            artifact_ref=record["artifact_ref"],
+            artifact_ref=artifact_ref,
         )
 
 
@@ -1929,6 +1955,7 @@ def approve_remediation_batch(
     extra_round_authorization_ref: str = "",
     extra_round_authorization: ExtraRoundAuthorization | Mapping[str, Any] | None = None,
     captured_input_ids: Sequence[str] = (),
+    captured_inputs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> RemediationLedger:
     batch = ledger.batch(batch_id)
     approval_ref = _required_text(approval_ref, "approval_ref")
@@ -1945,7 +1972,7 @@ def approve_remediation_batch(
         extra_authorization = ExtraRoundAuthorization.from_record(
             extra_round_authorization
         )
-    captured_inputs = _text_tuple(
+    captured_ids = _text_tuple(
         captured_input_ids, "captured_input_ids", sort=True
     )
     if bool(extra_ref) != bool(extra_authorization):
@@ -1957,9 +1984,35 @@ def approve_remediation_batch(
             raise RemediationLedgerError(
                 "extra-round authorization ref is not exact for this batch"
             )
-        if extra_authorization.input_id not in captured_inputs:
+        if extra_authorization.input_id not in captured_ids:
             raise RemediationLedgerError(
                 "extra-round authorization input is not a captured input"
+            )
+        if captured_inputs is None:
+            raise RemediationLedgerError(
+                "extra-round authorization requires captured input provenance"
+            )
+        captured_record = captured_inputs.get(extra_authorization.input_id)
+        if not isinstance(captured_record, Mapping):
+            raise RemediationLedgerError(
+                "extra-round authorization input is missing canonical captured metadata"
+            )
+        captured_source = _required_text(
+            captured_record.get("source"), "captured input source"
+        )
+        raw_digest = _required_text(
+            captured_record.get("prompt_digest"), "captured input content digest"
+        )
+        captured_digest = (
+            raw_digest if raw_digest.startswith("sha256:") else f"sha256:{raw_digest}"
+        )
+        captured_digest = _digest(captured_digest, "captured input content digest")
+        if (
+            captured_source != extra_authorization.source
+            or captured_digest != extra_authorization.content_digest
+        ):
+            raise RemediationLedgerError(
+                "extra-round authorization does not match captured user input provenance"
             )
         for approved_batch in ledger.batches:
             approved_authorization = approved_batch.extra_round_authorization
