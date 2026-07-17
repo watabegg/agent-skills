@@ -3921,6 +3921,7 @@ effort = "medium"
             transaction,
             resolved_tree=None,
         )
+        cherry_pick_env["GIT_EDITOR"] = "true"
         cherry_pick = subprocess.run(
             ["git", *hloop.CHERRY_PICK_GIT_CONFIG, "cherry-pick", *source_commits],
             cwd=repo,

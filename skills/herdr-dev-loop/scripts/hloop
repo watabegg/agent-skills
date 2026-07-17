@@ -17158,6 +17158,7 @@ def fixed_cherry_pick_committer(
             "GIT_COMMITTER_NAME": identity["committer_name"],
             "GIT_COMMITTER_EMAIL": identity["committer_email"],
             "GIT_COMMITTER_DATE": identity["committer_date"],
+            "GIT_EDITOR": "true",
         }
     )
     observed_ident = git(repo, ["var", "GIT_COMMITTER_IDENT"], env=env)
