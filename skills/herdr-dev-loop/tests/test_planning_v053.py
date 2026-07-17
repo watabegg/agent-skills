@@ -281,6 +281,7 @@ class PlanningContractTests(unittest.TestCase):
             current,
             required_requirement_refs=["REQ-001"],
             required_plan_item_refs=["P002"],
+            allowed_scope_refs=["runtime-release"],
         )
 
         self.assertTrue(result.ok, result.issues)
@@ -394,7 +395,12 @@ class PlanningContractTests(unittest.TestCase):
         graph = seal_planning_artifact(graph)
 
         result = validate_planning_bundle(
-            impact, graph, coverage, plan_gap, current
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            allowed_scope_refs=["runtime-release"],
         )
 
         reference_issues = [
@@ -452,7 +458,69 @@ class PlanningContractTests(unittest.TestCase):
         plan_gap = seal_planning_artifact(plan_gap)
 
         result = validate_planning_bundle(
-            impact, graph, coverage, plan_gap, current
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            allowed_scope_refs=["runtime-release"],
+        )
+
+        self.assertIn("scope-external", {issue.code for issue in result.issues})
+
+    def test_dispatch_requires_authoritative_allowed_scope_refs(self):
+        current, impact, graph, coverage, plan_gap = planning_bundle()
+
+        omitted = validate_dispatch_readiness(
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            required_requirement_refs=["REQ-001"],
+            required_plan_item_refs=["P002"],
+        )
+        pinned = validate_dispatch_readiness(
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            required_requirement_refs=["REQ-001"],
+            required_plan_item_refs=["P002"],
+            allowed_scope_refs=["runtime-release"],
+        )
+
+        self.assertIn(
+            "authoritative-scope-required",
+            {issue.code for issue in omitted.issues},
+        )
+        self.assertFalse(omitted.ok)
+        self.assertTrue(pinned.ok, pinned.issues)
+
+    def test_matching_unapproved_scope_self_declarations_are_rejected(self):
+        current, impact, graph, coverage, plan_gap = planning_bundle()
+        impact["surfaces"][0]["scope_refs"] = ["self-declared-scope"]
+        impact = seal_planning_artifact(impact)
+        graph["tasks"][0]["scope_refs"] = ["self-declared-scope"]
+        graph = seal_planning_artifact(graph)
+        coverage["impact_map_digest"] = impact["artifact_digest"]
+        coverage["task_graph_digest"] = graph["artifact_digest"]
+        coverage = seal_planning_artifact(coverage)
+        plan_gap["impact_map_digest"] = impact["artifact_digest"]
+        plan_gap["task_graph_digest"] = graph["artifact_digest"]
+        plan_gap["coverage_digest"] = coverage["artifact_digest"]
+        plan_gap = seal_planning_artifact(plan_gap)
+
+        result = validate_dispatch_readiness(
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            required_requirement_refs=["REQ-001"],
+            required_plan_item_refs=["P002"],
+            allowed_scope_refs=["runtime-release"],
         )
 
         self.assertIn("scope-external", {issue.code for issue in result.issues})
@@ -525,7 +593,12 @@ class PlanningContractTests(unittest.TestCase):
         current, impact, graph, coverage, plan_gap = physical_overlap_bundle()
 
         result = validate_planning_bundle(
-            impact, graph, coverage, plan_gap, current
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            allowed_scope_refs=["runtime-release"],
         )
 
         self.assertEqual(
@@ -574,6 +647,7 @@ class PlanningContractTests(unittest.TestCase):
             current,
             required_requirement_refs=["REQ-001"],
             required_plan_item_refs=["P002"],
+            allowed_scope_refs=["runtime-release"],
         )
 
         self.assertTrue(result.ok, result.issues)

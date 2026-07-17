@@ -1439,15 +1439,18 @@ def validate_coverage(
                     )
                 )
 
-    allowed = (
-        set(allowed_scope_refs)
-        if allowed_scope_refs is not None
-        else {
-            scope_ref
-            for surface in surfaces
-            for scope_ref in _texts(surface, "scope_refs")
-        }
-    )
+    if allowed_scope_refs is None:
+        issues.append(
+            PlanningIssue(
+                "authoritative-scope-required",
+                "dispatch readiness requires caller-supplied authoritative "
+                "allowed_scope_refs",
+                "allowed_scope_refs",
+            )
+        )
+        allowed: set[str] = set()
+    else:
+        allowed = set(allowed_scope_refs)
     for task_id, task in task_by_id.items():
         external = tuple(sorted(set(_texts(task, "scope_refs")) - allowed))
         if external:
