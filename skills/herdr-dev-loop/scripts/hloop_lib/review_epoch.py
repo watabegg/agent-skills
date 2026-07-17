@@ -33,27 +33,85 @@ LEASE_STATUSES = frozenset(
 
 _DIGEST_RE = re.compile(DIGEST_PATTERN)
 _EPOCH_ID_RE = re.compile(r"^E[0-9]{3,}$")
-_REVIEW_EPOCH_PLAN_TOP_LEVEL_FIELDS = frozenset(
-    {
-        "record_type",
-        "epoch_id",
-        "epoch_revision",
-        "base_sha",
-        "target_sha",
-        "scope_revision",
-        "source_snapshot_revision",
-        "scope_digest",
-        "source_refs",
-        "policy_digest",
-        "topology_digest",
-        "validation_identity",
-        "audit_agent_budget",
-        "required_executions",
-        "parent_plan_digest",
-        "additional_execution_ids",
-        "inherited_artifacts",
-        "plan_digest",
-    }
+_AUDIT_PROCESS_RECORD_FIELDS = (
+    "process_id",
+    "process_kind",
+    "agent_label",
+    "provider",
+    "model",
+    "effort",
+    "parent_process_id",
+    "lane_id",
+)
+_EPOCH_EXECUTION_RECORD_FIELDS = (
+    "execution_id",
+    "attempt_id",
+    "source_kind",
+    "protocol",
+    "independence_key",
+    "artifact_ref",
+    "processes",
+    "execution_digest",
+)
+_INHERITED_ARTIFACT_RECORD_FIELDS = (
+    "execution_id",
+    "execution_digest",
+    "artifact_ref",
+    "artifact_digest",
+    "source_plan_digest",
+)
+_REVIEW_EPOCH_PLAN_RECORD_FIELDS = (
+    "record_type",
+    "epoch_id",
+    "epoch_revision",
+    "base_sha",
+    "target_sha",
+    "scope_revision",
+    "source_snapshot_revision",
+    "scope_digest",
+    "source_refs",
+    "policy_digest",
+    "topology_digest",
+    "validation_identity",
+    "audit_agent_budget",
+    "required_executions",
+    "parent_plan_digest",
+    "additional_execution_ids",
+    "inherited_artifacts",
+    "plan_digest",
+)
+_LEASE_RESERVATION_RECORD_FIELDS = (
+    "process_id",
+    "process_kind",
+)
+_CAPACITY_LEASE_RECORD_FIELDS = (
+    "lease_id",
+    "epoch_id",
+    "epoch_revision",
+    "execution_id",
+    "attempt_id",
+    "plan_digest",
+    "reservations",
+    "reserved_slots",
+    "expires_at",
+    "status",
+    "credential_revoked",
+    "process_exit_confirmed",
+    "forced_abort_acknowledged",
+    "terminal_reason",
+)
+_EPOCH_CAPACITY_LEDGER_RECORD_FIELDS = (
+    "record_type",
+    "epoch_id",
+    "epoch_revision",
+    "plan_digest",
+    "ancestor_plan_digests",
+    "audit_agent_budget",
+    "leases",
+    "reserved_slots",
+    "live_slots",
+    "available_slots",
+    "blocks_new_starts",
 )
 
 
@@ -105,6 +163,20 @@ def _required_fields(
     if missing:
         raise ReviewEpochError(
             f"{field_name} is missing required fields: {', '.join(missing)}"
+        )
+
+
+def _exact_record_fields(
+    record: Mapping[str, Any], field_name: str, fields: Sequence[str]
+) -> None:
+    """Enforce one canonical persisted-record property set."""
+
+    _required_fields(record, field_name, fields)
+    allowed = frozenset(fields)
+    unknown = sorted(str(field) for field in record if field not in allowed)
+    if unknown:
+        raise ReviewEpochError(
+            f"{field_name} contains unknown fields: {', '.join(unknown)}"
         )
 
 
@@ -238,17 +310,8 @@ class AuditProcessPlan:
         if isinstance(value, cls):
             return value
         record = _record(value, "audit process plan")
-        _required_fields(
-            record,
-            "audit process plan",
-            (
-                "process_id",
-                "process_kind",
-                "agent_label",
-                "provider",
-                "model",
-                "effort",
-            ),
+        _exact_record_fields(
+            record, "audit process plan", _AUDIT_PROCESS_RECORD_FIELDS
         )
         return cls(
             process_id=record["process_id"],
@@ -257,8 +320,8 @@ class AuditProcessPlan:
             provider=record["provider"],
             model=record["model"],
             effort=record["effort"],
-            parent_process_id=record.get("parent_process_id", ""),
-            lane_id=record.get("lane_id", ""),
+            parent_process_id=record["parent_process_id"],
+            lane_id=record["lane_id"],
         )
 
 
@@ -350,19 +413,8 @@ class EpochExecutionPlan:
         if isinstance(value, cls):
             return value
         record = _record(value, "epoch execution plan")
-        _required_fields(
-            record,
-            "epoch execution plan",
-            (
-                "execution_id",
-                "attempt_id",
-                "source_kind",
-                "protocol",
-                "independence_key",
-                "artifact_ref",
-                "processes",
-                "execution_digest",
-            ),
+        _exact_record_fields(
+            record, "epoch execution plan", _EPOCH_EXECUTION_RECORD_FIELDS
         )
         execution = cls(
             execution_id=record["execution_id"],
@@ -433,16 +485,8 @@ class InheritedArtifact:
         if isinstance(value, cls):
             return value
         record = _record(value, "inherited artifact")
-        _required_fields(
-            record,
-            "inherited artifact",
-            (
-                "execution_id",
-                "execution_digest",
-                "artifact_ref",
-                "artifact_digest",
-                "source_plan_digest",
-            ),
+        _exact_record_fields(
+            record, "inherited artifact", _INHERITED_ARTIFACT_RECORD_FIELDS
         )
         return cls(**{field: record[field] for field in (
             "execution_id",
@@ -731,37 +775,9 @@ class ReviewEpochPlan:
         if isinstance(value, cls):
             return value
         record = _record(value, "review epoch plan")
-        _required_fields(
-            record,
-            "review epoch plan",
-            (
-                "record_type",
-                "epoch_id",
-                "epoch_revision",
-                "base_sha",
-                "target_sha",
-                "scope_revision",
-                "source_snapshot_revision",
-                "scope_digest",
-                "source_refs",
-                "policy_digest",
-                "topology_digest",
-                "validation_identity",
-                "audit_agent_budget",
-                "required_executions",
-                "plan_digest",
-            ),
+        _exact_record_fields(
+            record, "review epoch plan", _REVIEW_EPOCH_PLAN_RECORD_FIELDS
         )
-        unknown_fields = sorted(
-            str(field)
-            for field in record
-            if field not in _REVIEW_EPOCH_PLAN_TOP_LEVEL_FIELDS
-        )
-        if unknown_fields:
-            raise ReviewEpochError(
-                "review epoch plan contains unknown fields: "
-                + ", ".join(unknown_fields)
-            )
         if record["record_type"] != "review_epoch_plan":
             raise ReviewEpochError("review epoch plan record_type is invalid")
         plan = cls(
@@ -782,17 +798,17 @@ class ReviewEpochPlan:
                     record["required_executions"], "required_executions"
                 )
             ),
-            parent_plan_digest=record.get("parent_plan_digest", ""),
+            parent_plan_digest=record["parent_plan_digest"],
             additional_execution_ids=tuple(
                 _items(
-                    record.get("additional_execution_ids", ()),
+                    record["additional_execution_ids"],
                     "additional_execution_ids",
                 )
             ),
             inherited_artifacts=tuple(
                 InheritedArtifact.from_record(item)
                 for item in _items(
-                    record.get("inherited_artifacts", ()), "inherited_artifacts"
+                    record["inherited_artifacts"], "inherited_artifacts"
                 )
             ),
         )
@@ -968,8 +984,8 @@ class LeaseReservation:
         if isinstance(value, cls):
             return value
         record = _record(value, "lease reservation")
-        _required_fields(
-            record, "lease reservation", ("process_id", "process_kind")
+        _exact_record_fields(
+            record, "lease reservation", _LEASE_RESERVATION_RECORD_FIELDS
         )
         return cls(
             process_id=record["process_id"], process_kind=record["process_kind"]
@@ -1165,24 +1181,8 @@ class CapacityLease:
         if isinstance(value, cls):
             return value
         record = _record(value, "capacity lease")
-        _required_fields(
-            record,
-            "capacity lease",
-            (
-                "lease_id",
-                "epoch_id",
-                "epoch_revision",
-                "execution_id",
-                "attempt_id",
-                "plan_digest",
-                "reservations",
-                "expires_at",
-                "status",
-                "credential_revoked",
-                "process_exit_confirmed",
-                "forced_abort_acknowledged",
-                "terminal_reason",
-            ),
+        _exact_record_fields(
+            record, "capacity lease", _CAPACITY_LEASE_RECORD_FIELDS
         )
         lease = cls(
             lease_id=record["lease_id"],
@@ -1202,10 +1202,8 @@ class CapacityLease:
             forced_abort_acknowledged=record["forced_abort_acknowledged"],
             terminal_reason=record["terminal_reason"],
         )
-        supplied_slots = record.get("reserved_slots")
-        if supplied_slots is not None and _non_negative_int(
-            supplied_slots, "reserved_slots"
-        ) != lease.reserved_slots:
+        supplied_slots = _positive_int(record["reserved_slots"], "reserved_slots")
+        if supplied_slots != lease.reserved_slots:
             raise ReviewEpochError(
                 "reserved_slots does not match explicit process reservations"
             )
@@ -1448,23 +1446,13 @@ class EpochCapacityLedger:
         if isinstance(value, cls):
             return value
         record = _record(value, "epoch capacity ledger")
-        if (
-            record.get("record_type", "review_epoch_capacity")
-            != "review_epoch_capacity"
-        ):
-            raise ReviewEpochError("epoch capacity ledger record_type is invalid")
-        _required_fields(
+        _exact_record_fields(
             record,
             "epoch capacity ledger",
-            (
-                "epoch_id",
-                "epoch_revision",
-                "plan_digest",
-                "ancestor_plan_digests",
-                "audit_agent_budget",
-                "leases",
-            ),
+            _EPOCH_CAPACITY_LEDGER_RECORD_FIELDS,
         )
+        if record["record_type"] != "review_epoch_capacity":
+            raise ReviewEpochError("epoch capacity ledger record_type is invalid")
         ledger = cls(
             epoch_id=record["epoch_id"],
             epoch_revision=record["epoch_revision"],
@@ -1488,7 +1476,7 @@ class EpochCapacityLedger:
             "blocks_new_starts": ledger.blocks_new_starts,
         }
         for field_name, expected in derived.items():
-            if field_name in record and record[field_name] != expected:
+            if record[field_name] != expected:
                 raise ReviewEpochError(
                     f"{field_name} does not match capacity lease state"
                 )
