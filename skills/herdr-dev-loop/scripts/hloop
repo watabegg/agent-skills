@@ -95,6 +95,9 @@ from hloop_lib.migration import (
     schema_version_of,
 )
 from hloop_lib import migration as hloop_migration
+from hloop_lib import planning as hloop_planning
+from hloop_lib import task_contract as hloop_task_contract
+from hloop_lib import worker_candidate as hloop_worker_candidate
 
 
 LOOP_HOME = Path(".ai") / "herdr-dev-loop"
@@ -143,6 +146,31 @@ DEFAULT_ADVISOR_MODE = "single"
 DEFAULT_ADVISOR_MAX_ROUNDS = 2
 DEFAULT_SPECIFICATION_SCOUT = "auto"
 SPECIFICATION_SCOUT_MODES = {"auto", "always", "off"}
+PLANNING_ARTIFACT_FILENAMES = {
+    hloop_planning.IMPACT_RECORD_TYPE: "IMPACT.json",
+    hloop_planning.TASK_GRAPH_RECORD_TYPE: "TASK-GRAPH.json",
+    hloop_planning.COVERAGE_RECORD_TYPE: "COVERAGE.json",
+    hloop_planning.PLAN_GAP_RECORD_TYPE: "PLAN-GAP.json",
+}
+PATCH_REVIEW_TASK_STATUSES = {
+    "candidate_sealed",
+    "patch_review_pending",
+    "patch_review_running",
+    "patch_review_passed",
+    "patch_fix_running",
+    "blocked_patch_review",
+}
+ACTIVE_WORKER_CANDIDATE_STATUSES = frozenset(
+    {
+        "implementation_complete",
+        "candidate_sealed",
+        "patch_review_pending",
+        "patch_review_running",
+        "patch_review_passed",
+        "patch_fix_running",
+        "blocked_patch_review",
+    }
+)
 REPOSITORY_LOCK_RUNTIME_BASE = Path("/tmp")
 DEFAULT_REVIEW_LANES = [
     "integration-contract",
@@ -220,7 +248,13 @@ FOLLOW_UP_INPUT_JSON_FIELDS = (
     "verification_evidence",
     "implementation_constraints",
 )
-INTEGER_FRONTMATTER_FIELDS = frozenset({"issue_key_version"})
+INTEGER_FRONTMATTER_FIELDS = frozenset(
+    {
+        "issue_key_version",
+        "contract_schema_revision",
+        "exploration_budget_minutes",
+    }
+)
 ISSUE_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 DANGEROUS_AGENT_MARKERS = (
     "danger-full-access",
@@ -1676,7 +1710,24 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     if command == "task":
         return getattr(args, "task_command", "") in {"new", "update"}
     if command == "worker":
-        return getattr(args, "worker_command", "") in {"start", "harvest", "message", "finalize", "seal"}
+        return getattr(args, "worker_command", "") in {
+            "start",
+            "submit",
+            "candidate-seal",
+            "finalize",
+            "harvest",
+            "seal",
+            "accept-legacy-result",
+            "message",
+        }
+    if command == "planning":
+        return getattr(args, "planning_command", "") == "check"
+    if command == "patch-review":
+        return getattr(args, "patch_review_command", "") in {
+            "start",
+            "record",
+            "harvest",
+        }
     if command == "reviewer":
         return getattr(args, "reviewer_command", "") in {"start", "harvest", "close", "message"}
     if command == "gap":
@@ -2657,6 +2708,19 @@ def replace_frontmatter(path: Path, updates: dict[str, Any]) -> None:
     write_text(path, frontmatter(meta) + "\n" + rest)
 
 
+def replace_frontmatter_record(path: Path, meta: Mapping[str, Any]) -> None:
+    text = read_text(path)
+    if not text.startswith("---\n"):
+        raise HLoopError(f"missing frontmatter: {path}")
+    end = text.find("\n---", 4)
+    if end == -1:
+        raise HLoopError(f"unterminated frontmatter: {path}")
+    rest = text[end + 4 :]
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    write_text(path, frontmatter(dict(meta)) + "\n" + rest)
+
+
 def yaml_scalar(value: Any, *, key: str | None = None) -> str:
     if key in STRUCTURED_JSON_FIELDS:
         if not isinstance(value, (dict, list)):
@@ -3433,6 +3497,312 @@ def validate_task_update_provenance(
     authorize_task_record(repo, state, task_provenance_record(next_meta) or {})
 
 
+def _sha256_labelled(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _labelled_contract_digest(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", text):
+        return f"sha256:{text}"
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", text):
+        return text
+    raise HLoopError("task contract digest must be an exact SHA-256 digest")
+
+
+def v053_state_contracts_enabled(state: dict[str, Any]) -> bool:
+    revision = state.get("schema_revision")
+    return isinstance(revision, int) and not isinstance(revision, bool) and revision >= 3
+
+
+def task_contract_revision(meta: Mapping[str, Any]) -> int | None:
+    value = meta.get("contract_schema_revision")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def validate_revision_three_task(meta: Mapping[str, Any], *, task_id: str) -> None:
+    record = dict(meta)
+    for field in ("release_scope_revision", "remediation_round"):
+        value = record.get(field)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            record[field] = int(value)
+    validation = hloop_task_contract.validate_task_contract(record)
+    if not validation.ok:
+        detail = "; ".join(issue.message for issue in validation.issues)
+        raise HLoopError(f"invalid revision 3 task contract for {task_id}: {detail}")
+
+
+def current_planning_identity(
+    repo: Path, state: dict[str, Any]
+) -> hloop_planning.PlanningIdentity:
+    scope = assert_release_scope_snapshot(repo, state)
+    if scope.status != "locked":
+        raise HLoopError(
+            "planning identity requires an authoritative locked release scope"
+        )
+    scope_record = scope.to_record()
+    release_scope_digest = str(scope_record.get("scope_digest") or "")
+    if not release_scope_digest:
+        raise HLoopError("locked release scope is missing scope_digest")
+    task_contracts: dict[str, str] = {}
+    for task_id in sorted((state.get("tasks") or {}).keys()):
+        path = task_file(repo, task_id)
+        if not path.is_file():
+            raise HLoopError(f"planning identity task artifact is missing: {path}")
+        task_contracts[task_id] = _sha256_labelled(path.read_bytes())
+    source_digest = hloop_planning.canonical_digest(
+        {
+            "source_digests": scope_record.get("source_digests") or {},
+            "requirements": state.get("requirements") or {},
+            "task_contracts": task_contracts,
+        }
+    )
+    source_revision = int(scope_record.get("source_snapshot_revision") or 0)
+    scope_revision = int(scope_record.get("scope_revision") or 0)
+    if source_revision < 1 or scope_revision < 1:
+        raise HLoopError("locked release scope has an invalid planning revision")
+    requirements_revision = state.get("requirements_revision")
+    if (
+        isinstance(requirements_revision, bool)
+        or not isinstance(requirements_revision, int)
+        or requirements_revision < 1
+    ):
+        requirements_revision = max(1, len(state.get("requirements") or {}))
+    return hloop_planning.PlanningIdentity(
+        run_id=str(state.get("run_id") or ""),
+        plan_revision=source_revision,
+        requirements_revision=requirements_revision,
+        release_scope_revision=scope_revision,
+        release_scope_digest=release_scope_digest,
+        source_revision=source_revision,
+        source_digest=source_digest,
+    )
+
+
+def load_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise HLoopError(f"{label} is missing: {path}")
+    try:
+        value = json.loads(read_text(path))
+    except json.JSONDecodeError as exc:
+        raise HLoopError(f"{label} is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HLoopError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def load_planning_bundle(repo: Path) -> tuple[dict[str, Any], ...]:
+    records = []
+    for record_type in (
+        hloop_planning.IMPACT_RECORD_TYPE,
+        hloop_planning.TASK_GRAPH_RECORD_TYPE,
+        hloop_planning.COVERAGE_RECORD_TYPE,
+        hloop_planning.PLAN_GAP_RECORD_TYPE,
+    ):
+        records.append(
+            load_json_object(
+                planning_artifact_file(repo, record_type),
+                label=record_type,
+            )
+        )
+    return tuple(records)
+
+
+def planning_projection_issues(
+    state: dict[str, Any], task_graph: Mapping[str, Any]
+) -> list[hloop_planning.PlanningIssue]:
+    graph_tasks = {
+        str(item.get("task_id") or ""): item
+        for item in task_graph.get("tasks", [])
+        if isinstance(item, Mapping) and str(item.get("task_id") or "")
+    }
+    state_task_ids = set((state.get("tasks") or {}).keys())
+    graph_task_ids = set(graph_tasks)
+    issues: list[hloop_planning.PlanningIssue] = []
+    missing = tuple(sorted(state_task_ids - graph_task_ids))
+    unknown = tuple(sorted(graph_task_ids - state_task_ids))
+    if missing:
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "task-projection-missing",
+                "Task Risk Graph omits current tasks: " + ", ".join(missing),
+                "tasks",
+                missing,
+            )
+        )
+    if unknown:
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "task-projection-unknown",
+                "Task Risk Graph references unknown tasks: " + ", ".join(unknown),
+                "tasks",
+                unknown,
+            )
+        )
+    for task_id in sorted(state_task_ids & graph_task_ids):
+        projected = (state.get("tasks") or {}).get(task_id) or {}
+        graph_task = graph_tasks[task_id]
+        for field in ("depends_on", "write_allow", "scope_refs"):
+            if set(normalize_list(projected.get(field))) != set(
+                normalize_list(graph_task.get(field))
+            ):
+                issues.append(
+                    hloop_planning.PlanningIssue(
+                        "task-projection-mismatch",
+                        f"Task Risk Graph {field} does not match {task_id}",
+                        field,
+                        (task_id,),
+                    )
+                )
+    return issues
+
+
+def planning_dispatch_validation(
+    repo: Path, state: dict[str, Any], *, honor_recorded_status: bool = True
+) -> hloop_planning.PlanningValidation:
+    issues: list[hloop_planning.PlanningIssue] = []
+    projection = state.get("planning")
+    if honor_recorded_status and (
+        not isinstance(projection, dict) or projection.get("status") != "ready"
+    ):
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "planning-not-recorded",
+                "planning evidence has not been checked for the current state",
+                "planning.status",
+            )
+        )
+    try:
+        current = current_planning_identity(repo, state)
+        impact, task_graph, coverage, plan_gap = load_planning_bundle(repo)
+        scope = assert_release_scope_snapshot(repo, state)
+        allowed_scope_refs = tuple(scope.release_scope_refs)
+        if honor_recorded_status and isinstance(projection, dict):
+            expected_digests = {
+                "impact": impact.get("artifact_digest"),
+                "task_graph": task_graph.get("artifact_digest"),
+                "coverage": coverage.get("artifact_digest"),
+                "plan_gap": plan_gap.get("artifact_digest"),
+            }
+            if projection.get("identity") != current.to_dict():
+                issues.append(
+                    hloop_planning.PlanningIssue(
+                        "planning-record-stale",
+                        "recorded planning identity does not match the current identity",
+                        "planning.identity",
+                    )
+                )
+            if projection.get("artifact_digests") != expected_digests:
+                issues.append(
+                    hloop_planning.PlanningIssue(
+                        "planning-record-stale",
+                        "recorded planning artifact digests do not match current bytes",
+                        "planning.artifact_digests",
+                    )
+                )
+            if set(normalize_list(projection.get("allowed_scope_refs"))) != set(
+                allowed_scope_refs
+            ):
+                issues.append(
+                    hloop_planning.PlanningIssue(
+                        "planning-record-stale",
+                        "recorded authoritative scope refs do not match the locked scope",
+                        "planning.allowed_scope_refs",
+                    )
+                )
+        if not allowed_scope_refs:
+            issues.append(
+                hloop_planning.PlanningIssue(
+                    "authoritative-scope-required",
+                    "locked release scope has no authoritative release_scope_refs",
+                    "release_scope.release_scope_refs",
+                )
+            )
+        validation = hloop_planning.validate_dispatch_readiness(
+            impact,
+            task_graph,
+            coverage,
+            plan_gap,
+            current,
+            required_requirement_refs=scope.requirement_refs,
+            required_plan_item_refs=scope.plan_item_refs,
+            allowed_scope_refs=allowed_scope_refs,
+        )
+        issues.extend(validation.issues)
+        issues.extend(planning_projection_issues(state, task_graph))
+    except (HLoopError, hloop_planning.PlanningContractError) as exc:
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "planning-evidence-unavailable",
+                str(exc),
+                "planning",
+            )
+        )
+    return hloop_planning.PlanningValidation(tuple(issues))
+
+
+def assert_planning_dispatch_ready(repo: Path, state: dict[str, Any]) -> None:
+    validation = planning_dispatch_validation(repo, state)
+    if validation.ok:
+        return
+    detail = "; ".join(
+        f"{issue.code}: {issue.message}" for issue in validation.issues
+    )
+    raise HLoopError(f"planning dispatch gate blocked: {detail}")
+
+
+def invalidate_planning_evidence(state: dict[str, Any], *, reason: str) -> None:
+    planning = state.get("planning")
+    if not isinstance(planning, dict):
+        state["planning"] = {"status": "stale", "stale_reason": reason}
+        return
+    planning.update(
+        {
+            "status": "stale",
+            "stale_reason": reason,
+            "stale_at": now_iso(),
+        }
+    )
+
+
+def runtime_worker_task_preflight(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    task_id: str,
+    task_meta: Mapping[str, Any],
+) -> None:
+    revision = task_contract_revision(task_meta)
+    if revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        validate_revision_three_task(task_meta, task_id=task_id)
+        assert_planning_dispatch_ready(repo, state)
+        return
+    if not v053_state_contracts_enabled(state):
+        return
+    legacy_record = dict(task_meta)
+    task_state = (state.get("tasks") or {}).get(task_id) or {}
+    legacy_record["status"] = str(task_state.get("status") or task_meta.get("status") or "")
+    try:
+        migration = hloop_task_contract.migrate_legacy_task_contract(legacy_record)
+    except hloop_task_contract.ContractValidationError as exc:
+        raise HLoopError(f"invalid legacy task contract for {task_id}: {exc}") from exc
+    if migration.action == "reclassify-to-revision-3":
+        raise HLoopError(
+            f"legacy queued task {task_id} is blocked by "
+            f"{migration.migration_blocker}; use `hloop task update` to record "
+            "revision 3 risk, invariant, regression, gate, and effort fields"
+        )
+    if migration.requires_requeue_before_start:
+        raise HLoopError(f"legacy task {task_id} must be requeued before a new attempt")
+    if not migration.may_start_new_attempt:
+        raise HLoopError(
+            f"legacy task {task_id} cannot start a new attempt from status "
+            f"{migration.status}; migration action={migration.action}"
+        )
+
+
 def dispatch_start_preflight(
     repo: Path,
     state: dict[str, Any],
@@ -3455,6 +3825,12 @@ def dispatch_start_preflight(
     if role_kind == "worker":
         if task_meta is None:
             raise HLoopError(f"worker task metadata is unavailable: {role_id}")
+        runtime_worker_task_preflight(
+            repo,
+            state,
+            task_id=role_id,
+            task_meta=task_meta,
+        )
         record = task_provenance_record(task_meta)
         if record is None:
             if scope.status != "legacy-unlocked":
@@ -3479,9 +3855,110 @@ def assert_task_creation_dispatchable(state: dict[str, Any]) -> None:
         )
 
 
+def planning_status_payload(
+    repo: Path, state: dict[str, Any], *, honor_recorded_status: bool
+) -> dict[str, Any]:
+    validation = planning_dispatch_validation(
+        repo, state, honor_recorded_status=honor_recorded_status
+    )
+    identity: dict[str, Any] | None = None
+    allowed_scope_refs: list[str] = []
+    try:
+        identity = current_planning_identity(repo, state).to_dict()
+        allowed_scope_refs = list(
+            assert_release_scope_snapshot(repo, state).release_scope_refs
+        )
+    except HLoopError:
+        pass
+    return {
+        "ready": validation.ok,
+        "recorded_status": (
+            (state.get("planning") or {}).get("status")
+            if isinstance(state.get("planning"), dict)
+            else "missing"
+        ),
+        "identity": identity,
+        "allowed_scope_refs": allowed_scope_refs,
+        "issues": [
+            {
+                "code": issue.code,
+                "message": issue.message,
+                "field": issue.field,
+                "refs": list(issue.refs),
+            }
+            for issue in validation.issues
+        ],
+    }
+
+
+def cmd_planning_identity(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    payload = current_planning_identity(repo, state).to_dict()
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_planning_check(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    payload = planning_status_payload(repo, state, honor_recorded_status=False)
+    if not payload["ready"]:
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        detail = "; ".join(
+            f"{item['code']}: {item['message']}" for item in payload["issues"]
+        )
+        raise HLoopError(f"planning evidence is not dispatch-ready: {detail}")
+    impact, task_graph, coverage, plan_gap = load_planning_bundle(repo)
+    state["planning"] = {
+        "status": "ready",
+        "identity": payload["identity"],
+        "artifact_digests": {
+            "impact": impact["artifact_digest"],
+            "task_graph": task_graph["artifact_digest"],
+            "coverage": coverage["artifact_digest"],
+            "plan_gap": plan_gap["artifact_digest"],
+        },
+        "allowed_scope_refs": payload["allowed_scope_refs"],
+        "checked_at": now_iso(),
+    }
+    save_state(repo, state)
+    journal(repo, "Recorded clean, current planning evidence for Worker dispatch.")
+    payload["recorded_status"] = "ready"
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("planning evidence is dispatch-ready")
+    return 0
+
+
+def cmd_planning_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    payload = planning_status_payload(repo, state, honor_recorded_status=True)
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            "planning ready="
+            f"{str(payload['ready']).lower()} status={payload['recorded_status']}"
+        )
+        for issue in payload["issues"]:
+            print(f"- {issue['code']}: {issue['message']}")
+    return 0 if payload["ready"] else 1
+
+
 def role_ids_running(state: dict[str, Any]) -> list[str]:
     running: list[str] = []
-    for group_name in ("tasks", "reviews", "gaps", "advice", "decision_liaisons"):
+    for group_name in (
+        "tasks",
+        "reviews",
+        "patch_reviews",
+        "gaps",
+        "advice",
+        "decision_liaisons",
+    ):
         group = state.get(group_name)
         if not isinstance(group, dict):
             continue
@@ -4630,6 +5107,364 @@ def batch_file(repo: Path, batch_id: str) -> Path:
 
 def result_file(worktree: Path, task_id: str) -> Path:
     return loop_path(worktree) / "results" / task_id / "result.md"
+
+
+def planning_dir(repo: Path) -> Path:
+    return loop_path(repo) / "planning"
+
+
+def planning_artifact_file(repo: Path, record_type: str) -> Path:
+    filename = PLANNING_ARTIFACT_FILENAMES.get(record_type)
+    if filename is None:
+        raise HLoopError(f"unsupported planning artifact type: {record_type}")
+    return planning_dir(repo) / filename
+
+
+def implementation_candidate_rel(
+    task_id: str, attempt_id: str, candidate_revision: int
+) -> Path:
+    return (
+        LOOP_DIR
+        / "implementation-candidates"
+        / task_id
+        / attempt_id
+        / f"{candidate_revision}.json"
+    )
+
+
+def implementation_candidate_file(
+    repo: Path, task_id: str, attempt_id: str, candidate_revision: int
+) -> Path:
+    return repo / implementation_candidate_rel(task_id, attempt_id, candidate_revision)
+
+
+def patch_review_rel(task_id: str, attempt_id: str, review_attempt_id: str) -> Path:
+    return LOOP_DIR / "patch-reviews" / task_id / attempt_id / f"{review_attempt_id}.json"
+
+
+def patch_review_file(
+    repo: Path, task_id: str, attempt_id: str, review_attempt_id: str
+) -> Path:
+    return repo / patch_review_rel(task_id, attempt_id, review_attempt_id)
+
+
+def candidate_artifact_ref(
+    task_id: str, attempt_id: str, candidate_revision: int
+) -> str:
+    return (
+        Path("implementation-candidates")
+        / task_id
+        / attempt_id
+        / f"{candidate_revision}.json"
+    ).as_posix()
+
+
+def exact_json_bytes(record: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def load_candidate_artifact(
+    repo: Path,
+    task_id: str,
+    attempt_id: str,
+    candidate_revision: int,
+) -> tuple[hloop_worker_candidate.ImplementationCandidate, bytes]:
+    path = implementation_candidate_file(
+        repo, task_id, attempt_id, candidate_revision
+    )
+    if not path.is_file():
+        raise HLoopError(f"implementation candidate is missing: {path}")
+    payload = path.read_bytes()
+    try:
+        value = json.loads(payload)
+        candidate = hloop_worker_candidate.ImplementationCandidate.from_record(value)
+    except (
+        json.JSONDecodeError,
+        hloop_worker_candidate.WorkerCandidateError,
+    ) as exc:
+        raise HLoopError(f"invalid implementation candidate {path}: {exc}") from exc
+    return candidate, payload
+
+
+def active_attempt_id(task_id: str, task_state: Mapping[str, Any]) -> str:
+    attempt_id = str(
+        task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""
+    )
+    if not attempt_id:
+        raise HLoopError(f"active attempt is missing for {task_id}")
+    return attempt_id
+
+
+def approved_semantic_ack_event_id(
+    task_id: str, task_state: Mapping[str, Any]
+) -> str:
+    block_reason = semantic_ack_barrier_blocking(dict(task_state))
+    if block_reason:
+        raise HLoopError(f"candidate gate blocked for {task_id}: {block_reason}")
+    barrier = task_state.get("semantic_ack_barrier")
+    event_id = (
+        str(barrier.get("ack_event_id") or "")
+        if isinstance(barrier, Mapping)
+        else ""
+    )
+    if not event_id:
+        raise HLoopError(
+            f"candidate gate blocked for {task_id}: approved semantic ACK event is missing"
+        )
+    return event_id
+
+
+def exact_task_contract_digest(
+    repo: Path,
+    task_id: str,
+    task_state: Mapping[str, Any],
+) -> tuple[str, str]:
+    path = task_file(repo, task_id)
+    if not path.is_file():
+        raise HLoopError(f"task contract is missing: {path}")
+    raw_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    recorded = str(task_state.get("task_contract_digest") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", recorded):
+        raise HLoopError(
+            f"task contract digest projection is missing or invalid for {task_id}"
+        )
+    if recorded != raw_digest:
+        raise HLoopError(
+            f"task contract digest drift for {task_id}: "
+            f"state={recorded} artifact={raw_digest}"
+        )
+    return raw_digest, _labelled_contract_digest(raw_digest)
+
+
+def candidate_revision_numbers(
+    repo: Path, task_id: str, attempt_id: str
+) -> list[int]:
+    directory = implementation_candidate_file(repo, task_id, attempt_id, 1).parent
+    if not directory.is_dir():
+        return []
+    revisions: list[int] = []
+    for path in directory.iterdir():
+        match = re.fullmatch(r"([1-9][0-9]*)\.json", path.name)
+        if match:
+            revisions.append(int(match.group(1)))
+    return sorted(set(revisions))
+
+
+def changed_files_between_git_objects(
+    repo: Path, base_object: str, target_object: str
+) -> list[str]:
+    out = git_bytes(
+        repo,
+        [
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            f"{base_object}^{{tree}}",
+            f"{target_object}^{{tree}}",
+        ],
+        check=True,
+    )
+    return parse_changed_files_name_status_z(out)
+
+
+def proposed_worktree_tree(repo: Path, dirty_paths: Sequence[str]) -> str:
+    if not dirty_paths:
+        return git(repo, ["rev-parse", "HEAD^{tree}"])
+    descriptor, index_name = tempfile.mkstemp(prefix="hloop-candidate-index-")
+    os.close(descriptor)
+    index_path = Path(index_name)
+    try:
+        index_path.unlink()
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(index_path)
+        git(repo, ["read-tree", "HEAD"], env=env)
+        git(repo, ["add", "-A", "--", *dirty_paths], env=env)
+        return git(repo, ["write-tree"], env=env)
+    finally:
+        try:
+            index_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def candidate_changed_files(
+    repo: Path, base_sha: str, candidate_tree_sha: str
+) -> list[str]:
+    return changed_files_between_git_objects(repo, base_sha, candidate_tree_sha)
+
+
+def unstaged_product_paths(repo: Path) -> list[str]:
+    loop_root = LOOP_DIR.as_posix()
+    loop_prefix = loop_root + "/"
+    return [
+        path
+        for path in porcelain_paths_no_renames(repo)
+        if path != loop_root and not path.startswith(loop_prefix)
+    ]
+
+
+def exact_product_dirty_paths(repo: Path) -> list[str]:
+    loop_root = LOOP_DIR.as_posix()
+    loop_prefix = loop_root + "/"
+    return [
+        path
+        for path in porcelain_paths_all_no_renames(repo)
+        if path != loop_root and not path.startswith(loop_prefix)
+    ]
+
+
+def task_required_gates(meta: Mapping[str, Any]) -> frozenset[str]:
+    return frozenset(normalize_list(meta.get("required_gates")))
+
+
+def current_candidate_evidence(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+) -> tuple[
+    hloop_worker_candidate.ImplementationCandidate,
+    hloop_worker_candidate.CandidateSeal,
+    bytes,
+]:
+    candidate_record = task_state.get("implementation_candidate")
+    seal_record = task_state.get("candidate_seal")
+    if not isinstance(candidate_record, Mapping) or not isinstance(
+        seal_record, Mapping
+    ):
+        raise HLoopError(f"sealed implementation candidate is missing for {task_id}")
+    try:
+        candidate = hloop_worker_candidate.ImplementationCandidate.from_record(
+            candidate_record
+        )
+        seal = hloop_worker_candidate.CandidateSeal.from_record(seal_record)
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"stored candidate evidence is invalid for {task_id}: {exc}") from exc
+    attempt_id = active_attempt_id(task_id, task_state)
+    if candidate.attempt_id != attempt_id:
+        raise HLoopError(f"stored candidate attempt is stale for {task_id}")
+    path = implementation_candidate_file(
+        repo, task_id, attempt_id, candidate.candidate_revision
+    )
+    if not path.is_file():
+        raise HLoopError(f"sealed candidate artifact is missing: {path}")
+    payload = path.read_bytes()
+    try:
+        disk_candidate = hloop_worker_candidate.ImplementationCandidate.from_record(
+            json.loads(payload)
+        )
+    except (
+        json.JSONDecodeError,
+        hloop_worker_candidate.WorkerCandidateError,
+    ) as exc:
+        raise HLoopError(f"sealed candidate artifact is invalid: {path}: {exc}") from exc
+    if disk_candidate != candidate:
+        raise HLoopError(f"stored candidate projection differs from artifact: {path}")
+    artifact_digest = _sha256_labelled(payload)
+    try:
+        hloop_worker_candidate.validate_candidate_seal(
+            candidate,
+            seal,
+            candidate_artifact_digest=artifact_digest,
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"candidate seal is invalid for {task_id}: {exc}") from exc
+    expected_projection = {
+        "candidate_revision": candidate.candidate_revision,
+        "candidate_artifact_digest": artifact_digest,
+        "candidate_sha": seal.candidate_sha,
+        "candidate_tree_sha": seal.candidate_tree_sha,
+        "completion_mode": candidate.completion_mode,
+    }
+    for field, expected in expected_projection.items():
+        if task_state.get(field) != expected:
+            raise HLoopError(
+                f"candidate state projection is stale for {task_id}: {field} changed"
+            )
+    raw_contract_digest, labelled_contract_digest = exact_task_contract_digest(
+        repo, task_id, task_state
+    )
+    if candidate.task_contract_digest != labelled_contract_digest:
+        raise HLoopError(f"candidate task contract is stale for {task_id}")
+    if str(task_state.get("task_contract_digest") or raw_contract_digest) != raw_contract_digest:
+        raise HLoopError(f"candidate task contract projection is stale for {task_id}")
+    approved_ack = approved_semantic_ack_event_id(task_id, task_state)
+    if candidate.semantic_ack_event_id != approved_ack:
+        raise HLoopError(f"candidate semantic ACK is stale for {task_id}")
+    observed_tree = git(repo, ["show", "-s", "--format=%T", seal.candidate_sha])
+    if observed_tree != seal.candidate_tree_sha:
+        raise HLoopError(f"candidate commit tree drift for {task_id}")
+    return candidate, seal, payload
+
+
+def patch_review_round_limit(state: Mapping[str, Any]) -> int:
+    configured: Any = None
+    resolved = state.get("resolved_config")
+    if isinstance(resolved, Mapping):
+        audit = resolved.get("audit")
+        if isinstance(audit, Mapping):
+            configured = audit.get("max_patch_review_rounds_per_task")
+    if configured is None:
+        configured = state.get("max_patch_review_rounds_per_task")
+    if configured is None:
+        configured = hloop_worker_candidate.DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        raise HLoopError("max_patch_review_rounds_per_task must be an integer")
+    if not 0 <= configured <= hloop_worker_candidate.MAX_PATCH_REVIEW_ROUNDS_PER_TASK:
+        raise HLoopError(
+            "max_patch_review_rounds_per_task is outside the supported range"
+        )
+    return configured
+
+
+def task_patch_review_history(
+    task_state: Mapping[str, Any],
+) -> list[hloop_worker_candidate.PatchReview]:
+    history = task_state.get("patch_review_history") or []
+    if not isinstance(history, list):
+        raise HLoopError("patch_review_history must be an array")
+    try:
+        return [
+            hloop_worker_candidate.PatchReview.from_record(item) for item in history
+        ]
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"stored Patch Review history is invalid: {exc}") from exc
+
+
+def fresh_passed_patch_review(
+    repo: Path,
+    task_id: str,
+    task_state: Mapping[str, Any],
+    seal: hloop_worker_candidate.CandidateSeal,
+    *,
+    current_task_contract_digest: str,
+) -> hloop_worker_candidate.PatchReview | None:
+    current = task_state.get("current_patch_review")
+    if not isinstance(current, Mapping):
+        return None
+    try:
+        review = hloop_worker_candidate.PatchReview.from_record(current)
+        review = hloop_worker_candidate.require_fresh_patch_review(
+            review,
+            seal,
+            current_task_contract_digest=current_task_contract_digest,
+        )
+        path = patch_review_file(
+            repo, task_id, seal.attempt_id, review.review_attempt_id
+        )
+        if not path.is_file():
+            raise HLoopError(f"passed Patch Review artifact is missing: {path}")
+        expected_payload = exact_json_bytes(review.to_record())
+        if path.read_bytes() != expected_payload:
+            raise HLoopError(
+                f"passed Patch Review artifact differs from its exact state record: {path}"
+            )
+        return review
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"Patch Review gate is not satisfied: {exc}") from exc
 
 
 def review_file(repo: Path, review_id: str) -> Path:
@@ -14008,6 +14843,82 @@ def cmd_decision_reclassify(args: argparse.Namespace) -> int:
     return 0
 
 
+def revision_three_task_fields(
+    state: dict[str, Any],
+    *,
+    preserved_invariants: Sequence[str] | None,
+    regression_checks: Sequence[str] | None,
+    risk_class: str | None,
+    required_gates: Sequence[str] | None,
+    worker_agent_effort: str | None,
+    investigation_goal: str | None = None,
+    implementation_ready_evidence: Sequence[str] | None = None,
+    exploration_budget_minutes: int | None = None,
+    history_search_allowed: bool | None = None,
+) -> dict[str, Any]:
+    if not v053_state_contracts_enabled(state):
+        return {}
+    invariants = [str(item).strip() for item in (preserved_invariants or []) if str(item).strip()]
+    regressions = [str(item).strip() for item in (regression_checks or []) if str(item).strip()]
+    if not invariants:
+        raise HLoopError("revision 3 task creation requires --preserved-invariant")
+    if not regressions:
+        raise HLoopError("revision 3 task creation requires --regression-check")
+    if risk_class not in hloop_task_contract.RISK_CLASSES:
+        raise HLoopError(
+            "revision 3 task creation requires --risk-class mechanical|normal|high"
+        )
+    gates = list(dict.fromkeys(str(item) for item in (required_gates or [])))
+    invalid_gates = sorted(set(gates) - set(hloop_task_contract.REQUIRED_GATES))
+    if invalid_gates:
+        raise HLoopError("unsupported required gate(s): " + ", ".join(invalid_gates))
+    effort = normalize_agent_effort(
+        worker_agent_effort or state.get("worker_agent_effort") or DEFAULT_AGENT_EFFORT
+    )
+    fields: dict[str, Any] = {
+        "contract_schema_revision": hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION,
+        "preserved_invariants": invariants,
+        "regression_checks": regressions,
+        "risk_class": str(risk_class),
+        "required_gates": gates,
+        "worker_agent_effort": effort,
+    }
+    if investigation_goal:
+        fields["investigation_goal"] = str(investigation_goal).strip()
+    if implementation_ready_evidence:
+        fields["implementation_ready_evidence"] = [
+            str(item).strip()
+            for item in implementation_ready_evidence
+            if str(item).strip()
+        ]
+    if exploration_budget_minutes is not None:
+        if exploration_budget_minutes < 1:
+            raise HLoopError("exploration_budget_minutes must be positive")
+        fields["exploration_budget_minutes"] = exploration_budget_minutes
+    if history_search_allowed is not None:
+        fields["history_search_allowed"] = history_search_allowed
+    return fields
+
+
+def revision_three_projection(fields: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: fields[key]
+        for key in (
+            "contract_schema_revision",
+            "preserved_invariants",
+            "regression_checks",
+            "risk_class",
+            "required_gates",
+            "worker_agent_effort",
+            "investigation_goal",
+            "implementation_ready_evidence",
+            "exploration_budget_minutes",
+            "history_search_allowed",
+        )
+        if key in fields
+    }
+
+
 def create_loop_task(
     repo: Path,
     state: dict[str, Any],
@@ -14025,6 +14936,15 @@ def create_loop_task(
     batch_id: str | None = None,
     worker_agent_provider: str | None = None,
     worker_agent_model: str | None = None,
+    worker_agent_effort: str | None = None,
+    preserved_invariants: Sequence[str] | None = None,
+    regression_checks: Sequence[str] | None = None,
+    risk_class: str | None = None,
+    required_gates: Sequence[str] | None = None,
+    investigation_goal: str | None = None,
+    implementation_ready_evidence: Sequence[str] | None = None,
+    exploration_budget_minutes: int | None = None,
+    history_search_allowed: bool | None = None,
     allow_no_write: bool = False,
     provenance: dict[str, Any] | None = None,
 ) -> str:
@@ -14045,6 +14965,18 @@ def create_loop_task(
         require_batch(state, resolved_batch_id)
     provenance_input = provenance or provenance_record_from_args(None, state)
     normalized_provenance = authorize_task_record(repo, state, provenance_input)
+    v053_fields = revision_three_task_fields(
+        state,
+        preserved_invariants=preserved_invariants,
+        regression_checks=regression_checks,
+        risk_class=risk_class,
+        required_gates=required_gates,
+        worker_agent_effort=worker_agent_effort,
+        investigation_goal=investigation_goal,
+        implementation_ready_evidence=implementation_ready_evidence,
+        exploration_budget_minutes=exploration_budget_minutes,
+        history_search_allowed=history_search_allowed,
+    )
     fields = {
         "id": task_id,
         "run_id": str(state.get("run_id") or ""),
@@ -14069,6 +15001,7 @@ def create_loop_task(
         "worker_agent_model": normalize_agent_model(
             worker_agent_model or state.get("worker_agent_model") or DEFAULT_AGENT_MODEL
         ),
+        **v053_fields,
         **normalized_provenance.to_record(),
     }
     if resolved_batch_id:
@@ -14101,7 +15034,11 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
 ## Done when
 {chr(10).join(f"- {item}" for item in fields["acceptance"])}
 """
-    write_text(task_file(repo, task_id), frontmatter(fields) + "\n" + body)
+    task_path = task_file(repo, task_id)
+    write_text(task_path, frontmatter(fields) + "\n" + body)
+    if v053_fields:
+        validate_revision_three_task(read_frontmatter(task_path), task_id=task_id)
+    task_contract_digest = hashlib.sha256(task_path.read_bytes()).hexdigest()
     state["tasks"][task_id] = {
         "status": "queued",
         "branch": task_branch,
@@ -14115,7 +15052,9 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         "worker_qa_profile": fields["worker_qa_profile"],
         "agent_provider": fields["worker_agent_provider"],
         "agent_model": fields["worker_agent_model"],
+        **revision_three_projection(fields),
         **normalized_provenance.to_record(),
+        "task_contract_digest": task_contract_digest,
         "created_at": now_iso(),
     }
     if resolved_batch_id:
@@ -14134,6 +15073,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         target_sha="",
     )
     disarm_final_gate_for_new_task(state, task_id)
+    invalidate_planning_evidence(state, reason=f"task contract created: {task_id}")
     return task_id
 
 
@@ -14177,6 +15117,20 @@ def cmd_task_new(args: argparse.Namespace) -> int:
         state,
         provenance_record_from_args(args, state),
     )
+    v053_fields = revision_three_task_fields(
+        state,
+        preserved_invariants=getattr(args, "preserved_invariant", None),
+        regression_checks=getattr(args, "regression_check", None),
+        risk_class=getattr(args, "risk_class", None),
+        required_gates=getattr(args, "required_gate", None),
+        worker_agent_effort=getattr(args, "worker_agent_effort", None),
+        investigation_goal=getattr(args, "investigation_goal", None),
+        implementation_ready_evidence=getattr(
+            args, "implementation_ready_evidence", None
+        ),
+        exploration_budget_minutes=getattr(args, "exploration_budget_minutes", None),
+        history_search_allowed=getattr(args, "history_search_allowed", None),
+    )
     fields = {
         "id": task_id,
         "run_id": str(state.get("run_id") or ""),
@@ -14207,6 +15161,7 @@ def cmd_task_new(args: argparse.Namespace) -> int:
             or state.get("worker_agent_model")
             or DEFAULT_AGENT_MODEL
         ),
+        **v053_fields,
         **normalized_provenance.to_record(),
     }
     if resolved_batch_id:
@@ -14235,7 +15190,11 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
 ## Done when
 {chr(10).join(f"- {item}" for item in fields["acceptance"])}
 """
-    write_text(task_file(repo, task_id), frontmatter(fields) + "\n" + body)
+    task_path = task_file(repo, task_id)
+    write_text(task_path, frontmatter(fields) + "\n" + body)
+    if v053_fields:
+        validate_revision_three_task(read_frontmatter(task_path), task_id=task_id)
+    task_contract_digest = hashlib.sha256(task_path.read_bytes()).hexdigest()
     state["tasks"][task_id] = {
         "status": "queued",
         "branch": branch,
@@ -14248,7 +15207,9 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         "worker_qa_profile": fields["worker_qa_profile"],
         "agent_provider": fields["worker_agent_provider"],
         "agent_model": fields["worker_agent_model"],
+        **revision_three_projection(fields),
         **normalized_provenance.to_record(),
+        "task_contract_digest": task_contract_digest,
         "created_at": now_iso(),
     }
     if resolved_batch_id:
@@ -14267,6 +15228,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         target_sha="",
     )
     disarm_final_gate_for_new_task(state, task_id)
+    invalidate_planning_evidence(state, reason=f"task contract created: {task_id}")
     state["phase"] = "dispatching"
     save_state(repo, state)
     journal(repo, f"Created task `{task_id}`: {args.title}")
@@ -14305,6 +15267,30 @@ def cmd_task_update(args: argparse.Namespace) -> int:
             None,
             args.set_acceptance if args.set_acceptance is not None else None,
         ),
+        (
+            "preserved_invariants",
+            None,
+            None,
+            getattr(args, "set_preserved_invariant", None),
+        ),
+        (
+            "regression_checks",
+            None,
+            None,
+            getattr(args, "set_regression_check", None),
+        ),
+        (
+            "required_gates",
+            None,
+            None,
+            getattr(args, "set_required_gate", None),
+        ),
+        (
+            "implementation_ready_evidence",
+            None,
+            None,
+            getattr(args, "set_implementation_ready_evidence", None),
+        ),
     ]
     for key, additions, removals, replacement in list_specs:
         if additions or removals or replacement is not None:
@@ -14316,6 +15302,12 @@ def cmd_task_update(args: argparse.Namespace) -> int:
         "worker_qa_profile": args.worker_qa_profile,
         "worker_agent_provider": args.worker_agent_provider,
         "worker_agent_model": args.worker_agent_model,
+        "worker_agent_effort": getattr(args, "worker_agent_effort", None),
+        "risk_class": getattr(args, "risk_class", None),
+        "investigation_goal": getattr(args, "investigation_goal", None),
+        "exploration_budget_minutes": getattr(args, "exploration_budget_minutes", None),
+        "history_search_allowed": getattr(args, "history_search_allowed", None),
+        "contract_schema_revision": getattr(args, "contract_schema_revision", None),
     }
     updates.update({key: value for key, value in scalar_updates.items() if value is not None})
     if not updates:
@@ -14325,7 +15317,15 @@ def cmd_task_update(args: argparse.Namespace) -> int:
     next_allow = normalize_list(updates.get("write_allow", meta.get("write_allow")))
     if kind in {"implementation", "fix"} and not next_allow:
         raise HLoopError(f"{kind} task must keep a non-empty write_allow")
-    replace_frontmatter(path, updates)
+    next_meta = dict(meta)
+    next_meta.update(updates)
+    if (
+        next_meta.get("contract_schema_revision")
+        == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+    ):
+        next_meta.pop("migration_blocker", None)
+        validate_revision_three_task(next_meta, task_id=task_id)
+    replace_frontmatter_record(path, next_meta)
     for key in (
         "write_allow",
         "write_deny",
@@ -14334,6 +15334,16 @@ def cmd_task_update(args: argparse.Namespace) -> int:
         "validation_minimum",
         "worker_protocol",
         "worker_qa_profile",
+        "contract_schema_revision",
+        "preserved_invariants",
+        "regression_checks",
+        "risk_class",
+        "required_gates",
+        "worker_agent_effort",
+        "investigation_goal",
+        "implementation_ready_evidence",
+        "exploration_budget_minutes",
+        "history_search_allowed",
     ):
         if key in updates:
             task_state[key] = updates[key]
@@ -14344,6 +15354,17 @@ def cmd_task_update(args: argparse.Namespace) -> int:
     task_contract_digest = hashlib.sha256(path.read_bytes()).hexdigest()
     task_state["task_contract_digest"] = task_contract_digest
     task_state["contract_updated_at"] = now_iso()
+    task_state.pop("candidate", None)
+    task_state.pop("implementation_candidate", None)
+    task_state.pop("candidate_seal", None)
+    task_state.pop("candidate_artifact_digest", None)
+    task_state.pop("candidate_sha", None)
+    task_state.pop("candidate_tree_sha", None)
+    task_state.pop("current_patch_review", None)
+    task_state.pop("patch_review_decision", None)
+    task_state.pop("active_patch_review_id", None)
+    if task_state.get("candidate_lifecycle_status") in PATCH_REVIEW_TASK_STATUSES:
+        task_state["candidate_lifecycle_status"] = "running"
     if task_state.get("status") == "running":
         attempt_id = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or "")
         if not attempt_id:
@@ -14382,6 +15403,7 @@ def cmd_task_update(args: argparse.Namespace) -> int:
         persist_write_scope_conflict_graph(state, batch_id=batch_id)
         if batch_id and batch_id in state_batches(state):
             write_batch_artifact(repo, state, batch_id)
+    invalidate_planning_evidence(state, reason=f"task contract updated: {task_id}")
     save_state(repo, state)
     if task_state.get("status") == "running":
         refresh_running_worker_contract_snapshot(
@@ -14400,7 +15422,1328 @@ def cmd_task_update(args: argparse.Namespace) -> int:
             "before finalize, harvest, or merge. Send the changed requirements with `hloop worker message`."
         )
     else:
-            print("checkpoint required before starting this task")
+        print("checkpoint required before starting this task")
+    return 0
+
+
+def commit_worker_candidate_product(
+    repo: Path,
+    task_id: str,
+    meta: Mapping[str, Any],
+    dirty_product: Sequence[str],
+) -> None:
+    if cached_diff_paths_no_renames(repo):
+        raise HLoopError(
+            "worker submit requires an unstaged canonical index before candidate commit"
+        )
+    violations = validate_change_scope(task_id, dict(meta), list(dirty_product))
+    if violations:
+        raise HLoopError("write-scope violations: " + "; ".join(violations))
+    if not dirty_product:
+        return
+    try:
+        git(repo, ["add", "-A", "--", *dirty_product])
+        staged = cached_diff_paths_no_renames(repo)
+        remaining = unstaged_product_paths(repo)
+        if set(staged) != set(dirty_product) or remaining:
+            raise HLoopError(
+                "candidate commit scope changed while staging: "
+                f"staged={sorted(staged)} remaining={sorted(remaining)}"
+            )
+        git(repo, ["commit", "-m", f"ai-loop({task_id}): implementation candidate"])
+    except BaseException:
+        if cached_diff_paths_no_renames(repo):
+            git(repo, ["read-tree", "HEAD"])
+        raise
+
+
+def cmd_worker_submit(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    local_state = load_state(repo)
+    task_id = args.task_id
+    contract_repo, state = canonical_worker_contract_source(repo, task_id, local_state)
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    if str(task_state.get("status") or "") != "running":
+        raise HLoopError(f"worker submit requires an active attempt: {task_id}")
+    lifecycle = str(task_state.get("candidate_lifecycle_status") or "")
+    if lifecycle and lifecycle not in {"running", "patch_fix_running"}:
+        raise HLoopError(
+            f"worker submit is not allowed from candidate lifecycle {lifecycle!r}"
+        )
+    expected_worktree = str(task_state.get("worktree") or "")
+    if expected_worktree and repo != Path(expected_worktree).resolve():
+        raise HLoopError(
+            f"worker submit must run in the active attempt worktree: {expected_worktree}"
+        )
+    meta = read_frontmatter(task_file(contract_repo, task_id))
+    if task_contract_revision(meta) != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        raise HLoopError("worker submit is available only for revision 3 task contracts")
+    validate_revision_three_task(meta, task_id=task_id)
+    attempt_id = active_attempt_id(task_id, task_state)
+    ack_event_id = approved_semantic_ack_event_id(task_id, task_state)
+    _, labelled_contract_digest = exact_task_contract_digest(
+        contract_repo, task_id, task_state
+    )
+    expected_branch = str(task_state.get("branch") or meta.get("branch") or "")
+    branch = current_branch(repo)
+    if expected_branch and branch != expected_branch:
+        raise HLoopError(f"Worker branch mismatch: expected {expected_branch}, got {branch}")
+    base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
+    if not base_sha or not is_ancestor(repo, base_sha, "HEAD"):
+        raise HLoopError(f"active attempt base is not an ancestor of HEAD: {base_sha}")
+    if cached_diff_paths_no_renames(repo):
+        raise HLoopError("worker submit refuses pre-staged changes")
+
+    mode = str(
+        args.completion_mode
+        or task_state.get("completion_mode")
+        or "commit"
+    )
+    if mode not in hloop_worker_candidate.COMPLETION_MODES:
+        raise HLoopError(f"unsupported completion mode: {mode}")
+    dirty_product = exact_product_dirty_paths(repo)
+    if mode == "commit":
+        commit_worker_candidate_product(repo, task_id, meta, dirty_product)
+        dirty_product = exact_product_dirty_paths(repo)
+        if dirty_product:
+            raise HLoopError(
+                "candidate commit left product changes dirty: "
+                + ", ".join(dirty_product)
+            )
+        candidate_tree_sha = git(repo, ["rev-parse", "HEAD^{tree}"])
+    else:
+        violations = validate_change_scope(task_id, meta, dirty_product)
+        if violations:
+            raise HLoopError("write-scope violations: " + "; ".join(violations))
+        candidate_tree_sha = proposed_worktree_tree(repo, dirty_product)
+
+    files = candidate_changed_files(repo, base_sha, candidate_tree_sha)
+    violations = validate_change_scope(task_id, meta, files)
+    if violations:
+        raise HLoopError("write-scope violations: " + "; ".join(violations))
+    existing_revisions = candidate_revision_numbers(repo, task_id, attempt_id)
+    expected_revision = (max(existing_revisions) if existing_revisions else 0) + 1
+    requested_revision = args.candidate_revision or expected_revision
+    if requested_revision != expected_revision:
+        raise HLoopError(
+            f"candidate revision must be the next revision {expected_revision}, "
+            f"got {requested_revision}"
+        )
+    commands = normalize_list(args.validation_command)
+    results = normalize_list(args.validation_result)
+    if len(commands) != len(results):
+        raise HLoopError("--validation-command and --validation-result counts must match")
+    try:
+        candidate = hloop_worker_candidate.ImplementationCandidate(
+            run_id=str(state.get("run_id") or meta.get("run_id") or ""),
+            skill_version=str(state.get("skill_version") or SKILL_VERSION),
+            task_id=task_id,
+            attempt_id=attempt_id,
+            task_contract_digest=labelled_contract_digest,
+            semantic_ack_event_id=ack_event_id,
+            base_sha=base_sha,
+            candidate_revision=requested_revision,
+            completion_mode=mode,
+            candidate_tree_sha=candidate_tree_sha,
+            candidate_artifact_ref=candidate_artifact_ref(
+                task_id, attempt_id, requested_revision
+            ),
+            changed_files=tuple(files),
+            validation_commands=tuple(commands),
+            validation_results=tuple(results),
+            validation_summary=str(args.validation_summary or ""),
+            invariant_evidence=tuple(normalize_list(args.invariant_evidence)),
+            regression_evidence=tuple(normalize_list(args.regression_evidence)),
+            self_review_summary=str(args.self_review_summary or ""),
+            residual_risks=tuple(normalize_list(args.residual_risk)),
+            unrun_checks=tuple(normalize_list(args.unrun_check)),
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"invalid implementation candidate: {exc}") from exc
+    artifact_path = implementation_candidate_file(
+        repo, task_id, attempt_id, requested_revision
+    )
+    payload = exact_json_bytes(candidate.to_record())
+    write_text(artifact_path, payload.decode("utf-8"), durable=True)
+    print(
+        f"submitted {task_id} candidate revision {requested_revision}: "
+        f"mode={mode} tree={candidate_tree_sha} merge_ready=false"
+    )
+    return 0
+
+
+def require_worker_pane_quiesced_preserved(
+    task_id: str, task_state: Mapping[str, Any]
+) -> None:
+    pane_id = str(task_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(
+            f"cannot candidate-seal {task_id}: active Worker pane_id is missing"
+        )
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        raise HLoopError(
+            f"cannot candidate-seal {task_id}: Herdr is required to confirm "
+            f"Worker pane {pane_id} is quiesced"
+        )
+    pane = pane_info(pane_id)
+    if pane is None:
+        raise HLoopError(
+            f"cannot candidate-seal {task_id}: Worker pane {pane_id} is missing; "
+            "candidate seal must preserve the pane"
+        )
+    provider = str(
+        task_state.get("agent_provider")
+        or task_state.get("provider")
+        or DEFAULT_AGENT_PROVIDER
+    )
+    blocker = agent_tui_blocker(provider, pane, pane_text(pane_id, lines=200))
+    if blocker:
+        raise HLoopError(
+            f"cannot candidate-seal {task_id}: Worker pane is not quiesced: {blocker}"
+        )
+
+
+def commit_handoff_candidate(
+    worktree: Path,
+    task_id: str,
+    dirty_product: Sequence[str],
+    expected_tree: str,
+) -> str:
+    if not dirty_product:
+        raise HLoopError(f"handoff candidate has no pending product changes: {task_id}")
+    if cached_diff_paths_no_renames(worktree):
+        raise HLoopError("handoff candidate refuses pre-staged changes")
+    expected_parent = git(worktree, ["rev-parse", "HEAD"])
+    try:
+        git(worktree, ["add", "-A", "--", *dirty_product])
+        staged = cached_diff_paths_no_renames(worktree)
+        remaining = unstaged_product_paths(worktree)
+        observed_tree = git(worktree, ["write-tree"])
+        if set(staged) != set(dirty_product) or remaining:
+            raise HLoopError(
+                "handoff candidate changed while staging: "
+                f"staged={sorted(staged)} remaining={sorted(remaining)}"
+            )
+        if observed_tree != expected_tree:
+            raise HLoopError(
+                f"handoff candidate tree mismatch: submitted={expected_tree} "
+                f"observed={observed_tree}"
+            )
+        git(
+            worktree,
+            ["commit", "-m", f"ai-loop({task_id}): seal implementation candidate"],
+        )
+    except BaseException:
+        if cached_diff_paths_no_renames(worktree):
+            git(worktree, ["read-tree", expected_parent])
+        raise
+    return git(worktree, ["rev-parse", "HEAD"])
+
+
+def cmd_worker_candidate_seal(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo, require_herdr=True, require_integration_branch=True
+    )
+    task_id = args.task_id
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    if str(task_state.get("status") or "") != "running":
+        raise HLoopError(f"cannot candidate-seal inactive task: {task_id}")
+    lifecycle = str(task_state.get("candidate_lifecycle_status") or "")
+    if lifecycle and lifecycle not in {"running", "patch_fix_running"}:
+        raise HLoopError(
+            f"candidate seal is not allowed from lifecycle {lifecycle!r}"
+        )
+    attempt_id = active_attempt_id(task_id, task_state)
+    revision = args.candidate_revision
+    if revision is None:
+        revisions = candidate_revision_numbers(
+            Path(task_state.get("worktree") or "").resolve(), task_id, attempt_id
+        )
+        if not revisions:
+            raise HLoopError(f"no implementation candidate found for {task_id}")
+        revision = max(revisions)
+    worktree = Path(
+        task_state.get("worktree") or default_worktree(repo, task_id, state)
+    ).resolve()
+    if not worktree.is_dir():
+        raise HLoopError(f"worker worktree not found: {worktree}")
+    require_worker_pane_quiesced_preserved(task_id, task_state)
+    meta = read_frontmatter(task_file(repo, task_id))
+    if task_contract_revision(meta) != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        raise HLoopError("candidate seal is available only for revision 3 tasks")
+    candidate, payload = load_candidate_artifact(
+        worktree, task_id, attempt_id, revision
+    )
+    expected_revision = int((task_state.get("candidate_revision") or 0)) + 1
+    if candidate.candidate_revision != expected_revision:
+        raise HLoopError(
+            f"candidate revision must advance from {expected_revision - 1} "
+            f"to {expected_revision}"
+        )
+    raw_contract_digest, labelled_contract_digest = exact_task_contract_digest(
+        repo, task_id, task_state
+    )
+    approved_ack = approved_semantic_ack_event_id(task_id, task_state)
+    if candidate.task_contract_digest != labelled_contract_digest:
+        raise HLoopError(f"candidate task contract is stale for {task_id}")
+    if candidate.semantic_ack_event_id != approved_ack:
+        raise HLoopError(f"candidate semantic ACK is stale for {task_id}")
+    if candidate.attempt_id != attempt_id:
+        raise HLoopError(f"candidate attempt is stale for {task_id}")
+    base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
+    if candidate.base_sha != base_sha:
+        raise HLoopError(f"candidate base SHA is stale for {task_id}")
+    dirty_product = exact_product_dirty_paths(worktree)
+    if candidate.completion_mode == "commit":
+        if dirty_product:
+            raise HLoopError(
+                "commit-mode candidate worktree has dirty product paths: "
+                + ", ".join(dirty_product)
+            )
+        candidate_sha = git(worktree, ["rev-parse", "HEAD"])
+        observed_tree = git(worktree, ["rev-parse", "HEAD^{tree}"])
+    else:
+        proposed_tree = proposed_worktree_tree(worktree, dirty_product)
+        if proposed_tree != candidate.candidate_tree_sha:
+            raise HLoopError(
+                f"handoff candidate changed after submit: submitted="
+                f"{candidate.candidate_tree_sha} observed={proposed_tree}"
+            )
+        if dirty_product:
+            candidate_sha = commit_handoff_candidate(
+                worktree,
+                task_id,
+                dirty_product,
+                candidate.candidate_tree_sha,
+            )
+        else:
+            # The product commit may already have landed before a Manager
+            # crash, while the state projection below did not. The immutable
+            # submitted tree makes this safe to reconcile idempotently.
+            candidate_sha = git(worktree, ["rev-parse", "HEAD"])
+        observed_tree = git(worktree, ["rev-parse", "HEAD^{tree}"])
+    measured_files = candidate_changed_files(worktree, base_sha, observed_tree)
+    if measured_files != list(candidate.changed_files):
+        raise HLoopError(
+            f"candidate changed_files mismatch: submitted={list(candidate.changed_files)} "
+            f"observed={measured_files}"
+        )
+    violations = validate_change_scope(task_id, meta, measured_files)
+    if violations:
+        raise HLoopError("write-scope violations: " + "; ".join(violations))
+    artifact_digest = _sha256_labelled(payload)
+    try:
+        seal = hloop_worker_candidate.seal_candidate(
+            candidate,
+            candidate_sha=candidate_sha,
+            candidate_artifact_digest=artifact_digest,
+            observed_tree_sha=observed_tree,
+            active_attempt_id=attempt_id,
+            active_task_contract_digest=labelled_contract_digest,
+            approved_ack_event_id=approved_ack,
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"candidate seal rejected: {exc}") from exc
+    manager_path = implementation_candidate_file(
+        repo, task_id, attempt_id, candidate.candidate_revision
+    )
+    worker_path = implementation_candidate_file(
+        worktree, task_id, attempt_id, candidate.candidate_revision
+    )
+    if manager_path.exists() and manager_path.read_bytes() != payload:
+        raise HLoopError(
+            f"candidate revision already has different Manager artifact bytes: {manager_path}"
+        )
+    if manager_path.resolve() != worker_path.resolve():
+        write_text(manager_path, payload.decode("utf-8"), durable=True)
+    task_state.update(
+        {
+            "task_contract_digest": raw_contract_digest,
+            "candidate_revision": candidate.candidate_revision,
+            "implementation_candidate": candidate.to_record(),
+            "candidate_seal": seal.to_record(),
+            "candidate_artifact_digest": artifact_digest,
+            "candidate_sha": candidate_sha,
+            "candidate_tree_sha": observed_tree,
+            "completion_mode": candidate.completion_mode,
+            "merge_ready": False,
+            "candidate_lifecycle_status": (
+                "patch_review_pending"
+                if "patch_review" in task_required_gates(meta)
+                else "candidate_sealed"
+            ),
+            "candidate_sealed_at": now_iso(),
+        }
+    )
+    task_state.pop("current_patch_review", None)
+    task_state.pop("patch_review_decision", None)
+    task_state.pop("active_patch_review_id", None)
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Sealed nonterminal implementation candidate for `{task_id}` "
+        f"revision {candidate.candidate_revision} at `{candidate_sha}`.",
+    )
+    print(
+        f"candidate-sealed {task_id}: revision={candidate.candidate_revision} "
+        f"sha={candidate_sha} merge_ready=false"
+    )
+    return 0
+
+
+def apply_patch_review_record(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    review: hloop_worker_candidate.PatchReview,
+) -> hloop_worker_candidate.PatchReviewDecision:
+    candidate, seal, _ = current_candidate_evidence(
+        repo, state, task_id, task_state
+    )
+    if review.review_artifact_ref != (
+        Path("patch-reviews")
+        / task_id
+        / candidate.attempt_id
+        / f"{review.review_attempt_id}.json"
+    ).as_posix():
+        raise HLoopError("Patch Review artifact ref is not canonical")
+    history = task_patch_review_history(task_state)
+    existing = next(
+        (
+            item
+            for item in history
+            if item.review_attempt_id == review.review_attempt_id
+        ),
+        None,
+    )
+    if existing is not None:
+        if existing != review:
+            raise HLoopError(
+                "review_attempt_id was reused with different Patch Review content"
+            )
+    else:
+        history.append(review)
+    _, labelled_contract_digest = exact_task_contract_digest(repo, task_id, task_state)
+    try:
+        decision = hloop_worker_candidate.evaluate_patch_review_rounds(
+            seal,
+            history,
+            current_task_contract_digest=labelled_contract_digest,
+            max_rounds=patch_review_round_limit(state),
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"Patch Review transition rejected: {exc}") from exc
+    review_path = patch_review_file(
+        repo, task_id, seal.attempt_id, review.review_attempt_id
+    )
+    review_payload = exact_json_bytes(review.to_record())
+    if review_path.exists() and review_path.read_bytes() != review_payload:
+        raise HLoopError(
+            f"Patch Review artifact differs from its exact record: {review_path}"
+        )
+    write_text(review_path, review_payload.decode("utf-8"), durable=True)
+    task_state["patch_review_history"] = [item.to_record() for item in history]
+    task_state["current_patch_review"] = review.to_record()
+    task_state["patch_review_decision"] = decision.to_record()
+    task_state["candidate_lifecycle_status"] = {
+        "finalize_allowed": "patch_review_passed",
+        "patch_fix_running": "patch_fix_running",
+        "user_decision_required": "blocked_patch_review",
+        "candidate_resubmission_required": "patch_fix_running",
+        "patch_review_pending": "patch_review_pending",
+    }[decision.action]
+    task_state["merge_ready"] = False
+    if decision.requires_user_decision:
+        state["phase"] = "blocked_user_decision"
+        task_state["blocking_patch_review_findings"] = list(
+            decision.unresolved_finding_fingerprints
+        )
+        task_state["blocking_patch_review_candidate_sha"] = (
+            decision.last_candidate_sha
+        )
+        if existing is None:
+            append_text(
+                loop_path(repo) / "USER_ACTION_REQUIRED.md",
+                f"\n## Patch Review limit reached for {task_id}\n\n"
+                f"Candidate `{decision.last_candidate_sha}` retains unresolved findings:\n"
+                + "".join(
+                    f"- `{fingerprint}`\n"
+                    for fingerprint in decision.unresolved_finding_fingerprints
+                )
+                + "\nA user decision is required; no scope-expanding task was created automatically.\n",
+            )
+    elif decision.action == "patch_fix_running":
+        state["phase"] = "running"
+    return decision
+
+
+def patch_reviewer_agent_config(
+    state: Mapping[str, Any], args: argparse.Namespace
+) -> dict[str, str]:
+    defaults = hloop_config.V053_BUILT_IN_CONFIG_DEFAULTS["patch_reviewer"]
+    resolved = state.get("resolved_config")
+    configured = (
+        resolved.get("patch_reviewer")
+        if isinstance(resolved, Mapping)
+        and isinstance(resolved.get("patch_reviewer"), Mapping)
+        else {}
+    )
+    provider = normalize_agent_provider(
+        getattr(args, "agent_provider", None)
+        or configured.get("provider")
+        or defaults["provider"]
+    )
+    return {
+        "provider": provider,
+        "model": normalize_agent_model(
+            getattr(args, "agent_model", None)
+            or configured.get("model")
+            or defaults["model"]
+        ),
+        "effort": normalize_agent_effort(
+            getattr(args, "agent_effort", None)
+            or configured.get("effort")
+            or defaults["effort"]
+        ),
+        "claude_permission_mode": str(
+            state.get("reviewer_claude_permission_mode")
+            or DEFAULT_CLAUDE_PERMISSION_MODE
+        ),
+        "fallback_provider": "",
+    }
+
+
+def render_patch_reviewer_prompt(
+    state: Mapping[str, Any],
+    task_id: str,
+    task_meta: Mapping[str, Any],
+    seal: hloop_worker_candidate.CandidateSeal,
+    *,
+    review_attempt_id: str,
+    review_round: int,
+    agent_config: Mapping[str, str],
+    attempt_id: str,
+    task_contract_digest: str,
+    report_credential_file: str = "",
+) -> str:
+    artifact_ref = (
+        Path("patch-reviews")
+        / task_id
+        / seal.attempt_id
+        / f"{review_attempt_id}.json"
+    )
+    artifact_path = LOOP_DIR / artifact_ref
+    template = hloop_worker_candidate.record_patch_review(
+        seal,
+        review_attempt_id=review_attempt_id,
+        review_round=review_round,
+        reviewer_provider=agent_config["provider"],
+        reviewer_model=agent_config["model"],
+        reviewer_effort=agent_config["effort"],
+        verdict="passed",
+    ).to_record()
+    return f"""# HLoop Patch Reviewer {review_attempt_id}
+
+Review only task `{task_id}` at exact candidate `{seal.candidate_sha}`.
+Read the task contract, the candidate diff, preserved invariants, regression
+checks, related callers, and related tests. Do not perform a repository-wide
+review and do not edit product files.
+
+- task contract: `{task_file(Path('.'), task_id).as_posix()}`
+- candidate artifact: `{(LOOP_DIR / seal.candidate_artifact_ref).as_posix()}`
+- output artifact: `{artifact_path.as_posix()}`
+- review round: {review_round}
+- provider/model/effort: {agent_config['provider']}/{agent_config['model']}/{agent_config['effort']}
+- preserved invariants: {json.dumps(normalize_list(task_meta.get('preserved_invariants')), ensure_ascii=False)}
+- regression checks: {json.dumps(normalize_list(task_meta.get('regression_checks')), ensure_ascii=False)}
+
+Write one strict Patch Review JSON record. Use verdict `passed` only when no
+task-local finding remains. Use `fix_required` with one or more labelled
+SHA-256 unresolved finding fingerprints otherwise. Put task-external findings
+only in `follow_up_finding_fingerprints`; `automatic_task_ids` must remain [].
+
+Immutable record fields:
+```json
+{json.dumps(template, ensure_ascii=False, indent=2, sort_keys=True)}
+```
+
+{report_contract_text(review_attempt_id, attempt_id, dict(state), report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+"""
+
+
+def cmd_patch_review_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_id = args.task_id
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    meta = read_frontmatter(task_file(repo, task_id))
+    if "patch_review" not in task_required_gates(meta):
+        raise HLoopError(f"task {task_id} does not require Patch Review")
+    if task_state.get("candidate_lifecycle_status") != "patch_review_pending":
+        raise HLoopError(
+            f"Patch Review is not startable for {task_id}: "
+            f"{task_state.get('candidate_lifecycle_status') or 'missing candidate'}"
+        )
+    _, seal, _ = current_candidate_evidence(repo, state, task_id, task_state)
+    initial_candidate_sha = seal.candidate_sha
+    initial_candidate_artifact_digest = seal.candidate_artifact_digest
+    history = task_patch_review_history(task_state)
+    round_number = len(history) + 1
+    if round_number > patch_review_round_limit(state):
+        raise HLoopError(f"Patch Review round limit reached for {task_id}")
+    review_attempt_id = args.review_attempt_id or f"PR-{task_id}-R{round_number:03d}"
+    existing_reviews = state.setdefault("patch_reviews", {})
+    if review_attempt_id in existing_reviews:
+        raise HLoopError(f"Patch Review already exists: {review_attempt_id}")
+    agent_config = patch_reviewer_agent_config(state, args)
+    attempt_id = f"{review_attempt_id}-A001"
+    contract_material = {
+        "task_contract_digest": seal.task_contract_digest,
+        "candidate_sha": seal.candidate_sha,
+        "candidate_artifact_digest": seal.candidate_artifact_digest,
+        "review_attempt_id": review_attempt_id,
+        "review_round": round_number,
+    }
+    review_contract_digest = hashlib.sha256(
+        hloop_worker_candidate.canonical_json(contract_material).encode("utf-8")
+    ).hexdigest()
+    worktree = (
+        Path(args.worktree).resolve()
+        if args.worktree
+        else configured_worktree_path(
+            repo,
+            state,
+            review_attempt_id,
+            f"{repo.name}.{task_id.lower()}-patch-review-{round_number}",
+        )
+    )
+    prompt_rel = LOOP_DIR / "prompts" / f"{review_attempt_id}.patch-reviewer.md"
+    review_rel = patch_review_rel(task_id, seal.attempt_id, review_attempt_id)
+    prompt = render_patch_reviewer_prompt(
+        state,
+        task_id,
+        meta,
+        seal,
+        review_attempt_id=review_attempt_id,
+        review_round=round_number,
+        agent_config=agent_config,
+        attempt_id=attempt_id,
+        task_contract_digest=review_contract_digest,
+    )
+    runner = args.runner or "tui"
+    agent_command, preview_invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        role_id=review_attempt_id,
+        attempt_id=attempt_id,
+        output_rel=review_rel if runner == "exec" else None,
+    )
+    command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
+    if args.dry_run:
+        print(
+            f"DRY RUN worktree: git worktree add --detach {worktree} {seal.candidate_sha}"
+        )
+        print(f"DRY RUN prompt: {worktree / prompt_rel}")
+        print(f"DRY RUN {args.launcher}/{runner} command: {command}")
+        return 0
+    state = preflight_loop(
+        repo,
+        require_herdr=True,
+        require_agent_invocation=preview_invocation,
+        require_integration_branch=True,
+    )
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"Patch Review task disappeared before start: {task_id}")
+    if task_state.get("candidate_lifecycle_status") != "patch_review_pending":
+        raise HLoopError(
+            f"Patch Review became non-startable for {task_id}: "
+            f"{task_state.get('candidate_lifecycle_status') or 'missing candidate'}"
+        )
+    _, seal, _ = current_candidate_evidence(repo, state, task_id, task_state)
+    if (
+        seal.candidate_sha != initial_candidate_sha
+        or seal.candidate_artifact_digest != initial_candidate_artifact_digest
+    ):
+        raise HLoopError(f"Patch Review target candidate changed before start: {task_id}")
+    current_round = len(task_patch_review_history(task_state)) + 1
+    if current_round != round_number:
+        raise HLoopError(f"Patch Review round changed before start: {task_id}")
+    if review_attempt_id in (state.get("patch_reviews") or {}):
+        raise HLoopError(f"Patch Review already exists: {review_attempt_id}")
+    state.setdefault("patch_reviews", {})
+    worktree_preexisting = worktree.exists()
+    if not worktree_preexisting:
+        git(repo, ["worktree", "add", "--detach", str(worktree), seal.candidate_sha])
+    try:
+        prepare_role_worktree(
+            repo, worktree, state, role="reviewer", agent_id=review_attempt_id
+        )
+        ensure_task_visible_in_worktree(worktree, task_id)
+        ensure_worktree_parent_dirs(worktree, prompt_rel, review_rel)
+        credential, ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id=review_attempt_id,
+            attempt_id=attempt_id,
+            task_contract_digest=review_contract_digest,
+        )
+        prompt = render_patch_reviewer_prompt(
+            state,
+            task_id,
+            meta,
+            seal,
+            review_attempt_id=review_attempt_id,
+            review_round=round_number,
+            agent_config=agent_config,
+            attempt_id=attempt_id,
+            task_contract_digest=review_contract_digest,
+            report_credential_file=str(credential),
+        )
+        write_text(worktree / prompt_rel, prompt)
+        baseline_dirty = role_scope_paths(worktree)
+        if args.launcher == "agent":
+            pane_id = start_agent_launcher(
+                name=f"hloop-{state['goal_id']}-{review_attempt_id}-patch-reviewer",
+                direction=args.direction,
+                cwd=worktree,
+                command=command,
+            )
+        else:
+            pane_id = start_pane_launcher(
+                manager_pane=args.manager_pane or current_pane_id(),
+                direction=args.direction,
+                cwd=worktree,
+                command=command,
+            )
+    except BaseException:
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, review_attempt_id)
+        raise
+    review_state = {
+        "status": "running",
+        "gate_status": "running",
+        "task_id": task_id,
+        "task_attempt_id": seal.attempt_id,
+        "review_attempt_id": review_attempt_id,
+        "review_round": round_number,
+        "candidate_sha": seal.candidate_sha,
+        "candidate_artifact_digest": seal.candidate_artifact_digest,
+        "task_contract_digest": review_contract_digest,
+        "sealed_task_contract_digest": seal.task_contract_digest,
+        "attempt_id": attempt_id,
+        "pane_id": pane_id,
+        "worktree": str(worktree),
+        "prompt": str(worktree / prompt_rel),
+        "review_path": str(worktree / review_rel),
+        "baseline_dirty_files": baseline_dirty,
+        "agent_provider": agent_config["provider"],
+        "agent_model": agent_config["model"],
+        "agent_effort": agent_config["effort"],
+        "runner": runner,
+        "provider_invocation": preview_invocation.as_record(),
+        "started_at": now_iso(),
+    }
+    arm_initial_semantic_ack_barrier(
+        review_state,
+        attempt_id=attempt_id,
+        contract_digest=review_contract_digest,
+        required_reack_after_sequence=ack_floor,
+    )
+    state["patch_reviews"][review_attempt_id] = review_state
+    task_state["active_patch_review_id"] = review_attempt_id
+    task_state["candidate_lifecycle_status"] = "patch_review_running"
+    state["phase"] = "running"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Started Patch Reviewer `{review_attempt_id}` for `{task_id}` "
+        f"at candidate `{seal.candidate_sha}`.",
+    )
+    print(f"started Patch Review {review_attempt_id} in pane {pane_id}")
+    return 0
+
+
+def cmd_patch_review_record(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    task_id = args.task_id
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    _, seal, _ = current_candidate_evidence(repo, state, task_id, task_state)
+    history = task_patch_review_history(task_state)
+    requested_attempt = args.review_attempt_id
+    existing = next(
+        (
+            item
+            for item in history
+            if requested_attempt
+            and item.review_attempt_id == requested_attempt
+        ),
+        None,
+    )
+    if (
+        task_state.get("candidate_lifecycle_status")
+        not in {"patch_review_pending", "patch_review_running"}
+        and existing is None
+    ):
+        raise HLoopError(f"task {task_id} has no pending Patch Review")
+    review_round = existing.review_round if existing is not None else len(history) + 1
+    review_attempt_id = requested_attempt or f"PR-{task_id}-R{review_round:03d}"
+    try:
+        review = hloop_worker_candidate.record_patch_review(
+            seal,
+            review_attempt_id=review_attempt_id,
+            review_round=review_round,
+            reviewer_provider=args.reviewer_provider,
+            reviewer_model=args.reviewer_model,
+            reviewer_effort=args.reviewer_effort,
+            verdict=args.verdict,
+            unresolved_finding_fingerprints=normalize_list(
+                args.unresolved_finding_fingerprint
+            ),
+            follow_up_finding_fingerprints=normalize_list(
+                args.follow_up_finding_fingerprint
+            ),
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"invalid Patch Review: {exc}") from exc
+    path = patch_review_file(
+        repo, task_id, seal.attempt_id, review.review_attempt_id
+    )
+    payload = exact_json_bytes(review.to_record())
+    if path.exists() and path.read_bytes() != payload:
+        raise HLoopError(
+            f"Patch Review attempt already has different artifact bytes: {path}"
+        )
+    write_text(path, payload.decode("utf-8"), durable=True)
+    decision = apply_patch_review_record(
+        repo, state, task_id, task_state, review
+    )
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Recorded Patch Review `{review.review_attempt_id}` for `{task_id}`: "
+        f"{review.verdict}; next={decision.action}.",
+    )
+    print(
+        f"recorded Patch Review {review.review_attempt_id}: "
+        f"verdict={review.verdict} next={decision.action}"
+    )
+    return 2 if decision.requires_user_decision else 0
+
+
+def cmd_patch_review_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo, require_herdr=True, require_integration_branch=True
+    )
+    review_attempt_id = args.review_attempt_id
+    review_state = (state.get("patch_reviews") or {}).get(review_attempt_id)
+    if not isinstance(review_state, dict):
+        raise HLoopError(f"unknown Patch Review: {review_attempt_id}")
+    block_reason = semantic_ack_barrier_blocking(review_state)
+    if block_reason:
+        raise HLoopError(f"cannot harvest {review_attempt_id}: {block_reason}")
+    task_id = str(review_state.get("task_id") or "")
+    task_state = state["tasks"].get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"Patch Review task is missing: {task_id}")
+    _, seal, _ = current_candidate_evidence(repo, state, task_id, task_state)
+    if str(review_state.get("candidate_sha") or "") != seal.candidate_sha:
+        raise HLoopError(f"Patch Review target candidate is stale: {review_attempt_id}")
+    expected_review_projection = {
+        "task_attempt_id": seal.attempt_id,
+        "candidate_artifact_digest": seal.candidate_artifact_digest,
+        "sealed_task_contract_digest": seal.task_contract_digest,
+    }
+    for field, expected in expected_review_projection.items():
+        if review_state.get(field) != expected:
+            raise HLoopError(
+                f"Patch Review target projection is stale: {field} changed"
+            )
+    worktree_raw = str(review_state.get("worktree") or "")
+    if not worktree_raw:
+        raise HLoopError(f"Patch Review worktree is missing: {review_attempt_id}")
+    worktree = Path(worktree_raw).resolve()
+    if not worktree.is_dir():
+        raise HLoopError(f"Patch Review worktree is unavailable: {worktree}")
+    if git(worktree, ["rev-parse", "HEAD"]) != seal.candidate_sha:
+        raise HLoopError(
+            f"Patch Review worktree no longer targets the sealed candidate: {review_attempt_id}"
+        )
+    source = patch_review_file(
+        worktree, task_id, seal.attempt_id, review_attempt_id
+    )
+    if not source.is_file():
+        raise HLoopError(f"Patch Review artifact is missing: {source}")
+    payload = source.read_bytes()
+    try:
+        review = hloop_worker_candidate.PatchReview.from_record(json.loads(payload))
+    except (
+        json.JSONDecodeError,
+        hloop_worker_candidate.WorkerCandidateError,
+    ) as exc:
+        raise HLoopError(f"invalid Patch Review artifact {source}: {exc}") from exc
+    if review.review_attempt_id != review_attempt_id:
+        raise HLoopError("Patch Review attempt identity mismatch")
+    if review.review_round != int(review_state.get("review_round") or 0):
+        raise HLoopError("Patch Review round identity mismatch")
+    reviewer_identity = (
+        review.reviewer_provider,
+        review.reviewer_model,
+        review.reviewer_effort,
+    )
+    expected_reviewer_identity = (
+        str(review_state.get("agent_provider") or ""),
+        str(review_state.get("agent_model") or ""),
+        str(review_state.get("agent_effort") or ""),
+    )
+    if reviewer_identity != expected_reviewer_identity:
+        raise HLoopError(
+            "Patch Review reviewer identity mismatch: "
+            f"expected={expected_reviewer_identity} observed={reviewer_identity}"
+        )
+    if exact_product_dirty_paths(worktree):
+        raise HLoopError("Patch Reviewer changed product files")
+    baseline = set(normalize_list(review_state.get("baseline_dirty_files")))
+    current_paths = set(role_scope_paths(worktree))
+    unexpected = current_paths - baseline - {patch_review_rel(task_id, seal.attempt_id, review_attempt_id).as_posix()}
+    if unexpected:
+        raise HLoopError(
+            "Patch Reviewer changed files outside its artifact: "
+            + ", ".join(sorted(unexpected))
+        )
+    target = patch_review_file(
+        repo, task_id, seal.attempt_id, review_attempt_id
+    )
+    write_text(target, payload.decode("utf-8"), durable=True)
+    decision = apply_patch_review_record(
+        repo, state, task_id, task_state, review
+    )
+    review_state.update(
+        {
+            "status": "reported",
+            "gate_status": "reported",
+            "verdict": review.verdict,
+            "artifact_path": str(target),
+            "harvested_at": now_iso(),
+        }
+    )
+    cleanup_completed_agent_pane(
+        repo,
+        review_state,
+        label=f"Patch Reviewer {review_attempt_id}",
+        keep_pane=getattr(args, "keep_pane", False),
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    revoke_active_role_report_identity(repo, state, review_attempt_id)
+    if worktree.exists() and worktree != repo:
+        try:
+            git(repo, ["worktree", "remove", "--force", str(worktree)])
+            review_state["worktree_cleanup_status"] = "removed"
+            review_state["worktree_cleaned_at"] = now_iso()
+        except (HLoopError, subprocess.CalledProcessError) as exc:
+            record_worktree_cleanup_failure(
+                repo, review_state, f"Patch Reviewer {review_attempt_id}", exc
+            )
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Harvested Patch Review `{review_attempt_id}` for `{task_id}`: "
+        f"{review.verdict}; next={decision.action}.",
+    )
+    print(
+        f"harvested Patch Review {review_attempt_id}: "
+        f"verdict={review.verdict} next={decision.action}"
+    )
+    return 2 if decision.requires_user_decision else 0
+
+
+def cmd_patch_review_status(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    task_state = (state.get("tasks") or {}).get(args.task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {args.task_id}")
+    payload = {
+        "task_id": args.task_id,
+        "candidate_lifecycle_status": task_state.get(
+            "candidate_lifecycle_status", ""
+        ),
+        "candidate_revision": task_state.get("candidate_revision", 0),
+        "candidate_sha": task_state.get("candidate_sha", ""),
+        "active_patch_review_id": task_state.get("active_patch_review_id", ""),
+        "history": task_state.get("patch_review_history", []),
+        "decision": task_state.get("patch_review_decision", {}),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"{args.task_id}: {payload['candidate_lifecycle_status'] or 'not-submitted'} "
+            f"candidate={payload['candidate_sha'] or '-'} "
+            f"reviews={len(payload['history'])}"
+        )
+    return 0
+
+
+def cmd_worker_accept_legacy_result(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    if not v053_state_contracts_enabled(state):
+        raise HLoopError("legacy result acceptance is available only after 0.5.3 migration")
+    task_id = args.task_id
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    if str(task_state.get("status") or "") != "result_reported":
+        raise HLoopError(f"legacy result is not awaiting merge: {task_id}")
+    task_meta = read_frontmatter(task_file(repo, task_id))
+    if task_contract_revision(task_meta) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        raise HLoopError("revision 3 results cannot use legacy acceptance")
+    result_path = result_file(repo, task_id)
+    if not result_path.is_file():
+        raise HLoopError(f"legacy result artifact is missing: {result_path}")
+    result_meta = read_frontmatter(result_path)
+    try:
+        migrated = hloop_task_contract.migrate_legacy_result_contract(result_meta)
+    except hloop_task_contract.ContractValidationError as exc:
+        raise HLoopError(f"legacy result contract is invalid: {exc}") from exc
+    replace_frontmatter_record(result_path, migrated)
+    task_digest = hashlib.sha256(task_file(repo, task_id).read_bytes()).hexdigest()
+    result_digest = _sha256_labelled(result_path.read_bytes())
+    acceptance = {
+        "run_id": str(state.get("run_id") or ""),
+        "task_id": task_id,
+        "attempt_id": active_attempt_id(task_id, task_state),
+        "task_contract_digest": _labelled_contract_digest(task_digest),
+        "result_artifact_digest": result_digest,
+        "head_sha": str(task_state.get("head_sha") or ""),
+        "reason": str(args.reason or "").strip(),
+        "accepted_at": now_iso(),
+    }
+    if not acceptance["reason"]:
+        raise HLoopError("legacy result acceptance requires --reason")
+    if not acceptance["head_sha"]:
+        raise HLoopError("legacy result acceptance requires an exact harvested head SHA")
+    task_state["contract_schema_revision"] = (
+        hloop_task_contract.LEGACY_CONTRACT_SCHEMA_REVISION
+    )
+    task_state["legacy_result_acceptance"] = acceptance
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Accepted legacy revision 2 result for `{task_id}` at "
+        f"`{acceptance['head_sha']}`: {acceptance['reason']}",
+    )
+    print(f"accepted legacy result for {task_id} at {acceptance['head_sha']}")
+    return 0
+
+
+def assert_legacy_result_merge_accepted(
+    repo: Path,
+    state: Mapping[str, Any],
+    task_id: str,
+    task_state: Mapping[str, Any],
+) -> None:
+    acceptance = task_state.get("legacy_result_acceptance")
+    if not isinstance(acceptance, Mapping):
+        raise HLoopError(
+            f"legacy result {task_id} requires explicit Manager acceptance or "
+            "revision 3 gates before merge"
+        )
+    result_path = result_file(repo, task_id)
+    if not result_path.is_file():
+        raise HLoopError(f"accepted legacy result artifact is missing: {result_path}")
+    expected = {
+        "run_id": str(state.get("run_id") or ""),
+        "task_id": task_id,
+        "attempt_id": active_attempt_id(task_id, task_state),
+        "task_contract_digest": _labelled_contract_digest(
+            hashlib.sha256(task_file(repo, task_id).read_bytes()).hexdigest()
+        ),
+        "result_artifact_digest": _sha256_labelled(result_path.read_bytes()),
+        "head_sha": str(task_state.get("head_sha") or ""),
+    }
+    for field, value in expected.items():
+        if acceptance.get(field) != value:
+            raise HLoopError(
+                f"legacy result acceptance is stale for {task_id}: {field} changed"
+            )
+    if not str(acceptance.get("reason") or "").strip():
+        raise HLoopError(f"legacy result acceptance reason is missing for {task_id}")
+
+
+def combined_candidate_validation(
+    candidate: hloop_worker_candidate.ImplementationCandidate,
+    commands: Sequence[str],
+    results: Sequence[str],
+) -> tuple[list[str], list[str], bool]:
+    if len(commands) != len(results):
+        raise HLoopError("--validation-command and --validation-result counts must match")
+    supplied_pairs = list(zip(commands, results))
+    invalid = [result for _, result in supplied_pairs if result != "passed"]
+    if invalid:
+        raise HLoopError(
+            "revision 3 finalization requires every validation to pass: "
+            + ", ".join(invalid)
+        )
+    candidate_pairs = list(
+        zip(candidate.validation_commands, candidate.validation_results)
+    )
+    combined = list(candidate_pairs)
+    for pair in supplied_pairs:
+        if pair not in combined:
+            combined.append(pair)
+    extra_gate = any(pair not in candidate_pairs for pair in supplied_pairs)
+    return (
+        [command for command, _ in combined],
+        [result for _, result in combined],
+        extra_gate,
+    )
+
+
+def validate_revision_three_final_gate(
+    repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    meta: Mapping[str, Any],
+    *,
+    validation_commands: Sequence[str],
+    validation_results: Sequence[str],
+) -> tuple[
+    hloop_worker_candidate.ImplementationCandidate,
+    hloop_worker_candidate.CandidateSeal,
+    hloop_worker_candidate.PatchReview | None,
+    list[str],
+    list[str],
+]:
+    candidate, seal, payload = current_candidate_evidence(
+        repo, state, task_id, task_state
+    )
+    lifecycle = str(task_state.get("candidate_lifecycle_status") or "")
+    gates = task_required_gates(meta)
+    if "patch_review" in gates and lifecycle != "patch_review_passed":
+        raise HLoopError(
+            f"required Patch Review has not passed for {task_id}: {lifecycle or 'missing'}"
+        )
+    if "patch_review" not in gates and lifecycle != "candidate_sealed":
+        raise HLoopError(
+            f"candidate is not sealed for finalization: {lifecycle or 'missing'}"
+        )
+    _, labelled_contract_digest = exact_task_contract_digest(repo, task_id, task_state)
+    review = fresh_passed_patch_review(
+        repo,
+        task_id,
+        task_state,
+        seal,
+        current_task_contract_digest=labelled_contract_digest,
+    )
+    if "patch_review" in gates and review is None:
+        raise HLoopError(f"required Patch Review evidence is missing for {task_id}")
+    combined_commands, combined_results, has_extra_gate = combined_candidate_validation(
+        candidate, validation_commands, validation_results
+    )
+    if "full_suite" in gates and not has_extra_gate:
+        raise HLoopError(
+            "required full_suite evidence must add at least one passing validation "
+            "command beyond the candidate L1 record"
+        )
+    if _sha256_labelled(payload) != seal.candidate_artifact_digest:
+        raise HLoopError(f"candidate artifact digest changed for {task_id}")
+    return candidate, seal, review, combined_commands, combined_results
+
+
+def cmd_worker_finalize_v053(
+    args: argparse.Namespace,
+    repo: Path,
+    contract_repo: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    meta: Mapping[str, Any],
+) -> int:
+    validate_revision_three_task(meta, task_id=task_id)
+    branch = current_branch(repo)
+    expected_branch = str(task_state.get("branch") or meta.get("branch") or "")
+    if expected_branch and branch != expected_branch:
+        raise HLoopError(f"Worker branch mismatch: expected {expected_branch}, got {branch}")
+    expected_worktree = str(task_state.get("worktree") or "")
+    if expected_worktree and repo != Path(expected_worktree).resolve():
+        raise HLoopError(
+            f"worker finalize must run in the active attempt worktree: "
+            f"expected {expected_worktree}, got {repo}"
+        )
+    status = str(args.status)
+    handoff = bool(getattr(args, "handoff", False))
+    if status == "done" and bool(getattr(args, "no_commit", False)) and not handoff:
+        raise HLoopError(
+            "revision 3 status done must commit the final result as an exact child "
+            "of the sealed candidate"
+        )
+    result_rel = LOOP_DIR / "results" / task_id / "result.md"
+    dirty_product = exact_product_dirty_paths(repo)
+    if dirty_product:
+        raise HLoopError(
+            "revision 3 finalization requires the exact sealed candidate tree; "
+            "dirty product paths: " + ", ".join(dirty_product)
+        )
+    commands = normalize_list(args.validation_command)
+    results = normalize_list(args.validation_result)
+    blocking_questions = normalize_list(args.blocking_question)
+    candidate: hloop_worker_candidate.ImplementationCandidate | None = None
+    seal: hloop_worker_candidate.CandidateSeal | None = None
+    review: hloop_worker_candidate.PatchReview | None = None
+    if status == "done":
+        if blocking_questions:
+            raise HLoopError("status done cannot retain blocking questions")
+        candidate, seal, review, commands, results = validate_revision_three_final_gate(
+            contract_repo,
+            state,
+            task_id,
+            task_state,
+            meta,
+            validation_commands=commands,
+            validation_results=results,
+        )
+        if repo != contract_repo:
+            # Candidate evidence is Manager-owned, but the exact candidate commit
+            # is checked in the active Worker worktree too.
+            if git(repo, ["rev-parse", "HEAD"]) != seal.candidate_sha:
+                raise HLoopError(
+                    f"Worker HEAD is not the sealed candidate SHA: {seal.candidate_sha}"
+                )
+            observed_tree = git(repo, ["rev-parse", "HEAD^{tree}"])
+            if observed_tree != seal.candidate_tree_sha:
+                raise HLoopError("Worker candidate tree changed before finalization")
+        if handoff != (candidate.completion_mode == "handoff"):
+            raise HLoopError(
+                "finalization mode must match the sealed candidate completion mode"
+            )
+        fields: dict[str, Any] = {
+            "task_id": task_id,
+            "run_id": candidate.run_id,
+            "skill_version": candidate.skill_version,
+            "contract_schema_revision": hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION,
+            "attempt_id": candidate.attempt_id,
+            "status": "done",
+            "merge_ready": True,
+            "branch": branch,
+            "head_sha": "HEAD",
+            "base_sha": candidate.base_sha,
+            "changed_files": list(candidate.changed_files),
+            "validation_recorded": True,
+            "validation_commands": commands,
+            "validation_results": results,
+            "validation_summary": str(args.validation_summary or candidate.validation_summary),
+            "blocking_questions": [],
+            "handoff": handoff,
+            "invariant_evidence": list(candidate.invariant_evidence),
+            "regression_evidence": list(candidate.regression_evidence),
+            "self_review_summary": candidate.self_review_summary,
+            "residual_risks": list(candidate.residual_risks),
+            "unrun_checks": list(candidate.unrun_checks),
+        }
+        authenticity_record = dict(fields)
+        authenticity_record["head_sha"] = seal.candidate_sha
+        try:
+            hloop_worker_candidate.validate_final_result_authenticity(
+                candidate,
+                seal,
+                review,
+                authenticity_record,
+                candidate_artifact_digest=seal.candidate_artifact_digest,
+                current_task_contract_digest=candidate.task_contract_digest,
+                result_parent_candidate_sha=seal.candidate_sha,
+                require_patch_review="patch_review" in task_required_gates(meta),
+            )
+        except hloop_worker_candidate.WorkerCandidateError as exc:
+            raise HLoopError(f"final result authenticity gate rejected: {exc}") from exc
+    else:
+        if len(commands) != len(results):
+            raise HLoopError("--validation-command and --validation-result counts must match")
+        validation_recorded = bool(commands and results)
+        validation_error = worker_validation_error(
+            {
+                "validation_recorded": validation_recorded,
+                "validation_commands": commands,
+                "validation_results": results,
+            }
+        )
+        if validation_error:
+            raise HLoopError(f"invalid Worker validation: {validation_error}")
+        base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
+        fields = {
+            "task_id": task_id,
+            "run_id": str(state.get("run_id") or meta.get("run_id") or ""),
+            "skill_version": str(state.get("skill_version") or SKILL_VERSION),
+            "contract_schema_revision": hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION,
+            "attempt_id": active_attempt_id(task_id, task_state),
+            "status": status,
+            "merge_ready": False,
+            "branch": branch,
+            "head_sha": "HEAD",
+            "base_sha": base_sha,
+            "changed_files": changed_files(repo, base_sha, "HEAD"),
+            "validation_recorded": validation_recorded,
+            "validation_commands": commands,
+            "validation_results": results,
+            "validation_summary": str(args.validation_summary or ""),
+            "blocking_questions": blocking_questions,
+            "handoff": handoff,
+            "invariant_evidence": normalize_list(args.invariant_evidence),
+            "regression_evidence": normalize_list(args.regression_evidence),
+            "self_review_summary": str(args.self_review_summary or "not completed"),
+            "residual_risks": normalize_list(args.residual_risk),
+            "unrun_checks": normalize_list(args.unrun_check),
+        }
+        validation = hloop_task_contract.validate_result_contract(fields)
+        if not validation.ok:
+            raise HLoopError(
+                "invalid revision 3 result: "
+                + "; ".join(issue.message for issue in validation.issues)
+            )
+    body = f"# Worker Result {task_id}\n\nGenerated by `hloop worker finalize`.\n"
+    write_text(repo / result_rel, frontmatter(fields) + "\n" + body)
+    if handoff:
+        print(
+            "final result handoff recorded without terminal sentinel; ask the Manager "
+            f"to run `{seal_required_action_text(task_id)}`"
+        )
+        return 0
+    if not args.no_commit:
+        git(repo, ["add", "-f", "--", result_rel.as_posix()])
+        git(repo, ["commit", "-m", f"ai-loop({task_id}): finalize worker result"])
+        result_head = git(repo, ["rev-parse", "HEAD"])
+        if seal is not None:
+            parents = commit_parent_shas(repo, result_head)
+            if parents != (seal.candidate_sha,):
+                raise HLoopError(
+                    "final result commit is not an exact child of the sealed candidate"
+                )
+    print("finalized " + task_id + f": status={status} merge_ready={str(fields['merge_ready']).lower()}")
+    print(
+        f"HERDR_LOOP_ROLE_DONE:{fields['run_id']}:{task_id}:"
+        f"{fields['attempt_id']}:{status}"
+    )
     return 0
 
 
@@ -14415,6 +16758,10 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
     meta = read_frontmatter(task_file(contract_repo, task_id))
     if str(meta.get("id") or "") != task_id:
         raise HLoopError(f"task file mismatch for {task_id}")
+    if task_contract_revision(meta) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        return cmd_worker_finalize_v053(
+            args, repo, contract_repo, state, task_id, task_state, meta
+        )
     branch = current_branch(repo)
     expected_branch = str(task_state.get("branch") or meta.get("branch") or "")
     if expected_branch and branch != expected_branch:
@@ -14487,6 +16834,13 @@ def cmd_worker_finalize(args: argparse.Namespace) -> int:
         "task_id": task_id,
         "run_id": str(state.get("run_id") or meta.get("run_id") or ""),
         "skill_version": SKILL_VERSION,
+        **(
+            {
+                "contract_schema_revision": hloop_task_contract.LEGACY_CONTRACT_SCHEMA_REVISION
+            }
+            if v053_state_contracts_enabled(state)
+            else {}
+        ),
         "attempt_id": str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""),
         "status": status,
         "merge_ready": merge_ready,
@@ -15240,6 +17594,24 @@ def worker_result_contract_error(
             )
         if any(result != "passed" for result in results):
             return f"merge_ready is true with a non-passed validation result in {artifact_noun} artifact"
+    declared_revision = task_contract_revision(meta)
+    if v053_state_contracts_enabled(state) and declared_revision is None:
+        return f"missing or invalid contract_schema_revision in {artifact_noun} artifact"
+    task_revision = task_contract_revision(task_state)
+    if task_revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        if declared_revision != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+            return f"revision 3 task has non-revision-3 {artifact_noun} artifact"
+        validation = hloop_task_contract.validate_result_contract(meta)
+        if not validation.ok:
+            return (
+                f"invalid revision 3 {artifact_noun} artifact: "
+                + "; ".join(issue.message for issue in validation.issues)
+            )
+    elif (
+        v053_state_contracts_enabled(state)
+        and declared_revision != hloop_task_contract.LEGACY_CONTRACT_SCHEMA_REVISION
+    ):
+        return f"legacy task has non-revision-2 {artifact_noun} artifact"
     return ""
 
 
@@ -15545,6 +17917,7 @@ def resume_staged_seal_transaction(
     expected_scope = normalize_list(transaction.get("staged_paths"))
     commit_message = str(transaction.get("commit_message") or "")
     expected_tree = str(transaction.get("staged_tree") or "")
+    terminal_sentinel = str(transaction.get("terminal_sentinel") or "")
     if not expected_scope or not commit_message or not expected_tree:
         raise HLoopError(
             f"validated seal transaction is incomplete for {task_id}; refusing resume-commit"
@@ -15566,6 +17939,8 @@ def resume_staged_seal_transaction(
             f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha} "
             "(reconciled after crash)"
         )
+        if terminal_sentinel:
+            print(terminal_sentinel)
         return 0
     if current_head != expected_parent:
         raise HLoopError(
@@ -15617,6 +17992,8 @@ def resume_staged_seal_transaction(
         f"after a crash left the seal transaction staged ({head_sha}).",
     )
     print(f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha} (resumed after crash)")
+    if terminal_sentinel:
+        print(terminal_sentinel)
     return 0
 
 
@@ -15691,6 +18068,21 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     meta = read_frontmatter(task_file(repo, task_id))
     if str(meta.get("id") or "") != task_id:
         raise HLoopError(f"task file mismatch for {task_id}")
+    revision_three_handoff = (
+        task_contract_revision(meta)
+        == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+    )
+    v053_candidate: hloop_worker_candidate.ImplementationCandidate | None = None
+    v053_seal: hloop_worker_candidate.CandidateSeal | None = None
+    v053_review: hloop_worker_candidate.PatchReview | None = None
+    if revision_three_handoff:
+        v053_candidate, v053_seal, _ = current_candidate_evidence(
+            repo, state, task_id, task_state
+        )
+        if v053_candidate.completion_mode != "handoff":
+            raise HLoopError(
+                "worker seal cannot finalize a commit-mode revision 3 candidate"
+            )
 
     # Read-only precheck: confirm there is a genuinely complete, well-formed
     # handoff before doing anything that could disrupt a Worker that has not
@@ -15742,6 +18134,22 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     status = str(handoff_meta.get("status") or "")
     blocking_questions = normalize_list(handoff_meta.get("blocking_questions"))
     expected_parent = git(worktree, ["rev-parse", "HEAD"])
+    if revision_three_handoff and v053_seal is not None:
+        if expected_parent != v053_seal.candidate_sha:
+            raise HLoopError(
+                f"final handoff parent is not the sealed candidate SHA: "
+                f"expected={v053_seal.candidate_sha} observed={expected_parent}"
+            )
+        dirty_product = exact_product_dirty_paths(worktree)
+        if dirty_product:
+            raise HLoopError(
+                "revision 3 final handoff changed product files after candidate seal: "
+                + ", ".join(dirty_product)
+            )
+        # Candidate, prompt, and review artifacts are local-only evidence and
+        # must not be swept into the final commit. The result artifact is the
+        # only permissible dirty path after an exact candidate seal.
+        dirty = [result_rel.as_posix()]
 
     base_ref = str(task_state.get("base_ref") or meta.get("base_ref") or state.get("integration_branch") or "")
     if not base_ref:
@@ -15768,11 +18176,14 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     full_scope = list(dict.fromkeys([*committed_files, *dirty]))
 
     declared_changed_files = normalize_list(handoff_meta.get("changed_files"))
-    if set(declared_changed_files) != set(full_scope):
+    measured_declared_scope = (
+        committed_files if revision_three_handoff else full_scope
+    )
+    if set(declared_changed_files) != set(measured_declared_scope):
         raise HLoopError(
             f"stale handoff artifact: declared changed_files does not match the measured write "
             f"scope for {task_id}; declared={sorted(declared_changed_files)} "
-            f"measured={sorted(full_scope)}"
+            f"measured={sorted(measured_declared_scope)}"
         )
 
     violations = validate_change_scope(task_id, meta, full_scope)
@@ -15788,12 +18199,39 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 f"cannot seal {task_id} as status done without at least one Manager "
                 "--validation-command"
             )
-        validation_recorded = bool(manager_validation_commands)
-        validation_commands = manager_validation_commands
+        if revision_three_handoff:
+            if v053_candidate is None or v053_seal is None:
+                raise HLoopError("revision 3 candidate evidence disappeared during final seal")
+            (
+                v053_candidate,
+                v053_seal,
+                v053_review,
+                validation_commands,
+                validation_results,
+            ) = validate_revision_three_final_gate(
+                repo,
+                state,
+                task_id,
+                task_state,
+                meta,
+                validation_commands=[
+                    *normalize_list(handoff_meta.get("validation_commands")),
+                    *manager_validation_commands,
+                ],
+                validation_results=[
+                    *normalize_list(handoff_meta.get("validation_results")),
+                    *(["passed"] * len(manager_validation_commands)),
+                ],
+            )
+            validation_recorded = True
+        else:
+            validation_recorded = bool(manager_validation_commands)
+            validation_commands = manager_validation_commands
         # The result artifact is part of the immutable tree validated below.
         # Record the only result that is eligible to commit up front, then
         # commit that tree only if every real command earns the prediction.
-        validation_results = ["passed" for _ in manager_validation_commands]
+        if not revision_three_handoff:
+            validation_results = ["passed" for _ in manager_validation_commands]
         validation_summary = args.validation_summary or handoff_meta.get("validation_summary") or ""
     else:
         # Manager does not re-run validation for a `partial`/`blocked`/
@@ -15820,7 +18258,9 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     replace_frontmatter(
         result_path,
         {
-            "changed_files": full_scope,
+            "changed_files": (
+                declared_changed_files if revision_three_handoff else full_scope
+            ),
             "validation_recorded": validation_recorded,
             "validation_commands": validation_commands,
             "validation_results": validation_results,
@@ -15828,6 +18268,25 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
             "merge_ready": merge_ready,
         },
     )
+    if revision_three_handoff:
+        sealed_result_meta = read_frontmatter(result_path)
+        authenticity_meta = dict(sealed_result_meta)
+        authenticity_meta["head_sha"] = expected_parent
+        if v053_candidate is None or v053_seal is None:
+            raise HLoopError("revision 3 candidate evidence is missing at final seal")
+        try:
+            hloop_worker_candidate.validate_final_result_authenticity(
+                v053_candidate,
+                v053_seal,
+                v053_review,
+                authenticity_meta,
+                candidate_artifact_digest=v053_seal.candidate_artifact_digest,
+                current_task_contract_digest=v053_candidate.task_contract_digest,
+                result_parent_candidate_sha=expected_parent,
+                require_patch_review="patch_review" in task_required_gates(meta),
+            )
+        except hloop_worker_candidate.WorkerCandidateError as exc:
+            raise HLoopError(f"final handoff authenticity gate rejected: {exc}") from exc
     if result_rel.as_posix() not in dirty:
         dirty = [*dirty, result_rel.as_posix()]
 
@@ -15860,6 +18319,11 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
         "validation_required": status == "done",
         "validation_passed": False,
     }
+    if revision_three_handoff:
+        task_state["seal_transaction"]["terminal_sentinel"] = (
+            f"HERDR_LOOP_ROLE_DONE:{state.get('run_id', '')}:{task_id}:"
+            f"{expected_attempt}:{status}"
+        )
     save_state(repo, state)
 
     # The namespaced result artifact is the Worker/Manager hand-off contract
@@ -15895,6 +18359,13 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     # however small) before committing: no unstaged/untracked path may
     # remain, and the staged (cached) diff must be exactly what was scanned.
     remaining_dirty = porcelain_paths_no_renames(worktree)
+    if revision_three_handoff:
+        loop_prefix = LOOP_DIR.as_posix() + "/"
+        remaining_dirty = [
+            path
+            for path in remaining_dirty
+            if path != LOOP_DIR.as_posix() and not path.startswith(loop_prefix)
+        ]
     cached_files = cached_diff_paths_no_renames(worktree)
     if remaining_dirty or set(cached_files) != set(dirty):
         discard_unvalidated_seal_transaction(
@@ -15955,10 +18426,11 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
                 f"expected {expected_parent}, got {observed_parent}; preserving the staged "
                 "transaction without marking validation passed"
             )
-        if manager_validation_results != validation_results:
+        expected_manager_results = ["passed"] * len(manager_validation_commands)
+        if manager_validation_results != expected_manager_results:
             raise HLoopError(
                 f"Manager validation result mismatch for {task_id}: "
-                f"measured={manager_validation_results} recorded={validation_results}"
+                f"measured={manager_validation_results} recorded={expected_manager_results}"
             )
 
     # Non-done handoffs have no Manager validation gate; for done handoffs
@@ -15974,6 +18446,11 @@ def cmd_worker_seal(args: argparse.Namespace) -> int:
     save_state(repo, state)
     journal(repo, f"Sealed Worker handoff for `{task_id}` at attempt `{expected_attempt}` ({head_sha}).")
     print(f"sealed {task_id}: attempt={expected_attempt} head_sha={head_sha}")
+    if revision_three_handoff:
+        print(
+            f"HERDR_LOOP_ROLE_DONE:{state.get('run_id', '')}:{task_id}:"
+            f"{expected_attempt}:{status}"
+        )
     return 0
 
 
@@ -16607,6 +19084,18 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     task_state.update(
         {
             "status": "running",
+            **(
+                {
+                    "candidate_lifecycle_status": (
+                        "patch_fix_running"
+                        if task_state.get("candidate_revision")
+                        else "running"
+                    )
+                }
+                if task_contract_revision(task_meta)
+                == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+                else {}
+            ),
             "pane_id": pane_id,
             "worktree": str(worktree),
             "prompt": str(worktree / prompt_rel),
@@ -16636,6 +19125,69 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     journal(repo, f"Started Worker `{task_id}` in pane `{pane_id}` and worktree `{worktree}`.")
     print(f"started {task_id} in pane {pane_id}")
     return 0
+
+
+def validate_revision_three_committed_result(
+    repo: Path,
+    worktree: Path,
+    state: dict[str, Any],
+    task_id: str,
+    task_state: dict[str, Any],
+    meta: Mapping[str, Any],
+    actual_head_sha: str,
+) -> None:
+    task_meta = read_frontmatter(task_file(repo, task_id))
+    if task_contract_revision(task_meta) != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        raise HLoopError(f"revision 3 result is bound to a non-revision-3 task: {task_id}")
+    candidate, seal, payload = current_candidate_evidence(
+        repo, state, task_id, task_state
+    )
+    parents = commit_parent_shas(worktree, actual_head_sha)
+    if parents != (seal.candidate_sha,):
+        raise HLoopError(
+            f"final result commit parent is not the sealed candidate SHA for {task_id}"
+        )
+    if git(worktree, ["rev-parse", seal.candidate_sha]) != seal.candidate_sha:
+        raise HLoopError(f"sealed candidate commit is unavailable for {task_id}")
+    _, labelled_contract_digest = exact_task_contract_digest(repo, task_id, task_state)
+    gates = task_required_gates(task_meta)
+    review = fresh_passed_patch_review(
+        repo,
+        task_id,
+        task_state,
+        seal,
+        current_task_contract_digest=labelled_contract_digest,
+    )
+    if "patch_review" in gates and review is None:
+        raise HLoopError(f"required Patch Review evidence is missing for {task_id}")
+    result_record = dict(meta)
+    result_record["head_sha"] = actual_head_sha
+    result_pairs = list(
+        zip(
+            normalize_list(result_record.get("validation_commands")),
+            normalize_list(result_record.get("validation_results")),
+        )
+    )
+    candidate_pairs = list(
+        zip(candidate.validation_commands, candidate.validation_results)
+    )
+    if "full_suite" in gates and not any(
+        pair not in candidate_pairs and pair[1] == "passed" for pair in result_pairs
+    ):
+        raise HLoopError(f"required full_suite evidence is missing for {task_id}")
+    try:
+        hloop_worker_candidate.validate_final_result_authenticity(
+            candidate,
+            seal,
+            review,
+            result_record,
+            candidate_artifact_digest=_sha256_labelled(payload),
+            current_task_contract_digest=labelled_contract_digest,
+            result_parent_candidate_sha=parents[0],
+            require_patch_review="patch_review" in gates,
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"final result authenticity gate rejected: {exc}") from exc
 
 
 def cmd_worker_harvest(args: argparse.Namespace) -> int:
@@ -16677,6 +19229,23 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     if not base_sha:
         raise HLoopError(f"manager base_sha is missing for {task_id}")
     committed_result = require_committed_result(worktree, task_id, head_sha)
+    authoritative_task_meta = read_frontmatter(task_file(repo, task_id))
+    authoritative_task_revision = task_contract_revision(authoritative_task_meta)
+    if authoritative_task_revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        if (
+            task_contract_revision(task_state)
+            != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+        ):
+            raise HLoopError(
+                f"revision 3 task state projection is missing for {task_id}"
+            )
+        if task_contract_revision(meta) != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+            raise HLoopError(
+                f"revision 3 task has non-revision-3 result artifact: {task_id}"
+            )
+        validate_revision_three_committed_result(
+            repo, worktree, state, task_id, task_state, meta, head_sha
+        )
     final_result = result_file(repo, task_id)
     files = normalize_list(meta.get("changed_files")) or changed_files(worktree, base_sha, head_sha)
     validation_recorded = result_validation_recorded(meta)
@@ -16803,6 +19372,7 @@ def long_running_role_states(state: dict[str, Any]) -> list[dict[str, Any]]:
     roles = [
         *state.get("tasks", {}).values(),
         *state.get("reviews", {}).values(),
+        *(state.get("patch_reviews") or {}).values(),
         *state.get("gaps", {}).values(),
         *(
             participant
@@ -18178,6 +20748,21 @@ def cmd_merge(args: argparse.Namespace) -> int:
         raise HLoopError(
             f"worker head mismatch for {task_id}: result={reported_head} actual={actual_head}"
         )
+    task_meta = read_frontmatter(task_file(repo, task_id))
+    if v053_state_contracts_enabled(state):
+        if task_contract_revision(task_meta) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+            final_meta = read_frontmatter(result_file(repo, task_id))
+            validate_revision_three_committed_result(
+                repo,
+                repo,
+                state,
+                task_id,
+                task_state,
+                final_meta,
+                actual_head,
+            )
+        else:
+            assert_legacy_result_merge_accepted(repo, state, task_id, task_state)
     rel_result = (LOOP_DIR / "results" / task_id / "result.md").as_posix()
     git_show(repo, f"{actual_head}:{rel_result}")
     base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
@@ -18399,6 +20984,8 @@ def iter_all_roles(state: dict[str, Any]):
         yield "worker", task_id, task
     for review_id, review in state.get("reviews", {}).items():
         yield "reviewer", review_id, review
+    for review_id, review in (state.get("patch_reviews") or {}).items():
+        yield "patch-reviewer", review_id, review
     for gap_id, gap in state.get("gaps", {}).items():
         yield "gap", gap_id, gap
     for advice_id, advice in state.get("advice", {}).items():
@@ -18461,6 +21048,8 @@ def find_role_for_cleanup(state: dict[str, Any], role_id: str) -> tuple[str, str
         return "worker", role_id, state["tasks"][role_id]
     if role_id in state.get("reviews", {}):
         return "reviewer", role_id, state["reviews"][role_id]
+    if role_id in (state.get("patch_reviews") or {}):
+        return "patch-reviewer", role_id, state["patch_reviews"][role_id]
     if role_id in state.get("gaps", {}):
         return "gap", role_id, state["gaps"][role_id]
     advice_id, _, participant_id = role_id.partition("/")
@@ -18501,6 +21090,8 @@ def retry_role_cleanup(
             cleanup_task(repo, role_id, role_state, state, best_effort=True)
         elif role_kind == "reviewer":
             cleanup_review_worktree(repo, role_id, role_state, best_effort=True)
+        elif role_kind == "patch-reviewer":
+            cleanup_agent_worktree_for_lifecycle(repo, role_state, force=False)
         elif role_kind == "gap":
             cleanup_gap_worktree(repo, role_id, role_state, best_effort=True)
         elif role_kind == "advisor":
@@ -21181,6 +23772,9 @@ def cmd_pump(args: argparse.Namespace) -> int:
 
 def cmd_harvest(args: argparse.Namespace) -> int:
     agent_id = str(args.agent_id)
+    if agent_id.startswith("PR-"):
+        args.review_attempt_id = agent_id
+        return cmd_patch_review_harvest(args)
     if agent_id.startswith("T"):
         args.task_id = agent_id
         return cmd_worker_harvest(args)
@@ -21230,6 +23824,10 @@ def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict
         agent = state.get("tasks", {}).get(agent_id)
         if agent:
             return "worker", agent
+    if agent_id.startswith("PR-"):
+        agent = (state.get("patch_reviews") or {}).get(agent_id)
+        if agent:
+            return "patch-reviewer", agent
     if agent_id.startswith("R"):
         agent = state.get("reviews", {}).get(agent_id)
         if agent:
@@ -21482,6 +24080,22 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
             "pending_manager_messages",
             "unknown_manager_messages",
             "semantic_ack_barrier",
+            "candidate_revision",
+            "candidate_lifecycle_status",
+            "implementation_candidate",
+            "candidate_seal",
+            "candidate_artifact_digest",
+            "candidate_sha",
+            "candidate_tree_sha",
+            "completion_mode",
+            "candidate_sealed_at",
+            "patch_review_history",
+            "current_patch_review",
+            "patch_review_decision",
+            "active_patch_review_id",
+            "blocking_patch_review_findings",
+            "blocking_patch_review_candidate_sha",
+            "legacy_result_acceptance",
         ):
             agent.pop(key, None)
         agent["root_branch"] = root_branch
@@ -23153,6 +25767,11 @@ def running_agent_ids(state: dict[str, Any]) -> list[str]:
     ids.extend(
         review_id
         for review_id, review in state.get("reviews", {}).items()
+        if agent_gate_status(review) == "running"
+    )
+    ids.extend(
+        review_id
+        for review_id, review in (state.get("patch_reviews") or {}).items()
         if agent_gate_status(review) == "running"
     )
     ids.extend(
@@ -25180,6 +27799,25 @@ def build_parser() -> argparse.ArgumentParser:
     task_new.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS))
     task_new.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
     task_new.add_argument("--worker-agent-model")
+    task_new.add_argument("--worker-agent-effort")
+    task_new.add_argument("--preserved-invariant", action="append")
+    task_new.add_argument("--regression-check", action="append")
+    task_new.add_argument(
+        "--risk-class", choices=sorted(hloop_task_contract.RISK_CLASSES)
+    )
+    task_new.add_argument(
+        "--required-gate",
+        action="append",
+        choices=sorted(hloop_task_contract.REQUIRED_GATES),
+    )
+    task_new.add_argument("--investigation-goal")
+    task_new.add_argument("--implementation-ready-evidence", action="append")
+    task_new.add_argument("--exploration-budget-minutes", type=int)
+    task_new.add_argument(
+        "--history-search-allowed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     task_new.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
     task_new.add_argument(
         "--qa-profile",
@@ -25200,8 +27838,53 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS))
     task_update.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
     task_update.add_argument("--worker-agent-model")
+    task_update.add_argument("--worker-agent-effort")
+    task_update.add_argument("--set-preserved-invariant", action="append")
+    task_update.add_argument("--set-regression-check", action="append")
+    task_update.add_argument(
+        "--risk-class", choices=sorted(hloop_task_contract.RISK_CLASSES)
+    )
+    task_update.add_argument(
+        "--set-required-gate",
+        action="append",
+        choices=sorted(hloop_task_contract.REQUIRED_GATES),
+    )
+    task_update.add_argument("--investigation-goal")
+    task_update.add_argument(
+        "--set-implementation-ready-evidence", action="append"
+    )
+    task_update.add_argument("--exploration-budget-minutes", type=int)
+    task_update.add_argument(
+        "--history-search-allowed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    task_update.add_argument(
+        "--contract-schema-revision",
+        type=int,
+        choices=[hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION],
+    )
     task_update.add_argument("--worker-qa-profile", choices=sorted(QA_PROFILES))
     task_update.set_defaults(func=cmd_task_update)
+
+    planning = sub.add_parser(
+        "planning", help="inspect and record pre-dispatch planning evidence"
+    )
+    planning_sub = planning.add_subparsers(dest="planning_command", required=True)
+    planning_identity = planning_sub.add_parser(
+        "identity", help="print the current authoritative planning identity"
+    )
+    planning_identity.set_defaults(func=cmd_planning_identity)
+    planning_check = planning_sub.add_parser(
+        "check", help="validate and record the current planning bundle"
+    )
+    planning_check.add_argument("--json", action="store_true")
+    planning_check.set_defaults(func=cmd_planning_check)
+    planning_status = planning_sub.add_parser(
+        "status", help="show whether Worker dispatch planning evidence is ready"
+    )
+    planning_status.add_argument("--json", action="store_true")
+    planning_status.set_defaults(func=cmd_planning_status)
 
     specification_scout = sub.add_parser(
         "specification-scout",
@@ -25337,6 +28020,36 @@ def build_parser() -> argparse.ArgumentParser:
     worker_start.add_argument("--agent-model")
     worker_start.add_argument("--dry-run", action="store_true")
     worker_start.set_defaults(func=cmd_worker_start)
+    worker_submit = worker_sub.add_parser(
+        "submit",
+        help="submit nonterminal revision 3 implementation-candidate evidence",
+    )
+    worker_submit.add_argument("task_id")
+    worker_submit.add_argument(
+        "--completion-mode", choices=sorted(hloop_worker_candidate.COMPLETION_MODES)
+    )
+    worker_submit.add_argument("--candidate-revision", type=int)
+    worker_submit.add_argument("--validation-command", action="append", required=True)
+    worker_submit.add_argument(
+        "--validation-result",
+        action="append",
+        choices=sorted(WORKER_VALIDATION_RESULTS),
+        required=True,
+    )
+    worker_submit.add_argument("--validation-summary", required=True)
+    worker_submit.add_argument("--invariant-evidence", action="append", required=True)
+    worker_submit.add_argument("--regression-evidence", action="append", required=True)
+    worker_submit.add_argument("--self-review-summary", required=True)
+    worker_submit.add_argument("--residual-risk", action="append")
+    worker_submit.add_argument("--unrun-check", action="append")
+    worker_submit.set_defaults(func=cmd_worker_submit)
+    worker_candidate_seal = worker_sub.add_parser(
+        "candidate-seal",
+        help="Manager-only: bind a submitted candidate to its exact commit and tree",
+    )
+    worker_candidate_seal.add_argument("task_id")
+    worker_candidate_seal.add_argument("--candidate-revision", type=int)
+    worker_candidate_seal.set_defaults(func=cmd_worker_candidate_seal)
     worker_finalize = worker_sub.add_parser(
         "finalize", help="generate and optionally commit a schema-valid Worker result artifact"
     )
@@ -25352,6 +28065,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     worker_finalize.add_argument("--validation-summary")
     worker_finalize.add_argument("--blocking-question", action="append")
+    worker_finalize.add_argument("--invariant-evidence", action="append")
+    worker_finalize.add_argument("--regression-evidence", action="append")
+    worker_finalize.add_argument("--self-review-summary")
+    worker_finalize.add_argument("--residual-risk", action="append")
+    worker_finalize.add_argument("--unrun-check", action="append")
     worker_finalize.add_argument("--no-commit", action="store_true")
     worker_finalize.add_argument(
         "--handoff",
@@ -25387,6 +28105,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     worker_seal.add_argument("--validation-summary")
     worker_seal.set_defaults(func=cmd_worker_seal)
+    worker_accept_legacy = worker_sub.add_parser(
+        "accept-legacy-result",
+        help="explicitly accept a harvested revision 2 result before merge",
+    )
+    worker_accept_legacy.add_argument("task_id")
+    worker_accept_legacy.add_argument("--reason", required=True)
+    worker_accept_legacy.set_defaults(func=cmd_worker_accept_legacy_result)
     worker_watch = worker_sub.add_parser("watch")
     worker_watch.add_argument("task_id")
     worker_watch.add_argument("--lines", type=int, default=120)
@@ -25609,6 +28334,65 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_resolve.add_argument("--status", choices=["cleaned", "accepted-risk"], required=True)
     cleanup_resolve.add_argument("--reason", required=True)
     cleanup_resolve.set_defaults(func=cmd_cleanup_resolve)
+
+    patch_review = sub.add_parser(
+        "patch-review", help="task-local exact-candidate Patch Reviewer operations"
+    )
+    patch_review_sub = patch_review.add_subparsers(
+        dest="patch_review_command", required=True
+    )
+    patch_review_start = patch_review_sub.add_parser("start")
+    patch_review_start.add_argument("task_id")
+    patch_review_start.add_argument("--review-attempt-id")
+    patch_review_start.add_argument("--worktree")
+    patch_review_start.add_argument("--manager-pane")
+    patch_review_start.add_argument(
+        "--direction", choices=["right", "down"], default="down"
+    )
+    patch_review_start.add_argument(
+        "--launcher", choices=["pane", "agent"], default="pane"
+    )
+    patch_review_start.add_argument("--runner", choices=["exec", "tui"])
+    patch_review_start.add_argument(
+        "--agent-provider", choices=sorted(AGENT_PROVIDERS)
+    )
+    patch_review_start.add_argument("--agent-model")
+    patch_review_start.add_argument("--agent-effort")
+    patch_review_start.add_argument("--dry-run", action="store_true")
+    patch_review_start.set_defaults(func=cmd_patch_review_start)
+    patch_review_record = patch_review_sub.add_parser(
+        "record", help="record a strict Patch Review artifact and transition its task"
+    )
+    patch_review_record.add_argument("task_id")
+    patch_review_record.add_argument("--review-attempt-id")
+    patch_review_record.add_argument(
+        "--reviewer-provider", choices=sorted(AGENT_PROVIDERS), default="codex"
+    )
+    patch_review_record.add_argument("--reviewer-model", default="gpt-5.6-sol")
+    patch_review_record.add_argument("--reviewer-effort", default="xhigh")
+    patch_review_record.add_argument(
+        "--verdict",
+        choices=sorted(hloop_worker_candidate.PATCH_REVIEW_VERDICTS),
+        required=True,
+    )
+    patch_review_record.add_argument(
+        "--unresolved-finding-fingerprint", action="append"
+    )
+    patch_review_record.add_argument(
+        "--follow-up-finding-fingerprint", action="append"
+    )
+    patch_review_record.set_defaults(func=cmd_patch_review_record)
+    patch_review_harvest = patch_review_sub.add_parser("harvest")
+    patch_review_harvest.add_argument("review_attempt_id")
+    patch_review_harvest.add_argument("--keep-pane", action="store_true")
+    patch_review_harvest.add_argument(
+        "--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES)
+    )
+    patch_review_harvest.set_defaults(func=cmd_patch_review_harvest)
+    patch_review_status = patch_review_sub.add_parser("status")
+    patch_review_status.add_argument("task_id")
+    patch_review_status.add_argument("--json", action="store_true")
+    patch_review_status.set_defaults(func=cmd_patch_review_status)
 
     reviewer = sub.add_parser("reviewer", help="reviewer operations")
     reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)

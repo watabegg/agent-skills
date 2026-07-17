@@ -1132,12 +1132,13 @@ def evaluate_patch_review_rounds(
 def validate_final_result_authenticity(
     candidate: ImplementationCandidate | Mapping[str, Any],
     seal: CandidateSeal | Mapping[str, Any],
-    review: PatchReview | Mapping[str, Any],
+    review: PatchReview | Mapping[str, Any] | None,
     result: Mapping[str, Any],
     *,
     candidate_artifact_digest: str,
     current_task_contract_digest: str,
     result_parent_candidate_sha: str,
+    require_patch_review: bool = True,
 ) -> None:
     """Recheck candidate, review, and final result before harvest or merge."""
 
@@ -1152,11 +1153,15 @@ def validate_final_result_authenticity(
         sealed,
         candidate_artifact_digest=candidate_artifact_digest,
     )
-    require_fresh_patch_review(
-        review,
-        sealed,
-        current_task_contract_digest=current_task_contract_digest,
-    )
+    if review is None:
+        if require_patch_review:
+            raise WorkerCandidateError("required Patch Review evidence is missing")
+    else:
+        require_fresh_patch_review(
+            review,
+            sealed,
+            current_task_contract_digest=current_task_contract_digest,
+        )
     parent_candidate_sha = _git_object(
         result_parent_candidate_sha, "result_parent_candidate_sha"
     )
