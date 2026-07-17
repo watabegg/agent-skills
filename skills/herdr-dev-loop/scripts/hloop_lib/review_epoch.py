@@ -339,6 +339,7 @@ class EpochExecutionPlan:
                 "independence_key",
                 "artifact_ref",
                 "processes",
+                "execution_digest",
             ),
         )
         execution = cls(
@@ -353,9 +354,9 @@ class EpochExecutionPlan:
                 for item in _items(record["processes"], "execution processes")
             ),
         )
-        supplied = record.get("execution_digest")
-        if supplied is not None and not hmac.compare_digest(
-            _digest(supplied, "execution_digest"), execution.execution_digest
+        if not hmac.compare_digest(
+            _digest(record["execution_digest"], "execution_digest"),
+            execution.execution_digest,
         ):
             raise ReviewEpochError(
                 "execution_digest does not match canonical execution identity"
@@ -723,9 +724,11 @@ class ReviewEpochPlan:
                 "scope_digest",
                 "source_refs",
                 "policy_digest",
+                "topology_digest",
                 "validation_identity",
                 "audit_agent_budget",
                 "required_executions",
+                "plan_digest",
             ),
         )
         plan = cls(
@@ -760,16 +763,15 @@ class ReviewEpochPlan:
                 )
             ),
         )
-        supplied_topology = record.get("topology_digest")
-        if supplied_topology is not None and not hmac.compare_digest(
-            _digest(supplied_topology, "topology_digest"), plan.topology_digest
+        if not hmac.compare_digest(
+            _digest(record["topology_digest"], "topology_digest"),
+            plan.topology_digest,
         ):
             raise ReviewEpochError(
                 "topology_digest does not match required execution topology"
             )
-        supplied_plan = record.get("plan_digest")
-        if supplied_plan is not None and not hmac.compare_digest(
-            _digest(supplied_plan, "plan_digest"), plan.plan_digest
+        if not hmac.compare_digest(
+            _digest(record["plan_digest"], "plan_digest"), plan.plan_digest
         ):
             raise ReviewEpochError(
                 "plan_digest does not match canonical epoch identity"
