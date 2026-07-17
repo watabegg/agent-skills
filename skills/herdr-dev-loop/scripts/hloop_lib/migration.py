@@ -967,6 +967,20 @@ def _marker_identity_issues(
         "prepared_marker_digest"
     ) != plan.prepared_marker_digest:
         issues.append("migration marker prepared digest does not match the plan")
+    if status == "committed":
+        missing_mutation_fields = tuple(
+            field_name
+            for field_name in (
+                "first_v053_mutation_at",
+                "first_v053_mutation_command",
+            )
+            if field_name not in marker
+        )
+        if missing_mutation_fields:
+            issues.append(
+                "committed migration marker is missing mutation boundary fields: "
+                + ", ".join(missing_mutation_fields)
+            )
     return issues
 
 
