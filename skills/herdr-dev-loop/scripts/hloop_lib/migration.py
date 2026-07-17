@@ -823,6 +823,11 @@ def recover_legacy_remediation_history(state: State) -> RemediationHistoryRecove
             + ", ".join(f"{name}={value}" for name, value in counter_values)
         )
     group_count = len(recovered_batches)
+    if distinct_counters and not group_count:
+        issues.append(
+            "positive legacy remediation counter has no reconstructible remediation "
+            "provenance from a task, source, or batch"
+        )
     if distinct_counters and group_count and distinct_counters != {group_count}:
         issues.append(
             f"recovered remediation batch count {group_count} disagrees with legacy "
