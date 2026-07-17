@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 import json
 import sys
@@ -689,39 +690,214 @@ class EpochCapacityLeaseTests(unittest.TestCase):
 
 
 class ReviewEpochSchemaTests(unittest.TestCase):
+    def assert_schema_and_python_reject(
+        self,
+        validators,
+        record,
+        loader,
+        error_pattern: str,
+        *,
+        case_name: str,
+    ) -> None:
+        for schema_path, validator in validators:
+            with self.subTest(schema=schema_path.name, case=case_name):
+                self.assertTrue(list(validator.iter_errors(record)))
+                with self.assertRaisesRegex(ReviewEpochError, error_pattern):
+                    loader(record)
+
     def test_plan_top_level_python_and_schema_validation_have_parity(self):
         valid = epoch_plan().to_record()
-        missing_record_type = dict(valid)
-        del missing_record_type["record_type"]
-        cases = (
-            ("valid", valid, None),
-            ("missing-record-type", missing_record_type, "record_type"),
-            (
-                "invalid-record-type",
-                {**valid, "record_type": "review_epoch_capacity"},
-                "record_type",
-            ),
-            (
-                "unknown-property",
-                {**valid, "unexpected_top_level": True},
-                "unknown fields",
+        validators = tuple(
+            (schema_path, offline_validator(schema_path))
+            for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA)
+        )
+
+        for schema_path, validator in validators:
+            with self.subTest(schema=schema_path.name, case="valid"):
+                self.assertEqual(list(validator.iter_errors(valid)), [])
+                self.assertEqual(ReviewEpochPlan.from_record(valid), epoch_plan())
+
+        for field_name in valid:
+            record = deepcopy(valid)
+            del record[field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                ReviewEpochPlan.from_record,
+                field_name,
+                case_name=f"missing-{field_name}",
+            )
+
+        self.assert_schema_and_python_reject(
+            validators,
+            {**valid, "record_type": "review_epoch_capacity"},
+            ReviewEpochPlan.from_record,
+            "record_type",
+            case_name="invalid-record-type",
+        )
+        self.assert_schema_and_python_reject(
+            validators,
+            {**valid, "unexpected_top_level": True},
+            ReviewEpochPlan.from_record,
+            "unknown fields",
+            case_name="unknown-property",
+        )
+
+    def test_plan_nested_record_property_sets_match_canonical_schema(self):
+        validators = tuple(
+            (schema_path, offline_validator(schema_path))
+            for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA)
+        )
+        parent = epoch_plan()
+        successor = create_successor_revision(
+            parent,
+            additional_executions=(reviewer_execution("R002"),),
+            inherited_artifacts=(
+                inherit_artifact(
+                    parent,
+                    "R001",
+                    artifact_digest=digest("review-manifest"),
+                ),
             ),
         )
 
-        for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA):
-            validator = offline_validator(schema_path)
-            for case_name, record, error_pattern in cases:
-                with self.subTest(schema=schema_path.name, case=case_name):
-                    schema_errors = list(validator.iter_errors(record))
-                    if error_pattern is None:
-                        self.assertEqual(schema_errors, [])
-                        self.assertEqual(
-                            ReviewEpochPlan.from_record(record), epoch_plan()
-                        )
-                    else:
-                        self.assertTrue(schema_errors)
-                        with self.assertRaisesRegex(ReviewEpochError, error_pattern):
-                            ReviewEpochPlan.from_record(record)
+        plan_record = parent.to_record()
+        execution_fields = tuple(plan_record["required_executions"][0])
+        for field_name in execution_fields:
+            record = deepcopy(plan_record)
+            del record["required_executions"][0][field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                ReviewEpochPlan.from_record,
+                field_name,
+                case_name=f"execution-missing-{field_name}",
+            )
+
+        process_fields = tuple(
+            plan_record["required_executions"][0]["processes"][0]
+        )
+        for field_name in process_fields:
+            record = deepcopy(plan_record)
+            del record["required_executions"][0]["processes"][0][field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                ReviewEpochPlan.from_record,
+                field_name,
+                case_name=f"audit-process-missing-{field_name}",
+            )
+
+        successor_record = successor.to_record()
+        inherited_fields = tuple(successor_record["inherited_artifacts"][0])
+        for field_name in inherited_fields:
+            record = deepcopy(successor_record)
+            del record["inherited_artifacts"][0][field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                ReviewEpochPlan.from_record,
+                field_name,
+                case_name=f"inherited-artifact-missing-{field_name}",
+            )
+
+        for case_name, base_record, path in (
+            (
+                "execution-unknown-property",
+                plan_record,
+                ("required_executions", 0),
+            ),
+            (
+                "audit-process-unknown-property",
+                plan_record,
+                ("required_executions", 0, "processes", 0),
+            ),
+            (
+                "inherited-artifact-unknown-property",
+                successor_record,
+                ("inherited_artifacts", 0),
+            ),
+        ):
+            record = deepcopy(base_record)
+            nested = record
+            for key in path:
+                nested = nested[key]
+            nested["unexpected_nested"] = True
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                ReviewEpochPlan.from_record,
+                "unknown fields",
+                case_name=case_name,
+            )
+
+    def test_capacity_nested_record_property_sets_match_canonical_schema(self):
+        validators = tuple(
+            (schema_path, offline_validator(schema_path))
+            for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA)
+        )
+        plan = epoch_plan()
+        valid = plan.capacity_ledger().reserve(
+            plan,
+            lease_id="lease-reviewer",
+            execution_id="R001",
+            process_ids=("R001-coordinator",),
+            expires_at="2026-07-17T08:00:00Z",
+        ).to_record()
+
+        for field_name in tuple(valid):
+            record = deepcopy(valid)
+            del record[field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                EpochCapacityLedger.from_record,
+                field_name,
+                case_name=f"capacity-ledger-missing-{field_name}",
+            )
+
+        for field_name in tuple(valid["leases"][0]):
+            record = deepcopy(valid)
+            del record["leases"][0][field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                EpochCapacityLedger.from_record,
+                field_name,
+                case_name=f"capacity-lease-missing-{field_name}",
+            )
+
+        for field_name in tuple(valid["leases"][0]["reservations"][0]):
+            record = deepcopy(valid)
+            del record["leases"][0]["reservations"][0][field_name]
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                EpochCapacityLedger.from_record,
+                field_name,
+                case_name=f"lease-reservation-missing-{field_name}",
+            )
+
+        for case_name, path in (
+            ("capacity-ledger-unknown-property", ()),
+            ("capacity-lease-unknown-property", ("leases", 0)),
+            (
+                "lease-reservation-unknown-property",
+                ("leases", 0, "reservations", 0),
+            ),
+        ):
+            record = deepcopy(valid)
+            nested = record
+            for key in path:
+                nested = nested[key]
+            nested["unexpected_nested"] = True
+            self.assert_schema_and_python_reject(
+                validators,
+                record,
+                EpochCapacityLedger.from_record,
+                "unknown fields",
+                case_name=case_name,
+            )
 
     def test_canonical_and_public_schemas_validate_plan_and_capacity_records(self):
         plan = epoch_plan()
