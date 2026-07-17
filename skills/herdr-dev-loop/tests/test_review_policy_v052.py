@@ -129,6 +129,20 @@ class FindingDispositionTests(unittest.TestCase):
             )
         )
 
+    def test_accepted_risk_requires_explicit_authorization(self):
+        accepted_risk = disposition(
+            disposition="accepted_risk",
+            release_effect="non_blocking",
+        )
+        with self.assertRaisesRegex(ReviewPolicyError, "explicit authorization"):
+            validate_disposition(accepted_risk)
+        self.assertIs(
+            validate_disposition(
+                accepted_risk, accepted_risk_authorized=True
+            ),
+            accepted_risk,
+        )
+
     def test_insufficient_in_scope_evidence_requires_user_decision(self):
         candidate = disposition(
             fact_status="insufficient_evidence",

@@ -387,6 +387,23 @@ class StateMigrationV053Tests(unittest.TestCase):
         with self.assertRaisesRegex(MigrationError, "partial first-v0.5.3"):
             plan_format_three_revision_three(state)
 
+    def test_revision_two_rejects_malformed_mutation_boundary_types(self):
+        for value in (None, False, 0, " "):
+            with self.subTest(value=value):
+                state = legacy_state()
+                state["first_v053_mutation_at"] = value
+                state["first_v053_mutation_command"] = value
+                with self.assertRaises(MigrationError):
+                    plan_format_three_revision_three(state)
+
+    def test_zero_max_fix_rounds_is_preserved_by_revision_three_plan(self):
+        state = legacy_state()
+        state["review_policy"] = {"max_fix_rounds": 0}
+
+        plan = plan_format_three_revision_three(state)
+
+        self.assertEqual(plan.state["review_policy"]["max_fix_rounds"], 0)
+
     def test_task_key_and_embedded_identity_mismatch_fails_closed(self):
         state = legacy_state(
             tasks={"T001": legacy_task("queued", id="T999")}
@@ -570,6 +587,38 @@ class MigrationTransactionPlanningTests(unittest.TestCase):
                 self.assertTrue(rollback.blocked)
                 self.assertFalse(rollback.rollback_eligible)
                 self.assertIn(missing_field, " ".join(rollback.issues))
+
+    def test_malformed_committed_mutation_boundary_never_allows_rollback(self):
+        cases = (
+            (None, None),
+            (False, False),
+            (0, 0),
+            (" ", " "),
+            ("2026-07-17T07:00:00Z", ""),
+            ("", "worker start T001"),
+        )
+        for mutation_at, mutation_command in cases:
+            with self.subTest(
+                mutation_at=mutation_at, mutation_command=mutation_command
+            ):
+                plan = transaction_plan()
+                marker = plan.committed_marker
+                marker["first_v053_mutation_at"] = mutation_at
+                marker["first_v053_mutation_command"] = mutation_command
+
+                rollback = decide_migration_recovery(
+                    plan,
+                    marker=marker,
+                    archive_digest=plan.archive_digest,
+                    current_artifact_digests=output_digests(plan),
+                    requested_action="rollback",
+                )
+
+                self.assertTrue(rollback.blocked)
+                self.assertFalse(rollback.rollback_eligible)
+                self.assertIn(
+                    "mutation", " ".join(rollback.issues)
+                )
 
     def test_first_mutation_marker_permanently_disables_rollback(self):
         plan = transaction_plan()

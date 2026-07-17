@@ -25,8 +25,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 from hloop_lib.release_scope import ReleaseScope  # noqa: E402
 from hloop_lib.remediation import (  # noqa: E402
+    AcceptedRiskAuthorization,
     CandidateClassificationConflict,
     CandidateObservation,
+    ExtraRoundAuthorization,
     RemediationApprovalConflict,
     RemediationLedger,
     RemediationLedgerError,
@@ -76,6 +78,7 @@ def disposition(
     fact_status: str = "confirmed",
     disposition_value: str = "fix_now",
     release_effect: str = "blocking",
+    accepted_risk_decision_id: str = "",
 ) -> FindingDisposition:
     return FindingDisposition(
         fact_status=fact_status,
@@ -92,6 +95,7 @@ def disposition(
         target_sha=TARGET_SHA,
         requirement_refs=("REQ-003",),
         why_fix_now="The confirmed regression blocks REQ-003.",
+        accepted_risk_decision_id=accepted_risk_decision_id,
     )
 
 
@@ -102,6 +106,12 @@ def candidate(
     source_execution_id: str,
     semantic_fingerprint: str | None = None,
     severity: str = "P1",
+    origin: str = "introduced",
+    contract_relation: str = "in_scope",
+    fact_status: str = "confirmed",
+    disposition_value: str = "fix_now",
+    release_effect: str = "blocking",
+    accepted_risk_decision_id: str = "",
 ) -> CandidateObservation:
     semantic_fingerprint = semantic_fingerprint or fingerprint(observation_id)
     return CandidateObservation(
@@ -113,7 +123,15 @@ def candidate(
         fingerprint=semantic_fingerprint,
         target_sha=TARGET_SHA,
         classification=disposition(
-            observation_id, semantic_fingerprint, severity=severity
+            observation_id,
+            semantic_fingerprint,
+            severity=severity,
+            origin=origin,
+            contract_relation=contract_relation,
+            fact_status=fact_status,
+            disposition_value=disposition_value,
+            release_effect=release_effect,
+            accepted_risk_decision_id=accepted_risk_decision_id,
         ),
         requirement_refs=("REQ-003",),
         scope_refs=("runtime-release",),
@@ -206,6 +224,8 @@ def approve(
     task_number: int,
     remediation_round: int,
     extra_round_authorization_ref: str = "",
+    extra_round_authorization: ExtraRoundAuthorization | None = None,
+    captured_input_ids: tuple[str, ...] = (),
 ) -> RemediationLedger:
     batch = ledger.batch(batch_id)
     task_id = f"T{task_number:03d}"
@@ -225,6 +245,8 @@ def approve(
         first_task_number=task_number,
         release_scope=locked_scope(),
         extra_round_authorization_ref=extra_round_authorization_ref,
+        extra_round_authorization=extra_round_authorization,
+        captured_input_ids=captured_input_ids,
     )
 
 
@@ -457,6 +479,149 @@ class CandidateRegistrationTests(unittest.TestCase):
 
 
 class ApprovalAndRoundTests(unittest.TestCase):
+    def test_mixed_batch_terminalizes_non_actionable_candidates_and_plans_only_fix_now(self):
+        fix_fingerprint = fingerprint("mixed-fix")
+        discard_fingerprint = fingerprint("mixed-discard")
+        risk_fingerprint = fingerprint("mixed-risk")
+        ledger = create_remediation_batch(
+            RemediationLedger(),
+            batch_id="RB001",
+            epoch_id="E001",
+            target_sha=TARGET_SHA,
+            required_execution_ids=("R001",),
+        )
+        observations = (
+            candidate(
+                "review:fix",
+                source_kind="reviewer",
+                source_execution_id="R001",
+                semantic_fingerprint=fix_fingerprint,
+            ),
+            candidate(
+                "review:discard",
+                source_kind="reviewer",
+                source_execution_id="R001",
+                semantic_fingerprint=discard_fingerprint,
+                severity="P2",
+                origin="unrelated-pre-existing",
+                contract_relation="outside_release",
+                fact_status="refuted",
+                disposition_value="discard",
+                release_effect="non_blocking",
+            ),
+            candidate(
+                "review:risk",
+                source_kind="reviewer",
+                source_execution_id="R001",
+                semantic_fingerprint=risk_fingerprint,
+                severity="P2",
+                origin="unrelated-pre-existing",
+                contract_relation="outside_release",
+                disposition_value="accepted_risk",
+                release_effect="non_blocking",
+                accepted_risk_decision_id="D-RISK-001",
+            ),
+        )
+        for observation in observations:
+            ledger = register_candidate(ledger, "RB001", observation)
+
+        with self.assertRaisesRegex(
+            RemediationLedgerError, "accepted-risk authorizations"
+        ):
+            mark_ready_to_triage(
+                ledger,
+                "RB001",
+                terminal_execution_ids=("R001",),
+            )
+
+        authorization = AcceptedRiskAuthorization(
+            decision_id="D-RISK-001",
+            fingerprint=risk_fingerprint,
+            target_sha=TARGET_SHA,
+        )
+        ready = mark_ready_to_triage(
+            ledger,
+            "RB001",
+            terminal_execution_ids=("R001",),
+            accepted_risk_authorizations=(authorization,),
+        )
+        approved = approve_remediation_batch(
+            ready,
+            "RB001",
+            approval_ref="manager-approval:RB001",
+            scope_digest=locked_scope().scope_digest,
+            scope_revision=1,
+            task_contracts=(
+                remediation_task("T020", "review:fix", 1),
+            ),
+            first_task_number=20,
+            release_scope=locked_scope(),
+        )
+
+        batch = approved.batch("RB001")
+        self.assertEqual(len(batch.canonical_candidates), 3)
+        self.assertEqual(
+            batch.accepted_risk_authorizations, (authorization,)
+        )
+        self.assertEqual(
+            batch.materialization_plan[0].candidate_fingerprints,
+            (fix_fingerprint,),
+        )
+        self.assertEqual(approved.consumed_rounds, 1)
+
+    def test_accepted_risk_authorization_is_bound_to_fingerprint_and_target(self):
+        semantic = fingerprint("risk-binding")
+        ledger = create_remediation_batch(
+            RemediationLedger(),
+            batch_id="RB001",
+            epoch_id="E001",
+            target_sha=TARGET_SHA,
+            required_execution_ids=("R001",),
+        )
+        ledger = register_candidate(
+            ledger,
+            "RB001",
+            candidate(
+                "review:risk",
+                source_kind="reviewer",
+                source_execution_id="R001",
+                semantic_fingerprint=semantic,
+                severity="P2",
+                origin="unrelated-pre-existing",
+                contract_relation="outside_release",
+                disposition_value="accepted_risk",
+                release_effect="non_blocking",
+                accepted_risk_decision_id="D-RISK-002",
+            ),
+        )
+        for bad in (
+            AcceptedRiskAuthorization(
+                decision_id="D-OTHER",
+                fingerprint=semantic,
+                target_sha=TARGET_SHA,
+            ),
+            AcceptedRiskAuthorization(
+                decision_id="D-RISK-002",
+                fingerprint=fingerprint("other"),
+                target_sha=TARGET_SHA,
+            ),
+            AcceptedRiskAuthorization(
+                decision_id="D-RISK-002",
+                fingerprint=semantic,
+                target_sha="other-target",
+            ),
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(
+                    RemediationLedgerError, "accepted-risk authorizations"
+                ):
+                    mark_ready_to_triage(
+                        ledger,
+                        "RB001",
+                        terminal_execution_ids=("R001",),
+                        accepted_risk_authorizations=(bad,),
+                    )
+
     def test_approval_consumes_one_round_and_stores_deterministic_write_ahead_plan(self):
         ledger = candidate_batch()
         approved = approve(
@@ -557,12 +722,19 @@ class ApprovalAndRoundTests(unittest.TestCase):
         )
         with self.assertRaises(RemediationRoundLimitExceeded):
             approve(ledger, "RB002", task_number=21, remediation_round=2)
+        authorization = ExtraRoundAuthorization(
+            input_id="U0007",
+            authorized_extra_rounds=1,
+            remediation_batch_ids=("RB002",),
+        )
         ledger = approve(
             ledger,
             "RB002",
             task_number=21,
             remediation_round=2,
             extra_round_authorization_ref="U0007:RB002",
+            extra_round_authorization=authorization,
+            captured_input_ids=("U0007",),
         )
         self.assertEqual(ledger.consumed_rounds, 2)
         self.assertEqual(
@@ -584,6 +756,8 @@ class ApprovalAndRoundTests(unittest.TestCase):
             first_task_number=21,
             release_scope=locked_scope(),
             extra_round_authorization_ref="U0007:RB002",
+            extra_round_authorization=authorization,
+            captured_input_ids=("U0007",),
         )
         self.assertIs(replay, ledger)
         self.assertEqual(replay.consumed_rounds, 2)
@@ -592,6 +766,130 @@ class ApprovalAndRoundTests(unittest.TestCase):
         self.assertEqual(RemediationLedger().max_fix_rounds, 2)
         with self.assertRaisesRegex(RemediationLedgerError, "must not exceed 2"):
             RemediationLedger(max_fix_rounds=3)
+
+    def test_zero_automatic_rounds_requires_exact_captured_authorization(self):
+        ledger = candidate_batch(ledger=RemediationLedger(max_fix_rounds=0))
+        with self.assertRaises(RemediationRoundLimitExceeded):
+            approve(ledger, "RB001", task_number=20, remediation_round=1)
+
+        authorization = ExtraRoundAuthorization(
+            input_id="U0008",
+            authorized_extra_rounds=1,
+            remediation_batch_ids=("RB001",),
+        )
+        approved = approve(
+            ledger,
+            "RB001",
+            task_number=20,
+            remediation_round=1,
+            extra_round_authorization_ref="U0008:RB001",
+            extra_round_authorization=authorization,
+            captured_input_ids=("U0008",),
+        )
+
+        self.assertEqual(approved.max_fix_rounds, 0)
+        self.assertEqual(approved.consumed_rounds, 1)
+        self.assertEqual(
+            approved.consumed_extra_round_authorization_refs,
+            ("U0008:RB001",),
+        )
+        self.assertEqual(
+            RemediationLedger.from_record(approved.to_record()), approved
+        )
+
+    def test_extra_round_authorization_fails_closed_for_unsafe_records(self):
+        ledger = candidate_batch(ledger=RemediationLedger(max_fix_rounds=0))
+        exact = ExtraRoundAuthorization(
+            input_id="U0009",
+            authorized_extra_rounds=1,
+            remediation_batch_ids=("RB001",),
+        )
+        cases = (
+            (
+                "arbitrary-ref",
+                {
+                    "extra_round_authorization_ref": "arbitrary",
+                    "extra_round_authorization": exact,
+                    "captured_input_ids": ("U0009",),
+                },
+            ),
+            (
+                "uncaptured-input",
+                {
+                    "extra_round_authorization_ref": "U0009:RB001",
+                    "extra_round_authorization": exact,
+                    "captured_input_ids": (),
+                },
+            ),
+            (
+                "other-batch",
+                {
+                    "extra_round_authorization_ref": "U0009:RB001",
+                    "extra_round_authorization": ExtraRoundAuthorization(
+                        input_id="U0009",
+                        authorized_extra_rounds=1,
+                        remediation_batch_ids=("RB002",),
+                    ),
+                    "captured_input_ids": ("U0009",),
+                },
+            ),
+        )
+        for label, kwargs in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(RemediationLedgerError):
+                    approve(
+                        ledger,
+                        "RB001",
+                        task_number=20,
+                        remediation_round=1,
+                        **kwargs,
+                    )
+
+        with self.assertRaisesRegex(
+            RemediationLedgerError, "exactly match remediation_batch_ids"
+        ):
+            ExtraRoundAuthorization(
+                input_id="U0009",
+                authorized_extra_rounds=1,
+                remediation_batch_ids=("RB001", "RB002"),
+            )
+
+    def test_captured_input_authorization_cannot_be_redefined_for_reuse(self):
+        first_authorization = ExtraRoundAuthorization(
+            input_id="U0012",
+            authorized_extra_rounds=1,
+            remediation_batch_ids=("RB001",),
+        )
+        ledger = approve(
+            candidate_batch(ledger=RemediationLedger(max_fix_rounds=0)),
+            "RB001",
+            task_number=20,
+            remediation_round=1,
+            extra_round_authorization_ref="U0012:RB001",
+            extra_round_authorization=first_authorization,
+            captured_input_ids=("U0012",),
+        )
+        ledger = candidate_batch(
+            ledger=ledger,
+            batch_id="RB002",
+            semantic_fingerprint=fingerprint("reused-input"),
+        )
+        redefined = ExtraRoundAuthorization(
+            input_id="U0012",
+            authorized_extra_rounds=1,
+            remediation_batch_ids=("RB002",),
+        )
+
+        with self.assertRaisesRegex(RemediationLedgerError, "changed across batches"):
+            approve(
+                ledger,
+                "RB002",
+                task_number=21,
+                remediation_round=2,
+                extra_round_authorization_ref="U0012:RB002",
+                extra_round_authorization=redefined,
+                captured_input_ids=("U0012",),
+            )
 
 
 class CrashReconciliationTests(unittest.TestCase):
@@ -737,6 +1035,102 @@ class PersistenceAndSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(RemediationLedgerError, "contiguous"):
             RemediationLedger.from_record(approved)
 
+    def test_restore_recomputes_canonical_approval_payload(self):
+        approved = approve(
+            candidate_batch(), "RB001", task_number=20, remediation_round=1
+        ).to_record()
+
+        changed_plan = json.loads(json.dumps(approved))
+        planned = changed_plan["batches"][0]["materialization_plan"][0]
+        planned["task_contract"]["acceptance"] = ["expanded after approval"]
+        planned["task_contract_digest"] = canonical_digest(
+            planned["task_contract"]
+        )
+
+        changed_scope = json.loads(json.dumps(approved))
+        changed_scope["batches"][0]["scope_digest"] = canonical_digest(
+            {"scope": "changed"}
+        )
+
+        changed_round = json.loads(json.dumps(approved))
+        changed_round["batches"][0]["remediation_round"] = 2
+
+        changed_candidates = json.loads(json.dumps(approved))
+        canonical = changed_candidates["batches"][0]["canonical_candidates"]
+        canonical[0]["why_fix_now"] = "changed candidate evidence"
+        changed_candidates["batches"][0]["candidate_set_digest"] = canonical_digest(
+            canonical
+        )
+
+        changed_fingerprints = json.loads(json.dumps(approved))
+        changed_fingerprints["batches"][0]["materialization_plan"][0][
+            "candidate_fingerprints"
+        ] = [fingerprint("unapproved-candidate")]
+
+        for label, record, error in (
+            ("plan", changed_plan, "approval_digest"),
+            ("scope", changed_scope, "approval_digest"),
+            ("round", changed_round, "remediation_round|approval_digest"),
+            ("candidates", changed_candidates, "approval_digest"),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    RemediationLedgerError, error
+                ):
+                    RemediationLedger.from_record(record)
+
+        with self.assertRaisesRegex(
+            RemediationLedgerError, "exactly cover"
+        ):
+            RemediationLedger.from_record(changed_fingerprints)
+
+    def test_restore_binds_extra_authorization_and_artifact_paths(self):
+        ledger = candidate_batch(ledger=RemediationLedger(max_fix_rounds=0))
+        authorization = ExtraRoundAuthorization(
+            input_id="U0010",
+            authorized_extra_rounds=1,
+            remediation_batch_ids=("RB001",),
+        )
+        approved = approve(
+            ledger,
+            "RB001",
+            task_number=20,
+            remediation_round=1,
+            extra_round_authorization_ref="U0010:RB001",
+            extra_round_authorization=authorization,
+            captured_input_ids=("U0010",),
+        ).to_record()
+
+        changed_authorization = json.loads(json.dumps(approved))
+        batch = changed_authorization["batches"][0]
+        batch["extra_round_authorization"]["input_id"] = "U0011"
+        batch["extra_round_authorization_ref"] = "U0011:RB001"
+        changed_authorization["consumed_extra_round_authorization_refs"] = [
+            "U0011:RB001"
+        ]
+        with self.assertRaisesRegex(RemediationLedgerError, "approval_digest"):
+            RemediationLedger.from_record(changed_authorization)
+
+        changed_path = json.loads(json.dumps(approved))
+        changed_path["batches"][0]["materialization_plan"][0][
+            "artifact_ref"
+        ] = "tasks/T999.md"
+        with self.assertRaisesRegex(RemediationLedgerError, "canonical"):
+            RemediationLedger.from_record(changed_path)
+
+    def test_reconcile_revalidates_approval_digest(self):
+        approved = approve(
+            candidate_batch(), "RB001", task_number=20, remediation_round=1
+        )
+        object.__setattr__(
+            approved.batch("RB001"),
+            "approval_digest",
+            canonical_digest({"forged": True}),
+        )
+
+        with self.assertRaisesRegex(RemediationLedgerError, "approval_digest"):
+            reconcile_materialization(approved, "RB001", ())
+
     def test_reference_and_public_schemas_accept_contract_and_reject_unsafe_shapes(self):
         valid = approve(
             candidate_batch(), "RB001", task_number=20, remediation_round=1
@@ -757,6 +1151,9 @@ class PersistenceAndSchemaTests(unittest.TestCase):
             ambiguous["batches"][0]["status"] = "authorized"
             with self.subTest(schema=schema_path.name, case="authorized-gap"):
                 self.assertTrue(list(validator.iter_errors(ambiguous)))
+            zero_rounds = RemediationLedger(max_fix_rounds=0).to_record()
+            with self.subTest(schema=schema_path.name, case="zero-rounds"):
+                self.assertEqual(list(validator.iter_errors(zero_rounds)), [])
 
     def test_python_parser_rejects_unknown_fields_and_digest_mismatch(self):
         valid = approve(
