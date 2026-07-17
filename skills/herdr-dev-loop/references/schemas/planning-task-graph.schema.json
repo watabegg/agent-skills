@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/planning-task-graph.schema.json",
+  "title": "Herdr Dev Loop Task Risk Graph",
+  "allOf": [
+    {"$ref": "planning-common.schema.json#/$defs/identity"}
+  ],
+  "type": "object",
+  "required": [
+    "record_type",
+    "planning_schema_revision",
+    "run_id",
+    "plan_revision",
+    "requirements_revision",
+    "release_scope_revision",
+    "release_scope_digest",
+    "source_revision",
+    "source_digest",
+    "tasks",
+    "artifact_digest"
+  ],
+  "properties": {
+    "record_type": {"const": "task_risk_graph"},
+    "planning_schema_revision": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "plan_revision": {"type": "integer", "minimum": 1},
+    "requirements_revision": {"type": "integer", "minimum": 1},
+    "release_scope_revision": {"type": "integer", "minimum": 1},
+    "release_scope_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "source_revision": {"type": "integer", "minimum": 1},
+    "source_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "changes",
+          "change_refs",
+          "preserved_invariants",
+          "write_allow",
+          "non_goals",
+          "acceptance",
+          "regression_checks",
+          "depends_on",
+          "shared_surface_refs",
+          "risk_class",
+          "required_gates",
+          "requirement_refs",
+          "plan_item_refs",
+          "scope_refs",
+          "owner"
+        ],
+        "properties": {
+          "task_id": {"type": "string", "pattern": "^T[0-9]{3,}$"},
+          "changes": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "change_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "preserved_invariants": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "write_allow": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "non_goals": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "acceptance": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "regression_checks": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "depends_on": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "shared_surface_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "risk_class": {"enum": ["mechanical", "normal", "high"]},
+          "required_gates": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"enum": ["patch_review", "full_suite"]}
+          },
+          "requirement_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "plan_item_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "scope_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "owner": {"enum": ["worker", "manager"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "artifact_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    }
+  },
+  "additionalProperties": false
+}
