@@ -295,6 +295,19 @@ class ReviewEpochIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewEpochError, "record_type"):
             ReviewEpochPlan.from_record(record)
 
+    def test_deserialization_requires_persisted_identity_digests(self):
+        for field_name in ("plan_digest", "topology_digest"):
+            with self.subTest(field_name=field_name):
+                record = epoch_plan().to_record()
+                del record[field_name]
+                with self.assertRaisesRegex(ReviewEpochError, field_name):
+                    ReviewEpochPlan.from_record(record)
+
+        record = epoch_plan().to_record()
+        del record["required_executions"][0]["execution_digest"]
+        with self.assertRaisesRegex(ReviewEpochError, "execution_digest"):
+            ReviewEpochPlan.from_record(record)
+
     def test_existing_review_group_contract_remains_unchanged(self):
         group = plan_review_group("swarm", head_sha="target-def", probe_count=6)
         self.assertEqual(len(group.expected_lanes), 6)
