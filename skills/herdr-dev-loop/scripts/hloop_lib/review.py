@@ -85,6 +85,110 @@ POLICY_AXES = (
     "release_effect",
 )
 
+EXTERNALLY_PLANNED_CAPABILITY = "externally-planned-v1"
+_LABELLED_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalReviewProtocolAdapter:
+    """Pinned capability evidence for one externally planned review skill.
+
+    The adapter is capability evidence for a Reviewer execution, not another
+    audit source.  HLoop therefore keeps it outside the epoch execution and
+    independence-key sets while still binding the exact installed content.
+    """
+
+    protocol: str
+    source: str
+    version: str
+    content_digest: str
+    capabilities: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field_name in ("protocol", "source", "version"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ReviewModelError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        if self.protocol != "codex-review-multi-v2":
+            raise ReviewModelError(
+                "external review adapter supports only codex-review-multi-v2"
+            )
+        if not isinstance(self.content_digest, str) or not _LABELLED_DIGEST_RE.fullmatch(
+            self.content_digest
+        ):
+            raise ReviewModelError(
+                "external review content_digest must be a labelled SHA-256 digest"
+            )
+        raw_capabilities = tuple(self.capabilities)
+        if (
+            not raw_capabilities
+            or any(
+                not isinstance(item, str) or not item.strip()
+                for item in raw_capabilities
+            )
+        ):
+            raise ReviewModelError(
+                "external review capabilities must be unique non-empty strings"
+            )
+        capabilities = tuple(sorted(item.strip() for item in raw_capabilities))
+        if len(set(capabilities)) != len(capabilities):
+            raise ReviewModelError(
+                "external review capabilities must be unique non-empty strings"
+            )
+        if EXTERNALLY_PLANNED_CAPABILITY not in capabilities:
+            raise ReviewModelError(
+                "installed review protocol lacks externally-planned-v1 capability"
+            )
+        object.__setattr__(self, "capabilities", capabilities)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "record_type": "external_review_protocol_adapter",
+            "protocol": self.protocol,
+            "source": self.source,
+            "version": self.version,
+            "content_digest": self.content_digest,
+            "capabilities": list(self.capabilities),
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ExternalReviewProtocolAdapter":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise ReviewModelError("external review protocol adapter must be an object")
+        required = {
+            "record_type",
+            "protocol",
+            "source",
+            "version",
+            "content_digest",
+            "capabilities",
+        }
+        if set(value) != required:
+            missing = sorted(required - set(value))
+            unknown = sorted(set(value) - required)
+            raise ReviewModelError(
+                "external review protocol adapter fields are not canonical"
+                + (f"; missing={','.join(missing)}" if missing else "")
+                + (f"; unknown={','.join(unknown)}" if unknown else "")
+            )
+        if value["record_type"] != "external_review_protocol_adapter":
+            raise ReviewModelError("external review adapter record_type is invalid")
+        capabilities = value["capabilities"]
+        if isinstance(capabilities, (str, bytes)) or not isinstance(
+            capabilities, Sequence
+        ):
+            raise ReviewModelError("external review capabilities must be an array")
+        return cls(
+            protocol=value["protocol"],
+            source=value["source"],
+            version=value["version"],
+            content_digest=value["content_digest"],
+            capabilities=tuple(capabilities),
+        )
+
 DEFAULT_DISCOVERY_LANES = (
     "integration contract and write scope",
     "product correctness and edge cases",
@@ -2193,3 +2297,40 @@ def check_manifest_completeness(manifest: ReviewManifest) -> ManifestCompletenes
         missing_lanes=tuple(sorted(missing_lanes)),
         incomplete_findings=tuple(sorted(incomplete_findings)),
     )
+
+
+def validate_externally_planned_review_manifest(
+    value: ReviewManifest | Mapping[str, Any],
+    *,
+    expected_plan: ReviewGroupPlan | Mapping[str, Any],
+    adapter: ExternalReviewProtocolAdapter | Mapping[str, Any],
+) -> ReviewManifest:
+    """Validate one external protocol artifact as its Reviewer execution.
+
+    This function does not create an execution or an independence key.  It
+    validates that the external skill honored the exact HLoop lane plan and
+    returns the single manifest owned by the already-planned Reviewer
+    execution.
+    """
+
+    ExternalReviewProtocolAdapter.from_record(adapter)
+    plan = (
+        expected_plan
+        if isinstance(expected_plan, ReviewGroupPlan)
+        else ReviewGroupPlan.from_record(expected_plan)
+    )
+    manifest = value if isinstance(value, ReviewManifest) else ReviewManifest.from_record(value)
+    if manifest.plan != plan:
+        raise ReviewModelError(
+            "externally planned review manifest changed the HLoop lane plan"
+        )
+    completeness = check_manifest_completeness(manifest)
+    if completeness != manifest.completeness:
+        raise ReviewModelError(
+            "externally planned review manifest completeness is not canonical"
+        )
+    if not completeness.complete:
+        raise ReviewModelError(
+            "externally planned review manifest has incomplete required lanes or verification"
+        )
+    return manifest

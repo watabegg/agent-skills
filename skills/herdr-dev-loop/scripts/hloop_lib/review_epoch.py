@@ -30,6 +30,18 @@ EPOCH_SOURCE_KINDS = frozenset(
 LEASE_STATUSES = frozenset(
     {"starting", "running", "expired_quarantined", "terminal"}
 )
+EXECUTION_OUTCOME_STATUSES = frozenset(
+    {"succeeded", "failed", "timeout", "cancelled", "artifact_incomplete"}
+)
+EPOCH_COLLECTION_STATUSES = frozenset(
+    {
+        "collecting",
+        "ready_to_triage",
+        "incomplete",
+        "closed",
+        "superseded_for_completion",
+    }
+)
 
 _DIGEST_RE = re.compile(DIGEST_PATTERN)
 _EPOCH_ID_RE = re.compile(r"^E[0-9]{3,}$")
@@ -112,6 +124,33 @@ _EPOCH_CAPACITY_LEDGER_RECORD_FIELDS = (
     "live_slots",
     "available_slots",
     "blocks_new_starts",
+)
+_EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS = (
+    "record_type",
+    "epoch_id",
+    "epoch_revision",
+    "execution_id",
+    "attempt_id",
+    "plan_digest",
+    "execution_digest",
+    "source_kind",
+    "protocol",
+    "independence_key",
+    "artifact_ref",
+    "artifact_digest",
+    "artifact_complete",
+    "completed_process_ids",
+    "status",
+    "terminal_at",
+)
+_REVIEW_EPOCH_COLLECTION_RECORD_FIELDS = (
+    "record_type",
+    "plan",
+    "capacity",
+    "execution_outcomes",
+    "status",
+    "status_reason",
+    "remediation_batch_id",
 )
 
 
@@ -1364,6 +1403,16 @@ class EpochCapacityLedger:
         }
         if active.intersection(selected):
             raise ReviewEpochError("planned process already has an active lease")
+        historical = {
+            process_id
+            for lease in self.leases
+            for process_id in lease.process_ids
+        }
+        if historical.intersection(selected):
+            raise ReviewEpochError(
+                "planned process already has terminal lease history for this "
+                "canonical process identity"
+            )
         reservations = tuple(
             LeaseReservation(
                 process_id=process.process_id,
@@ -1481,6 +1530,506 @@ class EpochCapacityLedger:
                     f"{field_name} does not match capacity lease state"
                 )
         return ledger
+
+
+@dataclass(frozen=True, slots=True)
+class EpochExecutionOutcome:
+    """One terminal execution result bound to an immutable epoch plan.
+
+    The protocol artifact belongs to the execution.  It is deliberately not a
+    second source or independence key, which prevents an externally planned
+    Reviewer manifest from being double-counted as another audit execution.
+    """
+
+    epoch_id: str
+    epoch_revision: int
+    execution_id: str
+    attempt_id: str
+    plan_digest: str
+    execution_digest: str
+    source_kind: str
+    protocol: str
+    independence_key: str
+    artifact_ref: str
+    artifact_digest: str
+    artifact_complete: bool
+    completed_process_ids: tuple[str, ...]
+    status: str
+    terminal_at: str
+
+    def __post_init__(self) -> None:
+        identity = EpochArtifactIdentity(
+            epoch_id=_required_text(self.epoch_id, "epoch_id"),
+            epoch_revision=_positive_int(self.epoch_revision, "epoch_revision"),
+            execution_id=_required_text(self.execution_id, "execution_id"),
+            attempt_id=_required_text(self.attempt_id, "attempt_id"),
+            plan_digest=_digest(self.plan_digest, "plan_digest"),
+            execution_digest=_digest(self.execution_digest, "execution_digest"),
+            source_kind=_required_text(self.source_kind, "source_kind"),
+            protocol=_required_text(self.protocol, "protocol"),
+            independence_key=_required_text(
+                self.independence_key, "independence_key"
+            ),
+            artifact_ref=_required_text(self.artifact_ref, "artifact_ref"),
+        )
+        for field_name, value in identity.to_record().items():
+            object.__setattr__(self, field_name, value)
+        artifact_digest = _optional_text(self.artifact_digest, "artifact_digest")
+        if artifact_digest:
+            artifact_digest = _digest(artifact_digest, "artifact_digest")
+        object.__setattr__(self, "artifact_digest", artifact_digest)
+        if not isinstance(self.artifact_complete, bool):
+            raise ReviewEpochError("artifact_complete must be boolean")
+        completed = tuple(
+            sorted(
+                _text_tuple(
+                    self.completed_process_ids,
+                    "completed_process_ids",
+                    allow_empty=True,
+                )
+            )
+        )
+        object.__setattr__(self, "completed_process_ids", completed)
+        if self.status not in EXECUTION_OUTCOME_STATUSES:
+            raise ReviewEpochError(
+                f"unsupported execution outcome status: {self.status!r}"
+            )
+        object.__setattr__(
+            self, "terminal_at", _timestamp(self.terminal_at, "terminal_at")
+        )
+        if self.status == "succeeded" and (
+            not self.artifact_complete or not self.artifact_digest
+        ):
+            raise ReviewEpochError(
+                "succeeded execution outcomes require a complete artifact digest"
+            )
+        if self.status == "artifact_incomplete" and self.artifact_complete:
+            raise ReviewEpochError(
+                "artifact_incomplete outcomes cannot claim artifact completeness"
+            )
+
+    @classmethod
+    def for_plan(
+        cls,
+        plan: ReviewEpochPlan | Mapping[str, Any],
+        execution_id: str,
+        *,
+        artifact_digest: str = "",
+        artifact_complete: bool,
+        completed_process_ids: Sequence[str],
+        status: str,
+        terminal_at: str,
+    ) -> "EpochExecutionOutcome":
+        epoch = ReviewEpochPlan.from_record(plan)
+        identity = epoch.artifact_identity(execution_id)
+        outcome = cls(
+            **identity.to_record(),
+            artifact_digest=artifact_digest,
+            artifact_complete=artifact_complete,
+            completed_process_ids=tuple(completed_process_ids),
+            status=status,
+            terminal_at=terminal_at,
+        )
+        outcome.validate_for_plan(epoch)
+        return outcome
+
+    @property
+    def successful(self) -> bool:
+        return self.status == "succeeded" and self.artifact_complete
+
+    def validate_for_plan(
+        self, plan: ReviewEpochPlan | Mapping[str, Any]
+    ) -> None:
+        epoch = ReviewEpochPlan.from_record(plan)
+        identity = epoch.artifact_identity(self.execution_id).to_record()
+        observed_identity = {
+            key: getattr(self, key) for key in identity
+        }
+        if observed_identity != identity:
+            raise ReviewEpochError(
+                "execution outcome identity does not match immutable epoch plan"
+            )
+        execution = epoch.execution(self.execution_id)
+        expected_process_ids = tuple(
+            sorted(process.process_id for process in execution.processes)
+        )
+        if self.successful and self.completed_process_ids != expected_process_ids:
+            raise ReviewEpochError(
+                "succeeded execution outcome is missing planned process results"
+            )
+        unknown = sorted(set(self.completed_process_ids) - set(expected_process_ids))
+        if unknown:
+            raise ReviewEpochError(
+                "execution outcome contains unplanned process results: "
+                + ", ".join(unknown)
+            )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "record_type": "review_epoch_execution_outcome",
+            "epoch_id": self.epoch_id,
+            "epoch_revision": self.epoch_revision,
+            "execution_id": self.execution_id,
+            "attempt_id": self.attempt_id,
+            "plan_digest": self.plan_digest,
+            "execution_digest": self.execution_digest,
+            "source_kind": self.source_kind,
+            "protocol": self.protocol,
+            "independence_key": self.independence_key,
+            "artifact_ref": self.artifact_ref,
+            "artifact_digest": self.artifact_digest,
+            "artifact_complete": self.artifact_complete,
+            "completed_process_ids": list(self.completed_process_ids),
+            "status": self.status,
+            "terminal_at": self.terminal_at,
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "EpochExecutionOutcome":
+        if isinstance(value, cls):
+            return value
+        record = _record(value, "epoch execution outcome")
+        _exact_record_fields(
+            record,
+            "epoch execution outcome",
+            _EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS,
+        )
+        if record["record_type"] != "review_epoch_execution_outcome":
+            raise ReviewEpochError("execution outcome record_type is invalid")
+        return cls(
+            **{
+                field: record[field]
+                for field in _EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS
+                if field != "record_type"
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewEpochCollection:
+    """Canonical state for one epoch revision and its collection barrier."""
+
+    plan: ReviewEpochPlan
+    capacity: EpochCapacityLedger
+    execution_outcomes: tuple[EpochExecutionOutcome, ...] = ()
+    status: str = "collecting"
+    status_reason: str = ""
+    remediation_batch_id: str = ""
+
+    def __post_init__(self) -> None:
+        plan = ReviewEpochPlan.from_record(self.plan)
+        capacity = EpochCapacityLedger.from_record(self.capacity)
+        capacity.validate_for_plan(plan)
+        outcomes = tuple(
+            sorted(
+                (
+                    EpochExecutionOutcome.from_record(item)
+                    for item in self.execution_outcomes
+                ),
+                key=lambda item: item.execution_id,
+            )
+        )
+        execution_ids = [item.execution_id for item in outcomes]
+        independence_keys = [item.independence_key for item in outcomes]
+        if len(set(execution_ids)) != len(execution_ids):
+            raise ReviewEpochError("execution outcomes contain duplicate execution_id")
+        if len(set(independence_keys)) != len(independence_keys):
+            raise ReviewEpochError(
+                "execution outcomes contain duplicate independence_key"
+            )
+        for outcome in outcomes:
+            outcome.validate_for_plan(plan)
+        if self.status not in EPOCH_COLLECTION_STATUSES:
+            raise ReviewEpochError(
+                f"unsupported epoch collection status: {self.status!r}"
+            )
+        reason = _optional_text(self.status_reason, "status_reason")
+        batch_id = _optional_text(
+            self.remediation_batch_id, "remediation_batch_id"
+        )
+        if batch_id and re.fullmatch(r"RB[0-9]{3,}", batch_id) is None:
+            raise ReviewEpochError("remediation_batch_id must use RB<digits>")
+        derived = self._derived_status(plan, capacity, outcomes)
+        if self.status in {"collecting", "ready_to_triage", "incomplete"}:
+            if self.status != derived:
+                raise ReviewEpochError(
+                    f"epoch collection status {self.status!r} does not match {derived!r}"
+                )
+            if batch_id:
+                raise ReviewEpochError(
+                    "nonterminal epoch collection cannot reference a remediation batch"
+                )
+        elif self.status == "closed":
+            if derived != "ready_to_triage" or not reason:
+                raise ReviewEpochError(
+                    "closed epoch collection requires a complete triage-ready barrier"
+                )
+        elif not reason:
+            raise ReviewEpochError(
+                "superseded epoch collection requires status_reason"
+            )
+        object.__setattr__(self, "plan", plan)
+        object.__setattr__(self, "capacity", capacity)
+        object.__setattr__(self, "execution_outcomes", outcomes)
+        object.__setattr__(self, "status_reason", reason)
+        object.__setattr__(self, "remediation_batch_id", batch_id)
+
+    @staticmethod
+    def _derived_status(
+        plan: ReviewEpochPlan,
+        capacity: EpochCapacityLedger,
+        outcomes: Sequence[EpochExecutionOutcome],
+    ) -> str:
+        if any(not outcome.successful for outcome in outcomes):
+            return "incomplete"
+        by_execution = {item.execution_id: item for item in outcomes}
+        if set(by_execution) == {
+            execution.execution_id for execution in plan.required_executions
+        }:
+            if capacity.blocks_new_starts:
+                return "incomplete"
+            if capacity.reserved_slots == 0:
+                return "ready_to_triage"
+        return "collecting"
+
+    @classmethod
+    def create(
+        cls,
+        plan: ReviewEpochPlan | Mapping[str, Any],
+        *,
+        predecessor_capacity: EpochCapacityLedger | Mapping[str, Any] | None = None,
+    ) -> "ReviewEpochCollection":
+        epoch = ReviewEpochPlan.from_record(plan)
+        return cls(
+            plan=epoch,
+            capacity=epoch.capacity_ledger(predecessor_capacity),
+        )
+
+    def with_capacity(
+        self, capacity: EpochCapacityLedger | Mapping[str, Any]
+    ) -> "ReviewEpochCollection":
+        normalized = EpochCapacityLedger.from_record(capacity)
+        derived = self._derived_status(
+            self.plan, normalized, self.execution_outcomes
+        )
+        return replace(
+            self,
+            capacity=normalized,
+            status=derived,
+            status_reason=("execution or artifact incomplete" if derived == "incomplete" else ""),
+        )
+
+    def record_outcome(
+        self, outcome: EpochExecutionOutcome | Mapping[str, Any]
+    ) -> "ReviewEpochCollection":
+        if self.status in {"closed", "superseded_for_completion"}:
+            raise ReviewEpochError(
+                f"cannot record an execution outcome while epoch is {self.status}"
+            )
+        normalized = EpochExecutionOutcome.from_record(outcome)
+        normalized.validate_for_plan(self.plan)
+        terminal_process_ids = {
+            process_id
+            for lease in self.capacity.leases
+            if lease.status == "terminal"
+            and lease.execution_id == normalized.execution_id
+            and lease.attempt_id == normalized.attempt_id
+            for process_id in lease.process_ids
+        }
+        missing_terminal = sorted(
+            set(normalized.completed_process_ids) - terminal_process_ids
+        )
+        if missing_terminal:
+            raise ReviewEpochError(
+                "execution outcome contains processes without terminal lease history: "
+                + ", ".join(missing_terminal)
+            )
+        execution = self.plan.execution(normalized.execution_id)
+        lease_status_by_process = {
+            process_id: lease.status
+            for lease in self.capacity.leases
+            if lease.execution_id == normalized.execution_id
+            and lease.attempt_id == normalized.attempt_id
+            for process_id in lease.process_ids
+        }
+        nonterminal = sorted(
+            process.process_id
+            for process in execution.processes
+            if lease_status_by_process.get(process.process_id)
+            not in {"terminal", "expired_quarantined"}
+        )
+        if nonterminal:
+            raise ReviewEpochError(
+                "execution outcome cannot be recorded while planned process "
+                "leases are nonterminal or missing: "
+                + ", ".join(nonterminal)
+            )
+        for existing in self.execution_outcomes:
+            if existing.execution_id == normalized.execution_id:
+                if existing == normalized:
+                    return self
+                raise ReviewEpochError(
+                    "terminal execution outcome changed on retry"
+                )
+        outcomes = (*self.execution_outcomes, normalized)
+        derived = self._derived_status(self.plan, self.capacity, outcomes)
+        return replace(
+            self,
+            execution_outcomes=outcomes,
+            status=derived,
+            status_reason=(
+                f"execution {normalized.execution_id} ended as {normalized.status}"
+                if derived == "incomplete"
+                else ""
+            ),
+        )
+
+    def close(
+        self, *, reason: str, remediation_batch_id: str = ""
+    ) -> "ReviewEpochCollection":
+        if self.status == "closed":
+            if (
+                self.status_reason == _required_text(reason, "reason")
+                and self.remediation_batch_id == remediation_batch_id
+            ):
+                return self
+            raise ReviewEpochError("closed epoch semantics changed on retry")
+        if self.status != "ready_to_triage":
+            raise ReviewEpochError(
+                f"epoch cannot close before ready_to_triage: {self.status}"
+            )
+        return replace(
+            self,
+            status="closed",
+            status_reason=_required_text(reason, "reason"),
+            remediation_batch_id=remediation_batch_id,
+        )
+
+    def supersede(self, *, reason: str) -> "ReviewEpochCollection":
+        if self.status in {"closed", "superseded_for_completion"}:
+            raise ReviewEpochError(f"cannot supersede epoch while it is {self.status}")
+        return replace(
+            self,
+            status="superseded_for_completion",
+            status_reason=_required_text(reason, "reason"),
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "record_type": "review_epoch_collection",
+            "plan": self.plan.to_record(),
+            "capacity": self.capacity.to_record(),
+            "execution_outcomes": [
+                item.to_record() for item in self.execution_outcomes
+            ],
+            "status": self.status,
+            "status_reason": self.status_reason,
+            "remediation_batch_id": self.remediation_batch_id,
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ReviewEpochCollection":
+        if isinstance(value, cls):
+            return value
+        record = _record(value, "review epoch collection")
+        _exact_record_fields(
+            record,
+            "review epoch collection",
+            _REVIEW_EPOCH_COLLECTION_RECORD_FIELDS,
+        )
+        if record["record_type"] != "review_epoch_collection":
+            raise ReviewEpochError("review epoch collection record_type is invalid")
+        return cls(
+            plan=ReviewEpochPlan.from_record(record["plan"]),
+            capacity=EpochCapacityLedger.from_record(record["capacity"]),
+            execution_outcomes=tuple(
+                EpochExecutionOutcome.from_record(item)
+                for item in _items(
+                    record["execution_outcomes"], "execution_outcomes"
+                )
+            ),
+            status=record["status"],
+            status_reason=record["status_reason"],
+            remediation_batch_id=record["remediation_batch_id"],
+        )
+
+
+def create_successor_collection(
+    parent: ReviewEpochCollection | Mapping[str, Any],
+    successor_plan: ReviewEpochPlan | Mapping[str, Any],
+) -> tuple[ReviewEpochCollection, ReviewEpochCollection]:
+    """Supersede one revision and carry only explicitly inherited artifacts."""
+
+    previous = ReviewEpochCollection.from_record(parent)
+    successor = ReviewEpochPlan.from_record(successor_plan)
+    validate_successor_revision(previous.plan, successor)
+    parent_execution_ids = {
+        execution.execution_id for execution in previous.plan.required_executions
+    }
+    inherited_execution_ids = {
+        artifact.execution_id for artifact in successor.inherited_artifacts
+    }
+    if inherited_execution_ids != parent_execution_ids:
+        missing = sorted(parent_execution_ids - inherited_execution_ids)
+        raise ReviewEpochError(
+            "successor collection must explicitly inherit every successful "
+            "parent required execution artifact; missing: "
+            + ", ".join(missing)
+        )
+    already_superseded = previous.status == "superseded_for_completion"
+    expected_reason = f"superseded by revision {successor.epoch_revision}"
+    if already_superseded:
+        if previous.status_reason != expected_reason:
+            raise ReviewEpochError(
+                "superseded parent epoch names a different successor revision"
+            )
+        derived = ReviewEpochCollection._derived_status(
+            previous.plan, previous.capacity, previous.execution_outcomes
+        )
+        previous_for_creation = replace(
+            previous,
+            status=derived,
+            status_reason=(
+                "execution or artifact incomplete" if derived == "incomplete" else ""
+            ),
+        )
+    else:
+        previous_for_creation = previous
+    next_collection = ReviewEpochCollection.create(
+        successor, predecessor_capacity=previous_for_creation.capacity
+    )
+    outcomes_by_execution = {
+        item.execution_id: item for item in previous_for_creation.execution_outcomes
+    }
+    for inherited in successor.inherited_artifacts:
+        source = outcomes_by_execution.get(inherited.execution_id)
+        if (
+            source is None
+            or not source.successful
+            or not hmac.compare_digest(
+                source.artifact_digest, inherited.artifact_digest
+            )
+        ):
+            raise ReviewEpochError(
+                "successor inherited artifact has no exact successful parent outcome"
+            )
+        next_collection = next_collection.record_outcome(
+            EpochExecutionOutcome.for_plan(
+                successor,
+                inherited.execution_id,
+                artifact_digest=inherited.artifact_digest,
+                artifact_complete=True,
+                completed_process_ids=source.completed_process_ids,
+                status="succeeded",
+                terminal_at=source.terminal_at,
+            )
+        )
+    return (
+        previous
+        if already_superseded
+        else previous_for_creation.supersede(reason=expected_reason),
+        next_collection,
+    )
 
 
 # Descriptive aliases keep later CLI integration readable without weakening the
