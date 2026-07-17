@@ -1,6 +1,6 @@
 # Review Swarm And Dual Review Contract
 
-herdr-dev-loop 0.5.1 supports `single`, `swarm`, `dual`, and `dual-swarm`. A **review group** pins every discovery lane and verifier to one integration head SHA. A Coordinator owns the provider-native sub-agents and returns one manifest; individual sub-agents do not write HLoop artifacts or close gates.
+herdr-dev-loop 0.5.2 supports `single`, `swarm`, `dual`, and `dual-swarm`. A **review group** pins every discovery lane and verifier to one integration head SHA. A Coordinator owns the provider-native sub-agents and returns one manifest; individual sub-agents do not write HLoop artifacts or close gates.
 
 ## Discovery topology
 
@@ -28,5 +28,25 @@ The review budget bounds parallel verifiers, total verifications, provider-speci
 The final manifest records the expected and completed lanes, normalized findings, verifier assignments, verification results, provider usage, shortfalls, and completeness issues. The gate remains open when a lane is missing, a finding count drifts, an independent pass is missing, or a budget shortfall leaves evidence incomplete.
 
 The Manager triages confirmed findings into a fix task, user decision, accepted-risk candidate, or discard with evidence. Reviewer output cannot merge code, create tasks without Manager approval, or decide user-visible specifications.
+
+## Independent finding axes and follow-ups
+
+0.5.2 serializes the Manager's disposition as seven independent axes:
+
+- `fact_status`: `confirmed`, `refuted`, or `insufficient_evidence`
+- `origin`: `introduced`, `diff-expanded-pre-existing`, `unrelated-pre-existing`, or `unknown`
+- `contract_relation`: `in_scope`, `outside_release`, or `ambiguous`
+- `decision_requirement`: `none`, `spec`, or `user`
+- `severity`: `P0`, `P1`, `P2`, or `P3`
+- `disposition`: `fix_now`, `defer_follow_up`, `disable_feature`, `mark_experimental`, `user_decision`, `accepted_risk`, or `discard`
+- `release_effect`: `blocking` or `non_blocking`
+
+These axes are checked independently before a finding can become a task. A refuted finding must be discarded, and an introduced or diff-expanded in-scope regression cannot be hidden as a follow-up; in-scope P0/P1 regressions require immediate remediation, feature disablement, or a user decision. Non-blocking work is recorded with `hloop follow-up add`, whose `fu:v1:sha256:<64 hex>` key is derived from the stable semantic issue rather than the review title, target SHA, severity, or source line. Repeated discovery updates one follow-up instead of creating duplicates.
+
+## Bounded convergence and manual final
+
+For a new 0.5.2 loop, ordinary review waits for the current batch to close. The Manager then prepares a fixed-target convergence plan and records a complete manifest for each bounded remediation round. A convergence manifest that is incomplete, stale, or still contains verified actionable findings cannot pass; the automatic fix-round limit is at most two unless an explicit reopen authorizes additional work.
+
+After convergence reaches zero verified actionable findings, the Manager prepares a separate manual-final plan and manifest at the same fixed target SHA. Manual final recomputes lane completion, independent verification, shortfalls, plan/manifest identity, release-scope snapshot, report presence, and the actionable-finding count. A self-reported zero count or a passing pre-final swarm alone is insufficient. `hloop review reopen --action <action> --user-input-id <id>` is the only supported recovery from exhausted convergence or incomplete/failed manual final; the atomic transition invalidates stale evidence and applies the selected remediation, scope, or abort policy.
 
 Strict final review is armed only after the current batch closes, review triage is complete, no fix-task draft remains, and `hloop final-gates arm` pins the target SHA. Creating a new task disarms that record. This stability barrier prevents a full swarm and final gap audit from repeating after every incremental fix.

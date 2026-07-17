@@ -27,7 +27,23 @@
     "worker_agent_provider": {"type": "string", "enum": ["codex", "claude"]},
     "worker_agent_model": {"type": "string"},
     "worker_qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"]},
-    "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."}
+    "qa_profile": {"type": "string", "enum": ["repo-default", "local", "staging", "preview", "none", "custom"], "description": "Deprecated alias for worker_qa_profile."},
+    "task_origin": {"type": "string", "enum": ["planned", "finding", "user-amendment", "operational", "legacy-unclassified"]},
+    "release_scope_revision": {"type": "integer", "minimum": 0},
+    "plan_item_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "requirement_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "scope_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}, "description": "Locked release-scope or explicit safety-invariant references."},
+    "source_finding": {"type": "string", "description": "Canonical review finding ID or sha256 fingerprint persisted in finding_inventory."},
+    "authorization_input_id": {"type": "string", "pattern": "^$|^U[0-9]{4}$"},
+    "why_fix_now": {"type": "string"},
+    "operational_reason": {"type": "string"},
+    "origin": {"type": "string", "enum": ["", "introduced", "diff-expanded-pre-existing", "unrelated-pre-existing", "unknown"]},
+    "contract_relation": {"type": "string", "enum": ["", "in_scope", "outside_release", "ambiguous"]},
+    "release_effect": {"type": "string", "enum": ["", "blocking", "non_blocking"]},
+    "remediation_round": {"type": "integer", "minimum": 0},
+    "fact_status": {"type": "string", "enum": ["", "confirmed", "refuted", "insufficient_evidence"]},
+    "disposition": {"type": "string", "enum": ["", "fix_now", "defer_follow_up", "disable_feature", "mark_experimental", "user_decision", "accepted_risk", "discard"]},
+    "scope_expanding": {"type": "boolean"}
   },
   "allOf": [
     {

@@ -39,6 +39,69 @@ Manager final QA quality floor:
 5. If final QA cannot run, record `blocked` with the exact missing credential, URL, service, migration, or data dependency.
 6. If final QA fails, record `failed` and create fix tasks or ask for a decision before marking the loop done.
 
+## 0.5.2 release and review evidence
+
+Validation for a new 0.5.2 loop must be tied to the locked release scope and
+one concrete integration target SHA. Task artifacts record `task_origin`, the
+matching `release_scope_revision`, and the plan, requirement, finding, user
+input, or operational references that authorize the task. A review candidate
+without confirmed in-scope evidence is not sufficient authorization for a new
+fix task.
+
+At the closed-batch boundary, `hloop review readiness` must pass the release
+scope snapshot, current validation, clean checkout, task/merge state, and
+absence of blocking decisions. `hloop review convergence prepare|record`
+validates fixed base/target SHAs, lane completion, verification coverage,
+manifest completeness, and the recomputed count of verified actionable
+findings. The bounded automatic remediation budget is at most two rounds for a
+new loop. Findings are triaged across the independent axes
+`fact_status`, `origin`, `contract_relation`, `decision_requirement`,
+`severity`, `disposition`, and `release_effect`; an in-scope regression cannot
+be made non-blocking merely by labeling it a follow-up.
+
+Manual-final certification is a separate review evidence gate. Its
+`reviews/final/PLAN.json`, `MANIFEST.json`, and non-empty `FINAL.md` must
+share the prepared certification id, release-scope snapshot, base/target
+identity, and target SHA. Recording recomputes all expected lanes, required
+independent verifications, shortfalls, manifest completeness, report
+presence, and verified actionable findings. This is a complete-zero
+certification: `finish` accepts only a passed manual final with complete
+evidence and zero verified actionable findings; a
+zero count asserted by an agent or a skipped provider probe does not satisfy
+this condition. Recovery from failed, incomplete, or exhausted review uses
+atomic `hloop review reopen` with explicit user-input provenance.
+
+The public schema entry points for these artifacts are
+`schemas/final-review-plan.schema.json` and
+`schemas/final-review-manifest.schema.json`. They resolve to the canonical
+reference schemas and are checked by the 0.5.2 selftest. Provider E2E is
+reported separately: `--allow-skip --skip-reason <reason>` proves that the
+probe was intentionally not run, but it never turns into a provider pass.
+
+### Special verification evidence
+
+`hloop validate` records ordinary changed-file validation, but special domains
+must be recorded explicitly at the current integration head. For every domain
+reported by `hloop review readiness`, run:
+
+```sh
+hloop verification record \
+  --domain <migration|schema|public-docs|security-boundary> \
+  --target-sha <current-integration-head> \
+  --status passed \
+  --evidence-ref <non-empty-reference>
+```
+
+Repeat the command for each detected domain and use another
+`--evidence-ref` for additional logs or reports. The command writes one record
+under `STATE.json.special_verification_evidence.<domain>` with `target_sha`,
+`status`, `references`, and `recorded_at`. Unknown domains, empty evidence,
+and a target SHA different from the current integration head are rejected
+before state is written. `failed` and `blocked` records are retained for
+diagnostics but never satisfy readiness; `verified` remains accepted only for
+legacy evidence compatibility. Do not edit `STATE.json` directly to bypass
+this contract.
+
 ## Command Selection
 
 Pick commands from current repository evidence:

@@ -133,6 +133,7 @@ class ValidationEnvironmentTests(unittest.TestCase):
                 mock.patch.object(hloop, "git", return_value="abc123"),
                 mock.patch.object(hloop, "save_state"),
                 mock.patch.object(hloop, "journal"),
+                mock.patch.object(hloop, "_changed_file_inventory", return_value=[]),
                 mock.patch.object(hloop, "should_open_gap_gate", return_value=False),
                 mock.patch.object(hloop, "should_open_review_gate", return_value=False),
             ):

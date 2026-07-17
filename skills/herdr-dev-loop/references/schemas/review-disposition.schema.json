@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herdr Dev Loop Review Finding Disposition",
+  "description": "Independent finding classification axes and the Manager disposition.",
+  "type": "object",
+  "required": [
+    "fact_status",
+    "origin",
+    "contract_relation",
+    "decision_requirement",
+    "severity",
+    "disposition",
+    "release_effect"
+  ],
+  "properties": {
+    "finding_id": {"type": "string"},
+    "source_artifact": {"type": "string"},
+    "source_candidate_id": {"type": "string"},
+    "fingerprint": {
+      "anyOf": [
+        {"const": ""},
+        {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      ]
+    },
+    "target_sha": {"type": "string"},
+    "fact_status": {
+      "enum": ["confirmed", "refuted", "insufficient_evidence"]
+    },
+    "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+    "origin": {
+      "enum": [
+        "introduced",
+        "diff-expanded-pre-existing",
+        "unrelated-pre-existing",
+        "unknown"
+      ]
+    },
+    "contract_relation": {
+      "enum": ["in_scope", "outside_release", "ambiguous"]
+    },
+    "decision_requirement": {"enum": ["none", "spec", "user"]},
+    "disposition": {
+      "enum": [
+        "fix_now",
+        "defer_follow_up",
+        "disable_feature",
+        "mark_experimental",
+        "user_decision",
+        "accepted_risk",
+        "discard"
+      ]
+    },
+    "release_effect": {"enum": ["blocking", "non_blocking"]},
+    "requirement_refs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "why_fix_now": {"type": "string"},
+    "remediation_round": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 1}
+      ]
+    },
+    "duplicate_of": {"type": "string"},
+    "accepted_risk_decision_id": {"type": "string", "pattern": "^$|^D[0-9]{3}$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"disposition": {"const": "discard"}}},
+      "then": {"properties": {"release_effect": {"const": "non_blocking"}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "discard"}}},
+      "then": {"properties": {"release_effect": {"const": "non_blocking"}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "defer_follow_up"}}},
+      "then": {"properties": {"release_effect": {"const": "non_blocking"}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "accepted_risk"}}},
+      "then": {"properties": {"release_effect": {"const": "non_blocking"}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "accepted_risk"}}},
+      "then": {
+        "required": ["accepted_risk_decision_id"],
+        "properties": {
+          "accepted_risk_decision_id": {"pattern": "^D[0-9]{3}$"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "disposition": {
+            "enum": [
+              "fix_now",
+              "disable_feature",
+              "mark_experimental",
+              "user_decision"
+            ]
+          }
+        }
+      },
+      "then": {"properties": {"release_effect": {"const": "blocking"}}}
+    },
+    {
+      "if": {"properties": {"fact_status": {"const": "refuted"}}},
+      "then": {
+        "properties": {
+          "disposition": {"const": "discard"},
+          "release_effect": {"const": "non_blocking"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "origin": {
+            "enum": ["introduced", "diff-expanded-pre-existing"]
+          },
+          "contract_relation": {"const": "in_scope"},
+          "severity": {"enum": ["P0", "P1"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "disposition": {
+            "enum": ["fix_now", "disable_feature", "user_decision"]
+          },
+          "release_effect": {"const": "blocking"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "origin": {
+            "enum": ["introduced", "diff-expanded-pre-existing"]
+          },
+          "contract_relation": {"const": "in_scope"}
+        }
+      },
+      "then": {
+        "not": {
+          "properties": {"disposition": {"const": "defer_follow_up"}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "contract_relation": {"const": "outside_release"},
+          "disposition": {"const": "fix_now"}
+        }
+      },
+      "then": {"not": {}}
+    }
+  ],
+  "additionalProperties": false
+}

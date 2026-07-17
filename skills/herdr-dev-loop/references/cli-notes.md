@@ -23,9 +23,44 @@ $HLOOP namespaces
 
 `namespaces` lists coexisting loops and reports `.ai/loop` only as `legacy ignored`. `agent abort` and `agent requeue` recover roles that exited without artifacts. `experience show` and `experience recommend` expose the repo-local worktree setup history below `.ai/herdr-dev-loop/experience/`.
 
-Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revision 0 state. herdr-dev-loop 0.5.1 writes format 3 revision 1 and rejects mutation from an unknown future revision. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
+Use `migrate --dry-run` and then `migrate --apply` for format 2 or format 3 revision 0/1 state. herdr-dev-loop 0.5.2 writes format 3 revision 2 and rejects mutation from an unknown future revision. The migration preserves legacy merge-count cadence and disables the new manual-final requirement for migrated legacy runs. Use `pause --reason ...` / `resume` for an intentional stop. `pump` stops at `ready_to_finish`; only `finish` can transition the loop to `done` after rechecking every completion gate against the current integration SHA.
 
-Use `config path`, `config validate`, `config explain`, and `config init` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; 0.5.1 has no in-place `config apply` subcommand.
+Use `config path`, `config validate`, `config explain`, `config init`, and `config apply` for hierarchical TOML settings. A missing config file uses built-in defaults. `init` snapshots the selected source and resolved values; `config apply --dry-run` previews changes, while `config apply --apply` updates an idle active loop's runtime-facing snapshot and `review_policy`. Changing the review policy invalidates the existing readiness, convergence, and manual-final evidence. New-loop review defaults are stored under `review_policy` and use batch cadence, a two-round fix cap, `follow_up` for scope expansion, and complete-zero manual final certification.
+
+## 0.5.2 release-scope and review commands
+
+These commands are explicit state transitions; inspect with `--json` and keep the namespace prefix on every invocation:
+
+```bash
+$HLOOP release-scope lock --source MISSION.md --source PLAN.md \
+  --plan-item-ref P001 --requirement-ref R001 --scope-ref release-scope-contract
+$HLOOP release-scope status --json
+$HLOOP release-scope amend --kind editorial --reason 'fix a source typo' --source PLAN.md
+
+$HLOOP dispatch freeze --reason 'awaiting review evidence' --user-input-id U0001
+$HLOOP dispatch status --json
+$HLOOP dispatch unfreeze --user-input-id U0002
+
+$HLOOP review readiness --json
+$HLOOP review convergence prepare --mode swarm --json
+$HLOOP review convergence record --fix-round 0 --json
+$HLOOP review reopen --action retry-certification --user-input-id U0003 --authorized-extra-rounds 1 --json
+
+$HLOOP final-review prepare --mode swarm --json
+$HLOOP final-review record --json
+$HLOOP final-review status --json
+
+$HLOOP follow-up add --title 'next release item' --component 'component' \
+  --trigger-class 'trigger' --product-impact 'impact' --impact 'current impact' \
+  --affected-path 'src/example.py' --source-review-fingerprint sha256:<64 hex> \
+  --evidence reviews/R001.md --deferred-reason 'outside current scope' \
+  --reconsider-condition 'next release scope lock'
+$HLOOP follow-up list --json
+$HLOOP follow-up show fu:v1:sha256:<64 hex> --json
+$HLOOP follow-up export --output docs/follow-ups.md
+```
+
+`review convergence prepare` freezes a fixed integration SHA but does not start a Reviewer. `record` rejects stale targets, plan drift, incomplete lanes, verification shortfall, and nonzero actionable findings at the round limit. `review reopen` is the only path from failed/incomplete/exhausted certification back to task creation and requires a user input id. `final-review record` recomputes complete-zero evidence; a count of zero alone is insufficient.
 
 Mutating helper commands take `/tmp/herdr-dev-loop-<uid>/locks/<sha256>.lock` and write files atomically. The digest is derived from the canonical Git common directory and namespace. The fixed `/tmp` root does not follow `HLOOP_RUNTIME_DIR`, `XDG_RUNTIME_DIR`, or `TMPDIR`; its UID directory is secured to mode `0700`, lock files are mode `0600` and opened without following symlinks where the platform supports `O_NOFOLLOW`, and all lock state remains outside Git metadata. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
@@ -144,12 +179,14 @@ codex archive <session-id>
 
 ## Cadence Options
 
-Default init cadence keeps the loop active:
+New 0.5.2 loops use batch review cadence and explicit fixed-target final certification:
 
 ```bash
 hloop selftest
 hloop init ... --branch-strategy integration --worker-protocol native --review-protocol native --worker-qa-profile repo-default --manager-qa-profile none --max-workers 3 --max-reviewers 1 --max-gap-auditors 1 --review-after-merges 1 --gap-after-merges 3
 ```
+
+`--review-after-merges`と`--gap-after-merges`はstateへ保存されるlegacy/merge-count knobsであり、新規loopの`review_policy.cadence = "batch"`ではbatch closeと明示的な`review convergence`が優先されます。manual finalは`final-review prepare`と`final-review record`をManagerが実行し、complete-zero evidenceがなければfinishできません。
 
 Run `hloop selftest` after updating or installing the skill. It does not require `HERDR_ENV=1`; it checks skill-local frontmatter, agent metadata, JSON schemas, sample artifact parsing, and required field drift between `artifact-contract.md` and `state.schema.json`.
 

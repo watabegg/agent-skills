@@ -1,0 +1,1371 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+try:
+    import jsonschema
+except ImportError:  # pragma: no cover - optional for minimal skill installs
+    jsonschema = None
+
+import importlib.machinery
+import importlib.util
+import sys
+
+
+SCRIPT = Path(__file__).parents[1] / "scripts" / "hloop"
+sys.path.insert(0, str(SCRIPT.parent))
+loader = importlib.machinery.SourceFileLoader("hloop_policy_cli_v052", str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+hloop = importlib.util.module_from_spec(spec)
+loader.exec_module(hloop)
+
+
+class PolicyCliV052Tests(unittest.TestCase):
+    namespace = "policy-cli-v052"
+
+    def setUp(self) -> None:
+        self.previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace(self.namespace)
+
+    def tearDown(self) -> None:
+        hloop.configure_loop_namespace(self.previous_namespace)
+
+    def make_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def run_cli(self, repo: Path, *arguments: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            result = hloop.main(["--repo", str(repo), "--namespace", self.namespace, *arguments])
+        return result, output.getvalue()
+
+    def assert_follow_up_schema(self, record: dict) -> None:
+        if jsonschema is None:
+            self.skipTest("jsonschema is optional")
+        schema = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "references"
+                / "schemas"
+                / "follow-up.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = jsonschema.Draft202012Validator(schema)
+        self.assertEqual(list(validator.iter_errors(record)), [], record)
+
+    def assert_follow_up_projections(
+        self, repo: Path, loop: Path, payload: dict
+    ) -> dict:
+        record = payload["follow_up"]
+        artifact_path = loop / "follow-ups" / f"{record['id']}.md"
+        artifact = hloop.read_frontmatter(artifact_path)
+        result, output = self.run_cli(
+            repo, "follow-up", "show", record["id"], "--json"
+        )
+        self.assertEqual(result, 0, output)
+        shown = json.loads(output)
+        for projection in (record, artifact, shown):
+            self.assert_follow_up_schema(projection)
+        for field in ("history", "relations", "duplicate_relation"):
+            self.assertEqual(record.get(field), artifact.get(field), field)
+            self.assertEqual(record.get(field), shown.get(field), field)
+        return shown
+
+    def init_and_lock(self, repo: Path) -> Path:
+        result, output = self.run_cli(
+            repo,
+            "init",
+            "--goal-id",
+            "policy-cli-v052",
+            "--goal",
+            "policy CLI",
+            "--base",
+            "main",
+            "--integration",
+            "main",
+            "--create-branch",
+            "--specification-scout",
+            "off",
+        )
+        self.assertEqual(result, 0, output)
+        loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+        result, output = self.run_cli(
+            repo,
+            "input",
+            "record",
+            "--source",
+            "manager-chat",
+            "--text",
+            "policy CLI fixture authorization",
+        )
+        self.assertEqual(result, 0, output)
+        (loop / "PLAN.md").write_text(
+            (loop / "PLAN.md").read_text(encoding="utf-8")
+            + "\n- P004c: policy CLI test item\n",
+            encoding="utf-8",
+        )
+        state_path = loop / "STATE.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["requirements"] = {
+            "REQ-007": {
+                "id": "REQ-007",
+                "source_inputs": ["U0001"],
+                "acceptance": ["policy CLI test requirement"],
+                "priority": "P1",
+                "dependencies": [],
+                "accepted_at": "2026-07-16T00:00:00+00:00",
+                "status": "accepted",
+                "supersedes": [],
+                "superseded_by": "",
+            }
+        }
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        source_args = [
+            "--source-ref",
+            f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
+            "--source-ref",
+            f".ai/herdr-dev-loop/loops/{self.namespace}/PLAN.md",
+            "--source-ref",
+            f".ai/herdr-dev-loop/loops/{self.namespace}/PROFILE.md",
+            "--source-ref",
+            f".ai/herdr-dev-loop/loops/{self.namespace}/DECISIONS.md",
+        ]
+        result, output = self.run_cli(
+            repo,
+            "release-scope",
+            "lock",
+            *source_args,
+            "--plan-item-ref",
+            "P004c",
+            "--requirement-ref",
+            "REQ-007",
+            "--scope-ref",
+            "release-contract",
+        )
+        self.assertEqual(result, 0, output)
+        return loop
+
+    def test_release_scope_lock_rejects_unknown_plan_and_requirement_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            result, output = self.run_cli(
+                repo,
+                "init",
+                "--goal-id",
+                "policy-cli-v052",
+                "--goal",
+                "policy CLI",
+                "--base",
+                "main",
+                "--integration",
+                "main",
+                "--create-branch",
+                "--specification-scout",
+                "off",
+            )
+            self.assertEqual(result, 0, output)
+            loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+            (loop / "PLAN.md").write_text(
+                (loop / "PLAN.md").read_text(encoding="utf-8")
+                + "\n- P004c: policy CLI test item\n",
+                encoding="utf-8",
+            )
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["requirements"] = {
+                "REQ-007": {
+                    "id": "REQ-007",
+                    "source_inputs": ["U0001"],
+                    "acceptance": ["policy CLI test requirement"],
+                    "priority": "P1",
+                    "dependencies": [],
+                    "accepted_at": "2026-07-16T00:00:00+00:00",
+                    "status": "accepted",
+                    "supersedes": [],
+                    "superseded_by": "",
+                }
+            }
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            source_args = [
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PLAN.md",
+            ]
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "lock",
+                *source_args,
+                "--plan-item-ref",
+                "P999",
+                "--requirement-ref",
+                "REQ-007",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("missing locked PLAN reference", output)
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "lock",
+                *source_args,
+                "--plan-item-ref",
+                "P004c",
+                "--requirement-ref",
+                "REQ-999",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("accepted requirement", output)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["release_scope"]["status"], "unlocked")
+
+    def test_fresh_init_requires_scope_lock_but_migrated_legacy_keeps_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            result, output = self.run_cli(
+                repo,
+                "init",
+                "--goal-id",
+                "policy-cli-v052",
+                "--goal",
+                "policy CLI",
+                "--base",
+                "main",
+                "--integration",
+                "main",
+                "--create-branch",
+                "--specification-scout",
+                "off",
+            )
+            self.assertEqual(result, 0, output)
+            loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["release_scope"]["status"], "unlocked")
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "before lock",
+                "--id",
+                "T001",
+                "--kind",
+                "research",
+                "--allow-no-write",
+            )
+            self.assertNotEqual(result, 0, output)
+            with self.assertRaises(hloop.HLoopError):
+                hloop.dispatch_start_preflight(
+                    repo,
+                    json.loads(state_path.read_text(encoding="utf-8")),
+                    role_id="T001",
+                    role_kind="worker",
+                    task_meta={"task_origin": "planned"},
+                )
+
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["schema_revision"] = 1
+            legacy.pop("release_scope", None)
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+            result, output = self.run_cli(repo, "migrate", "--apply")
+            self.assertEqual(result, 0, output)
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["release_scope"]["status"], "legacy-unlocked")
+            self.assertEqual(migrated["review_policy"]["cadence"], "merge-count")
+            self.assertEqual(
+                migrated["manual_final_review"]["status"],
+                "not-required-for-legacy-run",
+            )
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "legacy task",
+                "--id",
+                "T001",
+                "--kind",
+                "research",
+                "--allow-no-write",
+            )
+            self.assertEqual(result, 0, output)
+
+    def test_task_creation_and_update_use_immutable_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            result, output = self.run_cli(
+                repo,
+                "init",
+                "--goal-id",
+                "policy-cli-v052",
+                "--goal",
+                "policy CLI",
+                "--base",
+                "main",
+                "--integration",
+                "main",
+                "--create-branch",
+                "--specification-scout",
+                "off",
+            )
+            self.assertEqual(result, 0, output)
+            loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["release_scope"] = {
+                "status": "unlocked",
+                "source_refs": [],
+                "source_digests": {},
+                "scope_revision": 0,
+                "source_snapshot_revision": 0,
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "before lock",
+                "--kind",
+                "research",
+                "--allow-no-write",
+            )
+            self.assertNotEqual(result, 0)
+            loop = self.init_and_lock(repo)
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "planned task",
+                "--id",
+                "T010",
+                "--kind",
+                "research",
+                "--allow-no-write",
+                "--task-origin",
+                "planned",
+                "--plan-item-ref",
+                "P004c",
+            )
+            self.assertEqual(result, 0, output)
+            task_meta = hloop.read_frontmatter(loop / "tasks" / "T010.md")
+            self.assertEqual(task_meta["task_origin"], "planned")
+            self.assertEqual(task_meta["release_scope_revision"], "1")
+            self.assertEqual(task_meta["plan_item_refs"], ["P004c"])
+
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "update",
+                "T010",
+                "--add-acceptance",
+                "still immutable",
+            )
+            self.assertEqual(result, 0, output)
+            updated_meta = hloop.read_frontmatter(loop / "tasks" / "T010.md")
+            self.assertEqual(updated_meta["task_origin"], "planned")
+            self.assertEqual(updated_meta["plan_item_refs"], ["P004c"])
+
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "scope expansion",
+                "--kind",
+                "research",
+                "--allow-no-write",
+                "--task-origin",
+                "planned",
+                "--plan-item-ref",
+                "P004c",
+                "--contract-relation",
+                "outside_release",
+            )
+            self.assertNotEqual(result, 0)
+
+    def test_finding_task_requires_persisted_evidence_and_allows_contract_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "a" * 64
+            finding_args = [
+                "task",
+                "new",
+                "contract recovery",
+                "--kind",
+                "fix",
+                "--write-allow",
+                "scripts/fix.py",
+                "--task-origin",
+                "finding",
+                "--source-finding",
+                fingerprint,
+                "--requirement-ref",
+                "REQ-007",
+                "--why-fix-now",
+                "confirmed accepted requirement violation",
+                "--origin",
+                "unrelated-pre-existing",
+                "--contract-relation",
+                "in_scope",
+                "--release-effect",
+                "non_blocking",
+                "--fact-status",
+                "confirmed",
+                "--disposition",
+                "fix_now",
+                "--remediation-round",
+                "1",
+            ]
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("finding inventory is empty", output)
+
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            current_target = subprocess.run(
+                ["git", "rev-parse", "main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            state["finding_inventory"] = {
+                "fingerprints": [fingerprint],
+                "finding_ids": ["FND-RECOVERY"],
+                "records": {
+                    fingerprint: {
+                        "fingerprint": fingerprint,
+                        "finding_ids": ["FND-RECOVERY"],
+                        "target_sha": current_target,
+                        "head_sha": current_target,
+                        "scope_revision": 1,
+                        "source_refs": ["reviews/R001/MANIFEST.json"],
+                        "confirmed": True,
+                        "policy_axes_explicit": True,
+                        "policy_axes": {
+                            "fact_status": "confirmed",
+                            "severity": "P1",
+                            "origin": "unrelated-pre-existing",
+                            "contract_relation": "in_scope",
+                            "decision_requirement": "none",
+                            "disposition": "fix_now",
+                            "release_effect": "non_blocking",
+                        },
+                        "requirement_refs": ["REQ-007"],
+                        "scope_refs": ["release-contract"],
+                    }
+                },
+                "updated_at": "2026-07-16T00:00:00+00:00",
+            }
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = False
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("finding inventory is empty", output)
+
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = True
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertEqual(result, 0, output)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            mismatched_axes = [*finding_args, "--priority", "P2"]
+            result, output = self.run_cli(repo, *mismatched_axes)
+            self.assertNotEqual(result, 0)
+            self.assertIn("severity", output)
+
+            state["finding_inventory"]["records"][fingerprint]["target_sha"] = "stale-target"
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("stale", output)
+
+            state["finding_inventory"]["records"][fingerprint]["target_sha"] = current_target
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = False
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            result, output = self.run_cli(repo, *finding_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("finding inventory is empty", output)
+
+            state["finding_inventory"]["records"][fingerprint]["confirmed"] = True
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+            outside_args = list(finding_args)
+            outside_args[outside_args.index("in_scope")] = "outside_release"
+            result, output = self.run_cli(repo, *outside_args)
+            self.assertNotEqual(result, 0)
+            self.assertIn("in_scope", output)
+
+    def test_scope_amendment_dispatch_freeze_and_follow_up_deduplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            (loop / "MISSION.md").write_text("authorized scope amendment\n", encoding="utf-8")
+            (loop / "SCOPE.md").write_text("new authorized scope\n", encoding="utf-8")
+            source_args = [
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PLAN.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PROFILE.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/DECISIONS.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/SCOPE.md",
+            ]
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "scope-change",
+                "--reason",
+                "authorized scope clarification",
+                *source_args,
+                "--basis-ref",
+                "REQ-007",
+                "--user-input-id",
+                "U0001",
+            )
+            self.assertEqual(result, 0, output)
+            result, output = self.run_cli(repo, "dispatch", "freeze", "--reason", "validation in progress")
+            self.assertEqual(result, 0, output)
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "blocked task",
+                "--kind",
+                "research",
+                "--allow-no-write",
+                "--task-origin",
+                "user-amendment",
+                "--authorization-input-id",
+                "U0001",
+            )
+            self.assertNotEqual(result, 0)
+            result, output = self.run_cli(repo, "dispatch", "unfreeze", "--user-input-id", "U0003")
+            self.assertEqual(result, 0, output)
+
+            fingerprint = "sha256:" + "0" * 64
+            follow_up_args = [
+                "follow-up",
+                "add",
+                "--title",
+                "Deferred integration concern",
+                "--component",
+                "integration",
+                "--trigger-class",
+                "review-follow-up",
+                "--product-impact",
+                "operator visibility",
+                "--source-review-fingerprint",
+                fingerprint,
+                "--discovered-head",
+                "HEAD",
+                "--evidence",
+                "review R001 evidence",
+                "--impact",
+                "No current release behavior is affected.",
+                "--affected-path",
+                "docs/follow-up.md",
+                "--deferred-reason",
+                "Outside the locked release contract.",
+                "--reconsider-condition",
+                "When the next release scope includes the integration surface.",
+            ]
+            result, output = self.run_cli(repo, *follow_up_args)
+            self.assertEqual(result, 0, output)
+            result, output = self.run_cli(repo, "follow-up", "list", "--json")
+            self.assertEqual(result, 0, output)
+            listed = json.loads(output)
+            self.assertEqual(listed[0]["id"], "F001")
+            result, output = self.run_cli(repo, "follow-up", "show", "F001", "--json")
+            self.assertEqual(result, 0, output)
+            shown = json.loads(output)
+            self.assertEqual(shown["issue_key"], listed[0]["issue_key"])
+            self.assertEqual(shown["root_cause"], "")
+            result, output = self.run_cli(
+                repo,
+                *follow_up_args[:14],
+                "--evidence",
+                "second review evidence",
+                "--impact",
+                "Same semantic concern remains deferred.",
+                "--affected-path",
+                "docs/follow-up.md",
+                "--deferred-reason",
+                "Still outside the current release contract.",
+                "--reconsider-condition",
+                "At the next release-scope lock.",
+            )
+            self.assertEqual(result, 0, output)
+            state = hloop.load_state(repo)
+            self.assertEqual(len(state["follow_ups"]["issue_keys"]), 1)
+            self.assertEqual(state["follow_ups"]["open_count"], 1)
+            result, output = self.run_cli(repo, "follow-up", "export", "--output", "docs/follow-ups.md")
+            self.assertEqual(result, 0, output)
+            self.assertTrue((repo / "docs" / "follow-ups.md").is_file())
+            result, output = self.run_cli(repo, "dashboard", "--json", "--no-pane-probe")
+            self.assertEqual(result, 0, output)
+            payload = json.loads(output)
+            self.assertFalse(payload["loop"]["dispatch_frozen"])
+            self.assertNotIn("hloop reviewer start", payload["next_actions"])
+
+    def test_scope_amendment_cli_rejects_uncaptured_id_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            plan = loop / "PLAN.md"
+            plan.write_text(
+                plan.read_text(encoding="utf-8")
+                + "\nUncaptured scope amendment fixture.\n",
+                encoding="utf-8",
+            )
+            state_path = loop / "STATE.json"
+            before_state = state_path.read_bytes()
+
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "scope-change",
+                "--reason",
+                "reject uncaptured scope authorization",
+                "--user-input-id",
+                "U0002",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("captured input inventory", output)
+            self.assertEqual(before_state, state_path.read_bytes())
+            self.assertEqual(list((loop / "release-scope" / "amendments").glob("A*.json")), [])
+
+    def test_user_amendment_task_cli_rejects_uncaptured_id_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            plan = loop / "PLAN.md"
+            plan.write_text(
+                plan.read_text(encoding="utf-8")
+                + "\nAuthorized task amendment fixture.\n",
+                encoding="utf-8",
+            )
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "scope-change",
+                "--reason",
+                "record authorized scope change",
+                "--user-input-id",
+                "U0001",
+            )
+            self.assertEqual(result, 0, output)
+
+            state_path = loop / "STATE.json"
+            before_state = state_path.read_bytes()
+            task_path = loop / "tasks" / "T050.md"
+            self.assertFalse(task_path.exists())
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "uncaptured scope expansion",
+                "--id",
+                "T050",
+                "--kind",
+                "implementation",
+                "--write-allow",
+                "src/example.py",
+                "--task-origin",
+                "user-amendment",
+                "--authorization-input-id",
+                "U0002",
+                "--scope-expanding",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("captured input inventory", output)
+            self.assertEqual(before_state, state_path.read_bytes())
+            self.assertFalse(task_path.exists())
+
+    def test_scope_amendment_invalidates_fixed_target_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            target = subprocess.check_output(
+                ["git", "rev-parse", "main"], cwd=repo, text=True
+            ).strip()
+            state.update(
+                {
+                    "phase": "awaiting_manual_final_review",
+                    "review_readiness": {
+                        "status": "ready",
+                        "target_sha": target,
+                        "errors": [],
+                        "checks": {"scope_status": "locked"},
+                    },
+                    "review_convergence": {
+                        "status": "converged",
+                        "target_sha": target,
+                        "verified_actionable_findings": 0,
+                        "artifact_refs": ["reviews/convergence/MANIFEST.json"],
+                    },
+                    "manual_final_review": {
+                        "status": "passed",
+                        "target_sha": target,
+                        "certification_id": "C001",
+                        "prepared_plan": "reviews/final/PLAN.json",
+                        "prepared_plan_digest": "sha256:" + "a" * 64,
+                        "manifest": "reviews/final/MANIFEST.json",
+                        "report": "reviews/final/FINAL.md",
+                        "manifest_complete": True,
+                        "verified_actionable_findings": 0,
+                        "attempt_history": [],
+                    },
+                }
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            (loop / "MISSION.md").write_text(
+                "changed after the fixed review snapshot\n", encoding="utf-8"
+            )
+            source_args = [
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/MISSION.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PLAN.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/PROFILE.md",
+                "--source-ref",
+                f".ai/herdr-dev-loop/loops/{self.namespace}/DECISIONS.md",
+            ]
+            result, output = self.run_cli(
+                repo,
+                "release-scope",
+                "amend",
+                "--kind",
+                "editorial",
+                "--reason",
+                "record the approved editorial source change",
+                *source_args,
+            )
+            self.assertEqual(result, 0, output)
+            after = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(after["release_scope"]["scope_revision"], 1)
+            self.assertEqual(after["release_scope"]["source_snapshot_revision"], 2)
+            self.assertEqual(after["review_readiness"]["status"], "pending")
+            self.assertEqual(after["review_convergence"]["status"], "pending")
+            self.assertEqual(after["manual_final_review"]["status"], "pending")
+            self.assertEqual(after["phase"], "dispatching")
+            self.assertEqual(after["review_convergence"]["target_sha"], target)
+
+    def test_operational_task_authorization_uses_complete_write_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "unsafe operational task",
+                "--id",
+                "T050",
+                "--kind",
+                "research",
+                "--write-allow",
+                "src/product.py",
+                "--task-origin",
+                "operational",
+                "--operational-reason",
+                "record operational evidence",
+            )
+            self.assertNotEqual(result, 0, output)
+            self.assertIn("product or release", output)
+            self.assertFalse((loop / "tasks" / "T050.md").exists())
+
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "new",
+                "evidence-only operational task",
+                "--id",
+                "T050",
+                "--kind",
+                "research",
+                "--allow-no-write",
+                "--task-origin",
+                "operational",
+                "--operational-reason",
+                "record operational evidence",
+            )
+            self.assertEqual(result, 0, output)
+            before = (loop / "tasks" / "T050.md").read_bytes()
+            result, output = self.run_cli(
+                repo,
+                "task",
+                "update",
+                "T050",
+                "--add-write-allow",
+                "src/product.py",
+            )
+            self.assertNotEqual(result, 0, output)
+            self.assertIn("product or release", output)
+            self.assertEqual(before, (loop / "tasks" / "T050.md").read_bytes())
+
+            state = hloop.load_state(repo)
+            task_meta = hloop.read_frontmatter(loop / "tasks" / "T050.md")
+            task_meta["write_allow"] = ["src/product.py"]
+            with self.assertRaisesRegex(hloop.HLoopError, "product or release"):
+                hloop.dispatch_start_preflight(
+                    repo,
+                    state,
+                    role_id="T050",
+                    role_kind="worker",
+                    task_meta=task_meta,
+                )
+
+    def test_config_apply_updates_review_policy_and_invalidates_policy_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            state_path = loop / "STATE.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            target = subprocess.check_output(
+                ["git", "rev-parse", "main"], cwd=repo, text=True
+            ).strip()
+            state.update(
+                {
+                    "phase": "awaiting_manual_final_review",
+                    "review_readiness": {"status": "ready", "target_sha": target},
+                    "review_convergence": {
+                        "status": "converged",
+                        "target_sha": target,
+                        "verified_actionable_findings": 0,
+                        "artifact_refs": ["reviews/convergence/MANIFEST.json"],
+                    },
+                    "manual_final_review": {
+                        "status": "passed",
+                        "target_sha": target,
+                        "manifest_complete": True,
+                        "verified_actionable_findings": 0,
+                        "release_blocking_findings": 0,
+                    },
+                }
+            )
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            config_home = Path(directory) / "config"
+            config_home.mkdir()
+            (config_home / "config.toml").write_text(
+                "version = 1\n\n[defaults.review]\ncadence = \"merge-count\"\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HLOOP_CONFIG_HOME": str(config_home)}):
+                result, output = self.run_cli(repo, "config", "apply", "--apply")
+            self.assertEqual(result, 0, output)
+            after = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(after["review_policy"]["cadence"], "merge-count")
+            self.assertTrue(json.loads(output)["review_policy_changed"])
+            self.assertEqual(after["review_convergence"]["status"], "pending")
+            self.assertEqual(after["manual_final_review"]["status"], "pending")
+            self.assertEqual(after["review_readiness"]["status"], "pending")
+
+    def test_review_failure_phases_reject_ordinary_dispatch_unfreeze(self) -> None:
+        for phase in (
+            "review_convergence_exhausted",
+            "manual_final_review_failed",
+            "manual_final_review_incomplete",
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                repo = self.make_repo(Path(directory))
+                loop = self.init_and_lock(repo)
+                state_path = loop / "STATE.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["phase"] = phase
+                state["dispatch_freeze"] = {
+                    "status": "active",
+                    "reason": "review stop",
+                    "frozen_at": "2026-07-16T00:00:00+00:00",
+                    "source_input_id": "",
+                    "allowed_running_role_ids": [],
+                }
+                state["review_convergence"] = {
+                    "status": "exhausted" if phase == "review_convergence_exhausted" else "pending",
+                    "fix_round": 2,
+                    "verified_actionable_findings": 1,
+                }
+                state["manual_final_review"] = {
+                    "status": phase.removeprefix("manual_final_review_")
+                    if phase.startswith("manual_final_review_")
+                    else "pending",
+                    "verified_actionable_findings": 1,
+                    "attempt_history": [],
+                }
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                before = state_path.read_bytes()
+                result, output = self.run_cli(
+                    repo,
+                    "dispatch",
+                    "unfreeze",
+                    "--reason",
+                    "attempt bypass",
+                )
+                self.assertNotEqual(result, 0, output)
+                self.assertIn("review reopen", output)
+                self.assertEqual(state_path.read_bytes(), before)
+
+    def test_follow_up_relations_promote_and_preserve_one_canonical_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "1" * 64
+
+            def add_follow_up(*extra: str) -> dict:
+                args = [
+                    "follow-up",
+                    "add",
+                    "--title",
+                    "Review follow-up",
+                    "--component",
+                    "review runtime",
+                    "--trigger-class",
+                    "classification drift",
+                    "--product-impact",
+                    "operator needs a later release decision",
+                    "--source-review-fingerprint",
+                    fingerprint,
+                    "--discovered-head",
+                    "abc123",
+                    "--evidence",
+                    "review evidence one",
+                    "--impact",
+                    "outside the current release contract",
+                    "--affected-path",
+                    "src/review.py",
+                    "--fact-status",
+                    "confirmed",
+                    "--severity",
+                    "P2",
+                    "--origin",
+                    "unrelated-pre-existing",
+                    "--contract-relation",
+                    "outside_release",
+                    "--decision-requirement",
+                    "none",
+                    "--release-effect",
+                    "non_blocking",
+                    "--disposition",
+                    "defer_follow_up",
+                    "--recommended-action",
+                    "defer_follow_up",
+                    "--deferred-reason",
+                    "outside this release",
+                    "--reconsider-condition",
+                    "next release scope lock",
+                    "--json",
+                    *extra,
+                ]
+                result, output = self.run_cli(repo, *args)
+                self.assertEqual(result, 0, output)
+                return json.loads(output)
+
+            provisional = add_follow_up()
+            provisional_key = provisional["follow_up"]["issue_key"]
+            self.assertTrue(provisional["follow_up"]["provisional"])
+            provisional_shown = self.assert_follow_up_projections(repo, loop, provisional)
+            self.assertEqual(
+                [event["action"] for event in provisional_shown["history"]],
+                ["create"],
+            )
+
+            final = add_follow_up(
+                "--root-cause",
+                "unsafe disposition merge",
+                "--alias-of",
+                provisional_key,
+                "--evidence",
+                "review evidence two",
+                "--source-review-fingerprint",
+                "sha256:" + "2" * 64,
+            )
+            final_record = final["follow_up"]
+            final_key = final_record["issue_key"]
+            self.assertEqual(final["status"], "deduplicated")
+            self.assertEqual(final_record["id"], "F001")
+            self.assertFalse(final_record["provisional"])
+            self.assertIn(provisional_key, final_record["aliases"])
+            self.assertEqual(
+                final_record["source_review_fingerprints"],
+                [fingerprint, "sha256:" + "2" * 64],
+            )
+            self.assertEqual(
+                final_record["evidence"],
+                ["review evidence one", "review evidence two"],
+            )
+            final_shown = self.assert_follow_up_projections(repo, loop, final)
+            self.assertEqual(
+                [event["action"] for event in final_shown["history"]],
+                ["create", "promote_provisional"],
+            )
+            self.assertEqual(
+                final_shown["duplicate_relation"]["relation"], "alias_of"
+            )
+            self.assertEqual(final_shown["duplicate_relation"], final["relation"])
+            state = hloop.load_state(repo)
+            self.assertEqual(state["follow_ups"]["issue_keys"], {final_key: "F001"})
+            self.assertEqual(
+                state["follow_ups"]["issue_key_aliases"][provisional_key], final_key
+            )
+            result, output = self.run_cli(
+                repo, "follow-up", "show", provisional_key, "--json"
+            )
+            self.assertEqual(result, 0, output)
+            self.assertEqual(json.loads(output)["id"], "F001")
+            self.assertEqual(json.loads(output)["issue_key"], final_key)
+
+            duplicate = add_follow_up(
+                "--root-cause",
+                "different wording",
+                "--duplicate-of",
+                final_key,
+            )
+            duplicate_key = duplicate["relation"]["source_issue_key"]
+            self.assertEqual(duplicate["follow_up"]["id"], "F001")
+            self.assertEqual(
+                hloop.load_state(repo)["follow_ups"]["issue_key_aliases"][duplicate_key],
+                final_key,
+            )
+            duplicate_shown = self.assert_follow_up_projections(repo, loop, duplicate)
+            self.assertEqual(
+                [event["action"] for event in duplicate_shown["history"]],
+                ["create", "promote_provisional", "duplicate_of"],
+            )
+            self.assertEqual(
+                duplicate_shown["duplicate_relation"]["relation"], "duplicate_of"
+            )
+            self.assertEqual(
+                duplicate_shown["duplicate_relation"], duplicate["relation"]
+            )
+            self.assertEqual(
+                [relation["relation"] for relation in duplicate_shown["relations"]],
+                ["alias_of", "duplicate_of"],
+            )
+
+            superseding = add_follow_up(
+                "--component",
+                "review runtime replacement",
+                "--root-cause",
+                "replacement design",
+                "--supersedes",
+                final_key,
+            )
+            self.assertEqual(superseding["follow_up"]["id"], "F002")
+            superseding_key = superseding["follow_up"]["issue_key"]
+            state = hloop.load_state(repo)
+            self.assertEqual(state["follow_ups"]["issue_keys"], {superseding_key: "F002"})
+            self.assertEqual(
+                state["follow_ups"]["issue_key_aliases"][final_key], superseding_key
+            )
+            self.assertEqual(
+                hloop.read_frontmatter(loop / "follow-ups" / "F001.md")["status"],
+                "superseded",
+            )
+            superseding_shown = self.assert_follow_up_projections(
+                repo, loop, superseding
+            )
+            self.assertEqual(
+                [event["action"] for event in superseding_shown["history"]],
+                ["supersedes"],
+            )
+            self.assertEqual(
+                superseding_shown["duplicate_relation"]["relation"], "supersedes"
+            )
+            self.assertEqual(
+                superseding_shown["duplicate_relation"], superseding["relation"]
+            )
+            superseded = hloop.read_frontmatter(loop / "follow-ups" / "F001.md")
+            result, output = self.run_cli(
+                repo, "follow-up", "show", "F001", "--json"
+            )
+            self.assertEqual(result, 0, output)
+            superseded_shown = json.loads(output)
+            self.assert_follow_up_schema(superseded)
+            self.assert_follow_up_schema(superseded_shown)
+            self.assertEqual(
+                [event["action"] for event in superseded["history"]],
+                ["create", "promote_provisional", "duplicate_of", "superseded"],
+            )
+            self.assertEqual(superseded["history"], superseded_shown["history"])
+            self.assertEqual(
+                superseded["duplicate_relation"]["relation"], "supersedes"
+            )
+            self.assertEqual(
+                superseded["duplicate_relation"], superseding["relation"]
+            )
+            result, output = self.run_cli(
+                repo, "follow-up", "show", provisional_key, "--json"
+            )
+            self.assertEqual(result, 0, output)
+            self.assertEqual(json.loads(output)["id"], "F002")
+
+            before = (loop / "STATE.json").read_bytes()
+            result, output = self.run_cli(
+                repo,
+                "follow-up",
+                "add",
+                "--title",
+                "Self relation",
+                "--component",
+                "review runtime",
+                "--trigger-class",
+                "classification drift",
+                "--product-impact",
+                "operator needs a later release decision",
+                "--root-cause",
+                "unsafe disposition merge",
+                "--source-review-fingerprint",
+                "sha256:" + "3" * 64,
+                "--evidence",
+                "invalid relation",
+                "--impact",
+                "invalid",
+                "--affected-path",
+                "src/review.py",
+                "--deferred-reason",
+                "invalid",
+                "--reconsider-condition",
+                "invalid",
+                "--alias-of",
+                final_key,
+            )
+            self.assertNotEqual(result, 0, output)
+            self.assertEqual((loop / "STATE.json").read_bytes(), before)
+
+    def test_follow_up_structured_fields_round_trip_as_json_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.make_repo(Path(directory))
+            loop = self.init_and_lock(repo)
+            fingerprint = "sha256:" + "4" * 64
+            decision_summary = {
+                "decision": "defer",
+                "rationale": "outside the current release",
+            }
+            verification_evidence = [
+                {"reference": "review/R001.md#FND-004", "status": "confirmed"},
+                {"reference": "tests/review.py", "status": "reproduced"},
+            ]
+            implementation_constraints = [
+                "requires a new scope amendment",
+                {"owner": "review-runtime", "milestone": "next release"},
+            ]
+            result, output = self.run_cli(
+                repo,
+                "follow-up",
+                "add",
+                "--title",
+                "Structured follow-up",
+                "--component",
+                "review runtime",
+                "--trigger-class",
+                "classification drift",
+                "--product-impact",
+                "operator needs a later release decision",
+                "--source-review-fingerprint",
+                fingerprint,
+                "--evidence",
+                "review evidence",
+                "--impact",
+                "outside the current release contract",
+                "--affected-path",
+                "src/review.py",
+                "--fact-status",
+                "confirmed",
+                "--origin",
+                "unrelated-pre-existing",
+                "--contract-relation",
+                "outside_release",
+                "--decision-requirement",
+                "none",
+                "--release-effect",
+                "non_blocking",
+                "--disposition",
+                "defer_follow_up",
+                "--recommended-action",
+                "defer_follow_up",
+                "--deferred-reason",
+                "outside this release",
+                "--reconsider-condition",
+                "next release scope lock",
+                "--decision-summary",
+                json.dumps(decision_summary, ensure_ascii=False),
+                "--verification-evidence",
+                json.dumps(verification_evidence, ensure_ascii=False),
+                "--implementation-constraints",
+                json.dumps(implementation_constraints, ensure_ascii=False),
+                "--json",
+            )
+            self.assertEqual(result, 0, output)
+            payload = json.loads(output)
+            self.assert_follow_up_schema(payload["follow_up"])
+            self.assertEqual(payload["follow_up"]["decision_summary"], decision_summary)
+            self.assertEqual(
+                payload["follow_up"]["verification_evidence"], verification_evidence
+            )
+            self.assertEqual(
+                payload["follow_up"]["implementation_constraints"],
+                implementation_constraints,
+            )
+
+            artifact = hloop.read_frontmatter(loop / "follow-ups" / "F001.md")
+            self.assert_follow_up_schema(artifact)
+            self.assertEqual(artifact["decision_summary"], decision_summary)
+            self.assertEqual(artifact["verification_evidence"], verification_evidence)
+            self.assertEqual(
+                artifact["implementation_constraints"], implementation_constraints
+            )
+
+            result, output = self.run_cli(
+                repo, "follow-up", "show", "F001", "--json"
+            )
+            self.assertEqual(result, 0, output)
+            shown = json.loads(output)
+            self.assert_follow_up_schema(shown)
+            self.assertEqual(shown["decision_summary"], decision_summary)
+            self.assertEqual(shown["verification_evidence"], verification_evidence)
+            self.assertEqual(
+                shown["implementation_constraints"], implementation_constraints
+            )
+
+    def test_follow_up_supersedes_failure_does_not_leave_partial_state(self) -> None:
+        boundaries = ("new_artifact", "old_artifact", "state", "journal")
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                repo = self.make_repo(Path(directory))
+                loop = self.init_and_lock(repo)
+                fingerprint = "sha256:" + "5" * 64
+                base_args = [
+                    "follow-up",
+                    "add",
+                    "--title",
+                    "Atomic follow-up",
+                    "--component",
+                    "review runtime",
+                    "--trigger-class",
+                    "classification drift",
+                    "--product-impact",
+                    "operator needs a later release decision",
+                    "--source-review-fingerprint",
+                    fingerprint,
+                    "--evidence",
+                    "review evidence",
+                    "--impact",
+                    "outside the current release contract",
+                    "--affected-path",
+                    "src/review.py",
+                    "--fact-status",
+                    "confirmed",
+                    "--origin",
+                    "unrelated-pre-existing",
+                    "--contract-relation",
+                    "outside_release",
+                    "--decision-requirement",
+                    "none",
+                    "--release-effect",
+                    "non_blocking",
+                    "--disposition",
+                    "defer_follow_up",
+                    "--recommended-action",
+                    "defer_follow_up",
+                    "--deferred-reason",
+                    "outside this release",
+                    "--reconsider-condition",
+                    "next release scope lock",
+                    "--json",
+                ]
+                result, output = self.run_cli(repo, *base_args)
+                self.assertEqual(result, 0, output)
+                first = json.loads(output)["follow_up"]
+                paths = {
+                    "new_artifact": (loop / "follow-ups" / "F002.md").resolve(),
+                    "old_artifact": (loop / "follow-ups" / "F001.md").resolve(),
+                    "state": (loop / "STATE.json").resolve(),
+                    "journal": (loop / "JOURNAL.md").resolve(),
+                }
+                before = {
+                    path: path.read_bytes() if path.exists() else None
+                    for path in paths.values()
+                }
+                injected = False
+                original_write_text = hloop.write_text
+                original_append_text = hloop.append_text
+
+                def fail_write(path: Path, text: str, *, durable: bool = False) -> None:
+                    nonlocal injected
+                    if (
+                        boundary != "journal"
+                        and Path(path).resolve() == paths[boundary]
+                        and not injected
+                    ):
+                        injected = True
+                        raise hloop.HLoopError(
+                            f"injected follow-up persistence failure at {boundary}"
+                        )
+                    original_write_text(path, text, durable=durable)
+
+                def fail_append(path: Path, text: str) -> None:
+                    nonlocal injected
+                    if boundary == "journal" and Path(path).resolve() == paths[boundary] and not injected:
+                        injected = True
+                        raise hloop.HLoopError(
+                            "injected follow-up persistence failure at journal"
+                        )
+                    original_append_text(path, text)
+
+                with mock.patch.object(hloop, "write_text", side_effect=fail_write), mock.patch.object(
+                    hloop, "append_text", side_effect=fail_append
+                ):
+                    result, output = self.run_cli(
+                        repo,
+                        *base_args[:-1],
+                        "--root-cause",
+                        "replacement design",
+                        "--supersedes",
+                        first["issue_key"],
+                    )
+                self.assertNotEqual(result, 0, output)
+                self.assertIn("injected follow-up persistence failure", output)
+                self.assertTrue(injected)
+                for path, expected in before.items():
+                    if expected is None:
+                        self.assertFalse(path.exists(), path)
+                    else:
+                        self.assertEqual(path.read_bytes(), expected, path)
+
+
+if __name__ == "__main__":
+    unittest.main()

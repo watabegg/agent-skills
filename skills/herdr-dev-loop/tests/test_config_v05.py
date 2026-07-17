@@ -27,6 +27,7 @@ _PORTABLE_DOC_PATHS = (
     "README.md",
     "docs/RELEASE-0.5.0.md",
     "docs/RELEASE-0.5.1.md",
+    "docs/RELEASE-0.5.2.md",
     "docs/2026-07-14-v0.5.0-plan.md",
     "docs/2026-07-16-v0.5.1-release-hardening-plan.md",
     "references/migration-install.md",
@@ -603,6 +604,52 @@ require_clean_worktree
                     check=False,
                 )
                 self.assertEqual(result.returncode, expected_status)
+
+
+class CurrentV052ReleaseArtifactTests(unittest.TestCase):
+    def test_current_version_docs_and_public_final_review_schemas(self):
+        self.assertEqual(
+            (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+            "0.5.2",
+        )
+        for relative_path in (
+            "README.md",
+            "SKILL.md",
+            "docs/RELEASE-0.5.2.md",
+            "references/artifact-contract.md",
+            "references/cli-notes.md",
+            "references/configuration.md",
+            "references/manager-loop.md",
+            "references/migration-install.md",
+            "references/report-protocol.md",
+            "references/review-swarm.md",
+            "references/reviewer-contract.md",
+            "references/state-machine.md",
+            "references/validation-policy.md",
+        ):
+            with self.subTest(relative_path=relative_path):
+                text = (SKILL_ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn("0.5.2", text)
+
+        for schema_name in (
+            "final-review-plan.schema.json",
+            "final-review-manifest.schema.json",
+        ):
+            with self.subTest(schema_name=schema_name):
+                schema = json.loads(
+                    (SKILL_ROOT / "schemas" / schema_name).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    schema["$schema"],
+                    "https://json-schema.org/draft/2020-12/schema",
+                )
+                self.assertTrue(
+                    schema["$ref"].startswith("../references/schemas/final-review-")
+                )
+
+    def test_current_config_example_matches_review_policy_defaults(self):
+        data = config.load_config_file(SKILL_ROOT / "examples" / "config.toml")
+        self.assertEqual(data["defaults"]["review"], config.REVIEW_POLICY_DEFAULTS)
 
 
 def _extract_hloop_function_snippets(text):

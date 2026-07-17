@@ -2,6 +2,7 @@
 
 __all__ = [
     "broker",
+    "certification",
     "config",
     "decisions",
     "events",
@@ -9,5 +10,7 @@ __all__ = [
     "migration",
     "providers",
     "requirements",
+    "release_scope",
     "review",
+    "review_policy",
 ]
