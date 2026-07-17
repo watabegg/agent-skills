@@ -160,6 +160,7 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
             transaction,
             resolved_tree=None,
         )
+        env["GIT_EDITOR"] = "true"
         return subprocess.run(
             ["git", *hloop.CHERRY_PICK_GIT_CONFIG, "cherry-pick", *source_commits],
             cwd=repo,
@@ -474,7 +475,27 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                 cwd=repo,
                 check=True,
             )
-            recovered = self.continue_then_crash_before_state_completion(repo, state)
+            real_git = hloop.git
+
+            def assert_non_interactive_continue(repo_arg, args, *positional, **keywords):
+                if args[-2:] == ["cherry-pick", "--continue"]:
+                    environment = keywords["env"]
+                    self.assertEqual(environment["TERM"], "dumb")
+                    self.assertNotIn("EDITOR", environment)
+                    self.assertEqual(environment["GIT_EDITOR"], "true")
+                return real_git(repo_arg, args, *positional, **keywords)
+
+            with mock.patch.dict(os.environ, {"TERM": "dumb"}, clear=False):
+                os.environ.pop("EDITOR", None)
+                os.environ.pop("GIT_EDITOR", None)
+                with mock.patch.object(
+                    hloop,
+                    "git",
+                    side_effect=assert_non_interactive_continue,
+                ):
+                    recovered = self.continue_then_crash_before_state_completion(
+                        repo, state
+                    )
             landed_head = hloop.git(repo, ["rev-parse", "HEAD"])
             self.assertEqual(
                 recovered["active_merge"]["cherry_pick_evidence"][0][
@@ -617,6 +638,7 @@ class CompletedCherryPickRecoveryTests(unittest.TestCase):
                 cwd=repo,
                 check=True,
                 capture_output=True,
+                env={**os.environ, "GIT_EDITOR": "true"},
             )
             with self.assertRaisesRegex(hloop.HLoopError, "missing an applied sequence"):
                 hloop.reconcile_completed_cherry_pick(repo, state, "T001")
