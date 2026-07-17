@@ -135,6 +135,9 @@ CONFIG_PRECEDENCE = (
     "start-override",
     "participant-override",
 )
+_RUNTIME_OVERRIDE_SOURCES = frozenset(
+    {"task-override", "start-override", "participant-override"}
+)
 
 
 def _identity_defaults(provider: str, model: str, effort: str) -> dict[str, str]:
@@ -1101,12 +1104,24 @@ def _merge_canonical_layer(
 def merge_config_layers(
     layers: Iterable[tuple[str, Mapping | None]],
 ) -> ConfigResolution:
-    """Normalize then merge config layers with complete assignment history."""
+    """Validate, normalize, then merge layers with assignment history.
+
+    Config-file defaults and scopes already pass through ``validate_config``.
+    Task, start, and participant overrides do not, so those runtime-only
+    layers independently enforce the same canonical keys and value bounds
+    before their higher precedence can take effect. Other sources retain the
+    0.5.2 compatibility behavior of accepting prevalidated snapshots/defaults.
+    """
 
     entries: dict[tuple[str, ...], ResolvedValue] = {}
     for source, mapping in layers:
         if not mapping:
             continue
+        if source in _RUNTIME_OVERRIDE_SOURCES:
+            errors: list[str] = []
+            _validate_defaults_table(source, mapping, errors)
+            if errors:
+                raise ConfigValidationError("; ".join(errors))
         normalized, origins = _normalize_config_layer_with_origins(mapping, source=source)
         _merge_canonical_layer(entries, normalized, source, origins)
     return ConfigResolution(entries)
