@@ -633,6 +633,66 @@ def _dependency_reachability(
     return frozenset(reached)
 
 
+def _has_glob_magic(pattern: str) -> bool:
+    return any(char in pattern for char in "*?[")
+
+
+def _normalize_write_pattern(pattern: str) -> str:
+    normalized = pattern[2:] if pattern.startswith("./") else pattern
+    return normalized.rstrip("/")
+
+
+def _direct_write_overlap_paths(
+    left_patterns: Iterable[str], right_patterns: Iterable[str]
+) -> frozenset[str]:
+    """Return overlaps decidable from exact and glob/exact write scopes."""
+
+    overlaps: set[str] = set()
+    for raw_left in left_patterns:
+        left = _normalize_write_pattern(raw_left)
+        if not left:
+            continue
+        left_is_glob = _has_glob_magic(left)
+        for raw_right in right_patterns:
+            right = _normalize_write_pattern(raw_right)
+            if not right:
+                continue
+            right_is_glob = _has_glob_magic(right)
+            if left == right:
+                overlaps.add(left)
+            elif not left_is_glob and not right_is_glob:
+                if left.startswith(right + "/"):
+                    overlaps.add(left)
+                elif right.startswith(left + "/"):
+                    overlaps.add(right)
+            elif not left_is_glob and fnmatch.fnmatchcase(left, right):
+                overlaps.add(left)
+            elif not right_is_glob and fnmatch.fnmatchcase(right, left):
+                overlaps.add(right)
+    return frozenset(overlaps)
+
+
+def _known_write_overlap_paths(
+    left_patterns: Iterable[str],
+    right_patterns: Iterable[str],
+    known_paths: Iterable[str],
+) -> frozenset[str]:
+    """Return additional overlap witnesses supplied by concrete impact paths."""
+
+    left = tuple(_normalize_write_pattern(pattern) for pattern in left_patterns)
+    right = tuple(_normalize_write_pattern(pattern) for pattern in right_patterns)
+    if _direct_write_overlap_paths(left, right):
+        return frozenset()
+    return frozenset(
+        path
+        for raw_path in known_paths
+        if (path := _normalize_write_pattern(raw_path))
+        and not _has_glob_magic(path)
+        and any(fnmatch.fnmatchcase(path, pattern) for pattern in left)
+        and any(fnmatch.fnmatchcase(path, pattern) for pattern in right)
+    )
+
+
 def _validate_task_graph(record: Mapping[str, Any]) -> list[PlanningIssue]:
     issues: list[PlanningIssue] = []
     tasks, item_issues = _validate_object_array(
@@ -777,8 +837,8 @@ def _validate_task_graph(record: Mapping[str, Any]) -> list[PlanningIssue]:
             shared_changes = set(_texts(left, "change_refs")) & set(
                 _texts(right, "change_refs")
             )
-            shared_writes = set(_texts(left, "write_allow")) & set(
-                _texts(right, "write_allow")
+            shared_writes = _direct_write_overlap_paths(
+                _texts(left, "write_allow"), _texts(right, "write_allow")
             )
             shared_declared = set(_texts(left, "shared_surface_refs")) & set(
                 _texts(right, "shared_surface_refs")
@@ -1147,6 +1207,50 @@ def validate_coverage(
         for task in tasks
         if isinstance(task.get("task_id"), str)
     }
+
+    known_paths = {
+        path
+        for surface in surfaces
+        for path in _texts(surface, "paths")
+        if not _has_glob_magic(path)
+    }
+    dependencies = {
+        task_id: _texts(task, "depends_on")
+        for task_id, task in task_by_id.items()
+    }
+    reachability = {
+        task_id: _dependency_reachability(dependencies, task_id)
+        for task_id in task_by_id
+    }
+    ordered_task_ids = sorted(task_by_id)
+    for index, left_id in enumerate(ordered_task_ids):
+        left = task_by_id[left_id]
+        for right_id in ordered_task_ids[index + 1 :]:
+            right = task_by_id[right_id]
+            overlaps = sorted(
+                _known_write_overlap_paths(
+                    _texts(left, "write_allow"),
+                    _texts(right, "write_allow"),
+                    known_paths,
+                )
+            )
+            if not overlaps:
+                continue
+            ordered = (
+                right_id in reachability[left_id]
+                or left_id in reachability[right_id]
+            )
+            if not ordered:
+                issues.append(
+                    PlanningIssue(
+                        "unordered-shared-change",
+                        f"{left_id} and {right_id} share mutable planning surfaces "
+                        "without a dependency order: "
+                        + ", ".join(overlaps),
+                        "tasks",
+                        (left_id, right_id, *overlaps),
+                    )
+                )
 
     expected = {
         "requirement": set(required_requirement_refs),

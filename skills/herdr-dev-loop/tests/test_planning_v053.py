@@ -202,6 +202,39 @@ def planning_bundle(
     return current, impact, task_graph, coverage, plan_gap
 
 
+def physical_overlap_bundle(
+    *, ordered: bool = False
+) -> tuple[PlanningIdentity, dict, dict, dict, dict]:
+    current, impact, graph, coverage, plan_gap = planning_bundle(second_task=True)
+    second_surface = copy.deepcopy(impact["surfaces"][0])
+    second_surface["surface_id"] = "planning-runtime"
+    impact["surfaces"].append(second_surface)
+    impact = seal_planning_artifact(impact)
+
+    graph["tasks"][0]["write_allow"] = [
+        "skills/herdr-dev-loop/scripts/**"
+    ]
+    graph["tasks"][1]["change_refs"] = ["planning-runtime"]
+    graph["tasks"][1]["write_allow"] = [
+        "skills/herdr-dev-loop/**/planning.py"
+    ]
+    graph["tasks"][1]["depends_on"] = ["T005"] if ordered else []
+    graph["tasks"][1]["plan_item_refs"] = ["P002"]
+    graph = seal_planning_artifact(graph)
+
+    coverage["impact_map_digest"] = impact["artifact_digest"]
+    coverage["task_graph_digest"] = graph["artifact_digest"]
+    coverage["entries"][0]["task_refs"].append("T007")
+    coverage["entries"][0]["surface_refs"].append("planning-runtime")
+    coverage = seal_planning_artifact(coverage)
+
+    plan_gap["impact_map_digest"] = impact["artifact_digest"]
+    plan_gap["task_graph_digest"] = graph["artifact_digest"]
+    plan_gap["coverage_digest"] = coverage["artifact_digest"]
+    plan_gap = seal_planning_artifact(plan_gap)
+    return current, impact, graph, coverage, plan_gap
+
+
 def offline_validator(schema_path: Path):
     if (
         jsonschema is None
@@ -443,6 +476,107 @@ class PlanningContractTests(unittest.TestCase):
         self.assertIn(
             "unordered-shared-change", {issue.code for issue in result.issues}
         )
+
+    def test_exact_and_glob_write_overlap_requires_dependency_order(self):
+        cases = {
+            "same-exact": (
+                "skills/herdr-dev-loop/scripts/hloop",
+                "skills/herdr-dev-loop/scripts/hloop",
+            ),
+            "nested-exact": (
+                "skills/herdr-dev-loop/scripts",
+                "skills/herdr-dev-loop/scripts/hloop",
+            ),
+            "glob-exact": (
+                "skills/herdr-dev-loop/scripts/**",
+                "skills/herdr-dev-loop/scripts/hloop_lib/planning.py",
+            ),
+            "exact-glob": (
+                "skills/herdr-dev-loop/scripts/hloop_lib/planning.py",
+                "skills/herdr-dev-loop/scripts/**",
+            ),
+        }
+        for name, (left_write, right_write) in cases.items():
+            with self.subTest(case=name):
+                _, _, graph, _, _ = planning_bundle(second_task=True)
+                graph["tasks"][0]["change_refs"] = ["left-surface"]
+                graph["tasks"][0]["write_allow"] = [left_write]
+                graph["tasks"][1]["change_refs"] = ["right-surface"]
+                graph["tasks"][1]["write_allow"] = [right_write]
+                graph["tasks"][1]["depends_on"] = []
+                graph = raw_digest(graph)
+
+                result = validate_planning_artifact(graph)
+
+                self.assertIn(
+                    "unordered-shared-change",
+                    {issue.code for issue in result.issues},
+                )
+
+                graph["tasks"][1]["depends_on"] = ["T005"]
+                graph = raw_digest(graph)
+                ordered = validate_planning_artifact(graph)
+                self.assertNotIn(
+                    "unordered-shared-change",
+                    {issue.code for issue in ordered.issues},
+                )
+
+    def test_bundle_uses_known_paths_to_detect_glob_overlap(self):
+        current, impact, graph, coverage, plan_gap = physical_overlap_bundle()
+
+        result = validate_planning_bundle(
+            impact, graph, coverage, plan_gap, current
+        )
+
+        self.assertEqual(
+            {issue.code for issue in result.issues},
+            {"unordered-shared-change"},
+        )
+        self.assertTrue(
+            any(
+                "skills/herdr-dev-loop/scripts/hloop_lib/planning.py"
+                in issue.refs
+                for issue in result.issues
+            )
+        )
+        for artifact in (impact, graph, coverage, plan_gap):
+            self.assertEqual(artifact["artifact_digest"], artifact_digest(artifact))
+
+    def test_distinct_exact_write_paths_do_not_require_dependency_order(self):
+        _, _, graph, _, _ = planning_bundle(second_task=True)
+        graph["tasks"][0]["change_refs"] = ["left-surface"]
+        graph["tasks"][0]["write_allow"] = [
+            "skills/herdr-dev-loop/scripts/hloop"
+        ]
+        graph["tasks"][1]["change_refs"] = ["right-surface"]
+        graph["tasks"][1]["write_allow"] = [
+            "skills/herdr-dev-loop/scripts/hloop_lib/planning.py"
+        ]
+        graph["tasks"][1]["depends_on"] = []
+        graph = raw_digest(graph)
+
+        result = validate_planning_artifact(graph)
+
+        self.assertNotIn(
+            "unordered-shared-change", {issue.code for issue in result.issues}
+        )
+
+    def test_dependency_order_allows_known_path_glob_overlap(self):
+        current, impact, graph, coverage, plan_gap = physical_overlap_bundle(
+            ordered=True
+        )
+
+        result = validate_dispatch_readiness(
+            impact,
+            graph,
+            coverage,
+            plan_gap,
+            current,
+            required_requirement_refs=["REQ-001"],
+            required_plan_item_refs=["P002"],
+        )
+
+        self.assertTrue(result.ok, result.issues)
 
     def test_unknown_self_and_cyclic_dependencies_fail_closed(self):
         _, _, graph, _, _ = planning_bundle(second_task=True)
