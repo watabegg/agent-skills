@@ -43,6 +43,7 @@ PATCH_REVIEW_ACTIONS = frozenset(
     }
 )
 DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK = 2
+MAX_PATCH_REVIEW_ROUNDS_PER_TASK = DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK
 
 _DIGEST_RE = re.compile(DIGEST_PATTERN)
 _GIT_OBJECT_RE = re.compile(GIT_OBJECT_PATTERN)
@@ -145,6 +146,20 @@ def _required_text(value: Any, field_name: str) -> str:
 def _positive_int(value: Any, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise WorkerCandidateError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _patch_review_round_limit(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > MAX_PATCH_REVIEW_ROUNDS_PER_TASK
+    ):
+        raise WorkerCandidateError(
+            "max_rounds must be an integer between 0 and "
+            f"{MAX_PATCH_REVIEW_ROUNDS_PER_TASK}"
+        )
     return value
 
 
@@ -1048,7 +1063,7 @@ def evaluate_patch_review_rounds(
     active_contract = _digest(
         current_task_contract_digest, "current_task_contract_digest"
     )
-    limit = _positive_int(max_rounds, "max_rounds")
+    limit = _patch_review_round_limit(max_rounds)
     history = _deduplicate_review_attempts(
         reviews, run_id=current.run_id, task_id=current.task_id
     )
@@ -1081,26 +1096,22 @@ def evaluate_patch_review_rounds(
     last_candidate_sha = current.candidate_sha
 
     if (
-        latest is not None
-        and latest.verdict == "fix_required"
-        and len(history) >= limit
+        latest_fresh is not None
+        and latest_fresh is latest
+        and latest_fresh.verdict == "passed"
     ):
+        action = "finalize_allowed"
+    elif len(history) >= limit:
         action = "user_decision_required"
-        unresolved = latest.unresolved_finding_fingerprints
-        last_candidate_sha = latest.candidate_sha
+        if latest is not None:
+            unresolved = latest.unresolved_finding_fingerprints
+            last_candidate_sha = latest.candidate_sha
     elif current.task_contract_digest != active_contract:
         action = "candidate_resubmission_required"
     elif latest_fresh is not None and latest_fresh is latest:
-        if latest_fresh.verdict == "passed":
-            action = "finalize_allowed"
-        else:
-            unresolved = latest_fresh.unresolved_finding_fingerprints
-            last_candidate_sha = latest_fresh.candidate_sha
-            action = (
-                "user_decision_required"
-                if len(history) >= limit
-                else "patch_fix_running"
-            )
+        unresolved = latest_fresh.unresolved_finding_fingerprints
+        last_candidate_sha = latest_fresh.candidate_sha
+        action = "patch_fix_running"
     return PatchReviewDecision(
         action=action,
         task_id=current.task_id,

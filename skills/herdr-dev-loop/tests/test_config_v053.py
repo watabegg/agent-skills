@@ -263,6 +263,50 @@ class HierarchicalPrecedenceV053Tests(unittest.TestCase):
                     resolved.source_of(role, "model"), "participant-override"
                 )
 
+    def test_task_start_and_participant_overrides_share_canonical_validation(self):
+        override_names = (
+            "task_override",
+            "start_override",
+            "participant_override",
+        )
+        invalid_layers = (
+            {"audit": {"max_patch_review_rounds_per_task": 3}},
+            {"patch_reviewer": {"provider": "unknown"}},
+            {"unknown_config_section": {"enabled": True}},
+        )
+        for override_name in override_names:
+            for invalid_layer in invalid_layers:
+                with self.subTest(
+                    override=override_name, invalid_layer=invalid_layer
+                ), self.assertRaises(config.ConfigValidationError):
+                    config.resolve_config(
+                        config.V053_BUILT_IN_CONFIG_DEFAULTS,
+                        target_dir=self.repo,
+                        **{override_name: invalid_layer},
+                    )
+
+            for max_rounds in (0, 1, config.MAX_PATCH_REVIEW_ROUNDS):
+                with self.subTest(
+                    override=override_name, max_rounds=max_rounds
+                ):
+                    resolved = config.resolve_config(
+                        config.V053_BUILT_IN_CONFIG_DEFAULTS,
+                        target_dir=self.repo,
+                        **{
+                            override_name: {
+                                "audit": {
+                                    "max_patch_review_rounds_per_task": max_rounds
+                                }
+                            }
+                        },
+                    )
+                    self.assertEqual(
+                        resolved.get(
+                            "audit", "max_patch_review_rounds_per_task"
+                        ),
+                        max_rounds,
+                    )
+
 
 class CanonicalProtocolSelectionTests(unittest.TestCase):
     def test_execution_kinds_read_distinct_keys_without_fallback(self):

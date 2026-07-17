@@ -387,6 +387,89 @@ class PatchReviewRoundTests(unittest.TestCase):
         self.assertEqual(decision.last_candidate_sha, second_seal.candidate_sha)
         self.assertEqual(decision.automatic_task_ids, ())
 
+    def test_exhausted_stale_pass_stops_with_counted_candidate_context(self):
+        first = candidate()
+        first_seal = sealed(first)
+        first_review = review(
+            first_seal,
+            verdict="fix_required",
+            unresolved=(digest("first-regression"),),
+        )
+        second = candidate(revision=2, tree="d" * 40)
+        second_seal = sealed(second, commit="e" * 40)
+        stale_pass = review(
+            second_seal,
+            attempt="PR-T006-A002",
+            round_number=2,
+        )
+        third = candidate(revision=3, tree="f" * 40)
+        third_seal = sealed(third, commit="1" * 40)
+
+        decision = evaluate_patch_review_rounds(
+            third_seal,
+            [first_review, stale_pass],
+            current_task_contract_digest=third.task_contract_digest,
+        )
+
+        self.assertEqual(decision.action, "user_decision_required")
+        self.assertEqual(decision.rounds_used, 2)
+        self.assertEqual(decision.last_candidate_sha, stale_pass.candidate_sha)
+        self.assertEqual(
+            decision.counted_review_attempt_ids,
+            (first_review.review_attempt_id, stale_pass.review_attempt_id),
+        )
+        self.assertEqual(
+            decision.stale_review_attempt_ids,
+            (first_review.review_attempt_id, stale_pass.review_attempt_id),
+        )
+
+        extra_review = review(
+            third_seal,
+            attempt="PR-T006-A003",
+            round_number=3,
+        )
+        with self.assertRaisesRegex(WorkerCandidateError, "round limit"):
+            evaluate_patch_review_rounds(
+                third_seal,
+                [first_review, stale_pass, extra_review],
+                current_task_contract_digest=third.task_contract_digest,
+            )
+
+    def test_patch_review_round_limit_matches_supported_config_bounds(self):
+        current = candidate()
+        current_seal = sealed(current)
+
+        zero = evaluate_patch_review_rounds(
+            current_seal,
+            [],
+            current_task_contract_digest=current.task_contract_digest,
+            max_rounds=0,
+        )
+        self.assertEqual(zero.action, "user_decision_required")
+        self.assertEqual(zero.max_rounds, 0)
+
+        for supported in (1, DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK):
+            with self.subTest(supported=supported):
+                decision = evaluate_patch_review_rounds(
+                    current_seal,
+                    [],
+                    current_task_contract_digest=current.task_contract_digest,
+                    max_rounds=supported,
+                )
+                self.assertEqual(decision.action, "patch_review_pending")
+                self.assertEqual(decision.max_rounds, supported)
+
+        for invalid in (-1, True, DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK + 1):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                WorkerCandidateError, "max_rounds"
+            ):
+                evaluate_patch_review_rounds(
+                    current_seal,
+                    [],
+                    current_task_contract_digest=current.task_contract_digest,
+                    max_rounds=invalid,
+                )
+
     def test_idempotent_review_record_does_not_double_count_or_hide_conflict(self):
         current = candidate()
         current_seal = sealed(current)
@@ -485,6 +568,27 @@ class FinalResultAuthenticityTests(unittest.TestCase):
                 current_task_contract_digest=current.task_contract_digest,
                 result_parent_candidate_sha=current_seal.candidate_sha,
             )
+
+    def test_schema_invalid_optional_result_values_fail_authenticity(self):
+        current = candidate()
+        current_seal = sealed(current)
+        passed = review(current_seal)
+
+        for field, value in (("validation_summary", 7), ("handoff", 0)):
+            result = final_result(current, current_seal)
+            result[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                WorkerCandidateError, "final result contract is invalid"
+            ):
+                validate_final_result_authenticity(
+                    current,
+                    current_seal,
+                    passed,
+                    result,
+                    candidate_artifact_digest=current.canonical_artifact_digest,
+                    current_task_contract_digest=current.task_contract_digest,
+                    result_parent_candidate_sha=current_seal.candidate_sha,
+                )
 
 
 @unittest.skipUnless(jsonschema is not None, "jsonschema is optional")

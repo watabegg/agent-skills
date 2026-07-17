@@ -524,6 +524,124 @@ class ContractSchemaTests(unittest.TestCase):
                     self.assertEqual(python_validator(record).ok, expected)
                     self.assertEqual(schema_validator.is_valid(record), expected)
 
+    def test_revision_three_python_rejects_every_task_schema_constraint_class(self):
+        mutations = (
+            ("id-pattern", "id", "task-001"),
+            ("run-id-min-length", "run_id", ""),
+            ("skill-version-type", "skill_version", 53),
+            ("kind-type", "kind", []),
+            ("kind-enum", "kind", "maintenance"),
+            ("status-enum", "status", "ready"),
+            ("created-from-type", "created_from", 1),
+            ("branch-min-length", "branch", ""),
+            ("base-ref-type", "base_ref", []),
+            ("base-sha-min-length", "base_sha", ""),
+            ("priority-enum", "priority", "P4"),
+            ("severity-enum", "severity", "critical"),
+            ("batch-pattern", "batch_id", "B1"),
+            ("depends-on-type", "depends_on", "T002"),
+            ("depends-on-pattern", "depends_on", ["task-002"]),
+            ("depends-on-unique", "depends_on", ["T002", "T002"]),
+            ("write-allow-item", "write_allow", [""]),
+            ("write-deny-type", "write_deny", "src/private.py"),
+            ("acceptance-min-items", "acceptance", []),
+            ("validation-minimum-empty-string", "validation_minimum", ""),
+            ("validation-minimum-empty-list", "validation_minimum", []),
+            ("validation-minimum-item", "validation_minimum", [""]),
+            ("worker-protocol-enum", "worker_protocol", "external"),
+            ("worker-provider-enum", "worker_agent_provider", "other"),
+            ("worker-model-min-length", "worker_agent_model", ""),
+            ("worker-effort-type", "worker_agent_effort", 1),
+            ("worker-qa-enum", "worker_qa_profile", "production"),
+            ("qa-alias-enum", "qa_profile", "production"),
+            ("preserved-invariants-min-items", "preserved_invariants", []),
+            ("regression-checks-item", "regression_checks", [""]),
+            ("risk-class-enum", "risk_class", "critical"),
+            ("required-gates-type", "required_gates", "patch_review"),
+            ("required-gates-enum", "required_gates", ["manual_review"]),
+            (
+                "required-gates-unique",
+                "required_gates",
+                ["patch_review", "patch_review"],
+            ),
+            ("investigation-goal-min-length", "investigation_goal", ""),
+            (
+                "implementation-ready-item",
+                "implementation_ready_evidence",
+                [""],
+            ),
+            ("exploration-budget-minimum", "exploration_budget_minutes", 0),
+            ("history-search-type", "history_search_allowed", 0),
+            ("task-origin-enum", "task_origin", "review"),
+            ("release-scope-minimum", "release_scope_revision", -1),
+            ("plan-refs-type", "plan_item_refs", "P001"),
+            ("plan-refs-item", "plan_item_refs", [1]),
+            ("plan-refs-unique", "plan_item_refs", ["P001", "P001"]),
+            ("requirement-refs-item", "requirement_refs", [1]),
+            ("scope-refs-unique", "scope_refs", ["scope", "scope"]),
+            ("source-finding-type", "source_finding", 1),
+            ("authorization-input-pattern", "authorization_input_id", "U1"),
+            ("why-fix-now-type", "why_fix_now", []),
+            ("operational-reason-type", "operational_reason", False),
+            ("origin-enum", "origin", "legacy"),
+            ("contract-relation-enum", "contract_relation", "related"),
+            ("decision-requirement-enum", "decision_requirement", "manager"),
+            ("release-effect-enum", "release_effect", "required"),
+            ("remediation-round-minimum", "remediation_round", -1),
+            ("fact-status-enum", "fact_status", "unknown"),
+            ("disposition-enum", "disposition", "ignore"),
+            ("scope-expanding-type", "scope_expanding", 0),
+        )
+        for case, field, value in mutations:
+            record = task_contract(revision=V053_CONTRACT_SCHEMA_REVISION)
+            record[field] = value
+            with self.subTest(case=case):
+                self.assertFalse(self.task_validator.is_valid(record))
+                self.assertFalse(validate_task_contract(record).ok)
+
+    def test_revision_three_python_rejects_every_result_schema_constraint_class(self):
+        mutations = (
+            ("task-id-pattern", "task_id", "task-001"),
+            ("run-id-min-length", "run_id", ""),
+            ("skill-version-type", "skill_version", 53),
+            ("attempt-id-pattern", "attempt_id", "T001/1"),
+            ("status-enum", "status", "merged"),
+            ("merge-ready-type", "merge_ready", 1),
+            ("branch-min-length", "branch", ""),
+            ("head-sha-type", "head_sha", []),
+            ("base-sha-min-length", "base_sha", ""),
+            ("changed-files-type", "changed_files", "src/task.py"),
+            ("changed-files-item", "changed_files", [1]),
+            ("validation-recorded-type", "validation_recorded", 1),
+            ("validation-commands-type", "validation_commands", "test"),
+            ("validation-commands-item", "validation_commands", [""]),
+            ("validation-results-type", "validation_results", 1),
+            ("validation-results-enum", "validation_results", ["skipped"]),
+            ("validation-summary-type", "validation_summary", 7),
+            ("blocking-questions-type", "blocking_questions", "question"),
+            ("blocking-questions-item", "blocking_questions", [1]),
+            ("handoff-type", "handoff", 0),
+            ("invariant-evidence-type", "invariant_evidence", "evidence"),
+            ("invariant-evidence-item", "invariant_evidence", [""]),
+            ("regression-evidence-item", "regression_evidence", [""]),
+            ("self-review-min-length", "self_review_summary", ""),
+            ("residual-risks-type", "residual_risks", "none"),
+            ("residual-risks-item", "residual_risks", [""]),
+            ("unrun-checks-type", "unrun_checks", "none"),
+            ("unrun-checks-item", "unrun_checks", [""]),
+            ("merge-ready-status-condition", "status", "partial"),
+            ("merge-ready-commands-condition", "validation_commands", []),
+            ("merge-ready-results-condition", "validation_results", []),
+            ("done-invariant-condition", "invariant_evidence", []),
+            ("done-regression-condition", "regression_evidence", []),
+        )
+        for case, field, value in mutations:
+            record = result_contract(revision=V053_CONTRACT_SCHEMA_REVISION)
+            record[field] = value
+            with self.subTest(case=case):
+                self.assertFalse(self.result_validator.is_valid(record))
+                self.assertFalse(validate_result_contract(record).ok)
+
 
 if __name__ == "__main__":
     unittest.main()
