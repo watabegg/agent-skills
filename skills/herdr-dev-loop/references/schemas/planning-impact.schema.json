@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/planning-impact.schema.json",
+  "title": "Herdr Dev Loop Repository Impact Map",
+  "allOf": [
+    {"$ref": "planning-common.schema.json#/$defs/identity"}
+  ],
+  "type": "object",
+  "required": [
+    "record_type",
+    "planning_schema_revision",
+    "run_id",
+    "plan_revision",
+    "requirements_revision",
+    "release_scope_revision",
+    "release_scope_digest",
+    "source_revision",
+    "source_digest",
+    "surfaces",
+    "preserved_invariants",
+    "non_goals",
+    "shared_contracts",
+    "artifact_digest"
+  ],
+  "properties": {
+    "record_type": {"const": "repository_impact_map"},
+    "planning_schema_revision": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "plan_revision": {"type": "integer", "minimum": 1},
+    "requirements_revision": {"type": "integer", "minimum": 1},
+    "release_scope_revision": {"type": "integer", "minimum": 1},
+    "release_scope_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "source_revision": {"type": "integer", "minimum": 1},
+    "source_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "surfaces": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "surface_id",
+          "kind",
+          "paths",
+          "symbols",
+          "entry_points",
+          "callers",
+          "consumers",
+          "success_paths",
+          "failure_paths",
+          "test_refs",
+          "fixture_refs",
+          "validation_commands",
+          "final_evidence_refs",
+          "requirement_refs",
+          "plan_item_refs",
+          "scope_refs"
+        ],
+        "properties": {
+          "surface_id": {"type": "string", "minLength": 1},
+          "kind": {
+            "enum": [
+              "module",
+              "entry_point",
+              "public_api",
+              "schema",
+              "cli",
+              "persistence",
+              "generated_artifact",
+              "migration",
+              "compatibility",
+              "operations",
+              "docs",
+              "fixture"
+            ]
+          },
+          "paths": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "symbols": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "entry_points": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "callers": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "consumers": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "success_paths": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "failure_paths": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "test_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "fixture_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "validation_commands": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "final_evidence_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "requirement_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "plan_item_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "scope_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "preserved_invariants": {
+      "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+    },
+    "non_goals": {
+      "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+    },
+    "shared_contracts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["contract_ref", "surface_refs", "invariant_refs"],
+        "properties": {
+          "contract_ref": {"type": "string", "minLength": 1},
+          "surface_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "invariant_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "artifact_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    }
+  },
+  "additionalProperties": false
+}

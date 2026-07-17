@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/planning-coverage.schema.json",
+  "title": "Herdr Dev Loop Acceptance Coverage Ledger",
+  "allOf": [
+    {"$ref": "planning-common.schema.json#/$defs/identity"}
+  ],
+  "type": "object",
+  "required": [
+    "record_type",
+    "planning_schema_revision",
+    "run_id",
+    "plan_revision",
+    "requirements_revision",
+    "release_scope_revision",
+    "release_scope_digest",
+    "source_revision",
+    "source_digest",
+    "impact_map_digest",
+    "task_graph_digest",
+    "entries",
+    "artifact_digest"
+  ],
+  "properties": {
+    "record_type": {"const": "acceptance_coverage_ledger"},
+    "planning_schema_revision": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "plan_revision": {"type": "integer", "minimum": 1},
+    "requirements_revision": {"type": "integer", "minimum": 1},
+    "release_scope_revision": {"type": "integer", "minimum": 1},
+    "release_scope_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "source_revision": {"type": "integer", "minimum": 1},
+    "source_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "impact_map_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "task_graph_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "coverage_id",
+          "acceptance_ref",
+          "requirement_refs",
+          "plan_item_refs",
+          "task_refs",
+          "surface_refs",
+          "caller_refs",
+          "consumer_refs",
+          "failure_path_refs",
+          "test_refs",
+          "final_evidence_refs",
+          "final_evidence_owner",
+          "review_lane_refs"
+        ],
+        "properties": {
+          "coverage_id": {"type": "string", "minLength": 1},
+          "acceptance_ref": {"type": "string", "minLength": 1},
+          "requirement_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "plan_item_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "task_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "surface_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "caller_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "consumer_refs": {
+            "$ref": "planning-common.schema.json#/$defs/uniqueTexts"
+          },
+          "failure_path_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "test_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "final_evidence_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "final_evidence_owner": {"enum": ["manager", "reviewer", "gap"]},
+          "review_lane_refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          }
+        },
+        "anyOf": [
+          {"properties": {"requirement_refs": {"minItems": 1}}},
+          {"properties": {"plan_item_refs": {"minItems": 1}}}
+        ],
+        "additionalProperties": false
+      }
+    },
+    "artifact_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    }
+  },
+  "additionalProperties": false
+}

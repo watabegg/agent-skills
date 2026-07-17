@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/planning-common.schema.json",
+  "title": "Herdr Dev Loop Planning Common Contracts",
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "uniqueTexts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "nonEmptyUniqueTexts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "planning_schema_revision",
+        "run_id",
+        "plan_revision",
+        "requirements_revision",
+        "release_scope_revision",
+        "release_scope_digest",
+        "source_revision",
+        "source_digest"
+      ],
+      "properties": {
+        "planning_schema_revision": {"const": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "plan_revision": {"type": "integer", "minimum": 1},
+        "requirements_revision": {"type": "integer", "minimum": 1},
+        "release_scope_revision": {"type": "integer", "minimum": 1},
+        "release_scope_digest": {"$ref": "#/$defs/digest"},
+        "source_revision": {"type": "integer", "minimum": 1},
+        "source_digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

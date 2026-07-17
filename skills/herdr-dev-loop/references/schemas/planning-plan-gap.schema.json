@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.herdr.dev/herdr-dev-loop/planning-plan-gap.schema.json",
+  "title": "Herdr Dev Loop Plan Gap Artifact",
+  "type": "object",
+  "required": [
+    "record_type",
+    "planning_schema_revision",
+    "run_id",
+    "plan_revision",
+    "requirements_revision",
+    "release_scope_revision",
+    "release_scope_digest",
+    "source_revision",
+    "source_digest",
+    "impact_map_digest",
+    "task_graph_digest",
+    "coverage_digest",
+    "checker",
+    "verdict",
+    "findings",
+    "artifact_digest"
+  ],
+  "properties": {
+    "record_type": {"const": "plan_gap"},
+    "planning_schema_revision": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "plan_revision": {"type": "integer", "minimum": 1},
+    "requirements_revision": {"type": "integer", "minimum": 1},
+    "release_scope_revision": {"type": "integer", "minimum": 1},
+    "release_scope_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "source_revision": {"type": "integer", "minimum": 1},
+    "source_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "impact_map_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "task_graph_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "coverage_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    },
+    "checker": {
+      "type": "object",
+      "required": ["role_id", "role_kind", "mode", "provider", "model", "effort"],
+      "properties": {
+        "role_id": {"type": "string", "minLength": 1},
+        "role_kind": {"const": "specification_scout"},
+        "mode": {"const": "coverage"},
+        "provider": {"const": "codex"},
+        "model": {"const": "gpt-5.6-sol"},
+        "effort": {"const": "xhigh"}
+      },
+      "additionalProperties": false
+    },
+    "verdict": {"enum": ["clean", "gaps_found"]},
+    "findings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["finding_id", "category", "refs", "message"],
+        "properties": {
+          "finding_id": {"type": "string", "minLength": 1},
+          "category": {
+            "enum": [
+              "unassigned_requirement",
+              "unassigned_plan_item",
+              "unassigned_caller",
+              "unassigned_consumer",
+              "unassigned_migration",
+              "unassigned_docs",
+              "unassigned_fixture",
+              "unassigned_failure_path",
+              "unassigned_test",
+              "missing_final_evidence",
+              "dependency_conflict",
+              "shared_invariant_conflict",
+              "write_scope_conflict",
+              "scope_external"
+            ]
+          },
+          "refs": {
+            "$ref": "planning-common.schema.json#/$defs/nonEmptyUniqueTexts"
+          },
+          "message": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "artifact_digest": {
+      "$ref": "planning-common.schema.json#/$defs/digest"
+    }
+  },
+  "allOf": [
+    {"$ref": "planning-common.schema.json#/$defs/identity"},
+    {
+      "if": {"properties": {"verdict": {"const": "clean"}}},
+      "then": {"properties": {"findings": {"maxItems": 0}}},
+      "else": {"properties": {"findings": {"minItems": 1}}}
+    }
+  ],
+  "additionalProperties": false
+}
