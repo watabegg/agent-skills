@@ -24,12 +24,14 @@ from hloop_lib.worker_candidate import (  # noqa: E402
     CandidateSeal,
     ImplementationCandidate,
     PatchReview,
+    PatchReviewFinding,
     WorkerCandidateError,
     canonical_digest,
     evaluate_patch_review_rounds,
     patch_review_staleness,
     record_patch_review,
     require_fresh_patch_review,
+    require_uniform_patch_review_finding_identity,
     seal_candidate,
     validate_candidate_seal,
     validate_final_result_authenticity,
@@ -99,8 +101,8 @@ def review(
     attempt: str = "PR-T006-A001",
     round_number: int = 1,
     verdict: str = "passed",
-    unresolved: tuple[str, ...] = (),
-    follow_ups: tuple[str, ...] = (),
+    unresolved: tuple[PatchReviewFinding, ...] = (),
+    follow_ups: tuple[PatchReviewFinding, ...] = (),
 ) -> PatchReview:
     return record_patch_review(
         current,
@@ -110,8 +112,20 @@ def review(
         reviewer_model="gpt-5.6-sol",
         reviewer_effort="xhigh",
         verdict=verdict,
-        unresolved_finding_fingerprints=unresolved,
-        follow_up_finding_fingerprints=follow_ups,
+        findings=(*unresolved, *follow_ups),
+    )
+
+
+def patch_finding(
+    label: str, *, scope: str = "unresolved"
+) -> PatchReviewFinding:
+    return PatchReviewFinding.from_evidence(
+        scope=scope,
+        file_path="src/worker.py",
+        symbol=f"worker_{label}",
+        trigger=f"Trigger {label}",
+        product_impact=f"Impact {label}",
+        proposed_fix=f"Fix {label}",
     )
 
 
@@ -301,12 +315,19 @@ class PatchReviewIdentityTests(unittest.TestCase):
 
     def test_verdict_consistency_and_no_automatic_scope_expansion(self):
         current_seal = sealed(candidate())
-        finding = digest("outside-task-finding")
+        finding = patch_finding("outside-task-finding", scope="follow_up")
         passed = review(current_seal, follow_ups=(finding,))
         self.assertEqual(passed.to_record()["automatic_task_ids"], [])
+        self.assertEqual(
+            passed.follow_up_finding_fingerprints, (finding.fingerprint,)
+        )
 
         with self.assertRaisesRegex(WorkerCandidateError, "cannot retain unresolved"):
-            review(current_seal, verdict="passed", unresolved=(digest("bug"),))
+            review(
+                current_seal,
+                verdict="passed",
+                unresolved=(patch_finding("bug"),),
+            )
         with self.assertRaisesRegex(WorkerCandidateError, "requires unresolved"):
             review(current_seal, verdict="fix_required")
 
@@ -318,12 +339,27 @@ class PatchReviewIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerCandidateError, "artifact filename"):
             review(current_seal, attempt="../../outside")
 
+    def test_candidate_artifact_ref_must_match_review_candidate_identity(self):
+        recorded = review(sealed(candidate()))
+
+        for artifact_ref in (
+            "implementation-candidates/T006/T006-A001/2.json",
+            "implementation-candidates/T006/T006-A002/1.json",
+            "implementation-candidates/T007/T006-A001/1.json",
+            "implementation-candidates/T006/T006-A001/../1.json",
+        ):
+            with self.subTest(artifact_ref=artifact_ref), self.assertRaisesRegex(
+                WorkerCandidateError,
+                "candidate_artifact_ref does not match task, attempt, and revision",
+            ):
+                replace(recorded, candidate_artifact_ref=artifact_ref)
+
 
 class PatchReviewRoundTests(unittest.TestCase):
     def test_fix_required_reuses_same_attempt_then_pass_allows_finalize(self):
         first = candidate()
         first_seal = sealed(first)
-        finding = digest("task-local-regression")
+        finding = patch_finding("task-local-regression")
         first_review = review(
             first_seal,
             verdict="fix_required",
@@ -355,8 +391,8 @@ class PatchReviewRoundTests(unittest.TestCase):
         self.assertIn(first_review.review_attempt_id, final_decision.stale_review_attempt_ids)
 
     def test_round_limit_stops_with_unresolved_findings_and_last_sha(self):
-        finding_one = digest("regression-one")
-        finding_two = digest("regression-two")
+        finding_one = patch_finding("regression-one")
+        finding_two = patch_finding("regression-two")
         first = candidate()
         first_seal = sealed(first)
         first_review = review(
@@ -383,7 +419,9 @@ class PatchReviewRoundTests(unittest.TestCase):
 
         self.assertEqual(decision.action, "user_decision_required")
         self.assertTrue(decision.requires_user_decision)
-        self.assertEqual(decision.unresolved_finding_fingerprints, (finding_two,))
+        self.assertEqual(
+            decision.unresolved_finding_fingerprints, (finding_two.fingerprint,)
+        )
         self.assertEqual(decision.last_candidate_sha, second_seal.candidate_sha)
         self.assertEqual(decision.automatic_task_ids, ())
 
@@ -393,7 +431,7 @@ class PatchReviewRoundTests(unittest.TestCase):
         first_review = review(
             first_seal,
             verdict="fix_required",
-            unresolved=(digest("first-regression"),),
+            unresolved=(patch_finding("first-regression"),),
         )
         second = candidate(revision=2, tree="d" * 40)
         second_seal = sealed(second, commit="e" * 40)
@@ -473,7 +511,7 @@ class PatchReviewRoundTests(unittest.TestCase):
     def test_idempotent_review_record_does_not_double_count_or_hide_conflict(self):
         current = candidate()
         current_seal = sealed(current)
-        finding = digest("regression")
+        finding = patch_finding("regression")
         recorded = review(
             current_seal,
             verdict="fix_required",
@@ -487,13 +525,75 @@ class PatchReviewRoundTests(unittest.TestCase):
         self.assertEqual(decision.rounds_used, 1)
         self.assertEqual(decision.action, "patch_fix_running")
 
-        conflicting = replace(recorded, follow_up_finding_fingerprints=(digest("extra"),))
-        with self.assertRaisesRegex(WorkerCandidateError, "reused with different"):
-            evaluate_patch_review_rounds(
+        conflicting_record = recorded.to_record()
+        conflicting_record["findings"][0]["trigger"] = "different trigger"
+        with self.assertRaisesRegex(WorkerCandidateError, "fingerprint"):
+            PatchReview.from_record(conflicting_record)
+
+        with self.assertRaisesRegex(
+            WorkerCandidateError, "canonical durable evidence"
+        ):
+            record_patch_review(
                 current_seal,
-                [recorded, conflicting],
+                review_attempt_id="PR-T006-LEGACY",
+                review_round=1,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="fix_required",
+                unresolved_finding_fingerprints=(digest("arbitrary"),),
+            )
+
+        legacy_record = recorded.to_record()
+        legacy_record.pop("finding_identity_contract")
+        legacy_record.pop("findings")
+        legacy = PatchReview.from_record(legacy_record)
+        self.assertTrue(legacy.legacy_finding_identity)
+        self.assertEqual(legacy.to_record(), legacy_record)
+        self.assertEqual(
+            require_uniform_patch_review_finding_identity((legacy,)), "legacy"
+        )
+        self.assertEqual(
+            require_uniform_patch_review_finding_identity((recorded,)),
+            "semantic-v1",
+        )
+        canonical_second = review(
+            current_seal,
+            attempt="PR-T006-A002",
+            round_number=2,
+            verdict="fix_required",
+            unresolved=(patch_finding("second"),),
+        )
+        with self.assertRaisesRegex(WorkerCandidateError, "legacy.*canonical"):
+            require_uniform_patch_review_finding_identity(
+                (legacy, canonical_second)
+            )
+        with self.assertRaisesRegex(WorkerCandidateError, "legacy.*canonical"):
+            evaluate_patch_review_rounds(
+                current_seal, [legacy, canonical_second],
                 current_task_contract_digest=current.task_contract_digest,
             )
+
+    def test_patch_review_fingerprint_matches_native_semantic_identity(self):
+        current = candidate()
+        current_seal = sealed(current)
+        finding = patch_finding("native-parity")
+        recorded = review(
+            current_seal, verdict="fix_required", unresolved=(finding,)
+        )
+
+        from hloop_lib.review import finding_fingerprint
+
+        expected = finding_fingerprint(
+            file_path=finding.file_path,
+            symbol=finding.symbol,
+            trigger=finding.trigger,
+            product_impact=finding.product_impact,
+            proposed_fix=finding.proposed_fix,
+        )
+        self.assertEqual(finding.fingerprint, expected)
+        self.assertEqual(recorded.unresolved_finding_fingerprints, (expected,))
+        self.assertEqual(PatchReview.from_record(recorded.to_record()), recorded)
 
     def test_contract_change_requires_candidate_resubmission(self):
         current = candidate()
@@ -556,7 +656,7 @@ class FinalResultAuthenticityTests(unittest.TestCase):
         fix_required = review(
             current_seal,
             verdict="fix_required",
-            unresolved=(digest("unresolved"),),
+            unresolved=(patch_finding("unresolved"),),
         )
         with self.assertRaisesRegex(WorkerCandidateError, "unresolved"):
             validate_final_result_authenticity(
@@ -650,9 +750,14 @@ class WorkerCandidateSchemaTests(unittest.TestCase):
         fix_required = review(
             current_seal,
             verdict="fix_required",
-            unresolved=(digest("regression"),),
+            unresolved=(patch_finding("regression"),),
         )
         self.review_validator.validate(fix_required.to_record())
+
+        legacy = fix_required.to_record()
+        legacy.pop("finding_identity_contract")
+        legacy.pop("findings")
+        self.review_validator.validate(legacy)
 
         invalid = fix_required.to_record()
         invalid["candidate_artifact_digest"] = "not-a-digest"

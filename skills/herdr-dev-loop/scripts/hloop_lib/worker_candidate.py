@@ -22,6 +22,7 @@ import json
 import re
 from typing import Any
 
+from .review import finding_fingerprint
 from .task_contract import V053_CONTRACT_SCHEMA_REVISION, validate_result_contract
 
 
@@ -33,6 +34,8 @@ REVIEW_ATTEMPT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
 
 COMPLETION_MODES = frozenset({"commit", "handoff"})
 PATCH_REVIEW_VERDICTS = frozenset({"passed", "fix_required"})
+PATCH_REVIEW_FINDING_IDENTITY_CONTRACT = "semantic-v1"
+PATCH_REVIEW_FINDING_SCOPES = frozenset({"unresolved", "follow_up"})
 PATCH_REVIEW_ACTIONS = frozenset(
     {
         "patch_review_pending",
@@ -105,7 +108,7 @@ CANDIDATE_SEAL_FIELDS = frozenset(
         "manager_validation_recorded",
     }
 )
-PATCH_REVIEW_FIELDS = frozenset(
+LEGACY_PATCH_REVIEW_FIELDS = frozenset(
     {
         "record_type",
         "run_id",
@@ -130,6 +133,9 @@ PATCH_REVIEW_FIELDS = frozenset(
         "follow_up_finding_fingerprints",
         "automatic_task_ids",
     }
+)
+PATCH_REVIEW_FIELDS = LEGACY_PATCH_REVIEW_FIELDS | frozenset(
+    {"finding_identity_contract", "findings"}
 )
 
 
@@ -225,6 +231,12 @@ def _git_object(value: Any, field_name: str) -> str:
             f"{field_name} must be an exact lowercase Git object ID"
         )
     return text
+
+
+def canonical_git_object_id(value: Any, field_name: str) -> str:
+    """Validate one exact Git object ID using the shared 40/64 contract."""
+
+    return _git_object(value, field_name)
 
 
 def _task_attempt(task_id: Any, attempt_id: Any) -> tuple[str, str]:
@@ -676,6 +688,111 @@ def validate_candidate_seal(
 
 
 @dataclass(frozen=True, slots=True)
+class PatchReviewFinding:
+    """Recomputable semantic evidence for one Patch Review finding."""
+
+    scope: str
+    fingerprint: str
+    file_path: str
+    symbol: str
+    trigger: str
+    product_impact: str
+    proposed_fix: str
+
+    def __post_init__(self) -> None:
+        if self.scope not in PATCH_REVIEW_FINDING_SCOPES:
+            raise WorkerCandidateError(
+                f"unsupported Patch Review finding scope: {self.scope!r}"
+            )
+        normalized_path = _required_text(self.file_path, "file_path").replace(
+            "\\", "/"
+        )
+        while normalized_path.startswith("./"):
+            normalized_path = normalized_path[2:]
+        object.__setattr__(self, "file_path", normalized_path)
+        for field_name in (
+            "symbol",
+            "trigger",
+            "product_impact",
+            "proposed_fix",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required_text(getattr(self, field_name), field_name),
+            )
+        supplied = _digest(self.fingerprint, "fingerprint")
+        expected = finding_fingerprint(
+            file_path=self.file_path,
+            symbol=self.symbol,
+            trigger=self.trigger,
+            product_impact=self.product_impact,
+            proposed_fix=self.proposed_fix,
+        )
+        if not hmac.compare_digest(supplied, expected):
+            raise WorkerCandidateError(
+                "Patch Review finding fingerprint does not match its durable evidence"
+            )
+        object.__setattr__(self, "fingerprint", supplied)
+
+    @classmethod
+    def from_evidence(
+        cls,
+        *,
+        scope: str,
+        file_path: str,
+        symbol: str,
+        trigger: str,
+        product_impact: str,
+        proposed_fix: str,
+    ) -> "PatchReviewFinding":
+        fingerprint = finding_fingerprint(
+            file_path=file_path,
+            symbol=symbol,
+            trigger=trigger,
+            product_impact=product_impact,
+            proposed_fix=proposed_fix,
+        )
+        return cls(
+            scope=scope,
+            fingerprint=fingerprint,
+            file_path=file_path,
+            symbol=symbol,
+            trigger=trigger,
+            product_impact=product_impact,
+            proposed_fix=proposed_fix,
+        )
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "scope": self.scope,
+            "fingerprint": self.fingerprint,
+            "file_path": self.file_path,
+            "symbol": self.symbol,
+            "trigger": self.trigger,
+            "product_impact": self.product_impact,
+            "proposed_fix": self.proposed_fix,
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "PatchReviewFinding":
+        record = _record(value, "Patch Review finding")
+        fields = frozenset(
+            {
+                "scope",
+                "fingerprint",
+                "file_path",
+                "symbol",
+                "trigger",
+                "product_impact",
+                "proposed_fix",
+            }
+        )
+        _exact_fields(record, fields, "Patch Review finding")
+        return cls(**{field_name: record[field_name] for field_name in fields})
+
+
+@dataclass(frozen=True, slots=True)
 class PatchReview:
     """One task-local review round bound to an exact candidate seal."""
 
@@ -698,6 +815,9 @@ class PatchReview:
     verdict: str
     unresolved_finding_fingerprints: tuple[str, ...] = ()
     follow_up_finding_fingerprints: tuple[str, ...] = ()
+    finding_identity_contract: str = PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
+    findings: tuple[PatchReviewFinding, ...] = ()
+    legacy_finding_identity: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -739,11 +859,18 @@ class PatchReview:
             "candidate_sha",
             _git_object(self.candidate_sha, "candidate_sha"),
         )
-        object.__setattr__(
-            self,
-            "candidate_artifact_ref",
-            _required_text(self.candidate_artifact_ref, "candidate_artifact_ref"),
+        expected_ref = (
+            f"implementation-candidates/{task_id}/{attempt_id}/"
+            f"{self.candidate_revision}.json"
         )
+        artifact_ref = _required_text(
+            self.candidate_artifact_ref, "candidate_artifact_ref"
+        )
+        if artifact_ref != expected_ref:
+            raise WorkerCandidateError(
+                "candidate_artifact_ref does not match task, attempt, and revision"
+            )
+        object.__setattr__(self, "candidate_artifact_ref", artifact_ref)
         object.__setattr__(
             self,
             "candidate_artifact_digest",
@@ -762,6 +889,13 @@ class PatchReview:
             raise WorkerCandidateError(
                 f"unsupported Patch Review verdict: {self.verdict!r}"
             )
+        normalized_findings = tuple(
+            finding
+            if isinstance(finding, PatchReviewFinding)
+            else PatchReviewFinding.from_record(finding)
+            for finding in _items(self.findings, "findings")
+        )
+        object.__setattr__(self, "findings", normalized_findings)
         for field_name in (
             "unresolved_finding_fingerprints",
             "follow_up_finding_fingerprints",
@@ -772,6 +906,43 @@ class PatchReview:
             for value in values:
                 _digest(value, field_name)
             object.__setattr__(self, field_name, values)
+        if self.legacy_finding_identity:
+            if self.finding_identity_contract or normalized_findings:
+                raise WorkerCandidateError(
+                    "legacy Patch Review identity cannot carry canonical finding evidence"
+                )
+        else:
+            if (
+                self.finding_identity_contract
+                != PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
+            ):
+                raise WorkerCandidateError(
+                    "Patch Review finding_identity_contract must be semantic-v1"
+                )
+            derived_unresolved = tuple(
+                finding.fingerprint
+                for finding in normalized_findings
+                if finding.scope == "unresolved"
+            )
+            derived_follow_ups = tuple(
+                finding.fingerprint
+                for finding in normalized_findings
+                if finding.scope == "follow_up"
+            )
+            if len(set(derived_unresolved + derived_follow_ups)) != len(
+                derived_unresolved + derived_follow_ups
+            ):
+                raise WorkerCandidateError(
+                    "Patch Review findings must not duplicate or mix a semantic fingerprint"
+                )
+            if self.unresolved_finding_fingerprints != derived_unresolved:
+                raise WorkerCandidateError(
+                    "unresolved finding fingerprints do not match canonical durable evidence"
+                )
+            if self.follow_up_finding_fingerprints != derived_follow_ups:
+                raise WorkerCandidateError(
+                    "follow-up finding fingerprints do not match canonical durable evidence"
+                )
         if set(self.unresolved_finding_fingerprints) & set(
             self.follow_up_finding_fingerprints
         ):
@@ -795,7 +966,7 @@ class PatchReview:
         )
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             "record_type": "patch_review",
             "run_id": self.run_id,
             "skill_version": self.skill_version,
@@ -823,11 +994,20 @@ class PatchReview:
             ),
             "automatic_task_ids": [],
         }
+        if not self.legacy_finding_identity:
+            record["finding_identity_contract"] = self.finding_identity_contract
+            record["findings"] = [finding.to_record() for finding in self.findings]
+        return record
 
     @classmethod
     def from_record(cls, value: Any) -> "PatchReview":
         record = _record(value, "Patch Review")
-        _exact_fields(record, PATCH_REVIEW_FIELDS, "Patch Review")
+        is_legacy = set(record) == LEGACY_PATCH_REVIEW_FIELDS
+        _exact_fields(
+            record,
+            LEGACY_PATCH_REVIEW_FIELDS if is_legacy else PATCH_REVIEW_FIELDS,
+            "Patch Review",
+        )
         if record["record_type"] != "patch_review":
             raise WorkerCandidateError("Patch Review record_type must be patch_review")
         if record["contract_schema_revision"] != V053_CONTRACT_SCHEMA_REVISION:
@@ -836,8 +1016,7 @@ class PatchReview:
             raise WorkerCandidateError(
                 "Patch Review cannot automatically create scope-expanding tasks"
             )
-        return cls(
-            **{
+        fields = {
                 field_name: record[field_name]
                 for field_name in (
                     "run_id",
@@ -861,7 +1040,46 @@ class PatchReview:
                     "follow_up_finding_fingerprints",
                 )
             }
+        if is_legacy:
+            fields.update(
+                finding_identity_contract="", legacy_finding_identity=True
+            )
+        else:
+            fields.update(
+                finding_identity_contract=record["finding_identity_contract"],
+                findings=tuple(record["findings"]),
+            )
+        return cls(**fields)
+
+
+def patch_review_finding_identity_kind(
+    review: PatchReview | Mapping[str, Any],
+) -> str:
+    """Return the durable finding-identity kind for one Patch Review."""
+
+    current = (
+        review
+        if isinstance(review, PatchReview)
+        else PatchReview.from_record(review)
+    )
+    return (
+        "legacy"
+        if current.legacy_finding_identity
+        else current.finding_identity_contract
+    )
+
+
+def require_uniform_patch_review_finding_identity(
+    reviews: Sequence[PatchReview | Mapping[str, Any]],
+) -> str | None:
+    """Reject an audit set that mixes legacy and semantic-v1 identities."""
+
+    kinds = {patch_review_finding_identity_kind(review) for review in reviews}
+    if len(kinds) > 1:
+        raise WorkerCandidateError(
+            "legacy and canonical Patch Review finding identities cannot be mixed"
         )
+    return next(iter(kinds), None)
 
 
 def record_patch_review(
@@ -873,12 +1091,33 @@ def record_patch_review(
     reviewer_model: str,
     reviewer_effort: str,
     verdict: str,
+    findings: Sequence[PatchReviewFinding | Mapping[str, Any]] = (),
     unresolved_finding_fingerprints: Sequence[str] = (),
     follow_up_finding_fingerprints: Sequence[str] = (),
 ) -> PatchReview:
     """Create a Patch Review bound to every immutable candidate axis."""
 
+    if unresolved_finding_fingerprints or follow_up_finding_fingerprints:
+        raise WorkerCandidateError(
+            "new Patch Review findings require canonical durable evidence"
+        )
     current = seal if isinstance(seal, CandidateSeal) else CandidateSeal.from_record(seal)
+    normalized_findings = tuple(
+        finding
+        if isinstance(finding, PatchReviewFinding)
+        else PatchReviewFinding.from_record(finding)
+        for finding in findings
+    )
+    unresolved = tuple(
+        finding.fingerprint
+        for finding in normalized_findings
+        if finding.scope == "unresolved"
+    )
+    follow_ups = tuple(
+        finding.fingerprint
+        for finding in normalized_findings
+        if finding.scope == "follow_up"
+    )
     return PatchReview(
         run_id=current.run_id,
         skill_version=current.skill_version,
@@ -897,8 +1136,9 @@ def record_patch_review(
         reviewer_model=reviewer_model,
         reviewer_effort=reviewer_effort,
         verdict=verdict,
-        unresolved_finding_fingerprints=tuple(unresolved_finding_fingerprints),
-        follow_up_finding_fingerprints=tuple(follow_up_finding_fingerprints),
+        unresolved_finding_fingerprints=unresolved,
+        follow_up_finding_fingerprints=follow_ups,
+        findings=normalized_findings,
     )
 
 
@@ -944,6 +1184,10 @@ def require_fresh_patch_review(
     """Return a passed fresh review or reject finalization."""
 
     recorded = review if isinstance(review, PatchReview) else PatchReview.from_record(review)
+    if recorded.legacy_finding_identity:
+        raise WorkerCandidateError(
+            "legacy Patch Review finding identity cannot authorize finalization"
+        )
     reasons = patch_review_staleness(
         recorded,
         seal,
@@ -1067,6 +1311,7 @@ def evaluate_patch_review_rounds(
     history = _deduplicate_review_attempts(
         reviews, run_id=current.run_id, task_id=current.task_id
     )
+    require_uniform_patch_review_finding_identity(history)
     if len(history) > limit:
         raise WorkerCandidateError("Patch Review history exceeds the per-task round limit")
 

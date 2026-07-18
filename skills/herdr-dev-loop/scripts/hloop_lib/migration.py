@@ -919,7 +919,7 @@ def plan_format_three_revision_three(state: State) -> V053StateMigrationPlan:
                 f"task key {normalized_id} disagrees with embedded id {artifact_id}"
             )
         try:
-            migration = migrate_legacy_task_contract(task)
+            migration = migrate_legacy_task_contract(task, record_type="state")
         except ContractValidationError as exc:
             raise MigrationError(f"cannot migrate task {task_id}: {exc}") from exc
         migrated_tasks[normalized_id] = deepcopy(dict(migration.record))
@@ -933,8 +933,10 @@ def plan_format_three_revision_three(state: State) -> V053StateMigrationPlan:
         "running",
         "waiting",
         "waiting-agent",
-        "reported",
+        "waiting-manager",
         "prepared",
+        "pending",
+        "requested",
     }
     for collection_name in ("reviews", "gaps"):
         collection = state.get(collection_name)
