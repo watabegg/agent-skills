@@ -119,6 +119,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
         base_sha: str,
         *,
         gates: tuple[str, ...] = ("patch_review", "full_suite"),
+        completion_mode: str = "commit",
     ) -> tuple[dict, dict]:
         loop = repo / hloop.LOOP_DIR
         task_path = loop / "tasks" / "T001.md"
@@ -143,8 +144,34 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             "write_allow": ["src/task.py"],
             "write_deny": [],
             "semantic_ack_barrier": {
+                "kind": "initial",
+                "message_id": "initial:T001-A001",
                 "status": "approved",
                 "ack_event_id": "ack-event-001",
+                "ack_sequence": 1,
+                "semantic_decision": {
+                    "status": "approved",
+                    "ack_event_id": "ack-event-001",
+                    "ack_sequence": 1,
+                },
+            },
+            "completion_mode": completion_mode,
+            "completion_mode_attempt_id": "T001-A001",
+            "completion_mode_ack_event_id": "ack-event-001",
+            "completion_mode_probe": {
+                "version": 1,
+                "mode": completion_mode,
+                "status": "writable" if completion_mode == "commit" else "unwritable",
+                "checked_at": "2026-07-18T00:00:00+00:00",
+                "git_metadata_paths": [str(repo / ".git")],
+                "checks": [
+                    {
+                        "resource": "git-metadata",
+                        "path": str(repo / ".git"),
+                        "status": "writable" if completion_mode == "commit" else "unwritable",
+                        "detail": "fixture",
+                    }
+                ],
             },
         }
         state = {
@@ -469,7 +496,9 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
     def test_handoff_submit_tree_can_be_committed_without_changing_attempt_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo, base_sha = self.make_repo(Path(directory))
-            state, task_state = self.write_fixture(repo, base_sha)
+            state, task_state = self.write_fixture(
+                repo, base_sha, completion_mode="handoff"
+            )
             (repo / "src" / "task.py").write_text("VALUE = 3\n", encoding="utf-8")
             old_cwd = Path.cwd()
             try:
@@ -638,7 +667,9 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
     def test_handoff_final_seal_rechecks_gates_and_emits_terminal_sentinel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo, base_sha = self.make_repo(Path(directory))
-            state, task_state = self.write_fixture(repo, base_sha)
+            state, task_state = self.write_fixture(
+                repo, base_sha, completion_mode="handoff"
+            )
             (repo / "src" / "task.py").write_text("VALUE = 7\n", encoding="utf-8")
             old_cwd = Path.cwd()
             try:

@@ -55,6 +55,21 @@ class PolicyCliV052Tests(unittest.TestCase):
         return repo
 
     def run_cli(self, repo: Path, *arguments: str) -> tuple[int, str]:
+        arguments = tuple(arguments)
+        if arguments[:2] == ("task", "new") and "--preserved-invariant" not in arguments:
+            arguments = (
+                *arguments,
+                "--preserved-invariant",
+                "preserve fixture behavior",
+                "--regression-check",
+                "run fixture regression",
+                "--risk-class",
+                "normal",
+                "--required-gate",
+                "patch_review",
+                "--required-gate",
+                "full_suite",
+            )
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             result = hloop.main(["--repo", str(repo), "--namespace", self.namespace, *arguments])
@@ -288,6 +303,9 @@ class PolicyCliV052Tests(unittest.TestCase):
             legacy = json.loads(state_path.read_text(encoding="utf-8"))
             legacy["schema_revision"] = 1
             legacy.pop("release_scope", None)
+            legacy["review_policy"]["cadence"] = "merge-count"
+            legacy.pop("first_v053_mutation_at", None)
+            legacy.pop("first_v053_mutation_command", None)
             state_path.write_text(json.dumps(legacy), encoding="utf-8")
             result, output = self.run_cli(repo, "migrate", "--apply")
             self.assertEqual(result, 0, output)
@@ -842,12 +860,10 @@ class PolicyCliV052Tests(unittest.TestCase):
             task_meta = hloop.read_frontmatter(loop / "tasks" / "T050.md")
             task_meta["write_allow"] = ["src/product.py"]
             with self.assertRaisesRegex(hloop.HLoopError, "product or release"):
-                hloop.dispatch_start_preflight(
+                hloop.authorize_task_record(
                     repo,
                     state,
-                    role_id="T050",
-                    role_kind="worker",
-                    task_meta=task_meta,
+                    hloop.task_provenance_record(task_meta) or {},
                 )
 
     def test_config_apply_updates_review_policy_and_invalidates_policy_evidence(self) -> None:
