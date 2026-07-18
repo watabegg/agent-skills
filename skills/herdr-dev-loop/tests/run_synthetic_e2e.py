@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the HLoop 0.5.1 release scenarios without live provider calls."""
+"""Run the HLoop 0.5.3 release scenarios without live provider calls."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -25,6 +26,7 @@ from typing import Any, Callable
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = SKILL_ROOT / "scripts" / "hloop"
+sys.path.insert(0, str(SKILL_ROOT.parents[1]))
 sys.path.insert(0, str(SCRIPT.parent))
 
 from hloop_lib.broker import spool_client_event  # noqa: E402
@@ -54,6 +56,11 @@ if spec is None:
     raise RuntimeError("could not load hloop runtime")
 hloop = importlib.util.module_from_spec(spec)
 loader.exec_module(hloop)
+
+v053_e2e = __import__(
+    "skills.herdr-dev-loop.tests.test_hloop_v053_e2e",
+    fromlist=["run_scenario"],
+)
 
 
 class ScenarioFailure(RuntimeError):
@@ -235,6 +242,18 @@ probes_per_provider = 4
     state["state_format_version"] = 2
     state.pop("schema_revision", None)
     state["skill_version"] = "0.4.0"
+    for v053_field in (
+        "config_identity_projection",
+        "first_v053_mutation_at",
+        "first_v053_mutation_command",
+        "manager_identity",
+        "migration_v053",
+        "remediation_ledger",
+        "remediation_source_links",
+        "review_epochs",
+        "review_protocol_selection",
+    ):
+        state.pop(v053_field, None)
     path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
     dry_run = run(
         hloop_command(repo, namespace, "migrate", "--dry-run"),
@@ -252,20 +271,37 @@ probes_per_provider = 4
         cwd=root,
         env=env,
     )
+    # Close rollback through the real first-material-command boundary before
+    # later synthetic scenarios make deliberate direct STATE projections.
+    run(
+        hloop_command(repo, namespace, "config", "apply", "--apply"),
+        cwd=root,
+        env=env,
+    )
     migrated = json.loads(path.read_text(encoding="utf-8"))
-    backups = list((path.parent / "migration").glob("STATE.v2.r0.*.json"))
+    marker_path = path.parent / "migration" / "v053" / "ACTIVE.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    generation_root = (
+        marker_path.parent
+        / "generations"
+        / f"{marker['migration_generation']:06d}"
+    )
+    archived_state = generation_root / "archive" / path.relative_to(repo)
     require(
         (migrated["state_format_version"], migrated["schema_revision"])
         == (hloop.STATE_FORMAT_VERSION, hloop.STATE_SCHEMA_REVISION),
         "migration failed",
     )
-    require(len(backups) == 1, "migration backup missing")
+    require(marker["status"] == "committed", "migration commit marker missing")
+    require(marker["first_v053_mutation_at"], "first mutation boundary missing")
+    require(archived_state.is_file(), "migration archive missing")
     return {
         "config_source": migrated["config_source"]["kind"],
         "resolved_max_workers": migrated["resolved_config"]["max_workers"],
         "explicit_apply_max_workers": migrated["max_workers"],
         "migration_steps": migration_plan["applied_steps"],
-        "backup_count": len(backups),
+        "migration_generation": marker["migration_generation"],
+        "archive_count": 1,
     }
 
 
@@ -360,7 +396,27 @@ def scenario_merge_conflict_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
     git(repo, "commit", "-am", "worker change")
     result_dir = repo / ".ai" / "herdr-dev-loop" / "loops" / namespace / "results" / task_id
     result_dir.mkdir(parents=True, exist_ok=True)
-    (result_dir / "result.md").write_text("---\nstatus: done\n---\n\n# Result\n", encoding="utf-8")
+    result_meta = {
+        "task_id": task_id,
+        "run_id": json.loads(path.read_text(encoding="utf-8"))["run_id"],
+        "skill_version": ctx["runtime_version"],
+        "contract_schema_revision": 2,
+        "attempt_id": f"{task_id}-A001",
+        "status": "done",
+        "merge_ready": True,
+        "branch": branch,
+        "head_sha": "HEAD",
+        "base_sha": base_sha,
+        "changed_files": ["README.md"],
+        "validation_recorded": True,
+        "validation_commands": ["synthetic worker validation"],
+        "validation_results": ["passed"],
+        "validation_summary": "synthetic validation passed",
+        "blocking_questions": [],
+        "handoff": False,
+    }
+    result_text = hloop.frontmatter(result_meta) + "\n\n# Result\n"
+    (result_dir / "result.md").write_text(result_text, encoding="utf-8")
     git(repo, "add", "-f", str(result_dir.relative_to(repo)))
     git(repo, "commit", "-m", "worker result")
     worker_head = git(repo, "rev-parse", branch).stdout.strip()
@@ -370,6 +426,22 @@ def scenario_merge_conflict_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
 
     def write_task() -> None:
         state = json.loads(path.read_text(encoding="utf-8"))
+        task_path = path.parent / "tasks" / f"{task_id}.md"
+        task_path.parent.mkdir(parents=True, exist_ok=True)
+        task_path.write_text(
+            hloop.frontmatter(
+                {
+                    "id": task_id,
+                    "status": "result_reported",
+                    "contract_schema_revision": 2,
+                }
+            )
+            + "\n\n# Synthetic legacy task\n",
+            encoding="utf-8",
+        )
+        result_path = path.parent / "results" / task_id / "result.md"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(result_text, encoding="utf-8")
         state["tasks"][task_id] = {
             "status": "result_reported",
             "branch": branch,
@@ -386,10 +458,32 @@ def scenario_merge_conflict_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
             "active_attempt_id": f"{task_id}-A001",
             "attempt_id": f"{task_id}-A001",
             "attempt_no": 1,
+            "contract_schema_revision": 2,
+            "blocking_questions": [],
+            "result_path": f"{worker_head}:{result_dir.relative_to(repo).as_posix()}/result.md",
+            "committed_result_path": f"{worker_head}:{result_dir.relative_to(repo).as_posix()}/result.md",
+            "harvested_at": now(),
+            "artifact_digest": hloop._sha256_labelled(result_path.read_bytes()),
+        }
+        state["tasks"][task_id]["legacy_result_acceptance"] = {
+            "run_id": state["run_id"],
+            "task_id": task_id,
+            "attempt_id": f"{task_id}-A001",
+            "task_contract_digest": hloop._labelled_contract_digest(
+                hashlib.sha256(task_path.read_bytes()).hexdigest()
+            ),
+            "result_artifact_digest": hloop._sha256_labelled(
+                result_path.read_bytes()
+            ),
+            "head_sha": worker_head,
+            "reason": "synthetic migration compatibility fixture",
+            "accepted_at": now(),
         }
         path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     write_task()
+    result_rel = (result_dir / "result.md").relative_to(repo).as_posix()
+    git(repo, "restore", "--source", branch, "--", result_rel)
 
     conflict = run(
         hloop_command(repo, namespace, "merge", task_id, "--mode", "squash"),
@@ -423,6 +517,7 @@ def scenario_merge_conflict_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
         "abort left the product file dirty",
     )
 
+    git(repo, "restore", "--source", branch, "--", result_rel)
     run(
         hloop_command(repo, namespace, "merge", task_id, "--mode", "squash"),
         cwd=root,
@@ -3010,6 +3105,18 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def scenario_v053_convergence(_ctx: dict[str, Any]) -> dict[str, Any]:
+    return v053_e2e.run_scenario("v053-convergence")
+
+
+def scenario_v053_fail_closed_matrix(_ctx: dict[str, Any]) -> dict[str, Any]:
+    return v053_e2e.run_scenario("v053-fail-closed-matrix")
+
+
+def scenario_v053_migration_crash_matrix(_ctx: dict[str, Any]) -> dict[str, Any]:
+    return v053_e2e.run_scenario("v053-migration-crash-matrix")
+
+
 SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = (
     ("config-and-migration", scenario_config_migration),
     ("attempt-and-merge-transaction", scenario_attempt_and_merge),
@@ -3029,6 +3136,9 @@ SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = 
     ("manual-final-authorized-reopen", scenario_manual_final_user_authorized_reopen),
     ("dual-review-and-budget", scenario_review_budget),
     ("final-gate-and-finish", scenario_finish),
+    ("v053-convergence", scenario_v053_convergence),
+    ("v053-fail-closed-matrix", scenario_v053_fail_closed_matrix),
+    ("v053-migration-crash-matrix", scenario_v053_migration_crash_matrix),
 )
 
 
@@ -3038,6 +3148,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="also write the structured result to this path")
     parser.add_argument("--keep-workdir", action="store_true", help="retain the temporary repositories")
     parser.add_argument(
+        "--expected-integration-sha",
+        help=(
+            "fail closed unless the resolved checkout HEAD equals this integration SHA; "
+            "defaults to HLOOP_EXPECTED_INTEGRATION_SHA and is otherwise required"
+        ),
+    )
+    parser.add_argument(
         "--scenario",
         action="append",
         dest="scenarios",
@@ -3046,10 +3163,99 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolved_checkout_head() -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(SKILL_ROOT), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    head = completed.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) is None:
+        raise ScenarioFailure(f"resolved checkout HEAD is not a canonical Git SHA: {head!r}")
+    return head
+
+
+def emit_result(args: argparse.Namespace, result: dict[str, Any]) -> None:
+    payload = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(payload, encoding="utf-8")
+    if args.json:
+        sys.stdout.write(payload)
+    else:
+        records = result["scenarios"]
+        print(
+            f"synthetic E2E: {result['status']} "
+            f"({len(records)}/{len(SCENARIOS)} scenarios)"
+        )
+        for record in records:
+            print(f"- {record['name']}: {record['status']}")
+            if record["error"]:
+                print(f"  {record['error']}")
+        identity_error = str(result.get("checkout_identity", {}).get("error") or "")
+        if identity_error:
+            print(f"- checkout-identity: failed\n  {identity_error}")
+
+
 def main() -> int:
     args = parse_args()
     started = now()
     runtime_version = (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    checkout_head = resolved_checkout_head()
+    expected_integration_sha = str(
+        args.expected_integration_sha
+        or os.environ.get("HLOOP_EXPECTED_INTEGRATION_SHA")
+        or ""
+    ).strip()
+    expected_is_canonical = bool(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_integration_sha)
+    )
+    checkout_identity_verified = (
+        expected_is_canonical and checkout_head == expected_integration_sha
+    )
+    checkout_identity_error = ""
+    if not expected_integration_sha:
+        checkout_identity_error = (
+            "expected integration SHA is required via --expected-integration-sha "
+            "or HLOOP_EXPECTED_INTEGRATION_SHA"
+        )
+    elif not expected_is_canonical:
+        checkout_identity_error = (
+            "expected integration SHA is not a canonical Git SHA: "
+            f"{expected_integration_sha!r}"
+        )
+    elif not checkout_identity_verified:
+        checkout_identity_error = (
+            "resolved checkout HEAD does not match expected integration SHA: "
+            f"head={checkout_head} expected={expected_integration_sha}"
+        )
+    identity_is_release_blocking = bool(expected_integration_sha) or not args.scenarios
+    if checkout_identity_error and identity_is_release_blocking:
+        result = {
+            "schema_version": 1,
+            "runner": "herdr-dev-loop-synthetic-e2e",
+            "runtime_version": runtime_version,
+            "state_format_version": hloop.STATE_FORMAT_VERSION,
+            "schema_revision": hloop.STATE_SCHEMA_REVISION,
+            "checkout_identity": {
+                "resolved_head_sha": checkout_head,
+                "expected_integration_sha": expected_integration_sha,
+                "verified": False,
+                "error": checkout_identity_error,
+            },
+            "status": "failed",
+            "started_at": started,
+            "finished_at": now(),
+            "workspace": None,
+            "workspace_retained": False,
+            "scenario_count": 0,
+            "scenarios": [],
+        }
+        emit_result(args, result)
+        return 1
+
     root = Path(tempfile.mkdtemp(prefix="hloop-synthetic-e2e-"))
     repo = make_repo(root)
     env = os.environ.copy()
@@ -3068,6 +3274,8 @@ def main() -> int:
         "env": env,
         "namespace": namespace,
         "runtime_version": runtime_version,
+        "checkout_head_sha": checkout_head,
+        "expected_integration_sha": expected_integration_sha,
     }
     records: list[dict[str, Any]] = []
     overall = "passed"
@@ -3108,6 +3316,12 @@ def main() -> int:
         "runtime_version": runtime_version,
         "state_format_version": hloop.STATE_FORMAT_VERSION,
         "schema_revision": hloop.STATE_SCHEMA_REVISION,
+        "checkout_identity": {
+            "resolved_head_sha": checkout_head,
+            "expected_integration_sha": expected_integration_sha,
+            "verified": checkout_identity_verified,
+            "error": checkout_identity_error,
+        },
         "status": overall,
         "started_at": started,
         "finished_at": now(),
@@ -3116,18 +3330,7 @@ def main() -> int:
         "scenario_count": len(records),
         "scenarios": records,
     }
-    payload = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(payload, encoding="utf-8")
-    if args.json:
-        sys.stdout.write(payload)
-    else:
-        print(f"synthetic E2E: {overall} ({len(records)}/{len(SCENARIOS)} scenarios)")
-        for record in records:
-            print(f"- {record['name']}: {record['status']}")
-            if record["error"]:
-                print(f"  {record['error']}")
+    emit_result(args, result)
     if not retained:
         shutil.rmtree(root, ignore_errors=True)
     return 0 if overall == "passed" else 1

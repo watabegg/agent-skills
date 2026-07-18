@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "scenarios": {
+    "v053-convergence": {
+      "acceptance": 51,
+      "evidence": [
+        "initial-batch",
+        "same-sha-reviewer-gap",
+        "one-remediation-batch",
+        "new-sha-clean-epoch"
+      ]
+    },
+    "v053-fail-closed-matrix": {
+      "acceptance": 52,
+      "evidence": [
+        "classification-conflict",
+        "incomplete-lane",
+        "successor-drift",
+        "budget-exhaustion",
+        "quarantined-orphan-lease",
+        "patch-review-limit",
+        "materialization-crash",
+        "migration-decision-required"
+      ]
+    },
+    "v053-migration-crash-matrix": {
+      "acceptance": [53, 54],
+      "evidence": [
+        "prepared-marker",
+        "every-apply-target-rename",
+        "committed-marker",
+        "corrupted-archive-identity-refusal",
+        "unknown-partial-live-bytes-refusal",
+        "rollback-prepared-marker",
+        "every-rollback-target-rename",
+        "rolled-back-marker",
+        "first-v053-mutation-marker"
+      ]
+    }
+  }
+}
