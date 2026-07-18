@@ -154,6 +154,16 @@ class QuickStartV052Tests(unittest.TestCase):
                 "REQ-001",
                 "--write-allow",
                 "reports/**",
+                "--preserved-invariant",
+                "preserve requirement-only authorization",
+                "--regression-check",
+                "run the requirement-only quick-start regression",
+                "--risk-class",
+                "normal",
+                "--required-gate",
+                "patch_review",
+                "--required-gate",
+                "full_suite",
             )
             self.assertEqual(result, 0, output)
             loop = repo / ".ai" / "herdr-dev-loop" / "loops" / self.namespace

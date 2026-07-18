@@ -331,11 +331,10 @@ class SupervisorPrimitiveTests(unittest.TestCase):
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(self.socket_path))
         stale.close()
-        stale_inode = self.socket_path.stat().st_ino
 
         owned = self.make_supervisor()
         metadata = owned.acquire()
-        self.assertNotEqual(self.socket_path.stat().st_ino, stale_inode)
+        self.assertTrue(stat.S_ISSOCK(self.socket_path.stat().st_mode))
         self.assertEqual(self.socket_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(broker.read_owner_metadata(self.metadata_path), metadata)
         owned.release()

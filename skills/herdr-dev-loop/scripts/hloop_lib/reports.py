@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import json
 import math
 from typing import Any, Mapping, Sequence
 
@@ -106,6 +107,14 @@ def _record(value: Any, field_name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise OutcomeModelError(f"{field_name} must be an object")
     return value
+
+
+def _record_sequence(value: Any, field_name: str) -> tuple[dict[str, Any], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise OutcomeModelError(f"{field_name} must be a sequence of objects")
+    return tuple(dict(_record(item, f"{field_name} item")) for item in value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +354,35 @@ class ExecutionMetrics:
     worker_runtime_seconds: float = 0.0
     batch_id: str = ""
     batch_metrics: tuple[BatchPerformance, ...] = ()
+    run_wall_time_seconds: float = 0.0
+    manager_active_time_seconds: float = 0.0
+    manager_wait_time_seconds: float = 0.0
+    user_blocked_time_seconds: float = 0.0
+    ack_wait_time_seconds: float = 0.0
+    review_epoch_count: int = 0
+    review_epoch_target_shas: tuple[str, ...] = ()
+    remediation_batch_count: int = 0
+    validation_execution_count: int = 0
+    validation_reuse_count: int = 0
+    validation_by_target_sha: tuple[Mapping[str, Any], ...] = ()
+    completion_mode_counts: Mapping[str, int] = field(default_factory=dict)
+    artifact_reconcile_time_seconds: float | None = None
+    finish_preparation_time_seconds: float | None = None
+    planned_agent_count: int = 0
+    reserved_agent_count: int = 0
+    live_agent_count: int = 0
+    peak_live_agent_count: int = 0
+    review_epoch_metrics: tuple[Mapping[str, Any], ...] = ()
+    lane_metrics: tuple[Mapping[str, Any], ...] = ()
+    role_usage_metrics: tuple[Mapping[str, Any], ...] = ()
+    verified_finding_count: int = 0
+    finding_yield: float | None = None
+    classification_conflict_count: int = 0
+    fingerprint_duplicate_rate: float | None = None
+    provider_capacity_wait_time_seconds: float | None = None
+    patch_review_round_count: int = 0
+    patch_findings_prevented_count: int = 0
+    escaped_finding_count: int | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -362,6 +400,18 @@ class ExecutionMetrics:
             "aborted_gap_count",
             "timeout_gap_count",
             "worker_count",
+            "review_epoch_count",
+            "remediation_batch_count",
+            "validation_execution_count",
+            "validation_reuse_count",
+            "planned_agent_count",
+            "reserved_agent_count",
+            "live_agent_count",
+            "peak_live_agent_count",
+            "verified_finding_count",
+            "classification_conflict_count",
+            "patch_review_round_count",
+            "patch_findings_prevented_count",
         ):
             object.__setattr__(
                 self, field_name, _nonnegative_int(getattr(self, field_name), field_name)
@@ -375,6 +425,7 @@ class ExecutionMetrics:
             "finding_contract_relation_counts",
             "finding_decision_requirement_counts",
             "finding_disposition_counts",
+            "completion_mode_counts",
         ):
             object.__setattr__(
                 self, field_name, _count_map(getattr(self, field_name), field_name)
@@ -406,13 +457,45 @@ class ExecutionMetrics:
             "review_wait_time_seconds",
             "longest_worker_seconds",
             "worker_runtime_seconds",
+            "run_wall_time_seconds",
+            "manager_active_time_seconds",
+            "manager_wait_time_seconds",
+            "user_blocked_time_seconds",
+            "ack_wait_time_seconds",
         ):
             object.__setattr__(
                 self,
                 field_name,
                 _nonnegative_float(getattr(self, field_name), field_name),
             )
+        for field_name in (
+            "artifact_reconcile_time_seconds",
+            "finish_preparation_time_seconds",
+            "provider_capacity_wait_time_seconds",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _nullable_nonnegative_float(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "escaped_finding_count",
+            _nullable_nonnegative_int(
+                self.escaped_finding_count, "escaped_finding_count"
+            ),
+        )
         object.__setattr__(self, "batch_id", _optional_text(self.batch_id, "batch_id"))
+        object.__setattr__(
+            self,
+            "review_epoch_target_shas",
+            _unique_texts(self.review_epoch_target_shas, "review_epoch_target_shas"),
+        )
+        for field_name in ("finding_yield", "fingerprint_duplicate_rate"):
+            value = _nullable_nonnegative_float(getattr(self, field_name), field_name)
+            if value is not None and value > 1:
+                raise OutcomeModelError(f"{field_name} must be at most 1")
+            object.__setattr__(self, field_name, value)
         raw_batch_metrics = self.batch_metrics
         if isinstance(raw_batch_metrics, (str, bytes)):
             raise OutcomeModelError("batch_metrics must be a sequence of objects")
@@ -424,6 +507,17 @@ class ExecutionMetrics:
                 else BatchPerformance.from_record(_record(value, "batch_metrics item"))
             )
         object.__setattr__(self, "batch_metrics", tuple(normalized_batch_metrics))
+        for field_name in (
+            "validation_by_target_sha",
+            "review_epoch_metrics",
+            "lane_metrics",
+            "role_usage_metrics",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _record_sequence(getattr(self, field_name), field_name),
+            )
 
     @property
     def review_attempt_count(self) -> int:
@@ -517,6 +611,37 @@ class ExecutionMetrics:
             "validation_time_seconds": self.validation_time_seconds,
             "review_wait_time_seconds": self.review_wait_time_seconds,
             "longest_worker_seconds": self.longest_worker_seconds,
+            "run_wall_time_seconds": self.run_wall_time_seconds,
+            "manager_active_time_seconds": self.manager_active_time_seconds,
+            "manager_wait_time_seconds": self.manager_wait_time_seconds,
+            "user_blocked_time_seconds": self.user_blocked_time_seconds,
+            "ack_wait_time_seconds": self.ack_wait_time_seconds,
+            "review_epoch_count": self.review_epoch_count,
+            "review_epoch_target_shas": list(self.review_epoch_target_shas),
+            "remediation_batch_count": self.remediation_batch_count,
+            "validation_execution_count": self.validation_execution_count,
+            "validation_reuse_count": self.validation_reuse_count,
+            "validation_by_target_sha": [
+                dict(item) for item in self.validation_by_target_sha
+            ],
+            "completion_mode_counts": dict(self.completion_mode_counts),
+            "artifact_reconcile_time_seconds": self.artifact_reconcile_time_seconds,
+            "finish_preparation_time_seconds": self.finish_preparation_time_seconds,
+            "planned_agent_count": self.planned_agent_count,
+            "reserved_agent_count": self.reserved_agent_count,
+            "live_agent_count": self.live_agent_count,
+            "peak_live_agent_count": self.peak_live_agent_count,
+            "review_epoch_metrics": [dict(item) for item in self.review_epoch_metrics],
+            "lane_metrics": [dict(item) for item in self.lane_metrics],
+            "role_usage_metrics": [dict(item) for item in self.role_usage_metrics],
+            "verified_finding_count": self.verified_finding_count,
+            "finding_yield": self.finding_yield,
+            "classification_conflict_count": self.classification_conflict_count,
+            "fingerprint_duplicate_rate": self.fingerprint_duplicate_rate,
+            "provider_capacity_wait_time_seconds": self.provider_capacity_wait_time_seconds,
+            "patch_review_round_count": self.patch_review_round_count,
+            "patch_findings_prevented_count": self.patch_findings_prevented_count,
+            "escaped_finding_count": self.escaped_finding_count,
         }
         # Preserve the legacy outcome schema when no GAP8 batch evidence was
         # observed. New fields become visible as one coherent projection once
@@ -574,6 +699,39 @@ class ExecutionMetrics:
             worker_runtime_seconds=record.get("worker_runtime_seconds", 0.0),
             batch_id=record.get("batch_id", ""),
             batch_metrics=tuple(record.get("batch_metrics") or ()),
+            run_wall_time_seconds=record.get("run_wall_time_seconds", 0.0),
+            manager_active_time_seconds=record.get("manager_active_time_seconds", 0.0),
+            manager_wait_time_seconds=record.get("manager_wait_time_seconds", 0.0),
+            user_blocked_time_seconds=record.get("user_blocked_time_seconds", 0.0),
+            ack_wait_time_seconds=record.get("ack_wait_time_seconds", 0.0),
+            review_epoch_count=record.get("review_epoch_count", 0),
+            review_epoch_target_shas=tuple(record.get("review_epoch_target_shas") or ()),
+            remediation_batch_count=record.get("remediation_batch_count", 0),
+            validation_execution_count=record.get("validation_execution_count", 0),
+            validation_reuse_count=record.get("validation_reuse_count", 0),
+            validation_by_target_sha=tuple(
+                record.get("validation_by_target_sha") or ()
+            ),
+            completion_mode_counts=record.get("completion_mode_counts", {}),
+            artifact_reconcile_time_seconds=record.get("artifact_reconcile_time_seconds"),
+            finish_preparation_time_seconds=record.get("finish_preparation_time_seconds"),
+            planned_agent_count=record.get("planned_agent_count", 0),
+            reserved_agent_count=record.get("reserved_agent_count", 0),
+            live_agent_count=record.get("live_agent_count", 0),
+            peak_live_agent_count=record.get("peak_live_agent_count", 0),
+            review_epoch_metrics=tuple(record.get("review_epoch_metrics") or ()),
+            lane_metrics=tuple(record.get("lane_metrics") or ()),
+            role_usage_metrics=tuple(record.get("role_usage_metrics") or ()),
+            verified_finding_count=record.get("verified_finding_count", 0),
+            finding_yield=record.get("finding_yield"),
+            classification_conflict_count=record.get("classification_conflict_count", 0),
+            fingerprint_duplicate_rate=record.get("fingerprint_duplicate_rate"),
+            provider_capacity_wait_time_seconds=record.get(
+                "provider_capacity_wait_time_seconds"
+            ),
+            patch_review_round_count=record.get("patch_review_round_count", 0),
+            patch_findings_prevented_count=record.get("patch_findings_prevented_count", 0),
+            escaped_finding_count=record.get("escaped_finding_count"),
         )
 
     @classmethod
@@ -1131,6 +1289,10 @@ class OutcomeReport:
     blocking_reason: str = ""
     external_goal_blocked: bool = False
     finalized: bool = False
+    phase: str = ""
+    final_target_sha: str = ""
+    finished_at: str = ""
+    terminal_outcome: Mapping[str, Any] | None = None
     manager_invocation: ManagerInvocation | None = None
     execution_metrics: ExecutionMetrics | None = None
     follow_ups: FollowUpProjection | None = None
@@ -1150,6 +1312,23 @@ class OutcomeReport:
         _required_text(self.run_id, "run_id")
         _required_text(self.goal, "goal")
         _rfc3339(self.generated_at, "generated_at")
+        object.__setattr__(self, "phase", _optional_text(self.phase, "phase"))
+        object.__setattr__(
+            self,
+            "final_target_sha",
+            _optional_text(self.final_target_sha, "final_target_sha"),
+        )
+        object.__setattr__(
+            self,
+            "finished_at",
+            _optional_text(self.finished_at, "finished_at"),
+        )
+        if self.terminal_outcome is None:
+            object.__setattr__(self, "terminal_outcome", {})
+        elif isinstance(self.terminal_outcome, Mapping):
+            object.__setattr__(self, "terminal_outcome", dict(self.terminal_outcome))
+        else:
+            raise OutcomeModelError("terminal_outcome must be an object")
         if any(not isinstance(item, RequirementProgress) for item in self.requirement_progress):
             raise OutcomeModelError(
                 "requirement_progress must contain RequirementProgress values"
@@ -1294,6 +1473,39 @@ class OutcomeReport:
             raise OutcomeModelError(
                 "FINAL outcome requires complete manual final review"
             )
+        terminal_projection_present = any(
+            (
+                self.phase,
+                self.final_target_sha,
+                self.finished_at,
+                self.terminal_outcome,
+            )
+        )
+        if terminal_projection_present:
+            if self.phase != "done":
+                raise OutcomeModelError("FINAL terminal phase must be done")
+            if self.final_target_sha != target:
+                raise OutcomeModelError(
+                    "FINAL terminal target does not match integration target"
+                )
+            _rfc3339(self.finished_at, "finished_at")
+            if self.generated_at != self.finished_at:
+                raise OutcomeModelError(
+                    "FINAL generated_at must equal the terminal finished_at"
+                )
+            expected_terminal = {
+                "status": "done",
+                "target_sha": target,
+                "recorded_at": self.finished_at,
+                "report": str(self.terminal_outcome.get("report") or ""),
+            }
+            if (
+                dict(self.terminal_outcome) != expected_terminal
+                or not expected_terminal["report"].endswith("/reports/FINAL.md")
+            ):
+                raise OutcomeModelError(
+                    "FINAL terminal_outcome does not match its terminal snapshot"
+                )
 
     def _validate_blocked(self) -> None:
         if not self.external_goal_blocked:
@@ -1333,6 +1545,22 @@ class OutcomeReport:
             "external_goal_blocked": self.external_goal_blocked,
             "finalized": self.finalized,
         }
+        if any(
+            (
+                self.phase,
+                self.final_target_sha,
+                self.finished_at,
+                self.terminal_outcome,
+            )
+        ):
+            record.update(
+                {
+                    "phase": self.phase,
+                    "final_target_sha": self.final_target_sha,
+                    "finished_at": self.finished_at,
+                    "terminal_outcome": dict(self.terminal_outcome or {}),
+                }
+            )
         if self.residual_risks:
             record["review"]["residual_risks"] = list(self.residual_risks)
         optional_projections = (
@@ -1395,6 +1623,10 @@ class OutcomeReport:
             blocking_reason=str(record.get("blocking_reason") or ""),
             external_goal_blocked=record.get("external_goal_blocked", False),
             finalized=record.get("finalized", False),
+            phase=str(record.get("phase") or ""),
+            final_target_sha=str(record.get("final_target_sha") or ""),
+            finished_at=str(record.get("finished_at") or ""),
+            terminal_outcome=record.get("terminal_outcome"),
             manager_invocation=(
                 record["manager_invocation"]
                 if isinstance(record.get("manager_invocation"), ManagerInvocation)
@@ -1476,10 +1708,30 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
         f"- Integration target: `{report.integration_target_sha or '-'}`",
         f"- Current branch SHA: `{report.current_branch_sha or '-'}`",
         f"- Finalized: `{str(report.finalized).lower()}`",
-        "",
-        "## Requirement Outcomes",
-        "",
     ]
+    if any(
+        (
+            report.phase,
+            report.final_target_sha,
+            report.finished_at,
+            report.terminal_outcome,
+        )
+    ):
+        lines.extend(
+            [
+                f"- Phase: `{report.phase or '-'}`",
+                f"- Final target: `{report.final_target_sha or '-'}`",
+                f"- Finished: `{report.finished_at or '-'}`",
+                "- Terminal outcome: `"
+                + json.dumps(
+                    dict(report.terminal_outcome or {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "`",
+            ]
+        )
+    lines.extend(["", "## Requirement Outcomes", ""])
     if report.requirement_progress:
         for item in report.requirement_progress:
             detail = item.remaining_work or "; ".join(item.blockers) or "完了"
@@ -1633,6 +1885,83 @@ def render_outcome_markdown(report: OutcomeReport) -> str:
                 f"review-wait={metrics.review_wait_time_seconds:.3f}, "
                 f"longest-worker={metrics.longest_worker_seconds:.3f}, "
                 f"worker-runtime={metrics.worker_runtime_seconds:.3f}"
+            )
+            lines.append(
+                "- Run timing (seconds): "
+                f"wall={metrics.run_wall_time_seconds:.3f}, "
+                f"manager-active={metrics.manager_active_time_seconds:.3f}, "
+                f"manager-wait={metrics.manager_wait_time_seconds:.3f}, "
+                f"user-blocked={metrics.user_blocked_time_seconds:.3f}, "
+                f"ack-wait={metrics.ack_wait_time_seconds:.3f}"
+            )
+            lines.append(
+                "- Validation: "
+                f"executed={metrics.validation_execution_count}, "
+                f"reused={metrics.validation_reuse_count}; "
+                f"review-epochs={metrics.review_epoch_count}, "
+                f"remediation-batches={metrics.remediation_batch_count}"
+            )
+            for validation_target in metrics.validation_by_target_sha:
+                lines.append(
+                    "  - Validation target "
+                    f"{validation_target.get('target_sha')}: "
+                    f"executed={validation_target.get('execution_count', 0)}, "
+                    f"reused={validation_target.get('reuse_count', 0)}, "
+                    "ids="
+                    + ",".join(validation_target.get("validation_ids") or ())
+                )
+            lines.append(
+                "- Agent capacity: "
+                f"planned={metrics.planned_agent_count}, "
+                f"reserved={metrics.reserved_agent_count}, "
+                f"live={metrics.live_agent_count}, "
+                f"peak-live={metrics.peak_live_agent_count}"
+            )
+            for epoch in metrics.review_epoch_metrics:
+                lines.append(
+                    "  - Epoch "
+                    f"{epoch.get('epoch_id')} r{epoch.get('epoch_revision')}: "
+                    f"target={epoch.get('target_sha') or 'unknown'}, "
+                    f"planned={epoch.get('planned_agent_count', 0)}, "
+                    f"reserved={epoch.get('reserved_agent_count', 0)}, "
+                    f"peak-live={epoch.get('peak_live_agent_count', 'unknown')}"
+                )
+            for lane in metrics.lane_metrics:
+                lines.append(
+                    "  - Lane "
+                    f"{lane.get('epoch_id')}/{lane.get('execution_id')}/"
+                    f"{lane.get('lane_id')}: runtime="
+                    f"{lane.get('runtime_seconds') if lane.get('runtime_seconds') is not None else 'unknown'}, "
+                    f"timeout={lane.get('timed_out') if lane.get('timed_out') is not None else 'unknown'}, "
+                    f"candidates={lane.get('finding_candidate_count') if lane.get('finding_candidate_count') is not None else 'unknown'}, "
+                    f"verified={lane.get('verified_finding_count') if lane.get('verified_finding_count') is not None else 'unknown'}"
+                )
+            for usage in metrics.role_usage_metrics:
+                lines.append(
+                    "  - Role usage "
+                    f"{usage.get('role')}: agents={usage.get('agent_count', 0)}, "
+                    f"tokens={usage.get('token_count') if usage.get('token_count') is not None else 'unavailable'}, "
+                    f"cost={usage.get('cost') if usage.get('cost') is not None else 'unavailable'}"
+                )
+            completion_modes = ", ".join(
+                f"{key}={count}" for key, count in metrics.completion_mode_counts.items()
+            ) or "none"
+            lines.append(f"- Completion modes: {completion_modes}")
+            lines.append(
+                "- Operational preparation (seconds): "
+                f"artifact-reconcile={metrics.artifact_reconcile_time_seconds if metrics.artifact_reconcile_time_seconds is not None else 'unknown'}, "
+                f"finish-preparation={metrics.finish_preparation_time_seconds if metrics.finish_preparation_time_seconds is not None else 'unknown'}, "
+                f"provider-capacity-wait={metrics.provider_capacity_wait_time_seconds if metrics.provider_capacity_wait_time_seconds is not None else 'unknown'}"
+            )
+            lines.append(
+                "- Finding effectiveness: "
+                f"verified={metrics.verified_finding_count}, "
+                f"yield={metrics.finding_yield if metrics.finding_yield is not None else 'unknown'}, "
+                f"classification-conflicts={metrics.classification_conflict_count}, "
+                f"fingerprint-duplicate-rate={metrics.fingerprint_duplicate_rate if metrics.fingerprint_duplicate_rate is not None else 'unknown'}, "
+                f"patch-rounds={metrics.patch_review_round_count}, "
+                f"patch-prevented={metrics.patch_findings_prevented_count}, "
+                f"escaped={metrics.escaped_finding_count if metrics.escaped_finding_count is not None else 'unknown'}"
             )
             lines.append(
                 f"- Workers: {metrics.worker_count}; planned tasks complete: "

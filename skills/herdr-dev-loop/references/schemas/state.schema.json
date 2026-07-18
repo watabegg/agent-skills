@@ -199,6 +199,60 @@
         "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
         "candidate_tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
         "completion_mode": {"type": "string", "enum": ["commit", "handoff"]},
+        "completion_mode_attempt_id": {"type": "string", "minLength": 1},
+        "completion_mode_ack_event_id": {"type": "string", "minLength": 1},
+        "completion_mode_bound_at": {"type": "string", "format": "date-time"},
+        "completion_mode_probe": {
+          "type": "object",
+          "required": ["version", "mode", "status", "checked_at", "git_metadata_paths", "checks"],
+          "properties": {
+            "version": {"const": 1},
+            "mode": {"type": "string", "enum": ["commit", "handoff"]},
+            "status": {"type": "string", "enum": ["writable", "unwritable", "unknown"]},
+            "checked_at": {"type": "string", "format": "date-time"},
+            "git_metadata_paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true},
+            "checks": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["resource", "path", "status", "detail"],
+                "properties": {
+                  "resource": {"type": "string", "minLength": 1},
+                  "path": {"type": "string"},
+                  "status": {"type": "string", "enum": ["writable", "unwritable", "unknown"]},
+                  "detail": {"type": "string"}
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "semantic_ack_barrier": {
+          "type": "object",
+          "properties": {
+            "message_id": {"type": "string"},
+            "digest": {"type": "string"},
+            "kind": {"type": "string"},
+            "status": {"type": "string"},
+            "armed_at": {"type": "string"},
+            "resolved_at": {"type": "string"},
+            "semantic_decision": {
+              "type": "object",
+              "required": ["status"],
+              "properties": {"status": {"type": "string", "enum": ["awaiting_ack", "approved", "rejected", "timed_out", "superseded"]}},
+              "additionalProperties": true
+            },
+            "approval_application": {
+              "type": "object",
+              "required": ["status"],
+              "properties": {"status": {"type": "string", "enum": ["pending", "delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"]}},
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
+        },
         "patch_review_history": {"type": "array", "items": {"type": "object"}},
         "current_patch_review": {"type": "object"},
         "patch_review_decision": {"type": "object"},
@@ -587,7 +641,36 @@
         "batch_metrics": {
           "type": "array",
           "items": {"$ref": "#/$defs/batchPerformanceRecord"}
-        }
+        },
+        "run_wall_time_seconds": {"type": "number", "minimum": 0},
+        "manager_active_time_seconds": {"type": "number", "minimum": 0},
+        "manager_wait_time_seconds": {"type": "number", "minimum": 0},
+        "user_blocked_time_seconds": {"type": "number", "minimum": 0},
+        "ack_wait_time_seconds": {"type": "number", "minimum": 0},
+        "review_epoch_count": {"type": "integer", "minimum": 0},
+        "review_epoch_target_shas": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "remediation_batch_count": {"type": "integer", "minimum": 0},
+        "validation_execution_count": {"type": "integer", "minimum": 0},
+        "validation_reuse_count": {"type": "integer", "minimum": 0},
+        "validation_by_target_sha": {"type": "array", "items": {"type": "object"}},
+        "completion_mode_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "artifact_reconcile_time_seconds": {"type": ["number", "null"], "minimum": 0},
+        "finish_preparation_time_seconds": {"type": ["number", "null"], "minimum": 0},
+        "planned_agent_count": {"type": "integer", "minimum": 0},
+        "reserved_agent_count": {"type": "integer", "minimum": 0},
+        "live_agent_count": {"type": "integer", "minimum": 0},
+        "peak_live_agent_count": {"type": "integer", "minimum": 0},
+        "review_epoch_metrics": {"type": "array", "items": {"type": "object"}},
+        "lane_metrics": {"type": "array", "items": {"type": "object"}},
+        "role_usage_metrics": {"type": "array", "items": {"type": "object"}},
+        "verified_finding_count": {"type": "integer", "minimum": 0},
+        "finding_yield": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "classification_conflict_count": {"type": "integer", "minimum": 0},
+        "fingerprint_duplicate_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "provider_capacity_wait_time_seconds": {"type": ["number", "null"], "minimum": 0},
+        "patch_review_round_count": {"type": "integer", "minimum": 0},
+        "patch_findings_prevented_count": {"type": "integer", "minimum": 0},
+        "escaped_finding_count": {"type": ["integer", "null"], "minimum": 0}
       },
       "additionalProperties": true
     },

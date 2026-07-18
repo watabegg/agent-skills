@@ -158,6 +158,110 @@
         "validation_time_seconds": {"type": "number", "minimum": 0},
         "review_wait_time_seconds": {"type": "number", "minimum": 0},
         "longest_worker_seconds": {"type": "number", "minimum": 0},
+        "run_wall_time_seconds": {"type": "number", "minimum": 0},
+        "manager_active_time_seconds": {"type": "number", "minimum": 0},
+        "manager_wait_time_seconds": {"type": "number", "minimum": 0},
+        "user_blocked_time_seconds": {"type": "number", "minimum": 0},
+        "ack_wait_time_seconds": {"type": "number", "minimum": 0},
+        "review_epoch_count": {"type": "integer", "minimum": 0},
+        "review_epoch_target_shas": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "remediation_batch_count": {"type": "integer", "minimum": 0},
+        "validation_execution_count": {"type": "integer", "minimum": 0},
+        "validation_reuse_count": {"type": "integer", "minimum": 0},
+        "validation_by_target_sha": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["target_sha", "execution_count", "reuse_count", "validation_ids"],
+            "properties": {
+              "target_sha": {"type": "string", "minLength": 1},
+              "execution_count": {"type": "integer", "minimum": 0},
+              "reuse_count": {"type": "integer", "minimum": 0},
+              "validation_ids": {"type": "array", "items": {"type": "string", "minLength": 1}}
+            },
+            "additionalProperties": false
+          }
+        },
+        "completion_mode_counts": {"$ref": "#/$defs/count_map"},
+        "artifact_reconcile_time_seconds": {"type": ["number", "null"], "minimum": 0},
+        "finish_preparation_time_seconds": {"type": ["number", "null"], "minimum": 0},
+        "planned_agent_count": {"type": "integer", "minimum": 0},
+        "reserved_agent_count": {"type": "integer", "minimum": 0},
+        "live_agent_count": {"type": "integer", "minimum": 0},
+        "peak_live_agent_count": {"type": "integer", "minimum": 0},
+        "review_epoch_metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["epoch_id", "epoch_revision", "target_sha", "planned_agent_count", "reserved_agent_count", "peak_live_agent_count"],
+            "properties": {
+              "epoch_id": {"type": "string", "minLength": 1},
+              "epoch_revision": {"type": "integer", "minimum": 0},
+              "target_sha": {"type": ["string", "null"]},
+              "planned_agent_count": {"type": "integer", "minimum": 0},
+              "reserved_agent_count": {"type": "integer", "minimum": 0},
+              "peak_live_agent_count": {"type": ["integer", "null"], "minimum": 0}
+            },
+            "additionalProperties": false
+          }
+        },
+        "lane_metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["epoch_id", "epoch_revision", "target_sha", "execution_id", "role", "process_id", "lane_id", "runtime_seconds", "timed_out", "finding_candidate_count", "verified_finding_count"],
+            "properties": {
+              "epoch_id": {"type": "string", "minLength": 1},
+              "epoch_revision": {"type": "integer", "minimum": 0},
+              "target_sha": {"type": ["string", "null"]},
+              "execution_id": {"type": "string"},
+              "role": {"type": "string", "minLength": 1},
+              "process_id": {"type": "string"},
+              "lane_id": {"type": "string", "minLength": 1},
+              "runtime_seconds": {"type": ["number", "null"], "minimum": 0},
+              "timed_out": {"type": ["boolean", "null"]},
+              "finding_candidate_count": {"type": ["integer", "null"], "minimum": 0},
+              "verified_finding_count": {"type": ["integer", "null"], "minimum": 0}
+            },
+            "additionalProperties": false
+          }
+        },
+        "role_usage_metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["role", "agent_count", "token_count", "cost"],
+            "properties": {
+              "role": {"type": "string", "minLength": 1},
+              "agent_count": {"type": "integer", "minimum": 0},
+              "token_count": {"type": ["integer", "null"], "minimum": 0},
+              "cost": {"type": ["number", "null"], "minimum": 0}
+            },
+            "additionalProperties": false
+          }
+        },
+        "verified_finding_count": {"type": "integer", "minimum": 0},
+        "finding_yield": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "number", "minimum": 0, "maximum": 1}
+          ]
+        },
+        "classification_conflict_count": {"type": "integer", "minimum": 0},
+        "fingerprint_duplicate_rate": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "number", "minimum": 0, "maximum": 1}
+          ]
+        },
+        "provider_capacity_wait_time_seconds": {"type": ["number", "null"], "minimum": 0},
+        "patch_review_round_count": {"type": "integer", "minimum": 0},
+        "patch_findings_prevented_count": {"type": "integer", "minimum": 0},
+        "escaped_finding_count": {"type": ["integer", "null"], "minimum": 0},
         "worker_runtime_seconds": {"type": "number", "minimum": 0},
         "batch_id": {"type": "string"},
         "batch_metrics": {
@@ -381,6 +485,25 @@
     "blocking_reason": {"type": "string"},
     "external_goal_blocked": {"type": "boolean"},
     "finalized": {"type": "boolean"},
+    "phase": {"type": "string"},
+    "final_target_sha": {"type": "string"},
+    "finished_at": {
+      "anyOf": [
+        {"const": ""},
+        {"type": "string", "format": "date-time"}
+      ]
+    },
+    "terminal_outcome": {
+      "type": "object",
+      "required": ["status", "target_sha", "recorded_at", "report"],
+      "properties": {
+        "status": {"enum": ["done", "blocked", "superseded", "handoff", "abandoned_by_user"]},
+        "target_sha": {"type": "string"},
+        "recorded_at": {"type": "string", "format": "date-time"},
+        "report": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
     "manager_invocation": {"$ref": "#/$defs/manager_invocation"},
     "execution_metrics": {"$ref": "#/$defs/execution_metrics"},
     "follow_ups": {"$ref": "#/$defs/follow_ups"},

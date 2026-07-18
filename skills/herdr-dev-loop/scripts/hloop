@@ -110,6 +110,14 @@ LOOP_DIR = LOOP_HOME / "loops" / LOOP_NAMESPACE
 EXPERIENCE_DIR = LOOP_HOME / "experience"
 LEGACY_LOOP_DIR = Path(".ai") / "loop"
 TASK_STATUSES_FINAL = {"done", "partial", "blocked", "failed", "abandoned"}
+PLANNING_MUTABLE_TASK_STATUSES = {
+    "queued",
+    "starting",
+    "running",
+    "awaiting_result",
+    "result_reported",
+    "failed_validation",
+}
 RUN_TERMINAL_PHASES = {"done", "blocked", "superseded", "handoff", "abandoned_by_user"}
 SESSION_CLEANUP_MODES = {"none", "archive", "delete"}
 DEFAULT_REVIEW_WAIT_MS = 600_000
@@ -245,6 +253,7 @@ STRUCTURED_JSON_FIELDS = (
     "duplicate_relation",
     "relations",
     "history",
+    "lane_metric_observations",
 )
 FOLLOW_UP_INPUT_JSON_FIELDS = (
     "decision_summary",
@@ -1411,9 +1420,18 @@ def migration_artifact_pairs(
             meta = migration_frontmatter_metadata(source, label=f"task {task_id}")
             if str(meta.get("id") or task_id) != task_id:
                 raise HLoopError(f"task artifact identity mismatch during migration: {task_id}")
-            if isinstance(task_record, Mapping) and str(task_record.get("status") or "") != str(
-                meta.get("status") or ""
-            ):
+            state_status = (
+                str(task_record.get("status") or "")
+                if isinstance(task_record, Mapping)
+                else ""
+            )
+            artifact_status = str(meta.get("status") or "")
+            status_mismatch = state_status != artifact_status
+            immutable_queued_history = (
+                artifact_status == "queued"
+                and state_status in hloop_task_contract.LEGACY_RUNTIME_TASK_STATUSES
+            )
+            if status_mismatch and not immutable_queued_history:
                 raise HLoopError(f"task state/artifact status mismatch during migration: {task_id}")
             try:
                 migrated_meta = hloop_task_contract.migrate_legacy_task_contract(meta).record
@@ -2365,9 +2383,13 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
             return getattr(args, "review_epoch_command", "") != "status"
         if review_command in {"readiness", "reopen"}:
             return True
-        return review_command == "convergence" and getattr(
-            args, "review_convergence_command", ""
-        ) in {"prepare", "record"}
+        if review_command == "convergence":
+            convergence_command = getattr(args, "review_convergence_command", "")
+            return convergence_command in {"prepare", "record"} or (
+                convergence_command == "draft"
+                and not bool(getattr(args, "dry_run", False))
+            )
+        return False
     if command == "final-review":
         return getattr(args, "final_review_command", "") in {"prepare", "record"}
     if command == "dispatch":
@@ -2421,6 +2443,11 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
         return True
     if command == "requirement":
         return True
+    if command == "requirements":
+        return (
+            getattr(args, "requirements_command", "") == "reconcile"
+            and bool(getattr(args, "apply", False))
+        )
     if command == "context":
         return True
     if command == "progress":
@@ -2568,6 +2595,7 @@ def material_command_identity(args: argparse.Namespace) -> str:
         "message_command",
         "triage_command",
         "planning_command",
+        "requirements_command",
         "task_command",
         "batch_command",
         "release_scope_command",
@@ -3241,6 +3269,26 @@ def _batch_performance_records(state: Mapping[str, Any]) -> list[dict[str, Any]]
     return sorted(records, key=lambda item: str(item.get("batch_id") or ""))
 
 
+def mutable_planning_task_ids(state: Mapping[str, Any]) -> list[str]:
+    """Return only tasks whose mutable contract still participates in dispatch.
+
+    Terminal task Markdown is immutable provenance.  Keeping it out of current
+    planning identity and conflict projection prevents a completed or aborted
+    task from staling a later plan while queued/running coverage remains
+    fail-closed.
+    """
+
+    tasks = state.get("tasks")
+    if not isinstance(tasks, Mapping):
+        return []
+    return sorted(
+        str(task_id)
+        for task_id, task in tasks.items()
+        if isinstance(task, Mapping)
+        and str(task.get("status") or "") in PLANNING_MUTABLE_TASK_STATUSES
+    )
+
+
 def build_write_scope_conflict_graph(
     state: Mapping[str, Any],
     task_ids: Sequence[str] | None = None,
@@ -3253,7 +3301,7 @@ def build_write_scope_conflict_graph(
         selected = (
             _batch_task_ids_for_metrics(state, batch_id)
             if batch_id
-            else sorted(str(task_id) for task_id in (state.get("tasks") or {}))
+            else mutable_planning_task_ids(state)
         )
     else:
         selected = sorted(dict.fromkeys(str(task_id) for task_id in task_ids))
@@ -3345,6 +3393,306 @@ def _state_metric_counts(
         1
         for record in records.values()
         if isinstance(record, Mapping) and str(record.get(key) or "") in statuses
+    )
+
+
+def _metric_interval(
+    started_at: Any, ended_at: Any
+) -> tuple[datetime, datetime] | None:
+    started = _parse_metric_timestamp(started_at)
+    ended = _parse_metric_timestamp(ended_at)
+    if started is None or ended is None or ended < started:
+        return None
+    return started, ended
+
+
+def _metric_union_seconds(
+    intervals: Sequence[tuple[datetime, datetime]],
+) -> float:
+    ordered = sorted(intervals, key=lambda item: (item[0], item[1]))
+    if not ordered:
+        return 0.0
+    total = 0.0
+    current_start, current_end = ordered[0]
+    for started, ended in ordered[1:]:
+        if started <= current_end:
+            current_end = max(current_end, ended)
+            continue
+        total += (current_end - current_start).total_seconds()
+        current_start, current_end = started, ended
+    total += (current_end - current_start).total_seconds()
+    return max(0.0, total)
+
+
+def _metric_role_records(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    records: list[Mapping[str, Any]] = []
+    for key in ("tasks", "reviews", "patch_reviews", "gaps", "decision_liaisons"):
+        values = state.get(key)
+        if isinstance(values, Mapping):
+            records.extend(item for item in values.values() if isinstance(item, Mapping))
+    advice = state.get("advice")
+    if isinstance(advice, Mapping):
+        for request in advice.values():
+            if isinstance(request, Mapping):
+                records.extend(
+                    item
+                    for item in request.get("participants") or []
+                    if isinstance(item, Mapping)
+                )
+    scout = state.get("specification_scout_run")
+    if isinstance(scout, Mapping):
+        records.append(scout)
+    return records
+
+
+def _record_metric_duration(
+    state: dict[str, Any], field_name: str, duration_seconds: float
+) -> None:
+    metrics = state.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        return
+    existing = metrics.get(field_name)
+    baseline = (
+        float(existing)
+        if isinstance(existing, (int, float)) and not isinstance(existing, bool)
+        else 0.0
+    )
+    metrics[field_name] = round(baseline + max(0.0, duration_seconds), 6)
+
+
+def _record_review_epoch_capacity_metrics(
+    state: dict[str, Any], collection: hloop_review_epoch.ReviewEpochCollection
+) -> None:
+    metrics = state.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        return
+    key = f"{collection.plan.epoch_id}:{collection.plan.epoch_revision}"
+    peaks = metrics.setdefault("review_epoch_peak_live", {})
+    if not isinstance(peaks, dict):
+        peaks = {}
+        metrics["review_epoch_peak_live"] = peaks
+    peaks[key] = max(normalize_int(peaks.get(key), 0), collection.capacity.live_slots)
+    metrics["peak_live_agent_count"] = max(
+        normalize_int(metrics.get("peak_live_agent_count"), 0),
+        collection.capacity.live_slots,
+    )
+
+
+_LANE_METRIC_VALUE_FIELDS = frozenset(
+    {
+        "runtime_seconds",
+        "timed_out",
+        "finding_candidate_count",
+        "verified_finding_count",
+    }
+)
+
+
+def _planned_lane_metric_processes(
+    state: Mapping[str, Any],
+    execution_id: str,
+    role_state: Mapping[str, Any],
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Return immutable planned lane processes for one authenticated role."""
+
+    identity = role_state.get("review_epoch_identity")
+    if not isinstance(identity, Mapping):
+        return {}
+    epoch_id = str(identity.get("epoch_id") or "")
+    revision = identity.get("epoch_revision")
+    if not epoch_id or isinstance(revision, bool) or not isinstance(revision, int):
+        return {}
+    epoch_store = state.get("review_epochs")
+    records = epoch_store.get("records") if isinstance(epoch_store, Mapping) else None
+    epoch = records.get(epoch_id) if isinstance(records, Mapping) else None
+    revisions = epoch.get("revisions") if isinstance(epoch, Mapping) else None
+    collection = revisions.get(str(revision)) if isinstance(revisions, Mapping) else None
+    plan = collection.get("plan") if isinstance(collection, Mapping) else None
+    if not isinstance(plan, Mapping) or str(plan.get("plan_digest") or "") != str(
+        identity.get("plan_digest") or ""
+    ):
+        return {}
+    executions = [
+        item
+        for item in plan.get("required_executions") or []
+        if isinstance(item, Mapping)
+        and str(item.get("execution_id") or "") == execution_id
+        and str(item.get("attempt_id") or "")
+        == str(identity.get("attempt_id") or "")
+    ]
+    if len(executions) != 1:
+        return {}
+    result: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for process in executions[0].get("processes") or []:
+        if not isinstance(process, Mapping):
+            continue
+        provider = str(process.get("provider") or "")
+        lane_id = str(process.get("lane_id") or "")
+        if not provider or not lane_id:
+            continue
+        key = (provider, lane_id)
+        if key in result:
+            return {}
+        result[key] = process
+    return result
+
+
+def _validated_lane_metric_values(
+    item: Mapping[str, Any], *, label: str
+) -> dict[str, Any]:
+    unknown = set(item) - {"provider", "lane_id"} - _LANE_METRIC_VALUE_FIELDS
+    if unknown:
+        raise HLoopError(
+            f"{label} contains unknown fields: " + ", ".join(sorted(unknown))
+        )
+    values: dict[str, Any] = {}
+    if "runtime_seconds" in item:
+        value = item["runtime_seconds"]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value < 0
+        ):
+            raise HLoopError(f"{label} runtime_seconds must be a non-negative number")
+        values["runtime_seconds"] = float(value)
+    if "timed_out" in item:
+        if not isinstance(item["timed_out"], bool):
+            raise HLoopError(f"{label} timed_out must be boolean")
+        values["timed_out"] = item["timed_out"]
+    for field_name in ("finding_candidate_count", "verified_finding_count"):
+        if field_name not in item:
+            continue
+        value = item[field_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise HLoopError(
+                f"{label} {field_name} must be a non-negative integer"
+            )
+        values[field_name] = value
+    if not values:
+        raise HLoopError(f"{label} does not contain an observed metric")
+    return values
+
+
+def durable_lane_metric_observations(
+    state: Mapping[str, Any],
+    execution_id: str,
+    role_state: Mapping[str, Any],
+    *,
+    supplied: Any = None,
+    derived: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate and merge only actually observed metrics for planned lanes."""
+
+    planned = _planned_lane_metric_processes(state, execution_id, role_state)
+    raw_supplied = supplied if supplied is not None else []
+    if not isinstance(raw_supplied, list):
+        raise HLoopError("lane_metric_observations must be a JSON array")
+    if (raw_supplied or derived) and not planned:
+        raise HLoopError(
+            "lane metric observations require a matching immutable review epoch plan"
+        )
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def merge_item(item: Any, *, label: str) -> None:
+        if not isinstance(item, Mapping):
+            raise HLoopError(f"{label} must be a JSON object")
+        provider = str(item.get("provider") or "")
+        lane_id = str(item.get("lane_id") or "")
+        key = (provider, lane_id)
+        process = planned.get(key)
+        if process is None:
+            raise HLoopError(
+                f"{label} does not match a planned provider/lane: {provider}/{lane_id}"
+            )
+        values = _validated_lane_metric_values(item, label=label)
+        target = merged.setdefault(
+            key,
+            {
+                "process_id": str(process.get("process_id") or ""),
+                "provider": provider,
+                "lane_id": lane_id,
+            },
+        )
+        for field_name, value in values.items():
+            if field_name in target and target[field_name] != value:
+                raise HLoopError(
+                    f"{label} conflicts with the durable {field_name} observation"
+                )
+            target[field_name] = value
+
+    for index, item in enumerate(raw_supplied, start=1):
+        merge_item(item, label=f"lane_metric_observations[{index}]")
+    for key, values in (derived or {}).items():
+        merge_item(
+            {"provider": key[0], "lane_id": key[1], **dict(values)},
+            label=f"derived lane metric {key[0]}/{key[1]}",
+        )
+    return [merged[key] for key in sorted(merged)]
+
+
+def reviewer_lane_metric_observations(
+    state: Mapping[str, Any],
+    review_id: str,
+    review_state: Mapping[str, Any],
+    manifest: hloop_review.ReviewManifest,
+    artifact_meta: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Derive manifest-backed finding/timeout metrics and merge real runtimes."""
+
+    if not _planned_lane_metric_processes(state, review_id, review_state):
+        if artifact_meta.get("lane_metric_observations"):
+            return durable_lane_metric_observations(
+                state,
+                review_id,
+                review_state,
+                supplied=artifact_meta.get("lane_metric_observations"),
+            )
+        return []
+    confirmed = set(manifest.confirmed_fingerprints)
+    derived: dict[tuple[str, str], dict[str, Any]] = {}
+    for lane in manifest.lane_results:
+        lane_verified = {
+            finding.fingerprint
+            for finding in manifest.findings
+            if finding.fingerprint in confirmed
+            if any(
+                candidate.provider == lane.provider
+                and candidate.discovering_agent == lane.agent_label
+                for candidate in finding.candidates
+            )
+        }
+        derived[(lane.provider, lane.lane_id)] = {
+            "timed_out": lane.status == "timeout",
+            "finding_candidate_count": lane.finding_count,
+            "verified_finding_count": len(lane_verified),
+        }
+    return durable_lane_metric_observations(
+        state,
+        review_id,
+        review_state,
+        supplied=artifact_meta.get("lane_metric_observations"),
+        derived=derived,
+    )
+
+
+def _record_escaped_finding_metrics(
+    state: dict[str, Any], fingerprints: Sequence[str]
+) -> None:
+    """Preserve unique findings first verified by manual final review."""
+
+    metrics = state.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        return
+    observed = {
+        str(item)
+        for item in normalize_list(metrics.get("escaped_finding_fingerprints"))
+        if str(item)
+    }
+    observed.update(str(item) for item in fingerprints if str(item))
+    metrics["escaped_finding_fingerprints"] = sorted(observed)
+    metrics["escaped_finding_count"] = max(
+        normalize_int(metrics.get("escaped_finding_count"), 0),
+        len(observed),
     )
 
 
@@ -3479,6 +3827,450 @@ def _refresh_execution_metrics(state: dict[str, Any]) -> None:
         str(batch_records[-1].get("batch_id") or "") if batch_records else ""
     )
 
+    run_wall = _observed_duration_seconds(
+        state.get("created_at") or state.get("started_at"),
+        state.get("finished_at") or state.get("updated_at"),
+    )
+    metrics["run_wall_time_seconds"] = round(run_wall or 0.0, 6)
+    snapshot_end = state.get("finished_at") or state.get("updated_at")
+    sleep_history = state.get("manager_sleep_history")
+    wait_intervals: list[tuple[datetime, datetime]] = []
+    legacy_wait_time = 0.0
+    for item in sleep_history or []:
+        if not isinstance(item, Mapping):
+            continue
+        interval = _metric_interval(item.get("started_at"), item.get("returned_at"))
+        if interval is not None:
+            wait_intervals.append(interval)
+        elif isinstance(item.get("duration_seconds"), (int, float)) and not isinstance(
+            item.get("duration_seconds"), bool
+        ):
+            legacy_wait_time += max(0.0, float(item["duration_seconds"]))
+
+    def ack_wait(record: Any) -> float:
+        if not isinstance(record, Mapping):
+            return 0.0
+        barriers = [
+            *(
+                item
+                for item in record.get("semantic_ack_history") or []
+                if isinstance(item, Mapping)
+            ),
+            record.get("semantic_ack_barrier"),
+        ]
+        return sum(
+            _observed_duration_seconds(
+                barrier.get("armed_at"),
+                barrier.get("resolved_at") or snapshot_end,
+            )
+            or 0.0
+            for barrier in barriers
+            if isinstance(barrier, Mapping)
+        )
+
+    participants = _metric_role_records(state)
+    ack_intervals: list[tuple[datetime, datetime]] = []
+    for participant in participants:
+        barriers = [
+            *(
+                item
+                for item in participant.get("semantic_ack_history") or []
+                if isinstance(item, Mapping)
+            ),
+            participant.get("semantic_ack_barrier"),
+        ]
+        for barrier in barriers:
+            if not isinstance(barrier, Mapping):
+                continue
+            interval = _metric_interval(
+                barrier.get("armed_at"),
+                barrier.get("resolved_at") or snapshot_end,
+            )
+            if interval is not None:
+                ack_intervals.append(interval)
+    wait_intervals.extend(ack_intervals)
+    metrics["ack_wait_time_seconds"] = round(
+        sum(ack_wait(item) for item in participants), 6
+    )
+
+    user_blocked_intervals: list[tuple[datetime, datetime]] = []
+    legacy_user_blocked = 0.0
+    decisions = state.get("decisions")
+    for decision in (decisions.values() if isinstance(decisions, Mapping) else ()):
+        if not isinstance(decision, Mapping):
+            continue
+        if str(decision.get("decision_class") or decision.get("class") or "") not in {
+            "blocking-user",
+            "blocking_user",
+        }:
+            continue
+        interval = _metric_interval(
+            decision.get("created_at"),
+            decision.get("resolved_at") or decision.get("responded_at") or snapshot_end,
+        )
+        if interval is not None:
+            user_blocked_intervals.append(interval)
+        else:
+            duration = _observed_duration_seconds(
+                decision.get("created_at"),
+                decision.get("resolved_at") or decision.get("responded_at"),
+            )
+            legacy_user_blocked += duration or 0.0
+    user_blocked = _metric_union_seconds(user_blocked_intervals) + legacy_user_blocked
+    all_nonactive = _metric_union_seconds(
+        [*wait_intervals, *user_blocked_intervals]
+    )
+    # User-blocked time is the more specific category. Remove its overlap from
+    # Manager wait so wall = active + wait + user-blocked remains explainable.
+    wait_time = max(
+        0.0,
+        all_nonactive - _metric_union_seconds(user_blocked_intervals),
+    ) + legacy_wait_time
+    metrics["manager_wait_time_seconds"] = round(wait_time, 6)
+    metrics["user_blocked_time_seconds"] = round(user_blocked, 6)
+    metrics["manager_active_time_seconds"] = round(
+        max(0.0, (run_wall or 0.0) - wait_time - user_blocked), 6
+    )
+
+    mode_counts: dict[str, int] = {}
+    for task in tasks.values():
+        if not isinstance(task, Mapping):
+            continue
+        mode = str(task.get("completion_mode") or "")
+        if mode in hloop_worker_candidate.COMPLETION_MODES:
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    metrics["completion_mode_counts"] = dict(sorted(mode_counts.items()))
+
+    validation_history = state.get("validation_history")
+    validation_records = [
+        item
+        for item in validation_history or []
+        if isinstance(item, Mapping) and str(item.get("level") or "") == "L3"
+    ]
+    metrics["validation_execution_count"] = sum(
+        not bool(item.get("reused")) for item in validation_records
+    )
+    metrics["validation_reuse_count"] = sum(
+        bool(item.get("reused")) for item in validation_records
+    )
+    validation_by_sha: dict[str, dict[str, Any]] = {}
+    for item in validation_records:
+        target_sha = str(item.get("head_sha") or "")
+        if not target_sha:
+            continue
+        projection = validation_by_sha.setdefault(
+            target_sha,
+            {
+                "target_sha": target_sha,
+                "execution_count": 0,
+                "reuse_count": 0,
+                "validation_ids": [],
+            },
+        )
+        counter = "reuse_count" if bool(item.get("reused")) else "execution_count"
+        projection[counter] += 1
+        validation_id = str(item.get("validation_id") or "")
+        if validation_id:
+            projection["validation_ids"].append(validation_id)
+    metrics["validation_by_target_sha"] = [
+        validation_by_sha[key] for key in sorted(validation_by_sha)
+    ]
+
+    epoch_store = state.get("review_epochs")
+    epoch_records = (
+        epoch_store.get("records")
+        if isinstance(epoch_store, Mapping)
+        and isinstance(epoch_store.get("records"), Mapping)
+        else {}
+    )
+    targets: set[str] = set()
+    planned_agents = 0
+    reserved_agents = 0
+    live_agents = 0
+    epoch_metrics: list[dict[str, Any]] = []
+    historical_epoch_peaks = metrics.get("review_epoch_peak_live")
+    historical_epoch_peaks = (
+        historical_epoch_peaks
+        if isinstance(historical_epoch_peaks, Mapping)
+        else {}
+    )
+    lane_metrics: list[dict[str, Any]] = []
+    role_usage: dict[str, dict[str, Any]] = {}
+    for epoch_id, epoch_record in sorted(
+        epoch_records.items(), key=lambda item: str(item[0])
+    ):
+        if not isinstance(epoch_record, Mapping):
+            continue
+        revisions = epoch_record.get("revisions")
+        if not isinstance(revisions, Mapping):
+            continue
+        for revision_key, collection in sorted(
+            revisions.items(), key=lambda item: str(item[0])
+        ):
+            if not isinstance(collection, Mapping):
+                continue
+            plan = collection.get("plan")
+            capacity = collection.get("capacity")
+            collection_planned = 0
+            collection_reserved = 0
+            if isinstance(plan, Mapping):
+                target = str(plan.get("target_sha") or "")
+                if target:
+                    targets.add(target)
+                for execution in plan.get("required_executions") or []:
+                    if isinstance(execution, Mapping):
+                        processes = [
+                            item
+                            for item in execution.get("processes") or []
+                            if isinstance(item, Mapping)
+                        ]
+                        planned_agents += len(processes)
+                        collection_planned += len(processes)
+                        execution_id = str(execution.get("execution_id") or "")
+                        role = str(execution.get("source_kind") or "unknown")
+                        role_records = (
+                            state.get("reviews")
+                            if role == "reviewer"
+                            else state.get("gaps") if role == "gap" else None
+                        )
+                        role_record = (
+                            role_records.get(execution_id)
+                            if isinstance(role_records, Mapping)
+                            else None
+                        )
+                        observations = {
+                            str(item.get("process_id") or ""): item
+                            for item in (
+                                role_record.get("lane_metric_observations") or []
+                                if isinstance(role_record, Mapping)
+                                else []
+                            )
+                            if isinstance(item, Mapping)
+                            and str(item.get("process_id") or "")
+                        }
+                        usage = role_usage.setdefault(
+                            role,
+                            {
+                                "role": role,
+                                "agent_count": 0,
+                                "token_count": None,
+                                "cost": None,
+                            },
+                        )
+                        usage["agent_count"] += len(processes)
+                        for process in processes:
+                            lane_id = str(process.get("lane_id") or "")
+                            if not lane_id:
+                                continue
+                            observation = observations.get(
+                                str(process.get("process_id") or ""), {}
+                            )
+                            runtime = observation.get("runtime_seconds")
+                            candidate_count = observation.get(
+                                "finding_candidate_count"
+                            )
+                            verified_count = observation.get(
+                                "verified_finding_count"
+                            )
+                            timed_out = observation.get("timed_out")
+                            lane_metrics.append(
+                                {
+                                    "epoch_id": str(plan.get("epoch_id") or epoch_id),
+                                    "epoch_revision": normalize_int(
+                                        plan.get("epoch_revision"),
+                                        normalize_int(revision_key, 0),
+                                    ),
+                                    "target_sha": target or None,
+                                    "execution_id": execution_id,
+                                    "role": role,
+                                    "process_id": str(process.get("process_id") or ""),
+                                    "lane_id": lane_id,
+                                    "runtime_seconds": (
+                                        float(runtime)
+                                        if isinstance(runtime, (int, float))
+                                        and not isinstance(runtime, bool)
+                                        else None
+                                    ),
+                                    "timed_out": (
+                                        timed_out
+                                        if isinstance(timed_out, bool)
+                                        else None
+                                    ),
+                                    "finding_candidate_count": (
+                                        candidate_count
+                                        if isinstance(candidate_count, int)
+                                        and not isinstance(candidate_count, bool)
+                                        else None
+                                    ),
+                                    "verified_finding_count": (
+                                        verified_count
+                                        if isinstance(verified_count, int)
+                                        and not isinstance(verified_count, bool)
+                                        else None
+                                    ),
+                                }
+                            )
+            if isinstance(capacity, Mapping):
+                reserved_agents += normalize_int(capacity.get("reserved_slots"), 0)
+                live_agents += normalize_int(capacity.get("live_slots"), 0)
+                collection_reserved = sum(
+                    normalize_int(item.get("reserved_slots"), 0)
+                    for item in capacity.get("leases") or []
+                    if isinstance(item, Mapping)
+                )
+            if isinstance(plan, Mapping):
+                peak_key = (
+                    f"{str(plan.get('epoch_id') or epoch_id)}:"
+                    f"{normalize_int(plan.get('epoch_revision'), normalize_int(revision_key, 0))}"
+                )
+                recorded_peak = historical_epoch_peaks.get(peak_key)
+                peak_live = (
+                    recorded_peak
+                    if isinstance(recorded_peak, int)
+                    and not isinstance(recorded_peak, bool)
+                    else (
+                        normalize_int(capacity.get("live_slots"), 0)
+                        if isinstance(capacity, Mapping)
+                        else None
+                    )
+                )
+                epoch_metrics.append(
+                    {
+                        "epoch_id": str(plan.get("epoch_id") or epoch_id),
+                        "epoch_revision": normalize_int(
+                            plan.get("epoch_revision"), normalize_int(revision_key, 0)
+                        ),
+                        "target_sha": str(plan.get("target_sha") or "") or None,
+                        "planned_agent_count": collection_planned,
+                        "reserved_agent_count": collection_reserved,
+                        "peak_live_agent_count": peak_live,
+                    }
+                )
+    metrics["review_epoch_count"] = len(epoch_records)
+    metrics["review_epoch_target_shas"] = sorted(targets)
+    metrics["planned_agent_count"] = planned_agents
+    metrics["reserved_agent_count"] = reserved_agents
+    metrics["live_agent_count"] = live_agents
+    metrics["peak_live_agent_count"] = max(
+        normalize_int(metrics.get("peak_live_agent_count"), 0),
+        live_agents,
+        *(
+            normalize_int(item.get("peak_live_agent_count"), 0)
+            for item in epoch_metrics
+            if item.get("peak_live_agent_count") is not None
+        ),
+    )
+    metrics["review_epoch_metrics"] = epoch_metrics
+    metrics["lane_metrics"] = lane_metrics
+    metrics["role_usage_metrics"] = [role_usage[key] for key in sorted(role_usage)]
+
+    remediation = state.get("remediation_ledger")
+    batches = remediation.get("batches") if isinstance(remediation, Mapping) else None
+    remediation_batches = [
+        item
+        for item in (
+            batches.values() if isinstance(batches, Mapping) else batches or []
+        )
+        if isinstance(item, Mapping)
+    ]
+    metrics["remediation_batch_count"] = (
+        len(remediation_batches)
+    )
+    finding_history = [
+        item
+        for item in metrics.get("finding_metric_history") or []
+        if isinstance(item, Mapping)
+    ]
+    if finding_history:
+        observed_fingerprints = [
+            str(fingerprint)
+            for item in finding_history
+            for fingerprint in normalize_list(item.get("fingerprints"))
+            if str(fingerprint)
+        ]
+        verified_fingerprints = {
+            str(fingerprint)
+            for item in finding_history
+            for fingerprint in normalize_list(item.get("confirmed_fingerprints"))
+            if str(fingerprint)
+        }
+        metrics["candidate_count"] = len(observed_fingerprints)
+        metrics["confirmed_count"] = len(verified_fingerprints)
+    else:
+        observed_fingerprints = []
+    metrics["verified_finding_count"] = normalize_int(metrics.get("confirmed_count"), 0)
+    candidates = normalize_int(metrics.get("candidate_count"), 0)
+    metrics["finding_yield"] = (
+        round(metrics["verified_finding_count"] / candidates, 6)
+        if candidates
+        else None
+    )
+    conflict_fingerprints = {
+        str(fingerprint)
+        for batch in remediation_batches
+        for fingerprint in normalize_list(batch.get("classification_conflicts"))
+        if str(fingerprint)
+    }
+    observation_count = sum(
+        len([item for item in batch.get("observations") or [] if isinstance(item, Mapping)])
+        for batch in remediation_batches
+    )
+    canonical_count = sum(
+        len(
+            [
+                item
+                for item in batch.get("canonical_candidates") or []
+                if isinstance(item, Mapping)
+            ]
+        )
+        for batch in remediation_batches
+    )
+    metrics["classification_conflict_count"] = len(conflict_fingerprints)
+    if observed_fingerprints:
+        metrics["fingerprint_duplicate_rate"] = round(
+            (len(observed_fingerprints) - len(set(observed_fingerprints)))
+            / len(observed_fingerprints),
+            6,
+        )
+    else:
+        metrics["fingerprint_duplicate_rate"] = (
+            round(max(0, observation_count - canonical_count) / observation_count, 6)
+            if observation_count
+            else None
+        )
+    metrics.setdefault("provider_capacity_wait_time_seconds", None)
+    patch_reviews = state.get("patch_reviews")
+    patch_records = [
+        item
+        for item in (
+            patch_reviews.values() if isinstance(patch_reviews, Mapping) else ()
+        )
+        if isinstance(item, Mapping)
+    ]
+    patch_records.extend(
+        item
+        for task in tasks.values()
+        if isinstance(task, Mapping)
+        for item in task.get("patch_review_history") or []
+        if isinstance(item, Mapping)
+    )
+    patch_records_by_id = {
+        str(item.get("review_attempt_id") or _canonical_digest(item)): item
+        for item in patch_records
+    }
+    metrics["patch_review_round_count"] = len(patch_records_by_id)
+    prevented_fingerprints = {
+        str(fingerprint)
+        for item in patch_records_by_id.values()
+        if str(item.get("verdict") or "") == "fix_required"
+        for fingerprint in normalize_list(item.get("unresolved_finding_fingerprints"))
+        if str(fingerprint)
+    }
+    metrics["patch_findings_prevented_count"] = len(prevented_fingerprints)
+    metrics.setdefault("escaped_finding_count", None)
+    metrics.setdefault("artifact_reconcile_time_seconds", None)
+    metrics.setdefault("finish_preparation_time_seconds", None)
+
 
 def _empty_execution_metrics() -> dict[str, Any]:
     """Return the complete zero-valued state projection for a fresh loop."""
@@ -3515,6 +4307,35 @@ def _empty_execution_metrics() -> dict[str, Any]:
         "worker_runtime_seconds": 0.0,
         "batch_id": "",
         "batch_metrics": [],
+        "run_wall_time_seconds": 0.0,
+        "manager_active_time_seconds": 0.0,
+        "manager_wait_time_seconds": 0.0,
+        "user_blocked_time_seconds": 0.0,
+        "ack_wait_time_seconds": 0.0,
+        "review_epoch_count": 0,
+        "review_epoch_target_shas": [],
+        "remediation_batch_count": 0,
+        "validation_execution_count": 0,
+        "validation_reuse_count": 0,
+        "validation_by_target_sha": [],
+        "completion_mode_counts": {},
+        "artifact_reconcile_time_seconds": None,
+        "finish_preparation_time_seconds": None,
+        "planned_agent_count": 0,
+        "reserved_agent_count": 0,
+        "live_agent_count": 0,
+        "peak_live_agent_count": 0,
+        "review_epoch_metrics": [],
+        "lane_metrics": [],
+        "role_usage_metrics": [],
+        "verified_finding_count": 0,
+        "finding_yield": None,
+        "classification_conflict_count": 0,
+        "fingerprint_duplicate_rate": None,
+        "provider_capacity_wait_time_seconds": None,
+        "patch_review_round_count": 0,
+        "patch_findings_prevented_count": 0,
+        "escaped_finding_count": None,
     }
 
 
@@ -4546,7 +5367,7 @@ def current_planning_identity(
     if not release_scope_digest:
         raise HLoopError("locked release scope is missing scope_digest")
     task_contracts: dict[str, str] = {}
-    for task_id in sorted((state.get("tasks") or {}).keys()):
+    for task_id in mutable_planning_task_ids(state):
         path = task_file(repo, task_id)
         if not path.is_file():
             raise HLoopError(f"planning identity task artifact is missing: {path}")
@@ -4617,11 +5438,12 @@ def planning_projection_issues(
         for item in task_graph.get("tasks", [])
         if isinstance(item, Mapping) and str(item.get("task_id") or "")
     }
-    state_task_ids = set((state.get("tasks") or {}).keys())
+    all_state_task_ids = set((state.get("tasks") or {}).keys())
+    state_task_ids = set(mutable_planning_task_ids(state))
     graph_task_ids = set(graph_tasks)
     issues: list[hloop_planning.PlanningIssue] = []
     missing = tuple(sorted(state_task_ids - graph_task_ids))
-    unknown = tuple(sorted(graph_task_ids - state_task_ids))
+    unknown = tuple(sorted(graph_task_ids - all_state_task_ids))
     if missing:
         issues.append(
             hloop_planning.PlanningIssue(
@@ -5610,13 +6432,37 @@ def arm_semantic_ack_barrier(
     even if an earlier barrier had already been resolved.
     """
 
+    previous = agent_state.get("semantic_ack_barrier")
+    if isinstance(previous, Mapping):
+        previous = json.loads(json.dumps(previous, ensure_ascii=False))
+        previous["status"] = "superseded"
+        previous_decision = previous.get("semantic_decision")
+        if isinstance(previous_decision, dict):
+            previous_decision["status"] = "superseded"
+            previous_decision["superseded_at"] = now_iso()
+        previous_application = previous.get("approval_application")
+        if isinstance(previous_application, dict):
+            previous_application["status"] = "superseded"
+            previous_application["updated_at"] = now_iso()
+        history = agent_state.setdefault("semantic_ack_history", [])
+        if isinstance(history, list):
+            history.append(previous)
+    armed_at = now_iso()
     agent_state["semantic_ack_barrier"] = {
         "message_id": message_id,
         "digest": digest,
         "kind": kind,
         "status": "awaiting_ack",
-        "armed_at": now_iso(),
+        "armed_at": armed_at,
         "required_reack_after_sequence": required_reack_after_sequence,
+        "semantic_decision": {
+            "status": "awaiting_ack",
+            "armed_at": armed_at,
+        },
+        "approval_application": {
+            "status": "pending",
+            "updated_at": armed_at,
+        },
     }
 
 
@@ -5664,11 +6510,17 @@ def semantic_ack_barrier_blocking(agent_state: dict[str, Any]) -> str:
     """Return a non-empty block reason while material work must wait, else ""."""
 
     barrier = agent_state.get("semantic_ack_barrier")
-    if not isinstance(barrier, dict) or barrier.get("status") == "approved":
+    decision = barrier.get("semantic_decision") if isinstance(barrier, dict) else None
+    status = (
+        str(decision.get("status") or "")
+        if isinstance(decision, Mapping)
+        else str((barrier or {}).get("status") or "")
+    )
+    if not isinstance(barrier, dict) or status == "approved":
         return ""
     return (
         f"semantic ACK barrier `{barrier.get('message_id')}` is "
-        f"{barrier.get('status') or 'awaiting_ack'}; a fresh authenticated ACK "
+        f"{status or 'awaiting_ack'}; a fresh authenticated ACK "
         "must be approved with `hloop agent ack resolve`"
     )
 
@@ -5685,7 +6537,13 @@ def resolve_semantic_ack_barrier(
     barrier = agent_state.get("semantic_ack_barrier")
     if not isinstance(barrier, dict):
         raise HLoopError("no pending semantic ACK barrier to resolve")
-    if barrier.get("status") == "approved":
+    decision_record = barrier.get("semantic_decision")
+    current_status = (
+        str(decision_record.get("status") or "")
+        if isinstance(decision_record, Mapping)
+        else str(barrier.get("status") or "")
+    )
+    if current_status == "approved":
         raise HLoopError("semantic ACK barrier is already approved")
     latest_sequence = int((latest_ack or {}).get("sequence") or 0)
     required_after = int(barrier.get("required_reack_after_sequence") or 0)
@@ -5704,17 +6562,90 @@ def resolve_semantic_ack_barrier(
         raise HLoopError(
             "the corrected semantic ACK does not match the active task contract digest"
         )
+    completion_mode = str((latest_ack or {}).get("completion_mode") or "")
+    completion_probe = (latest_ack or {}).get("completion_mode_probe")
+    active_attempt = str(
+        agent_state.get("active_attempt_id") or agent_state.get("attempt_id") or ""
+    )
+    initial_message = str(barrier.get("message_id") or "")
+    if not active_attempt and initial_message.startswith("initial:T"):
+        active_attempt = initial_message.removeprefix("initial:")
+    is_worker_ack = bool(
+        active_attempt.startswith("T")
+        and task_contract_revision(agent_state)
+        == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+    )
+    recorded_mode = str(agent_state.get("completion_mode") or "")
+    recorded_attempt = str(agent_state.get("completion_mode_attempt_id") or "")
+    if decision == "approve" and is_worker_ack:
+        if not completion_mode:
+            raise HLoopError(
+                "revision 3 Worker approval requires completion mode probe evidence"
+            )
+        if completion_mode not in hloop_worker_candidate.COMPLETION_MODES:
+            raise HLoopError("semantic ACK carries an invalid completion mode")
+        if not isinstance(completion_probe, Mapping):
+            raise HLoopError("semantic ACK completion mode lacks probe evidence")
+        if recorded_mode:
+            if not recorded_attempt:
+                raise HLoopError(
+                    "completion mode lacks its initial semantic ACK attempt binding"
+                )
+            if recorded_attempt != active_attempt:
+                raise HLoopError(
+                    "completion mode attempt binding does not match the active attempt"
+                )
+            if completion_mode != recorded_mode:
+                raise HLoopError(
+                    "completion mode drift is forbidden after the initial semantic ACK"
+                )
+        elif str(barrier.get("kind") or "") != "initial":
+            raise HLoopError(
+                "completion mode must be bound by the initial semantic ACK before material work"
+            )
+    resolved_at = now_iso()
     if decision == "approve":
         barrier["status"] = "approved"
         barrier["ack_event_id"] = latest_ack["event_id"]
         barrier["ack_sequence"] = latest_sequence
+        barrier["semantic_decision"] = {
+            "status": "approved",
+            "decision": decision,
+            "reason": reason,
+            "resolved_at": resolved_at,
+            "ack_event_id": latest_ack["event_id"],
+            "ack_sequence": latest_sequence,
+        }
+        barrier["approval_application"] = {
+            "status": "pending",
+            "updated_at": resolved_at,
+            "ack_event_id": latest_ack["event_id"],
+        }
+        if completion_mode and not recorded_mode:
+            agent_state["completion_mode"] = completion_mode
+            agent_state["completion_mode_probe"] = json.loads(
+                json.dumps(completion_probe, ensure_ascii=False)
+            )
+            agent_state["completion_mode_attempt_id"] = active_attempt
+            agent_state["completion_mode_ack_event_id"] = latest_ack["event_id"]
+            agent_state["completion_mode_bound_at"] = resolved_at
     else:
         barrier["status"] = "rejected" if decision == "reject" else "timed_out"
         barrier["required_reack_after_sequence"] = max(required_after, latest_sequence)
         if latest_ack is not None:
             barrier["rejected_ack_event_id"] = latest_ack["event_id"]
             barrier["rejected_ack_sequence"] = latest_sequence
-    barrier["resolved_at"] = now_iso()
+        barrier["semantic_decision"] = {
+            "status": barrier["status"],
+            "decision": decision,
+            "reason": reason,
+            "resolved_at": resolved_at,
+        }
+        barrier["approval_application"] = {
+            "status": "superseded",
+            "updated_at": resolved_at,
+        }
+    barrier["resolved_at"] = resolved_at
     barrier["resolution_reason"] = reason
     return barrier
 
@@ -6203,6 +7134,71 @@ def approved_semantic_ack_event_id(
     if block_reason:
         raise HLoopError(f"candidate gate blocked for {task_id}: {block_reason}")
     barrier = task_state.get("semantic_ack_barrier")
+    if task_contract_revision(task_state) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        if not isinstance(barrier, Mapping):
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: structured semantic ACK barrier is missing"
+            )
+        kind = str(barrier.get("kind") or "")
+        if kind not in {"initial", "task-contract"}:
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: legacy unstructured ACK is forbidden"
+            )
+        decision = barrier.get("semantic_decision")
+        if not isinstance(decision, Mapping) or str(decision.get("status") or "") != "approved":
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: structured semantic ACK decision is missing"
+            )
+        if str(barrier.get("status") or "") != "approved":
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: semantic ACK barrier is not approved"
+            )
+        active_attempt = str(
+            task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""
+        )
+        if not active_attempt:
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: active attempt binding is missing"
+            )
+        if kind == "initial" and str(barrier.get("message_id") or "") != f"initial:{active_attempt}":
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: initial ACK attempt binding is stale"
+            )
+        barrier_event = str(barrier.get("ack_event_id") or "")
+        decision_event = str(decision.get("ack_event_id") or "")
+        barrier_sequence = barrier.get("ack_sequence")
+        decision_sequence = decision.get("ack_sequence")
+        if (
+            not barrier_event
+            or decision_event != barrier_event
+            or isinstance(barrier_sequence, bool)
+            or not isinstance(barrier_sequence, int)
+            or barrier_sequence < 1
+            or decision_sequence != barrier_sequence
+        ):
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: semantic ACK decision binding is inconsistent"
+            )
+        mode = str(task_state.get("completion_mode") or "")
+        mode_attempt = str(task_state.get("completion_mode_attempt_id") or "")
+        mode_event = str(task_state.get("completion_mode_ack_event_id") or "")
+        probe = task_state.get("completion_mode_probe")
+        if mode not in hloop_worker_candidate.COMPLETION_MODES:
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: completion mode binding is missing"
+            )
+        if mode_attempt != active_attempt:
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: completion mode attempt binding is stale"
+            )
+        if not mode_event or (kind == "initial" and mode_event != barrier_event):
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: completion mode ACK binding is inconsistent"
+            )
+        if not isinstance(probe, Mapping) or str(probe.get("mode") or "") != mode:
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: completion mode probe binding is inconsistent"
+            )
     event_id = (
         str(barrier.get("ack_event_id") or "")
         if isinstance(barrier, Mapping)
@@ -6393,6 +7389,16 @@ def current_candidate_evidence(
     approved_ack = approved_semantic_ack_event_id(task_id, task_state)
     if candidate.semantic_ack_event_id != approved_ack:
         raise HLoopError(f"candidate semantic ACK is stale for {task_id}")
+    approved_mode = str(task_state.get("completion_mode") or "")
+    if not approved_mode or candidate.completion_mode != approved_mode:
+        raise HLoopError(
+            f"candidate completion mode is not bound to the approved preflight for {task_id}"
+        )
+    bound_completion_mode(
+        task_state,
+        candidate.completion_mode,
+        revision=task_contract_revision(read_frontmatter(task_file(repo, task_id))),
+    )
     observed_tree = git(repo, ["show", "-s", "--format=%T", seal.candidate_sha])
     if observed_tree != seal.candidate_tree_sha:
         raise HLoopError(f"candidate commit tree drift for {task_id}")
@@ -9066,8 +10072,22 @@ def cmd_review_epoch_reserve(args: argparse.Namespace) -> int:
         )
         collection = collection.with_capacity(capacity)
     except hloop_review_epoch.ReviewEpochError as exc:
+        if "cannot satisfy capacity reservation" in str(exc):
+            metrics = state.get("execution_metrics")
+            if isinstance(metrics, dict):
+                metrics.setdefault("provider_capacity_wait_started_at", now_iso())
+                save_state(repo, state)
         raise HLoopError(f"cannot reserve review epoch capacity: {exc}") from exc
     store_review_epoch_collection(state, collection, make_active=False)
+    _record_review_epoch_capacity_metrics(state, collection)
+    metrics = state.get("execution_metrics")
+    if isinstance(metrics, dict):
+        wait_started_at = metrics.pop("provider_capacity_wait_started_at", None)
+        wait_duration = _observed_duration_seconds(wait_started_at, now_iso())
+        if wait_duration is not None:
+            _record_metric_duration(
+                state, "provider_capacity_wait_time_seconds", wait_duration
+            )
     save_state(repo, state)
     print(
         f"reserved {len(args.process_id)} slots in {args.epoch_id} revision {collection.plan.epoch_revision}"
@@ -9102,6 +10122,7 @@ def cmd_review_epoch_lease(args: argparse.Namespace) -> int:
     except hloop_review_epoch.ReviewEpochError as exc:
         raise HLoopError(f"invalid review epoch lease transition: {exc}") from exc
     store_review_epoch_collection(state, collection, make_active=False)
+    _record_review_epoch_capacity_metrics(state, collection)
     save_state(repo, state)
     print(f"review epoch lease {args.lease_id}: {args.action}")
     return 0
@@ -9634,15 +10655,7 @@ def _review_validation_is_current(
 ) -> bool:
     if repo is not None:
         _refresh_validation_staleness(repo, state)
-    if normalize_bool(state.get("validation_stale")):
-        return False
-    validation = state.get("last_validation")
-    if not isinstance(validation, dict):
-        return False
-    results = validation.get("results")
-    return bool(results) and str(validation.get("head_sha") or "") == target and all(
-        isinstance(item, dict) and item.get("result") == "passed" for item in results
-    )
+    return release_validation_is_current(repo, state, target)
 
 
 def _changed_file_inventory(repo: Path, base_sha: str, target_sha: str) -> list[str]:
@@ -10083,6 +11096,21 @@ def _update_review_execution_metrics(
         metrics["review_fix_rounds"] = max(current_round, max(0, round_number))
     else:
         metrics["review_fix_rounds"] = max(0, round_number)
+    history = metrics.setdefault("finding_metric_history", [])
+    if isinstance(history, list):
+        entry = {
+            "target_sha": manifest.plan.head_sha,
+            "round": max(0, round_number),
+            "manifest_digest": _canonical_digest(manifest.to_record()),
+            "fingerprints": [finding.fingerprint for finding in manifest.findings],
+            "confirmed_fingerprints": list(manifest.confirmed_fingerprints),
+        }
+        if not any(
+            isinstance(item, Mapping)
+            and item.get("manifest_digest") == entry["manifest_digest"]
+            for item in history
+        ):
+            history.append(entry)
 
 
 def _final_paths(repo: Path) -> dict[str, Path]:
@@ -10489,6 +11517,125 @@ def cmd_review_readiness(args: argparse.Namespace) -> int:
     }
     print_policy_payload(payload, as_json=bool(args.json), label="review readiness")
     return 0 if snapshot["ready"] else 2
+
+
+def convergence_draft_projection(
+    state: Mapping[str, Any], target_sha: str, *, repo: Path | None = None
+) -> dict[str, Any]:
+    """Project complete epoch + current L3 evidence without claiming final review."""
+
+    validation = fresh_l3_validation_evidence(state, target_sha, repo=repo)
+    if validation is None:
+        raise HLoopError("convergence draft requires fresh L3 validation for the target SHA")
+    store = state.get("review_epochs")
+    if not isinstance(store, Mapping):
+        raise HLoopError("convergence draft requires review epoch evidence")
+    epoch_id = str(store.get("active_epoch_id") or "")
+    records = store.get("records")
+    epoch_record = records.get(epoch_id) if isinstance(records, Mapping) else None
+    if not epoch_id or not isinstance(epoch_record, Mapping):
+        raise HLoopError("convergence draft requires an active review epoch")
+    revision = epoch_record.get("active_revision")
+    revisions = epoch_record.get("revisions")
+    record = revisions.get(str(revision)) if isinstance(revisions, Mapping) else None
+    if isinstance(revision, bool) or not isinstance(revision, int) or not isinstance(record, Mapping):
+        raise HLoopError("active review epoch revision is invalid")
+    plan = record.get("plan")
+    outcomes = record.get("execution_outcomes")
+    if not isinstance(plan, Mapping) or not isinstance(outcomes, Sequence):
+        raise HLoopError("active review epoch evidence is incomplete")
+    if str(plan.get("target_sha") or "") != target_sha:
+        raise HLoopError("active review epoch target does not match convergence target")
+    required = {
+        str(item.get("execution_id") or ""): item
+        for item in plan.get("required_executions", [])
+        if isinstance(item, Mapping) and str(item.get("execution_id") or "")
+    }
+    observed = {
+        str(item.get("execution_id") or ""): item
+        for item in outcomes
+        if isinstance(item, Mapping) and str(item.get("execution_id") or "")
+    }
+    if not required or set(observed) != set(required):
+        raise HLoopError("review epoch outcomes do not cover every required execution")
+    source_kinds = {str(item.get("source_kind") or "") for item in required.values()}
+    if not {"reviewer", "gap"}.issubset(source_kinds):
+        raise HLoopError("convergence draft requires independent reviewer and gap executions")
+    projected: list[dict[str, Any]] = []
+    for execution_id, execution in sorted(required.items()):
+        outcome = observed[execution_id]
+        if (
+            str(outcome.get("status") or "") != "succeeded"
+            or outcome.get("artifact_complete") is not True
+            or not str(outcome.get("artifact_ref") or execution.get("artifact_ref") or "")
+        ):
+            raise HLoopError(
+                f"convergence draft execution is not successfully complete: {execution_id}"
+            )
+        projected.append(
+            {
+                "execution_id": execution_id,
+                "source_kind": str(execution.get("source_kind") or ""),
+                "attempt_id": str(execution.get("attempt_id") or outcome.get("attempt_id") or ""),
+                "protocol": str(execution.get("protocol") or outcome.get("protocol") or ""),
+                "independence_key": str(
+                    execution.get("independence_key")
+                    or outcome.get("independence_key")
+                    or ""
+                ),
+                "artifact_ref": str(
+                    outcome.get("artifact_ref") or execution.get("artifact_ref") or ""
+                ),
+                "artifact_digest": str(outcome.get("artifact_digest") or ""),
+                "status": "succeeded",
+            }
+        )
+    return {
+        "record_type": "review_convergence_draft",
+        "epoch_id": epoch_id,
+        "epoch_revision": revision,
+        "plan_digest": str(plan.get("plan_digest") or ""),
+        "target_sha": target_sha,
+        "executions": projected,
+        "manager_validation": {
+            "validation_id": str(validation.get("validation_id") or ""),
+            "level": "L3",
+            "reused": bool(validation.get("reused")),
+            "reuse_source_validation_id": str(
+                validation.get("reuse_source_validation_id") or ""
+            ),
+            "result_refs": [
+                str(item.get("log") or item.get("command") or "")
+                for item in validation.get("results", [])
+                if isinstance(item, Mapping)
+            ],
+        },
+        "manual_final_claimed": False,
+        "manual_final_status": "not-evaluated",
+        "drafted_at": now_iso(),
+    }
+
+
+def cmd_review_convergence_draft(args: argparse.Namespace) -> int:
+    reconcile_started = time.monotonic()
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    target = current_integration_target(repo, state)
+    if not target:
+        raise HLoopError("integration target is unavailable for convergence draft")
+    draft = convergence_draft_projection(state, target, repo=repo)
+    path = loop_path(repo) / "reviews" / "convergence" / "DRAFT.json"
+    if not args.dry_run:
+        _write_json_artifact(path, draft)
+        _record_metric_duration(
+            state,
+            "artifact_reconcile_time_seconds",
+            time.monotonic() - reconcile_started,
+        )
+        save_state(repo, state)
+    payload = {**draft, "artifact": str(path.relative_to(repo)), "dry_run": bool(args.dry_run)}
+    print_policy_payload(payload, as_json=bool(args.json), label="review convergence draft")
+    return 0
 
 
 def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
@@ -11172,9 +12319,10 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         raise HLoopError(
             "manual final review disposition policy: " + "; ".join(policy_issues)
         )
-    actionable = evidence.recomputed_verified_actionable_count_for_scope(
+    escaped_fingerprints = evidence.recomputed_verified_actionable_fingerprints_for_scope(
         allow_legacy=allow_legacy
     )
+    actionable = len(escaped_fingerprints)
     release_blocking = evidence.recomputed_verified_release_blocking_count_for_scope(
         allow_legacy=allow_legacy
     )
@@ -11206,6 +12354,7 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
             evidence.review_manifest,
             source_ref=str(manifest_path.relative_to(repo)),
         )
+        _record_escaped_finding_metrics(state, escaped_fingerprints)
         state["accepted_risk_authorizations"] = {
             fingerprint: authorization.to_record()
             for fingerprint, authorization in accepted_risk_authorizations.items()
@@ -11686,7 +12835,12 @@ def state_list(state: dict[str, Any], key: str, default: list[str]) -> list[str]
     return normalize_list(state.get(key)) or list(default)
 
 
-def worker_protocol_text(protocol: str, worker_qa_profile: str, base_ref: str) -> str:
+def worker_protocol_text(
+    protocol: str,
+    worker_qa_profile: str,
+    base_ref: str,
+    completion_mode: str = "",
+) -> str:
     if protocol == "codex-impl":
         return f"""Compatibility mode:
 - You may use $codex-impl for this bounded task.
@@ -11697,6 +12851,16 @@ def worker_protocol_text(protocol: str, worker_qa_profile: str, base_ref: str) -
   - QA target diff: this task branch against {base_ref}
 - Do not ask the user for codex-impl preflight choices; Manager already owns them.
 """
+    completion_step = {
+        "commit": "Write the result artifact and commit your branch.",
+        "handoff": (
+            "Write the result artifact through the explicit handoff path; do not "
+            "write Git metadata or require a Worker-created commit."
+        ),
+    }.get(
+        completion_mode,
+        "Follow the attempt-bound commit or handoff result path described below.",
+    )
     return f"""HLoop Worker Protocol:
 1. Re-read MISSION, PLAN, DECISIONS, PROFILE, and your task contract.
 2. Inspect the current code enough to verify the task is still valid.
@@ -11710,7 +12874,7 @@ def worker_protocol_text(protocol: str, worker_qa_profile: str, base_ref: str) -
    - `staging` or `preview`: collect evidence only when the target URL/credentials are already available in the task or PROFILE; otherwise report blocked QA explicitly.
    - `custom`: follow PROFILE.md and task instructions exactly.
    - `none`: record why QA is intentionally skipped.
-8. Write the result artifact and commit your branch.
+8. {completion_step}
 
 Manager final QA is a separate gate. Do not treat staging/preview final QA as your task's done condition unless the task contract explicitly says so.
 
@@ -12100,7 +13264,36 @@ def render_worker_prompt(
     branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
     base_ref = str(task_meta.get("base_ref") or "the integration branch")
     agent_config = role_agent_config(state, "worker", overrides=task_meta)
-    protocol = worker_protocol_text(worker_protocol, worker_qa_profile, base_ref)
+    completion_mode = str(task_meta.get("completion_mode") or "")
+    protocol = worker_protocol_text(
+        worker_protocol,
+        worker_qa_profile,
+        base_ref,
+        completion_mode,
+    )
+    revision_three_notice = ""
+    if task_contract_revision(task_meta) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+        revision_three_notice = f"""
+Completion-mode preflight:
+- Your first semantic ACK automatically performs a real Git metadata create/fsync/unlink probe.
+- Manager approval binds `commit` or `handoff` to this attempt before material work.
+- Do not choose or change the mode at submit/finalize time. Use `hloop agent ack status {task_id} --attempt-id {str(task_meta.get('attempt_id') or '')} --apply` to learn/apply approval without relying on pane Enter delivery.
+- Submit the exact revision-3 implementation candidate with `hloop worker submit`; candidate and final seals must retain the approved completion mode.
+"""
+    if completion_mode == "handoff":
+        required_output = f"""- Do not run `git add` or `git commit`; handoff mode must not require a product, branch, or result commit from the Worker.
+- Submit the exact dirty-tree candidate with `python3 {Path(__file__).resolve()} {loop_namespace_flag()} worker submit {task_id} --completion-mode handoff ...`.
+- After the Manager seals and approves the candidate, generate the result with:
+  `python3 {Path(__file__).resolve()} {loop_namespace_flag()} worker finalize {task_id} --handoff --status done --validation-command '<command>' --validation-result passed --validation-summary '<summary>'`
+- Ask the Manager to run the emitted `worker seal` action; the Manager owns the final commit."""
+    elif completion_mode == "commit":
+        required_output = f"""- Commit product changes first, leaving no unrelated dirty files.
+- Generate and commit the result with:
+  `python3 {Path(__file__).resolve()} {loop_namespace_flag()} worker finalize {task_id} --status done --validation-command '<command>' --validation-result passed --validation-summary '<summary>'`"""
+    else:
+        required_output = f"""- Learn the Manager-approved attempt mode with `hloop agent ack status {task_id} --attempt-id {str(task_meta.get('attempt_id') or '')}` before choosing a result path.
+- In `commit` mode, commit product changes first and use `worker submit` plus `worker finalize` without `--handoff`.
+- In `handoff` mode, do not run `git add` or `git commit`; use `worker submit --completion-mode handoff` and `worker finalize --handoff` so the Manager can seal the result."""
     return f"""You are Worker {task_id}.
 
 HLoop skill version: {SKILL_VERSION}
@@ -12128,6 +13321,7 @@ Loop profile:
 - Fixed Worker base SHA: {str(task_meta.get("base_sha") or "")}
 {report_contract_text(task_id, str(task_meta.get("attempt_id") or task_id), state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 {protocol}
+{revision_three_notice}
 
 Rules:
 - Edit only the files allowed by write_allow in {LOOP_DIR.as_posix()}/tasks/{task_id}.md.
@@ -12138,9 +13332,7 @@ Rules:
 - If the task needs a specification decision not present in MISSION/PLAN/task, write status: blocked.
 
 Required output:
-- Commit product changes first, leaving no unrelated dirty files.
-- Generate and commit the result with:
-  `python3 {Path(__file__).resolve()} {loop_namespace_flag()} worker finalize {task_id} --status done --validation-command '<command>' --validation-result passed --validation-summary '<summary>'`
+{required_output}
 - Repeat `--validation-command` and `--validation-result` in matching order for multiple checks.
 - For blocked or failed work, use the matching `--status` and `--blocking-question` instead of claiming done.
 
@@ -12268,6 +13460,7 @@ def render_reviewer_prompt(
     report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
+    repo: Path | None = None,
 ) -> str:
     review_protocol = canonical_review_protocol(state, "ordinary").protocol
     worker_qa_profile = state_worker_qa_profile(state)
@@ -12281,6 +13474,18 @@ def render_reviewer_prompt(
         worker_qa_profile,
         manager_qa_profile,
         branch_strategy,
+    )
+    reusable_l3 = (
+        fresh_l3_validation_evidence(state, head_sha, repo=repo)
+        if head_sha
+        else None
+    )
+    validation_guidance = (
+        "Fresh L3 Manager validation already covers this exact target. Reuse the generic "
+        "suite evidence and run only planned independent verification, finding reproduction, "
+        "or targeted checks; do not rerun the full generic suite."
+        if reusable_l3 is not None
+        else "No reusable fresh L3 evidence is recorded for this target; report validation gaps truthfully."
     )
     mode = review_plan.mode if review_plan is not None else "single"
     if mode == "single":
@@ -12319,6 +13524,7 @@ Directory artifact contract:
 - `MANIFEST.json` must follow `skills/herdr-dev-loop/schemas/review-manifest.schema.json`. Start from the immutable plan above, add each provider's actual `lanes`, normalized `findings`, planned verification assignments and shortfalls, actual verification `records`, and the recomputed `completeness` result. Never claim a missing or failed lane as completed.
 - Every provider Markdown must have frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, head_sha: {head_sha}, provider, status: reported|blocked|failed. Record lane results, candidates, refutations, and shortfalls for only that provider.
 - `FINAL.md` must have frontmatter: review_id, run_id: {str(state.get("run_id") or "")}, skill_version: {SKILL_VERSION}, base, head, head_sha: {head_sha}, status: reported|blocked|failed.
+- When the provider exposes actual per-lane metrics, add `lane_metric_observations` to `FINAL.md` frontmatter as a JSON array. Each item identifies the exact planned `provider` and `lane_id`, and may contain observed `runtime_seconds`, `timed_out`, `finding_candidate_count`, or `verified_finding_count`. Omit unavailable fields; never estimate them. HLoop checks the immutable epoch plan and manifest-backed counts while harvesting.
 - `FINAL.md` must summarize confirmed, refuted, needs-spec, and insufficient-evidence findings without promoting incomplete evidence.
 - Include `## Fix Task Candidates` in `FINAL.md`. A candidate is permitted only when all required manifest verification records for its fingerprint have `fact_status: confirmed`; include `source_finding: <sha256 fingerprint>` plus action, severity, write_allow, acceptance, and rationale. Non-confirmed or unknown fingerprints are rejected by `hloop triage`.
 - A task candidate must additionally carry `fact_status: confirmed`, `origin: introduced|diff-expanded-pre-existing`, `contract_relation: in_scope`, `decision_requirement: none`, `disposition: fix_now`, `release_effect: blocking|non_blocking`, a non-empty `why_fix_now`, and `requirement_refs` or `scope_refs`; otherwise `hloop triage` rejects it.
@@ -12354,6 +13560,7 @@ Review profile:
 - Review lanes: {", ".join(lanes)}
 - Review mode: {mode}
 - Agent backend: {agent_display(agent_config)}
+- Validation reuse: {validation_guidance}
 {report_contract_text(review_id, attempt_id or f"{review_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
 
 {protocol}
@@ -12388,6 +13595,7 @@ def render_gap_prompt(
     task_contract_digest: str = "",
     attempt_id: str = "",
     epoch_execution: hloop_review_epoch.EpochExecutionPlan | None = None,
+    repo: Path | None = None,
 ) -> str:
     agent_config = agent_config or role_agent_config(state or {}, "gap")
     if spec_sources:
@@ -12407,6 +13615,17 @@ Review epoch execution contract:
 {json.dumps(epoch_execution.to_record(), ensure_ascii=False, indent=2)}
 ```
 """
+    reusable_l3 = (
+        fresh_l3_validation_evidence(state or {}, head_sha, repo=repo)
+        if head_sha
+        else None
+    )
+    validation_guidance = (
+        "Fresh L3 Manager validation already covers this exact target. Reuse generic suite "
+        "evidence and limit execution to planned independent or gap-targeted checks."
+        if reusable_l3 is not None
+        else "No reusable fresh L3 evidence is recorded for this target."
+    )
     return f"""You are Gap Auditor {gap_id}.
 
 HLoop skill version: {SKILL_VERSION}
@@ -12420,6 +13639,7 @@ Compare:
 - base branch: {base_branch}
 - integration branch: {integration_branch}
 - Agent backend: {agent_display(agent_config)}
+- Validation reuse: {validation_guidance}
 
 You are running in a detached gap-audit worktree. Treat the target as read-only during investigation.
 
@@ -12449,6 +13669,7 @@ Output:
 - During investigation, do not write files.
 - After the audit is complete, write only {LOOP_DIR.as_posix()}/gaps/{gap_id}.md.
 - Include frontmatter: gap_id, run_id: {str((state or {}).get("run_id") or "")}, skill_version: {SKILL_VERSION}, base, head, head_sha: {head_sha}, status: aligned|gaps-found|blocked|failed, spec_sources, gap_count.
+- When the provider exposes actual per-lane metrics, add `lane_metric_observations` as a JSON array. Each item identifies the exact planned `provider` and `lane_id`, and may contain observed `runtime_seconds`, `timed_out`, `finding_candidate_count`, or `verified_finding_count`. Omit unavailable fields and never estimate them; HLoop validates every item against the immutable epoch plan.
 - If blocked or failed, still write the artifact with the concrete reason.
 - Include a `## Fix Task Candidates` section. For every missing or partial requirement that should become a Worker fix task, add:
   `### FTNNN: <title>`, `action: fix_task`, `priority: P0|P1|P2|P3`, non-empty `write_allow:`, non-empty `acceptance:`, and non-empty `rationale:`.
@@ -13096,7 +14317,12 @@ validation_commands: ["npm test -- --grep foo,bar"]
         "- Agent backend: claude:opus" in worker_prompt,
         "worker prompt ignored task-level worker agent backend override",
     )
-    check("worker finalize T001" in worker_prompt, "worker prompt omitted deterministic finalizer")
+    check(
+        "hloop agent ack status T001" in worker_prompt
+        and "worker finalize --handoff" in worker_prompt
+        and "worker finalize` without `--handoff" in worker_prompt,
+        "worker prompt omitted completion-mode-specific finalization guidance",
+    )
     check(
         f"herdr-dev-loop {SKILL_VERSION} / namespace {LOOP_NAMESPACE} / Worker T001" in worker_prompt,
         "worker prompt omitted first-message version identity",
@@ -17336,6 +18562,253 @@ def commit_worker_candidate_product(
         raise
 
 
+def _git_metadata_path(repo: Path, value: str) -> Path:
+    path = Path(value)
+    return (path if path.is_absolute() else repo / path).resolve()
+
+
+def _completion_probe_targets(
+    repo: Path, common_dir: Path, git_dir: Path
+) -> list[tuple[str, Path, str]]:
+    """Return the Git resources exercised by add/commit for this worktree."""
+
+    targets: list[tuple[str, Path, str]] = [
+        ("git-common-dir", common_dir, "directory"),
+        ("git-dir", git_dir, "directory"),
+        ("object-store", common_dir / "objects", "directory"),
+        ("index-lock", git_dir / "index.lock", "lock"),
+        ("head-lock", git_dir / "HEAD.lock", "lock"),
+        ("packed-refs-lock", common_dir / "packed-refs.lock", "lock"),
+        ("head-log", git_dir / "logs" / "HEAD", "append"),
+    ]
+    head_path = git_dir / "HEAD"
+    try:
+        head_text = head_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise HLoopError("Git HEAD cannot be read for completion probing") from exc
+    if head_text.startswith("ref: "):
+        ref_name = head_text.removeprefix("ref: ").strip()
+        try:
+            git(repo, ["check-ref-format", ref_name])
+        except (HLoopError, subprocess.CalledProcessError) as exc:
+            raise HLoopError("Git HEAD symbolic reference is invalid") from exc
+        ref_path = common_dir / ref_name
+        targets.extend(
+            (
+                ("reference-lock", ref_path.with_name(ref_path.name + ".lock"), "lock"),
+                ("reference-log", common_dir / "logs" / ref_name, "append"),
+            )
+        )
+    elif not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head_text):
+        raise HLoopError("Git HEAD is neither a symbolic reference nor a detached object id")
+    return targets
+
+
+def _nearest_existing_directory(path: Path) -> Path | None:
+    candidate = path if path.is_dir() else path.parent
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate if candidate.is_dir() else None
+
+
+def _probe_completion_resource(label: str, path: Path, kind: str) -> dict[str, str]:
+    """Probe one Git write resource without changing durable repository content."""
+
+    descriptor: int | None = None
+    directory_descriptor: int | None = None
+    created_path: Path | None = None
+    probe_path = path
+    detail = ""
+    try:
+        if kind == "directory":
+            if not path.is_dir():
+                raise OSError(getattr(os, "ENOENT", 2), "required directory is missing")
+            probe_path = path / f".hloop-write-probe-{uuid.uuid4().hex}"
+            detail = "create/fsync/unlink/fsync-dir passed"
+            descriptor = os.open(
+                probe_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            created_path = probe_path
+        elif kind == "lock":
+            if not path.parent.is_dir():
+                raise OSError(getattr(os, "ENOENT", 2), "lock parent is missing")
+            detail = "lock create/fsync/unlink/fsync-dir passed"
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            created_path = path
+        elif kind == "append" and path.exists():
+            flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            detail = "existing log append-open/fsync passed"
+            descriptor = os.open(path, flags)
+        elif kind == "append":
+            parent = _nearest_existing_directory(path)
+            if parent is None:
+                raise OSError(getattr(os, "ENOENT", 2), "log parent is unavailable")
+            probe_path = parent / f".hloop-log-probe-{uuid.uuid4().hex}"
+            detail = "future log parent create/fsync/unlink/fsync-dir passed"
+            descriptor = os.open(
+                probe_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            created_path = probe_path
+        else:
+            raise OSError(getattr(os, "EINVAL", 22), f"unsupported probe kind: {kind}")
+        if created_path is not None:
+            os.write(descriptor, b"hloop completion-mode probe\n")
+        os.fsync(descriptor)
+        closing_descriptor = descriptor
+        descriptor = None
+        os.close(closing_descriptor)
+        if created_path is not None:
+            created_path.unlink()
+            created_path = None
+        parent = probe_path if probe_path.is_dir() else probe_path.parent
+        directory_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        os.fsync(directory_descriptor)
+        closing_directory_descriptor = directory_descriptor
+        directory_descriptor = None
+        os.close(closing_directory_descriptor)
+        return {"resource": label, "path": str(path), "status": "writable", "detail": detail}
+    except OSError as exc:
+        return {
+            "resource": label,
+            "path": str(path),
+            "status": "unwritable",
+            "detail": f"{exc.__class__.__name__}: errno={exc.errno}",
+        }
+    finally:
+        for pending in (descriptor, directory_descriptor):
+            if pending is None:
+                continue
+            try:
+                os.close(pending)
+            except OSError:
+                pass
+        if created_path is not None:
+            try:
+                created_path.unlink()
+            except OSError:
+                pass
+
+
+def probe_completion_mode(repo: Path) -> dict[str, Any]:
+    """Select commit/handoff using a real, cleanup-verified Git metadata write.
+
+    Lock resources are created with O_EXCL and removed only after this process
+    successfully owns the descriptor.  Any lookup, write, cleanup, or
+    durability uncertainty fails closed to handoff.
+    """
+
+    checked_at = now_iso()
+    try:
+        common_dir = _git_metadata_path(
+            repo, git(repo, ["rev-parse", "--git-common-dir"])
+        )
+        git_dir = _git_metadata_path(repo, git(repo, ["rev-parse", "--git-dir"]))
+        targets = _completion_probe_targets(repo, common_dir, git_dir)
+    except (HLoopError, subprocess.CalledProcessError, OSError) as exc:
+        return {
+            "version": 1,
+            "mode": "handoff",
+            "status": "unknown",
+            "checked_at": checked_at,
+            "git_metadata_paths": [str(repo)],
+            "checks": [
+                {
+                    "resource": "git-metadata-lookup",
+                    "path": str(repo),
+                    "status": "unknown",
+                    "detail": f"git metadata lookup failed: {type(exc).__name__}",
+                }
+            ],
+        }
+    checks: list[dict[str, str]] = []
+    for label, path, kind in targets:
+        check = _probe_completion_resource(label, path, kind)
+        checks.append(check)
+        if check["status"] != "writable":
+            break
+    all_writable = len(checks) == len(targets) and all(
+        item["status"] == "writable" for item in checks
+    )
+    mode = "commit" if all_writable and checks else "handoff"
+    return {
+        "version": 1,
+        "mode": mode,
+        "status": "writable" if mode == "commit" else "unwritable",
+        "checked_at": checked_at,
+        "git_metadata_paths": list(
+            dict.fromkeys(str(path) for _label, path, _kind in targets)
+        )
+        or [str(repo)],
+        "checks": checks
+        or [
+            {
+                "resource": "git-metadata",
+                "path": str(repo),
+                "status": "unknown",
+                "detail": "no metadata paths",
+            }
+        ],
+    }
+
+
+def bound_completion_mode(
+    task_state: Mapping[str, Any],
+    requested_mode: str | None,
+    *,
+    revision: int | None,
+    require_recorded: bool = True,
+) -> str:
+    """Return the preflight-bound mode, rejecting late selection or drift."""
+
+    recorded = str(task_state.get("completion_mode") or "")
+    requested = str(requested_mode or "")
+    active_attempt = str(
+        task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""
+    )
+    recorded_attempt = str(task_state.get("completion_mode_attempt_id") or "")
+    if (
+        revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+        and require_recorded
+    ):
+        if not active_attempt:
+            raise HLoopError(
+                "revision 3 worker completion mode requires an active attempt binding"
+            )
+        if not recorded or not recorded_attempt:
+            raise HLoopError(
+                "revision 3 worker completion mode was not bound by the initial semantic ACK"
+            )
+        if recorded_attempt != active_attempt:
+            raise HLoopError(
+                "revision 3 worker completion mode is bound to a different attempt"
+            )
+    mode = recorded or requested
+    if revision != hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION and not mode:
+        mode = "commit"
+    if requested and recorded and requested != recorded:
+        raise HLoopError(
+            f"requested completion mode {requested!r} does not match preflight-bound mode {recorded!r}"
+        )
+    if mode not in hloop_worker_candidate.COMPLETION_MODES:
+        raise HLoopError(f"unsupported completion mode: {mode}")
+    return mode
+
+
 def cmd_worker_submit(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     local_state = load_state(repo)
@@ -17375,13 +18848,15 @@ def cmd_worker_submit(args: argparse.Namespace) -> int:
     if cached_diff_paths_no_renames(repo):
         raise HLoopError("worker submit refuses pre-staged changes")
 
-    mode = str(
-        args.completion_mode
-        or task_state.get("completion_mode")
-        or "commit"
+    mode = bound_completion_mode(
+        task_state,
+        args.completion_mode,
+        revision=task_contract_revision(meta),
+        # Runtime-created revision-3 barriers carry separate decision state.
+        # The abbreviated legacy barrier remains readable for pre-3.3 fixture
+        # compatibility, but cannot be produced by the current role launcher.
+        require_recorded=True,
     )
-    if mode not in hloop_worker_candidate.COMPLETION_MODES:
-        raise HLoopError(f"unsupported completion mode: {mode}")
     dirty_product = exact_product_dirty_paths(repo)
     if mode == "commit":
         commit_worker_candidate_product(repo, task_id, meta, dirty_product)
@@ -17577,6 +19052,11 @@ def cmd_worker_candidate_seal(args: argparse.Namespace) -> int:
     base_sha = str(task_state.get("worker_base_sha") or task_state.get("base_sha") or "")
     if candidate.base_sha != base_sha:
         raise HLoopError(f"candidate base SHA is stale for {task_id}")
+    bound_completion_mode(
+        task_state,
+        candidate.completion_mode,
+        revision=task_contract_revision(meta),
+    )
     dirty_product = exact_product_dirty_paths(worktree)
     if candidate.completion_mode == "commit":
         if dirty_product:
@@ -21160,6 +22640,7 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
             "result_path": committed_result,
             "committed_result_path": committed_result,
             "harvested_at": now_iso(),
+            "artifact_digest": _sha256_labelled(final_result.read_bytes()),
         }
     )
     cleanup_completed_agent_pane(
@@ -23070,6 +24551,628 @@ def normalize_validation_log_output(output: str) -> str:
     return "".join(pieces)
 
 
+def _validation_result_set_passes(results: Any) -> bool:
+    return bool(isinstance(results, Sequence) and results) and all(
+        isinstance(item, Mapping) and str(item.get("result") or "") == "passed"
+        for item in results
+    )
+
+
+def parse_independent_validation_attestations(
+    values: Any,
+    *,
+    commands: Sequence[str],
+    target_sha: str,
+    execution_id: str,
+) -> list[dict[str, Any]]:
+    """Validate exact command evidence attested by an authenticated role report."""
+
+    raw_values = normalize_list(values)
+    if len(raw_values) != len(commands):
+        raise HLoopError(
+            "independent validation report does not contain one attestation per command"
+        )
+    results: list[dict[str, Any]] = []
+    required = {
+        "record_type",
+        "execution_id",
+        "command",
+        "result",
+        "head_sha",
+        "evidence_ref",
+    }
+    for index, (raw, expected_command) in enumerate(
+        zip(raw_values, commands, strict=True), start=1
+    ):
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HLoopError(
+                f"independent validation attestation {index} is not JSON"
+            ) from exc
+        if not isinstance(item, Mapping) or set(item) != required:
+            raise HLoopError(
+                f"independent validation attestation {index} has an invalid shape"
+            )
+        expected = {
+            "record_type": "independent_validation_result",
+            "execution_id": execution_id,
+            "command": expected_command,
+            "result": "passed",
+            "head_sha": target_sha,
+        }
+        if any(str(item.get(key) or "") != value for key, value in expected.items()):
+            raise HLoopError(
+                f"independent validation attestation {index} does not match the "
+                "requested execution, command, target, and passing result"
+            )
+        evidence_ref = str(item.get("evidence_ref") or "").strip()
+        if not evidence_ref:
+            raise HLoopError(
+                f"independent validation attestation {index} lacks evidence_ref"
+            )
+        results.append(
+            {
+                "command": expected_command,
+                "result": "passed",
+                "evidence_ref": evidence_ref,
+            }
+        )
+    return results
+
+
+def independent_validation_role_is_terminal(
+    role_kind: str, role_state: Mapping[str, Any]
+) -> bool:
+    """Require the harvested role's own lifecycle to be terminal."""
+
+    if role_kind == "worker":
+        return str(role_state.get("status") or "") in {
+            "result_reported",
+            "merged",
+            "partial",
+            "blocked",
+            "failed",
+            "abandoned",
+        }
+    if role_kind in {"reviewer", "gap", "advisor"}:
+        return str(
+            role_state.get("gate_status") or role_state.get("status") or ""
+        ) in {
+            "reported",
+            "triaged",
+            "blocked_write_scope",
+            "consumed",
+        }
+    return False
+
+
+def authenticated_independent_validation_results(
+    repo: Path,
+    state: Mapping[str, Any],
+    *,
+    commands: Sequence[str],
+    target_sha: str,
+    execution_id: str,
+    role_id: str,
+    forbidden_event_id: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Import independent results from one separately authenticated role.
+
+    The Manager never executes these commands while assigning an arbitrary
+    role label.  Instead, the broker-authenticated role completion report
+    supplies exact JSON attestations and points to its harvested loop artifact.
+    """
+
+    if not role_id or role_id == "manager":
+        raise HLoopError("independent validation requires a non-Manager role")
+    try:
+        role_kind, role_state = resolve_agent_state(dict(state), role_id)
+    except HLoopError as exc:
+        raise HLoopError(
+            f"independent validation role is not registered in STATE: {role_id}"
+        ) from exc
+    attempt_id = str(
+        role_state.get("attempt_id") or role_state.get("active_attempt_id") or ""
+    )
+    if not attempt_id:
+        raise HLoopError(
+            f"independent validation role lacks an attempt identity: {role_id}"
+        )
+    if role_kind not in {"worker", "reviewer", "gap", "advisor"}:
+        raise HLoopError(
+            f"independent validation role has no canonical harvest artifact: {role_id}"
+        )
+    if (
+        not str(role_state.get("harvested_at") or "").strip()
+        or not independent_validation_role_is_terminal(role_kind, role_state)
+        or not artifact_was_harvested(role_state)
+    ):
+        raise HLoopError(
+            f"independent validation role is not terminal and harvested: {role_id}"
+        )
+    store = _open_broker_store(repo)
+    try:
+        with store.transaction() as transaction:
+            event = store.latest_role_event(
+                transaction,
+                run_id=str(state.get("run_id") or "local"),
+                role_id=role_id,
+                attempt_id=attempt_id,
+                report_type="completion",
+            )
+    except hloop_broker.BrokerStorageError as exc:
+        raise HLoopError(f"cannot read independent validation report: {exc}") from exc
+    if not isinstance(event, Mapping):
+        raise HLoopError(
+            f"independent validation role has no authenticated completion report: {role_id}"
+        )
+    event_id = str(event.get("event_id") or "")
+    if not event_id or (forbidden_event_id and event_id == forbidden_event_id):
+        raise HLoopError(
+            "independent validation requires a fresh authenticated role report"
+        )
+    expected_event_identity = {
+        "run_id": str(state.get("run_id") or "local"),
+        "role_id": role_id,
+        "attempt_id": attempt_id,
+        "type": "completion",
+    }
+    if any(str(event.get(key) or "") != value for key, value in expected_event_identity.items()):
+        raise HLoopError(
+            "independent validation report does not match the harvested role attempt"
+        )
+    if str(event.get("head_sha") or "") != target_sha:
+        raise HLoopError("independent validation report targets a different SHA")
+    artifact_ref = str(event.get("artifact") or "").strip()
+    if not artifact_ref or Path(artifact_ref).is_absolute():
+        raise HLoopError(
+            "independent validation report must reference a harvested loop artifact"
+        )
+    artifact_path = (repo / artifact_ref).resolve()
+    expected_artifact_path = agent_artifact_path(
+        repo,
+        dict(state),
+        role_id,
+        role_kind,
+        role_state,
+    ).resolve()
+    try:
+        artifact_path.relative_to(loop_path(repo).resolve())
+    except ValueError as exc:
+        raise HLoopError(
+            "independent validation artifact escapes the loop directory"
+        ) from exc
+    if not artifact_path.is_file():
+        raise HLoopError(
+            f"independent validation artifact is not harvested: {artifact_ref}"
+        )
+    if artifact_path != expected_artifact_path:
+        raise HLoopError(
+            "independent validation report does not reference the canonical harvested role artifact"
+        )
+    try:
+        expected_artifact_ref = expected_artifact_path.relative_to(repo.resolve()).as_posix()
+    except ValueError as exc:
+        raise HLoopError(
+            "canonical independent validation artifact escapes the repository"
+        ) from exc
+    if Path(artifact_ref).as_posix() != expected_artifact_ref:
+        raise HLoopError(
+            "independent validation report artifact path is not canonical"
+        )
+    observed_digest = _sha256_labelled(artifact_path.read_bytes())
+    event_digest = str(event.get("artifact_digest") or "")
+    if event_digest != observed_digest:
+        raise HLoopError(
+            "independent validation artifact digest does not match its completion report"
+        )
+    recorded_digest = str(
+        role_state.get("artifact_digest")
+        or role_state.get("result_artifact_digest")
+        or ""
+    )
+    if recorded_digest and recorded_digest != observed_digest:
+        raise HLoopError(
+            "independent validation artifact digest does not match harvested role state"
+        )
+    try:
+        artifact_meta = read_frontmatter(artifact_path)
+    except HLoopError as exc:
+        raise HLoopError(
+            f"independent validation artifact has invalid frontmatter: {exc}"
+        ) from exc
+    identity_error = artifact_identity_error(
+        dict(state), role_id, role_kind, role_state, artifact_meta
+    )
+    if identity_error:
+        raise HLoopError(
+            f"independent validation artifact identity mismatch: {identity_error}"
+        )
+    if str(artifact_meta.get("head_sha") or "") != target_sha:
+        raise HLoopError(
+            "independent validation artifact target does not match the requested SHA"
+        )
+    results = parse_independent_validation_attestations(
+        event.get("validation_results"),
+        commands=commands,
+        target_sha=target_sha,
+        execution_id=execution_id,
+    )
+    for result in results:
+        evidence_path_ref = str(result.get("evidence_ref") or "").split("#", 1)[0]
+        if not evidence_path_ref or Path(evidence_path_ref).is_absolute():
+            raise HLoopError(
+                "independent validation attestation evidence_ref is not artifact-bound"
+            )
+        candidates = {
+            (repo / evidence_path_ref).resolve(),
+            (loop_path(repo) / evidence_path_ref).resolve(),
+        }
+        if artifact_path not in candidates:
+            raise HLoopError(
+                "independent validation attestation does not reference the canonical artifact"
+            )
+    for result in results:
+        result.update(
+            {
+                "report_event_id": event_id,
+                "role_id": role_id,
+                "role_attempt_id": attempt_id,
+            }
+        )
+    return results, {
+        "execution_id": execution_id,
+        "role_id": role_id,
+        "role_attempt_id": attempt_id,
+        "report_event_id": event_id,
+        "artifact": artifact_ref,
+        "artifact_digest": observed_digest,
+    }
+
+
+def manager_validation_attempt_id(state: Mapping[str, Any]) -> str:
+    """Return the run-bound Manager attempt identity used for validation attestations."""
+
+    run_id = str(state.get("run_id") or "local")
+    return f"MGR-{hashlib.sha256(run_id.encode('utf-8')).hexdigest()[:16]}-A001"
+
+
+def manager_validation_artifact_payload(
+    state: Mapping[str, Any], record: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project the canonical, non-circular Manager validation artifact."""
+
+    provenance = record.get("execution_provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    identity = record.get("validation_identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    return {
+        "record_type": "manager_validation_attestation",
+        "run_id": str(state.get("run_id") or "local"),
+        "validation_id": str(record.get("validation_id") or ""),
+        "target_sha": str(record.get("head_sha") or ""),
+        "level": str(record.get("level") or ""),
+        "commands": [str(item) for item in normalize_list(record.get("commands"))],
+        "results": json.loads(
+            json.dumps(record.get("results") or [], ensure_ascii=False)
+        ),
+        "validation_identity": json.loads(json.dumps(identity, ensure_ascii=False)),
+        "validation_identity_digest": f"sha256:{_canonical_digest(identity)}",
+        "execution_id": str(provenance.get("execution_id") or ""),
+        "manager_role_id": str(provenance.get("role_id") or ""),
+        "manager_attempt_id": str(provenance.get("role_attempt_id") or ""),
+        "reused": bool(record.get("reused")),
+        "reuse_source_validation_id": str(
+            record.get("reuse_source_validation_id") or ""
+        ),
+        "completed_at": str(record.get("completed_at") or record.get("at") or ""),
+    }
+
+
+def manager_validation_event_results(
+    record: Mapping[str, Any], artifact_digest: str
+) -> list[str]:
+    provenance = record.get("execution_provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    return [
+        json.dumps(
+            {
+                "record_type": "manager_validation_result",
+                "validation_id": str(record.get("validation_id") or ""),
+                "execution_id": str(provenance.get("execution_id") or ""),
+                "command": str(item.get("command") or ""),
+                "result": str(item.get("result") or ""),
+                "head_sha": str(record.get("head_sha") or ""),
+                "artifact_digest": artifact_digest,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for item in (record.get("results") or [])
+        if isinstance(item, Mapping)
+    ]
+
+
+def record_manager_validation_attestation(
+    repo: Path,
+    state: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> dict[str, str]:
+    """Persist and broker-bind one official Manager validation execution."""
+
+    validation_id = str(record.get("validation_id") or "")
+    if not validation_id:
+        raise HLoopError("Manager validation attestation lacks validation_id")
+    target_sha = str(record.get("head_sha") or "")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", target_sha):
+        # A mocked or corrupt non-Git target may still be recorded as ordinary
+        # validation history for compatibility, but it receives no broker
+        # attestation and therefore can never qualify as fresh L3 evidence.
+        return {}
+    artifact_rel = LOOP_DIR / "validation" / f"{validation_id}-manager.json"
+    artifact_path = repo / artifact_rel
+    payload = manager_validation_artifact_payload(state, record)
+    _write_json_artifact(artifact_path, payload)
+    artifact_digest = _sha256_labelled(artifact_path.read_bytes())
+    identity = record.get("validation_identity")
+    if not isinstance(identity, Mapping):
+        raise HLoopError("Manager validation attestation lacks validation_identity")
+    report = {
+        "run_id": str(state.get("run_id") or "local"),
+        "role_id": "manager",
+        "attempt_id": manager_validation_attempt_id(state),
+        "task_contract_digest": _canonical_digest(identity),
+        "type": "completion",
+        "stage": f"validation/{str(record.get('level') or '')}",
+        "summary": f"Manager validation {validation_id} completed",
+        "artifact": artifact_rel.as_posix(),
+        "artifact_digest": artifact_digest,
+        "head_sha": target_sha,
+        "validation_results": manager_validation_event_results(
+            record, artifact_digest
+        ),
+        "residual_risks": ["none"],
+        "handoff": "Canonical Manager validation evidence recorded",
+        "next": "Use only while target and validation identity remain current",
+        "needs_manager": False,
+        "evidence_refs": [artifact_rel.as_posix()],
+        "created_at": now_iso(),
+    }
+    try:
+        client_event = hloop_events.prepare_client_event(report)
+        store = _open_broker_store(repo)
+        with store.transaction() as transaction:
+            stored = store.accept_report(transaction, client_event)
+            store.acknowledge_inbox(
+                transaction,
+                event_id=str(stored.event["event_id"]),
+                run_id=str(report["run_id"]),
+            )
+    except (
+        hloop_events.ReportValidationError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+    ) as exc:
+        raise HLoopError(f"cannot record Manager validation attestation: {exc}") from exc
+    return {
+        "report_event_id": str(stored.event["event_id"]),
+        "artifact": artifact_rel.as_posix(),
+        "artifact_digest": artifact_digest,
+        "validation_identity_digest": f"sha256:{_canonical_digest(identity)}",
+    }
+
+
+def manager_validation_provenance_is_current(
+    repo: Path,
+    state: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> bool:
+    """Verify canonical identity, history, artifact, and broker provenance."""
+
+    identity = record.get("validation_identity")
+    provenance = record.get("execution_provenance")
+    if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
+        return False
+    commands = [str(item) for item in normalize_list(record.get("commands"))]
+    result_commands = [
+        str(item.get("command") or "")
+        for item in (record.get("results") or [])
+        if isinstance(item, Mapping)
+    ]
+    if not commands or result_commands != commands:
+        return False
+    try:
+        current_identity = build_validation_identity(
+            repo, state, str(record.get("head_sha") or ""), commands
+        )
+    except (HLoopError, OSError, subprocess.CalledProcessError):
+        return False
+    if hloop_events.canonical_json(identity) != hloop_events.canonical_json(
+        current_identity
+    ):
+        return False
+    history = state.get("validation_history")
+    if not isinstance(history, list) or not any(
+        isinstance(item, Mapping)
+        and hloop_events.canonical_json(item) == hloop_events.canonical_json(record)
+        for item in history
+    ):
+        return False
+    validation_id = str(record.get("validation_id") or "")
+    event_id = str(provenance.get("report_event_id") or "")
+    artifact_ref = str(provenance.get("artifact") or "")
+    artifact_digest = str(provenance.get("artifact_digest") or "")
+    identity_digest = f"sha256:{_canonical_digest(identity)}"
+    expected_artifact_ref = (
+        LOOP_DIR / "validation" / f"{validation_id}-manager.json"
+    ).as_posix()
+    if any(
+        (
+            str(provenance.get("role_id") or "") != "manager",
+            str(provenance.get("role_attempt_id") or "")
+            != manager_validation_attempt_id(state),
+            not str(provenance.get("execution_id") or ""),
+            not event_id,
+            artifact_ref != expected_artifact_ref,
+            str(provenance.get("validation_identity_digest") or "")
+            != identity_digest,
+        )
+    ):
+        return False
+    artifact_path = (repo / artifact_ref).resolve()
+    if not artifact_path.is_file() or _sha256_labelled(
+        artifact_path.read_bytes()
+    ) != artifact_digest:
+        return False
+    try:
+        observed_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if observed_payload != manager_validation_artifact_payload(state, record):
+        return False
+    try:
+        store = _open_broker_store(repo)
+        with store.transaction() as transaction:
+            event = store.get_event(transaction, event_id=event_id)
+    except (hloop_broker.BrokerStorageError, OSError):
+        return False
+    if not isinstance(event, Mapping):
+        return False
+    expected_event = {
+        "run_id": str(state.get("run_id") or "local"),
+        "role_id": "manager",
+        "attempt_id": manager_validation_attempt_id(state),
+        "task_contract_digest": _canonical_digest(identity),
+        "type": "completion",
+        "stage": f"validation/{str(record.get('level') or '')}",
+        "artifact": expected_artifact_ref,
+        "artifact_digest": artifact_digest,
+        "head_sha": str(record.get("head_sha") or ""),
+        "validation_results": manager_validation_event_results(
+            record, artifact_digest
+        ),
+    }
+    return (
+        isinstance(event.get("sequence"), int)
+        and event.get("sequence", 0) > 0
+        and all(event.get(key) == value for key, value in expected_event.items())
+    )
+
+
+def fresh_l3_validation_evidence(
+    state: Mapping[str, Any],
+    target_sha: str,
+    *,
+    repo: Path | None = None,
+) -> dict[str, Any] | None:
+    """Return current L3 evidence only when every authoritative lane passes."""
+
+    record = state.get("last_validation")
+    if not isinstance(record, Mapping):
+        return None
+    if (
+        str(record.get("level") or "") != "L3"
+        or str(record.get("head_sha") or "") != target_sha
+        or bool(state.get("validation_stale"))
+        or bool(record.get("stale"))
+        or not _validation_result_set_passes(record.get("results"))
+    ):
+        return None
+    if repo is None or not manager_validation_provenance_is_current(
+        repo, state, record
+    ):
+        return None
+    required_independent_commands = normalize_list(
+        state.get("independent_validation_commands")
+    )
+    independent = record.get("independent_verification")
+    if required_independent_commands and not isinstance(independent, Mapping):
+        return None
+    if isinstance(independent, Mapping):
+        independent_commands = normalize_list(independent.get("commands"))
+        independent_results = independent.get("results")
+        result_commands = [
+            str(item.get("command") or "")
+            for item in independent_results or []
+            if isinstance(item, Mapping)
+        ]
+        if required_independent_commands and (
+            independent_commands != required_independent_commands
+            or result_commands != required_independent_commands
+        ):
+            return None
+        if (
+            independent_commands
+            and not _validation_result_set_passes(independent_results)
+        ) or (
+            independent_results
+            and not _validation_result_set_passes(independent_results)
+        ):
+            return None
+        if independent_commands or independent_results:
+            provenance = record.get("execution_provenance")
+            if not isinstance(provenance, Mapping):
+                return None
+            execution_id = str(provenance.get("execution_id") or "")
+            role_id = str(provenance.get("role_id") or "")
+            independent_execution_id = str(independent.get("execution_id") or "")
+            independent_role_id = str(independent.get("role_id") or "")
+            independent_attempt_id = str(
+                independent.get("role_attempt_id") or ""
+            )
+            independent_event_id = str(independent.get("report_event_id") or "")
+            independent_artifact = str(independent.get("artifact") or "")
+            if not all(
+                (
+                    execution_id,
+                    role_id,
+                    independent_execution_id,
+                    independent_role_id,
+                    independent_attempt_id,
+                    independent_event_id,
+                    independent_artifact,
+                )
+            ):
+                return None
+            if (
+                independent_execution_id == execution_id
+                or independent_role_id == role_id
+                or str(independent.get("source_execution_id") or "") != execution_id
+                or str(independent.get("source_role_id") or "") != role_id
+            ):
+                return None
+    return json.loads(json.dumps(record, ensure_ascii=False))
+
+
+def release_validation_is_current(
+    repo: Path | None,
+    state: Mapping[str, Any],
+    target_sha: str,
+) -> bool:
+    """Require authenticated canonical L3 evidence for schema-3.3 release gates."""
+
+    if normalize_int(state.get("schema_revision"), 0) >= 3:
+        return bool(
+            repo is not None
+            and fresh_l3_validation_evidence(state, target_sha, repo=repo) is not None
+        )
+    if normalize_bool(state.get("validation_stale")):
+        return False
+    validation = state.get("last_validation")
+    if not isinstance(validation, Mapping):
+        return False
+    results = validation.get("results")
+    return (
+        bool(results)
+        and str(validation.get("head_sha") or "") == target_sha
+        and all(
+            isinstance(item, Mapping) and item.get("result") == "passed"
+            for item in results
+        )
+    )
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -23087,7 +25190,151 @@ def cmd_validate(args: argparse.Namespace) -> int:
     state["completion_target_sha"] = head_sha
     _refresh_validation_staleness(repo, state)
     identity = build_validation_identity(repo, state, head_sha, commands)
+    level = str(getattr(args, "level", None) or "L3")
+    prior_validation = state.get("last_validation")
+    prior_independent = (
+        prior_validation.get("independent_verification")
+        if isinstance(prior_validation, Mapping)
+        else None
+    )
+    prior_auxiliary = (
+        prior_validation.get("auxiliary_validation")
+        if isinstance(prior_validation, Mapping)
+        else None
+    )
+    requested_independent = getattr(args, "independent_command", None)
+    if requested_independent is not None:
+        independent_source = requested_independent
+    elif "independent_validation_commands" in state:
+        # An explicit empty current configuration clears the group.  Falling
+        # through here would resurrect stale commands from last_validation.
+        independent_source = state.get("independent_validation_commands")
+    else:
+        independent_source = (
+            prior_independent.get("commands")
+            if isinstance(prior_independent, Mapping)
+            else None
+        )
+    independent_commands = normalize_list(independent_source)
+
+    requested_auxiliary = getattr(args, "auxiliary_command", None)
+    if requested_auxiliary is not None:
+        auxiliary_source = requested_auxiliary
+    elif "auxiliary_validation_commands" in state:
+        auxiliary_source = state.get("auxiliary_validation_commands")
+    else:
+        auxiliary_source = (
+            prior_auxiliary.get("commands")
+            if isinstance(prior_auxiliary, Mapping)
+            else None
+        )
+    auxiliary_commands = normalize_list(auxiliary_source)
+    validation_id = f"V{time.time_ns()}"
+    requested_validation_role = str(
+        getattr(args, "validation_role_id", None) or "manager"
+    )
+    if requested_validation_role != "manager":
+        raise HLoopError(
+            "official validation provenance is reserved for the Manager role"
+        )
+    execution_provenance = {
+        "execution_id": str(
+            getattr(args, "validation_execution_id", None)
+            or f"{validation_id}:official"
+        ),
+        "role_id": "manager",
+        "role_attempt_id": manager_validation_attempt_id(state),
+    }
+    independent_provenance: dict[str, str] = {}
+    independent_results: list[dict[str, Any]] = []
+    if independent_commands:
+        independent_execution_id = str(
+            getattr(args, "independent_execution_id", None) or ""
+        ).strip()
+        independent_role_id = str(
+            getattr(args, "independent_role_id", None) or ""
+        ).strip()
+        if not independent_execution_id or not independent_role_id:
+            raise HLoopError(
+                "independent validation requires --independent-execution-id and "
+                "--independent-role-id provenance"
+            )
+        if (
+            independent_execution_id == execution_provenance["execution_id"]
+            or independent_role_id == execution_provenance["role_id"]
+        ):
+            raise HLoopError(
+                "independent validation must use a different execution and role"
+            )
+        previous_independent_event_id = (
+            str(prior_independent.get("report_event_id") or "")
+            if isinstance(prior_independent, Mapping)
+            else ""
+        )
+        independent_results, independent_provenance = (
+            authenticated_independent_validation_results(
+                repo,
+                state,
+                commands=independent_commands,
+                target_sha=head_sha,
+                execution_id=independent_execution_id,
+                role_id=independent_role_id,
+                forbidden_event_id=previous_independent_event_id,
+            )
+        )
+        independent_provenance.update(
+            {
+            "source_execution_id": execution_provenance["execution_id"],
+            "source_role_id": execution_provenance["role_id"],
+            }
+        )
     validation_started = time.monotonic()
+
+    def run_validation_group(
+        group_commands: Sequence[str], *, group: str, index_offset: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        group_results: list[dict[str, Any]] = []
+        group_failed = False
+        for index, command in enumerate(group_commands, start=1):
+            if args.dry_run:
+                print(f"DRY RUN [{group}] {command}")
+                group_results.append({"command": command, "result": "dry-run"})
+                continue
+            validation_env = os.environ.copy()
+            validation_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            proc = subprocess.run(
+                command,
+                cwd=str(repo),
+                text=True,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=validation_env,
+            )
+            output = proc.stdout or ""
+            if output:
+                sys.stdout.write(output)
+                if not output.endswith("\n"):
+                    sys.stdout.write("\n")
+            log_rel = validation_log_rel(state, index_offset + index)
+            completed_at = now_iso()
+            header = (
+                f"group: {group}\ncommand: {command}\nhead_sha: {head_sha}\n"
+                f"completed_at: {completed_at}\nreturncode: {proc.returncode}\n\n"
+            )
+            write_text(repo / log_rel, header + normalize_validation_log_output(output))
+            result = "passed" if proc.returncode == 0 else f"failed:{proc.returncode}"
+            group_results.append(
+                {
+                    "command": command,
+                    "result": result,
+                    "returncode": proc.returncode,
+                    "log": log_rel.as_posix(),
+                }
+            )
+            if proc.returncode != 0:
+                group_failed = True
+        return group_results, group_failed
 
     def record_validation_history(record: dict[str, Any]) -> None:
         history = state.setdefault("validation_history", [])
@@ -23095,7 +25342,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
             history = []
             state["validation_history"] = history
         history.append(json.loads(json.dumps(record, ensure_ascii=False)))
-        del history[:-64]
 
     def apply_validation_transition(failed: bool) -> None:
         state["needs_validation"] = failed
@@ -23115,25 +25361,64 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             state["phase"] = "dispatching"
 
-    if not args.dry_run and _validation_reusable(state, identity):
+    reusable_record = state.get("last_validation")
+    reusable_level = (
+        str(reusable_record.get("level") or "")
+        if isinstance(reusable_record, Mapping)
+        else ""
+    )
+    if not reusable_level and not v053_state_contracts_enabled(state):
+        reusable_level = "L3"
+    if (
+        not args.dry_run
+        and reusable_level == level
+        and _validation_reusable(state, identity)
+        and (
+            level != "L3"
+            or fresh_l3_validation_evidence(state, head_sha, repo=repo) is not None
+        )
+    ):
         previous = state.get("last_validation")
         if not isinstance(previous, Mapping):
             raise HLoopError("passing validation evidence disappeared before reuse")
         reused_at = now_iso()
         reused_record = json.loads(json.dumps(previous, ensure_ascii=False))
+        independent_failed = False
+        auxiliary_results, _auxiliary_failed = run_validation_group(
+            auxiliary_commands, group="auxiliary", index_offset=200
+        )
+        source_validation_id = str(previous.get("validation_id") or "")
         reused_record.update(
             {
-                "validation_id": str(previous.get("validation_id") or f"V{time.time_ns()}"),
+                "validation_id": f"V{time.time_ns()}",
                 "at": reused_at,
                 "completed_at": reused_at,
                 "duration_seconds": 0.0,
                 "reused": True,
+                "fresh": True,
+                "level": level,
+                "reuse_source_validation_id": source_validation_id,
                 "reused_at": reused_at,
                 "head_sha": head_sha,
                 "commands": list(commands),
                 "batch_id": _validation_batch_id(state),
                 "validation_identity": identity,
+                "execution_provenance": execution_provenance,
+                "independent_verification": {
+                    "commands": list(independent_commands),
+                    "results": independent_results,
+                    "executed_on_reuse": True,
+                    **independent_provenance,
+                },
+                "auxiliary_validation": {
+                    "commands": list(auxiliary_commands),
+                    "results": auxiliary_results,
+                    "authoritative": False,
+                },
             }
+        )
+        execution_provenance.update(
+            record_manager_validation_attestation(repo, state, reused_record)
         )
         state["last_validation"] = reused_record
         record_validation_history(reused_record)
@@ -23148,7 +25433,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             if isinstance(item, Mapping) and item.get("result") == "passed"
         ]
         state["changed_file_validation"] = {
-            "status": "passed" if evidence_refs else "failed",
+            "status": "passed" if evidence_refs and not independent_failed else "failed",
             "target_sha": head_sha,
             "paths": inventory,
             "mapping": {path: list(evidence_refs) for path in inventory},
@@ -23159,7 +25444,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         metrics = state.get("execution_metrics")
         if isinstance(metrics, dict):
             metrics["validation_time_seconds"] = 0.0
-        apply_validation_transition(False)
+        apply_validation_transition(independent_failed)
         batch_id = str(reused_record.get("batch_id") or "")
         if batch_id and batch_id in state_batches(state):
             _refresh_batch_performance(state, batch_id)
@@ -23168,7 +25453,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         save_state(repo, state)
         journal(repo, f"Reused passing validation evidence for `{head_sha}`: {identity}")
         print(f"reused validation evidence for {head_sha}")
-        return 0
+        return 1 if independent_failed else 0
 
     validation_started_at = now_iso()
     results = []
@@ -23213,10 +25498,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
         if proc.returncode != 0:
             failed = True
             break
+    independent_failed = False
+    auxiliary_results, _auxiliary_failed = run_validation_group(
+        auxiliary_commands, group="auxiliary", index_offset=200
+    )
+    failed = failed or independent_failed
     if not args.dry_run:
         completed_at = now_iso()
         validation_record = {
-            "validation_id": f"V{time.time_ns()}",
+            "validation_id": validation_id,
             "at": completed_at,
             "started_at": validation_started_at,
             "completed_at": completed_at,
@@ -23225,9 +25515,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
             "commands": list(commands),
             "batch_id": _validation_batch_id(state),
             "validation_identity": identity,
+            "execution_provenance": execution_provenance,
             "reused": False,
+            "fresh": True,
+            "level": level,
             "results": results,
+            "independent_verification": {
+                "commands": list(independent_commands),
+                "results": independent_results,
+                "executed_on_reuse": False,
+                **independent_provenance,
+            },
+            "auxiliary_validation": {
+                "commands": list(auxiliary_commands),
+                "results": auxiliary_results,
+                "authoritative": False,
+            },
         }
+        execution_provenance.update(
+            record_manager_validation_attestation(repo, state, validation_record)
+        )
         state["last_validation"] = validation_record
         record_validation_history(validation_record)
         try:
@@ -23272,6 +25579,12 @@ def cmd_validation_configure(args: argparse.Namespace) -> int:
     if not commands:
         raise HLoopError("provide at least one --command")
     state["validation_commands"] = commands
+    state["independent_validation_commands"] = normalize_list(
+        getattr(args, "independent_command", None)
+    )
+    state["auxiliary_validation_commands"] = normalize_list(
+        getattr(args, "auxiliary_command", None)
+    )
     save_state(repo, state)
     journal(repo, f"Configured integration validation commands: {commands}")
     print("configured integration validation")
@@ -23418,6 +25731,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         agent_config=agent_config,
         head_sha=head_sha,
         review_plan=review_plan,
+        repo=repo,
     )
     agent_command, preview_invocation = role_agent_command(
         repo,
@@ -23494,6 +25808,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         agent_config=agent_config,
         head_sha=head_sha,
         review_plan=review_plan,
+        repo=repo,
     )
     task_contract_digest = prompt_contract_digest(prompt_without_identity)
     agent_command, provider_invocation = role_agent_command(
@@ -23534,6 +25849,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
+            repo=repo,
         )
         write_text(prompt_path, prompt)
         baseline_dirty = role_scope_paths(worktree)
@@ -23738,7 +26054,17 @@ def cmd_reviewer_harvest(args: argparse.Namespace) -> int:
     review_state["gate_status"] = "reported"
     review_state["artifact_status"] = artifact_status
     review_state["harvested_at"] = now_iso()
+    review_state["artifact_digest"] = _sha256_labelled(final_path.read_bytes())
     if harvested_manifest is not None:
+        lane_observations = reviewer_lane_metric_observations(
+            state,
+            review_id,
+            review_state,
+            harvested_manifest,
+            meta,
+        )
+        if lane_observations:
+            review_state["lane_metric_observations"] = lane_observations
         persist_finding_inventory(
             state,
             harvested_manifest,
@@ -23998,6 +26324,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         agent_config=agent_config,
         head_sha=head_sha,
         epoch_execution=epoch_execution,
+        repo=repo,
     )
     agent_command, preview_invocation = role_agent_command(
         repo,
@@ -24062,6 +26389,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         agent_config=agent_config,
         head_sha=head_sha,
         epoch_execution=epoch_execution,
+        repo=repo,
     )
     task_contract_digest = prompt_contract_digest(prompt_without_identity)
     agent_command, provider_invocation = role_agent_command(
@@ -24103,6 +26431,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
             epoch_execution=epoch_execution,
+            repo=repo,
         )
         write_text(prompt_path, prompt)
         baseline_dirty = role_scope_paths(worktree)
@@ -24231,6 +26560,15 @@ def cmd_gap_harvest(args: argparse.Namespace) -> int:
     gap_state["artifact_status"] = artifact_status
     gap_state["gap_count"] = meta.get("gap_count", "")
     gap_state["harvested_at"] = now_iso()
+    gap_state["artifact_digest"] = _sha256_labelled(final_path.read_bytes())
+    lane_observations = durable_lane_metric_observations(
+        state,
+        gap_id,
+        gap_state,
+        supplied=meta.get("lane_metric_observations"),
+    )
+    if lane_observations:
+        gap_state["lane_metric_observations"] = lane_observations
     cleanup_completed_agent_pane(
         repo,
         gap_state,
@@ -24776,6 +27114,7 @@ def cmd_advisor_harvest(args: argparse.Namespace) -> int:
     participant["gate_status"] = "reported"
     participant["artifact_status"] = artifact_status
     participant["harvested_at"] = now_iso()
+    participant["artifact_digest"] = _sha256_labelled(final_path.read_bytes())
     cleanup_completed_agent_pane(
         repo,
         participant,
@@ -26487,7 +28826,7 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
             submit_verify_ms=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
             submit_attempts=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         )
-        return send_manager_message_and_record(
+        delivery_code = send_manager_message_and_record(
             repo,
             state,
             agent,
@@ -26497,6 +28836,166 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
             message=notice,
             source="semantic-ack-resolution",
             args=delivery_args,
+        )
+        refreshed = load_state(repo)
+        _refreshed_role, refreshed_agent = resolve_agent_state(
+            refreshed, args.agent_id
+        )
+        refreshed_barrier = refreshed_agent.get("semantic_ack_barrier")
+        if isinstance(refreshed_barrier, dict):
+            application = refreshed_barrier.get("approval_application")
+            if isinstance(application, dict):
+                messages = refreshed_agent.get("manager_messages") or []
+                latest_message = messages[-1] if messages else {}
+                delivery_status = str(
+                    latest_message.get("delivery_status") or "unknown"
+                )
+                if delivery_status not in {"delivered", "undelivered", "unknown"}:
+                    delivery_status = "unknown"
+                application["status"] = delivery_status
+                application["notification_delivery_status"] = delivery_status
+                application["notification_updated_at"] = now_iso()
+                save_state(repo, refreshed)
+        # The semantic decision and application record are authoritative.
+        # Pane delivery is advisory and may be undelivered/unknown without
+        # rolling back an approved decision.
+        if delivery_code:
+            print(
+                f"{args.agent_id}: approval remains available; "
+                "pane notification was not confirmed"
+            )
+        return 0
+    application = barrier.get("approval_application")
+    if isinstance(application, dict):
+        application["notification_delivery_status"] = "not-required"
+        application["notification_updated_at"] = now_iso()
+        save_state(repo, state)
+    return 0
+
+
+def cmd_agent_ack_status(args: argparse.Namespace) -> int:
+    """Let a role learn and explicitly apply an approval without pane input."""
+
+    role_repo = repo_root(Path(args.repo).resolve())
+    manager_repo = str(os.environ.get("HLOOP_MANAGER_REPO") or "").strip()
+    repo = repo_root(
+        Path(manager_repo).resolve()
+        if manager_repo
+        else role_repo
+    )
+    state = load_state(repo)
+    role, agent = resolve_agent_state(state, args.agent_id)
+    attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
+    requested_attempt = str(getattr(args, "attempt_id", None) or "")
+    if requested_attempt and requested_attempt != attempt_id:
+        raise HLoopError(
+            f"ACK status attempt mismatch: active={attempt_id} requested={requested_attempt}"
+        )
+    barrier = agent.get("semantic_ack_barrier")
+    if not isinstance(barrier, dict):
+        raise HLoopError(f"no semantic ACK state for {args.agent_id}")
+    decision = barrier.get("semantic_decision")
+    application = barrier.get("approval_application")
+    if not isinstance(decision, Mapping) or not isinstance(application, dict):
+        raise HLoopError("semantic ACK state predates separate decision/application records")
+    acknowledge = bool(getattr(args, "acknowledge", False))
+    apply = bool(getattr(args, "apply", False))
+    if acknowledge or apply:
+        if str(decision.get("status") or "") != "approved":
+            raise HLoopError("only an approved semantic ACK can be applied")
+        if str(application.get("status") or "") not in {
+            "pending",
+            "delivered",
+            "acknowledged",
+            "applied",
+            "undelivered",
+            "unknown",
+        }:
+            raise HLoopError("semantic ACK approval is not available for application")
+        requested_status = "applied" if apply else "acknowledged"
+        current_application_status = str(application.get("status") or "")
+        already_satisfied = current_application_status == "applied" or (
+            requested_status == "acknowledged"
+            and current_application_status == "acknowledged"
+        )
+        if not already_satisfied:
+            decision_ack_event_id = str(decision.get("ack_event_id") or "")
+            message_id = str(barrier.get("message_id") or "")
+            digest = str(barrier.get("digest") or "")
+            if not decision_ack_event_id or not message_id or not re.fullmatch(
+                r"[0-9a-f]{64}", digest
+            ):
+                raise HLoopError(
+                    "semantic ACK application identity is incomplete or invalid"
+                )
+            credential = role_report_credential_path(
+                role_repo,
+                state,
+                role_id=args.agent_id,
+                attempt_id=attempt_id,
+            )
+            invocation_suffix = hashlib.sha256(
+                f"{message_id}\0{requested_status}".encode("utf-8")
+            ).hexdigest()[:24]
+            report_args = argparse.Namespace(
+                repo=str(role_repo),
+                role_id=args.agent_id,
+                attempt_id=attempt_id,
+                run_id=str(state.get("run_id") or "local"),
+                task_contract_digest=digest,
+                report_token=None,
+                report_credential_file=str(credential),
+                invocation_id=f"{attempt_id}:ack-application/{invocation_suffix}",
+                event_id=None,
+                file=None,
+                stdin=False,
+                type="attention",
+                stage="semantic-ack-application",
+                summary=(
+                    f"{args.agent_id} requests Manager application of approved "
+                    f"semantic ACK {decision_ack_event_id}"
+                ),
+                next="Manager consumer validates and applies this event under the loop lock",
+                evidence_ref=[f"semantic-ack:{decision_ack_event_id}"],
+                understood_goal=None,
+                scope=None,
+                acceptance=None,
+                approach=None,
+                risk=None,
+                impact="approved material work remains unavailable until Manager state records application",
+                attempted=["read the approved attempt-bound semantic ACK decision"],
+                option_text=["Manager consumer applies the authenticated event idempotently"],
+                recommendation="apply after exact run, role, attempt, digest, message, and ACK checks",
+                blocked_scope=["semantic ACK approval application state"],
+                artifact=None,
+                head_sha=None,
+                validation_result_ref=None,
+                residual_risk=None,
+                handoff=None,
+                approval_application={
+                    "message_id": message_id,
+                    "decision_ack_event_id": decision_ack_event_id,
+                    "requested_status": requested_status,
+                },
+            )
+            cmd_agent_report(report_args)
+    payload = {
+        "role": role,
+        "agent_id": args.agent_id,
+        "attempt_id": attempt_id,
+        "message_id": barrier.get("message_id"),
+        "semantic_decision": dict(decision),
+        "approval_application": dict(application),
+        "completion_mode": agent.get("completion_mode", ""),
+        "completion_mode_probe": agent.get("completion_mode_probe", {}),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"{args.agent_id}: decision={decision.get('status')} "
+            f"application={application.get('status')} "
+            f"completion_mode={agent.get('completion_mode') or 'n/a'}"
         )
     return 0
 
@@ -26589,6 +29088,10 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
             "candidate_sha",
             "candidate_tree_sha",
             "completion_mode",
+            "completion_mode_probe",
+            "completion_mode_attempt_id",
+            "completion_mode_ack_event_id",
+            "completion_mode_bound_at",
             "candidate_sealed_at",
             "patch_review_history",
             "current_patch_review",
@@ -27064,6 +29567,7 @@ _AGENT_REPORT_CONTENT_ARGS = (
     "recommendation",
     "blocked_scope",
     "artifact",
+    "artifact_digest",
     "head_sha",
     "validation_result_ref",
     "residual_risk",
@@ -27100,6 +29604,228 @@ def _read_agent_report_body(args: argparse.Namespace) -> dict[str, Any] | None:
             "report JSON contains unknown fields: " + ", ".join(sorted(unknown))
         )
     return body
+
+
+def retained_role_report_event(
+    outbox_path: Path,
+    *,
+    invocation_id: str | None = None,
+    event_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Read one retained explicit retry envelope without allocating a new one.
+
+    Worker ACKs contain a real Git-metadata probe whose timestamp is expected
+    to change between processes.  Explicit retries must therefore recover the
+    first retained envelope *before* probing again.  The broker still performs
+    the final semantic-content comparison, so changing any caller-controlled
+    report field remains an idempotency conflict.
+    """
+
+    if invocation_id is not None and event_id is not None:
+        raise HLoopError("use only one of --event-id or --invocation-id")
+    if invocation_id is None and event_id is None:
+        return None
+    try:
+        normalized_invocation = (
+            hloop_events.normalize_legacy_invocation_id(invocation_id)
+            if invocation_id is not None
+            else None
+        )
+        normalized_event_id = (
+            hloop_events.normalize_event_id(event_id)
+            if event_id is not None
+            else None
+        )
+    except hloop_events.ReportValidationError as exc:
+        raise HLoopError(f"invalid report retry identity: {exc}") from exc
+
+    events = retained_role_report_events(outbox_path)
+
+    matches: list[dict[str, Any]] = []
+    for event, recorded_invocation in events:
+        if (
+            normalized_invocation is not None
+            and recorded_invocation == normalized_invocation
+        ) or (
+            normalized_event_id is not None
+            and event["event_id"] == normalized_event_id
+        ):
+            matches.append(event)
+    if not matches:
+        return None
+    event_ids = {str(item["event_id"]) for item in matches}
+    if len(event_ids) != 1:
+        raise HLoopError("role report outbox contains ambiguous retry identities")
+    return matches[0]
+
+
+def retained_role_report_events(
+    outbox_path: Path,
+) -> list[tuple[dict[str, Any], str | None]]:
+    """Read every retained structured report envelope in original order."""
+
+    if not outbox_path.exists():
+        return []
+    lock_path = outbox_path.parent / f".{outbox_path.name}.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+            try:
+                raw = json.loads(outbox_path.read_text(encoding="utf-8"))
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HLoopError(f"cannot read role report outbox {outbox_path}: {exc}") from exc
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("entries"), list):
+        raise HLoopError(f"role report outbox has an invalid shape: {outbox_path}")
+
+    events: list[tuple[dict[str, Any], str | None]] = []
+    for entry in raw["entries"]:
+        if not isinstance(entry, Mapping):
+            # The legacy digest/event-id pair has no retained report body and
+            # therefore cannot safely supply completion-mode probe evidence.
+            continue
+        allowed = {
+            "semantic_digest",
+            "event",
+            "status",
+            "invocation_id",
+        }
+        if not set(entry).issubset(allowed) or not {"semantic_digest", "event"}.issubset(
+            entry
+        ):
+            raise HLoopError(f"role report outbox entry has an invalid shape: {outbox_path}")
+        try:
+            event = hloop_events.validate_client_event(entry["event"])
+            recorded_invocation = (
+                hloop_events.normalize_legacy_invocation_id(entry["invocation_id"])
+                if "invocation_id" in entry
+                else None
+            )
+        except hloop_events.ReportValidationError as exc:
+            raise HLoopError(f"role report outbox entry is invalid: {exc}") from exc
+        events.append((event, recorded_invocation))
+    return events
+
+
+def retained_worker_ack_event(
+    outbox_path: Path,
+    *,
+    run_id: str,
+    role_id: str,
+    attempt_id: str,
+    task_contract_digest: str | None = None,
+    semantic_content: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the first matching attempt ACK retained by the role outbox."""
+
+    matches: list[dict[str, Any]] = []
+    for event, _invocation_id in retained_role_report_events(outbox_path):
+        if any(
+            event.get(key) != value
+            for key, value in {
+                "run_id": run_id,
+                "role_id": role_id,
+                "attempt_id": attempt_id,
+                "type": "ack",
+            }.items()
+        ):
+            continue
+        if task_contract_digest is not None and event.get(
+            "task_contract_digest"
+        ) != task_contract_digest:
+            continue
+        if semantic_content is not None and any(
+            event.get(key) != value for key, value in semantic_content.items()
+        ):
+            continue
+        matches.append(event)
+    if not matches:
+        return None
+    modes = {
+        (
+            str(event.get("completion_mode") or ""),
+            hloop_events.canonical_json(event.get("completion_mode_probe") or {}),
+        )
+        for event in matches
+    }
+    if len(modes) != 1:
+        raise HLoopError("retained Worker ACKs disagree on attempt completion capability")
+    return matches[0]
+
+
+def worker_ack_completion_mode_probe(
+    repo: Path,
+    outbox_path: Path,
+    *,
+    run_id: str,
+    role_id: str,
+    attempt_id: str,
+    task_contract_digest: str,
+    supplied_mode: str = "",
+    invocation_id: str | None = None,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the attempt's first retained ACK probe or perform it once."""
+
+    retained = retained_role_report_event(
+        outbox_path,
+        invocation_id=invocation_id,
+        event_id=event_id,
+    )
+    if retained is not None:
+        expected_identity = {
+            "run_id": run_id,
+            "role_id": role_id,
+            "attempt_id": attempt_id,
+            "task_contract_digest": task_contract_digest,
+            "type": "ack",
+        }
+        if any(retained.get(key) != value for key, value in expected_identity.items()):
+            raise HLoopError("retained Worker ACK retry identity does not match this attempt")
+        probe = retained.get("completion_mode_probe")
+        retained_mode = str(retained.get("completion_mode") or "")
+        if not isinstance(probe, Mapping) or retained_mode not in {
+            "commit",
+            "handoff",
+        }:
+            raise HLoopError("retained Worker ACK lacks completion-mode probe evidence")
+        if supplied_mode and supplied_mode != retained_mode:
+            raise HLoopError(
+                f"ACK completion mode {supplied_mode!r} does not match retained "
+                f"preflight {retained_mode!r}"
+            )
+        return json.loads(json.dumps(probe, ensure_ascii=False))
+
+    attempt_ack = retained_worker_ack_event(
+        outbox_path,
+        run_id=run_id,
+        role_id=role_id,
+        attempt_id=attempt_id,
+    )
+    if attempt_ack is not None:
+        retained_mode = str(attempt_ack.get("completion_mode") or "")
+        probe = attempt_ack.get("completion_mode_probe")
+        if not isinstance(probe, Mapping) or retained_mode not in {
+            "commit",
+            "handoff",
+        }:
+            raise HLoopError("retained Worker ACK lacks completion-mode probe evidence")
+        if supplied_mode and supplied_mode != retained_mode:
+            raise HLoopError(
+                f"ACK completion mode {supplied_mode!r} does not match attempt-bound "
+                f"preflight {retained_mode!r}"
+            )
+        return json.loads(json.dumps(probe, ensure_ascii=False))
+
+    probe = probe_completion_mode(repo)
+    if supplied_mode and supplied_mode != probe["mode"]:
+        raise HLoopError(
+            f"ACK completion mode {supplied_mode!r} does not match fresh Git metadata "
+            f"preflight {probe['mode']!r}"
+        )
+    return probe
 
 
 def cmd_agent_report(args: argparse.Namespace) -> int:
@@ -27169,21 +29895,84 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
                 recommendation=args.recommendation or "",
                 blocked_scope=args.blocked_scope or [],
             )
+            application_evidence = getattr(args, "approval_application", None)
+            if application_evidence is not None:
+                content["approval_application"] = application_evidence
         elif report_type == "completion":
             content.update(
                 artifact=args.artifact or "",
+                artifact_digest=getattr(args, "artifact_digest", None) or "",
                 head_sha=args.head_sha or "",
                 validation_results=args.validation_result_ref or [],
                 residual_risks=args.residual_risk or [],
                 handoff=args.handoff or "",
             )
 
+    if report_type == "completion":
+        artifact_ref = str(content.get("artifact") or "").strip()
+        if artifact_ref and not Path(artifact_ref).is_absolute():
+            artifact_path = (repo / artifact_ref).resolve()
+            try:
+                artifact_path.relative_to(repo)
+            except ValueError:
+                artifact_path = Path()
+            if artifact_path.is_file():
+                observed_digest = _sha256_labelled(artifact_path.read_bytes())
+                supplied_digest = str(content.get("artifact_digest") or "").strip()
+                if supplied_digest and supplied_digest != observed_digest:
+                    raise HLoopError(
+                        "completion artifact digest does not match the reported artifact"
+                    )
+                content["artifact_digest"] = observed_digest
+
+    raw_event_id = getattr(args, "event_id", None)
+    raw_invocation_id = getattr(args, "invocation_id", None)
+    if raw_event_id is not None and raw_invocation_id is not None:
+        raise HLoopError("use only one of --event-id or --invocation-id")
+    role_id = str(args.role_id or "")
+    attempt_id = str(args.attempt_id or args.role_id or "")
+    task_contract_digest = str(
+        args.task_contract_digest
+        or hashlib.sha256(role_id.encode("utf-8")).hexdigest()
+    )
+    outbox_path = role_report_outbox_path(
+        repo,
+        run_id=str(run_id),
+        role_id=role_id,
+        attempt_id=attempt_id,
+    )
+
+    implicit_ack_retry: dict[str, Any] | None = None
+    if report_type == "ack" and role_id.startswith("T"):
+        if raw_invocation_id is None and raw_event_id is None:
+            implicit_ack_retry = retained_worker_ack_event(
+                outbox_path,
+                run_id=str(run_id),
+                role_id=role_id,
+                attempt_id=attempt_id,
+                task_contract_digest=task_contract_digest,
+                semantic_content=content,
+            )
+        supplied_mode = str(content.get("completion_mode") or "")
+        probe = worker_ack_completion_mode_probe(
+            repo,
+            outbox_path,
+            run_id=str(run_id),
+            role_id=role_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+            supplied_mode=supplied_mode,
+            invocation_id=raw_invocation_id,
+            event_id=raw_event_id,
+        )
+        content["completion_mode"] = probe["mode"]
+        content["completion_mode_probe"] = probe
+
     report: dict[str, Any] = {
         "run_id": run_id,
-        "role_id": args.role_id,
-        "attempt_id": args.attempt_id or args.role_id,
-        "task_contract_digest": args.task_contract_digest
-        or hashlib.sha256(args.role_id.encode("utf-8")).hexdigest(),
+        "role_id": role_id,
+        "attempt_id": attempt_id,
+        "task_contract_digest": task_contract_digest,
         "type": report_type,
         "needs_manager": report_type in {"ack", "attention"},
         "created_at": now_iso(),
@@ -27194,27 +29983,19 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
         normalized = hloop_events.validate_report(report)
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid report: {exc}") from exc
-    raw_event_id = getattr(args, "event_id", None)
-    raw_invocation_id = getattr(args, "invocation_id", None)
-    if raw_event_id is not None and raw_invocation_id is not None:
-        raise HLoopError("use only one of --event-id or --invocation-id")
     requested_event_id = None
     if raw_event_id is not None:
         try:
             requested_event_id = hloop_events.normalize_event_id(raw_event_id)
         except hloop_events.ReportValidationError as exc:
             raise HLoopError(f"invalid report: {exc}") from exc
+    elif implicit_ack_retry is not None:
+        requested_event_id = str(implicit_ack_retry["event_id"])
     invocation_id = None
     if raw_invocation_id is not None:
         # The outbox decides whether this is a retry of a retained 0.5.0 key
         # or a new 0.5.1 key.  New keys still require the shell-safe grammar.
         invocation_id = raw_invocation_id
-    outbox_path = role_report_outbox_path(
-        repo,
-        run_id=str(report["run_id"]),
-        role_id=str(report["role_id"]),
-        attempt_id=str(report["attempt_id"]),
-    )
     try:
         client_event = hloop_broker.role_outbox_client_event(
             outbox_path,
@@ -27344,6 +30125,8 @@ def manager_consumer_command_name(args: argparse.Namespace) -> str | None:
         manager_command = str(getattr(args, "manager_command", "") or "")
         if manager_command in {"next", "sleep"}:
             return f"manager {manager_command}"
+    if command == "validate":
+        return "validate"
     return None
 
 
@@ -27436,6 +30219,86 @@ def manager_consumer_preflight(args: argparse.Namespace, command: str) -> None:
     )
 
 
+def apply_semantic_ack_application_event(
+    state: dict[str, Any], event: Mapping[str, Any]
+) -> bool:
+    """Apply one authenticated broker event to Manager-owned ACK state."""
+
+    try:
+        normalized = hloop_events.validate_client_event(
+            {key: value for key, value in event.items() if key != "sequence"}
+        )
+    except hloop_events.ReportValidationError as exc:
+        raise HLoopError(f"invalid ACK application event: {exc}") from exc
+    evidence = normalized.get("approval_application")
+    if evidence is None:
+        return False
+    if normalized.get("type") != "attention" or normalized.get("stage") != (
+        "semantic-ack-application"
+    ):
+        raise HLoopError("ACK application evidence uses an invalid report type or stage")
+    if normalized.get("run_id") != str(state.get("run_id") or "local"):
+        raise HLoopError("ACK application event belongs to a different run")
+    role_id = str(normalized.get("role_id") or "")
+    _role, agent = resolve_agent_state(state, role_id)
+    attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
+    if not attempt_id or normalized.get("attempt_id") != attempt_id:
+        raise HLoopError("ACK application event belongs to a stale attempt")
+    barrier = agent.get("semantic_ack_barrier")
+    if not isinstance(barrier, Mapping):
+        raise HLoopError("ACK application event has no active semantic barrier")
+    decision = barrier.get("semantic_decision")
+    application = barrier.get("approval_application")
+    if not isinstance(decision, Mapping) or not isinstance(application, dict):
+        raise HLoopError("ACK application target lacks structured decision state")
+    if str(decision.get("status") or "") != "approved":
+        raise HLoopError("ACK application event targets a non-approved decision")
+    expected = {
+        "task_contract_digest": str(barrier.get("digest") or ""),
+        "message_id": str(barrier.get("message_id") or ""),
+        "decision_ack_event_id": str(decision.get("ack_event_id") or ""),
+    }
+    observed = {
+        "task_contract_digest": str(normalized.get("task_contract_digest") or ""),
+        "message_id": str(evidence.get("message_id") or ""),
+        "decision_ack_event_id": str(evidence.get("decision_ack_event_id") or ""),
+    }
+    if observed != expected:
+        raise HLoopError("ACK application event identity does not match the active decision")
+    requested_status = str(evidence.get("requested_status") or "")
+    current_status = str(application.get("status") or "")
+    if current_status == "superseded":
+        raise HLoopError("ACK application event targets a superseded barrier")
+    if current_status == "applied" or (
+        current_status == "acknowledged" and requested_status == "acknowledged"
+    ):
+        return False
+    if current_status not in {
+        "pending",
+        "delivered",
+        "acknowledged",
+        "undelivered",
+        "unknown",
+    }:
+        raise HLoopError(
+            f"ACK application cannot advance from status {current_status or 'missing'}"
+        )
+    applied_at = now_iso()
+    application["status"] = requested_status
+    application[f"{requested_status}_at"] = applied_at
+    application[f"{requested_status}_by"] = role_id
+    application["application_event_id"] = str(normalized.get("event_id") or "")
+    application["application_event_digest"] = str(
+        normalized.get("payload_digest") or ""
+    )
+    application["application_attempt_id"] = attempt_id
+    application["application_task_contract_digest"] = observed[
+        "task_contract_digest"
+    ]
+    application["updated_at"] = applied_at
+    return True
+
+
 def cmd_inbox_list(args: argparse.Namespace) -> int:
     manager_consumer_preflight(args, "inbox list")
     repo = repo_root(Path(args.repo).resolve())
@@ -27471,6 +30334,13 @@ def cmd_inbox_ack(args: argparse.Namespace) -> int:
     state = load_state(repo)
     store = _open_broker_store(repo)
     with store.transaction() as txn:
+        event = store.get_event(txn, event_id=args.event_id)
+    if event is None:
+        raise HLoopError(f"no such broker event: {args.event_id}")
+    if apply_semantic_ack_application_event(state, event):
+        save_state(repo, state)
+        journal(repo, f"Applied semantic ACK application event `{args.event_id}`.")
+    with store.transaction() as txn:
         result = store.acknowledge_inbox(
             txn,
             event_id=args.event_id,
@@ -27495,6 +30365,8 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
         args.manager_session_id or os.environ.get("HERDR_SESSION_ID") or "manager"
     )
     pane_id = args.pane_id or os.environ.get("HERDR_PANE_ID") or "manager"
+    sleep_started_at = now_iso()
+    sleep_started = time.monotonic()
     fallback_watches: list[hloop_supervisor.FallbackWatch] = []
     role_states = long_running_role_states(state)
     for role_state in role_states:
@@ -27532,6 +30404,9 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
         "returned_at": now_iso(),
     }
     last_manager_sleep = {
+        "started_at": sleep_started_at,
+        "returned_at": broker_lease["returned_at"],
+        "duration_seconds": round(max(0.0, time.monotonic() - sleep_started), 6),
         "reason": result.reason,
         "event_ids": list(result.event_ids),
         "drained_reports": result.drained_reports,
@@ -27560,6 +30435,10 @@ def cmd_manager_sleep(args: argparse.Namespace) -> int:
             )
         latest_state["broker_lease"] = broker_lease
         latest_state["last_manager_sleep"] = last_manager_sleep
+        history = latest_state.setdefault("manager_sleep_history", [])
+        if isinstance(history, list):
+            history.append(json.loads(json.dumps(last_manager_sleep, ensure_ascii=False)))
+            del history[:-128]
         save_state(repo, latest_state)
         journal(
             repo,
@@ -27599,9 +30478,24 @@ def cmd_manager_next(args: argparse.Namespace) -> int:
         unread = store.unconsumed_inbox(
             txn, run_id=str(state.get("run_id") or "local")
         )
+        events = [
+            store.get_event(txn, event_id=str(row["event_id"])) for row in unread
+        ]
     if not unread:
         print("no pending wakes")
         return 0
+    applied_event_ids = []
+    for event in events:
+        if event is not None and apply_semantic_ack_application_event(state, event):
+            applied_event_ids.append(str(event.get("event_id") or ""))
+    if applied_event_ids:
+        save_state(repo, state)
+        journal(
+            repo,
+            "Applied semantic ACK application event(s): "
+            + ", ".join(f"`{event_id}`" for event_id in applied_event_ids)
+            + ".",
+        )
     for row in unread:
         print(json.dumps(row, sort_keys=True))
     return 0
@@ -28113,6 +31007,209 @@ def cmd_requirement_status(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(path)
+    return 0
+
+
+def requirement_reconciliation_projection(
+    state: Mapping[str, Any], *, target_sha: str, repo: Path | None = None
+) -> dict[str, dict[str, Any]]:
+    """Recommend evidence-conservative requirement progress transitions.
+
+    Worker completion and agent reports can establish implementation progress,
+    but only already-valid Manager/HLoop evidence may retain or recommend the
+    verified state.  Generic suite success is never silently mapped to every
+    requirement.
+    """
+
+    requirements = state.get("requirements")
+    tasks = state.get("tasks")
+    if not isinstance(requirements, Mapping):
+        return {}
+    tasks = tasks if isinstance(tasks, Mapping) else {}
+    shared_evidence: list[str] = []
+    validation = fresh_l3_validation_evidence(state, target_sha, repo=repo)
+    if validation is not None:
+        shared_evidence.append(
+            "validation:" + str(validation.get("validation_id") or target_sha)
+        )
+    try:
+        convergence = convergence_draft_projection(state, target_sha, repo=repo)
+    except HLoopError:
+        convergence = None
+    if isinstance(convergence, Mapping):
+        shared_evidence.extend(
+            str(item.get("artifact_ref") or "")
+            for item in convergence.get("executions", [])
+            if isinstance(item, Mapping) and str(item.get("artifact_ref") or "")
+        )
+    projection: dict[str, dict[str, Any]] = {}
+    terminal_implemented = {"merged"}
+    active = {"queued", "starting", "running", "awaiting_result", "failed_validation"}
+    for requirement_id, requirement in sorted(requirements.items()):
+        requirement_id = str(requirement_id)
+        record = requirement if isinstance(requirement, Mapping) else {}
+        linked = sorted(
+            str(task_id)
+            for task_id, task in tasks.items()
+            if isinstance(task, Mapping)
+            and requirement_id in normalize_list(
+                task.get("requirement_refs") or task.get("requirement_ref")
+            )
+        )
+        statuses = [
+            str(tasks[task_id].get("status") or "")
+            for task_id in linked
+            if isinstance(tasks.get(task_id), Mapping)
+        ]
+        current_status = "not_started"
+        raw_progress = record.get("progress")
+        valid_verified = False
+        if isinstance(raw_progress, Mapping):
+            current_status = str(raw_progress.get("status") or "not_started")
+            if current_status == "verified":
+                try:
+                    parsed = hloop_requirements.RequirementProgress.from_record(raw_progress)
+                    evidence_heads = {
+                        item.head_sha for item in parsed.evidence if item.head_sha
+                    }
+                    valid_verified = evidence_heads == {target_sha}
+                except hloop_requirements.RequirementModelError:
+                    valid_verified = False
+        if current_status == "superseded":
+            recommended = "superseded"
+            reason = "terminal superseded progress is preserved"
+        elif str(record.get("status") or "") == "superseded":
+            recommended = "superseded"
+            reason = "requirement ledger marks this requirement superseded"
+        elif current_status == "verified":
+            recommended = "verified"
+            reason = (
+                "existing authoritative artifact and test/QA evidence matches target"
+                if valid_verified
+                else "verified progress requires explicit evidence repair before any downgrade"
+            )
+        elif linked and statuses and all(item in terminal_implemented for item in statuses):
+            recommended = "implemented_unverified"
+            reason = "all linked tasks are implemented; requirement-specific verification is absent"
+        elif any(item in active | {"done", "result_reported"} for item in statuses):
+            if current_status == "implemented_unverified":
+                recommended = current_status
+                reason = "existing implemented progress is preserved while linked work remains active"
+            else:
+                recommended = "in_progress"
+                reason = "one or more linked tasks remain active"
+        else:
+            recommended = current_status
+            reason = (
+                "no linked implementation evidence"
+                if current_status == "not_started"
+                else "explicit progress is preserved without contrary evidence"
+            )
+        projection[requirement_id] = {
+            "current_status": current_status,
+            "recommended_status": recommended,
+            "task_ids": linked,
+            "task_statuses": statuses,
+            "target_sha": target_sha,
+            "reason": reason,
+            "evidence_refs": [
+                *(f"task:{task_id}:{tasks[task_id].get('status')}" for task_id in linked),
+                *shared_evidence,
+            ],
+            "auto_verified": False,
+        }
+    return projection
+
+
+def _apply_reconciled_requirement_progress(
+    current: hloop_requirements.RequirementProgress,
+    recommended: str,
+    *,
+    task_ids: Sequence[str],
+) -> hloop_requirements.RequirementProgress:
+    if current.status == "superseded":
+        return hloop_requirements.transition_progress(
+            current, "superseded", task_ids=tuple(task_ids)
+        )
+    if current.status == recommended:
+        return hloop_requirements.transition_progress(
+            current, recommended, task_ids=tuple(task_ids)
+        )
+    route: list[str]
+    if current.status == "not_started" and recommended == "implemented_unverified":
+        route = ["in_progress", "implemented_unverified"]
+    elif current.status in {"blocked", "deferred"} and recommended == "implemented_unverified":
+        route = ["in_progress", "implemented_unverified"]
+    else:
+        route = [recommended]
+    updated = current
+    for status in route:
+        updated = hloop_requirements.transition_progress(
+            updated,
+            status,
+            task_ids=tuple(task_ids),
+            blockers=() if status != "blocked" else updated.blockers,
+            remaining_work=(
+                "requirement-specific Manager/HLoop verification remains"
+                if status == "implemented_unverified"
+                else updated.remaining_work
+            ),
+        )
+    return updated
+
+
+def cmd_requirements_reconcile(args: argparse.Namespace) -> int:
+    reconcile_started = time.monotonic()
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    target = current_integration_target(repo, state)
+    if not target:
+        raise HLoopError("requirements reconcile requires a current integration target")
+    projection = requirement_reconciliation_projection(
+        state, target_sha=target, repo=repo
+    )
+    if args.apply:
+        for requirement_id, suggestion in projection.items():
+            requirement = require_requirement(state, requirement_id)
+            current = requirement_progress_from_state(state, requirement_id)
+            recommended = str(suggestion["recommended_status"])
+            if current.status == "verified" and recommended != "verified":
+                # A stale verified record requires explicit evidence repair;
+                # reconciliation reports it but never manufactures a downgrade.
+                continue
+            try:
+                updated = _apply_reconciled_requirement_progress(
+                    current,
+                    recommended,
+                    task_ids=tuple(suggestion["task_ids"]),
+                )
+            except hloop_requirements.RequirementModelError as exc:
+                raise HLoopError(
+                    f"cannot reconcile {requirement.requirement_id}: {exc}"
+                ) from exc
+            state["requirements"][requirement_id]["progress"] = updated.to_record()
+        write_requirement_artifacts(repo, state)
+        write_progress_artifact(repo, state)
+        _record_metric_duration(
+            state,
+            "artifact_reconcile_time_seconds",
+            time.monotonic() - reconcile_started,
+        )
+        save_state(repo, state)
+        journal(repo, f"Applied evidence-conservative requirement reconciliation for `{target}`.")
+    payload = {
+        "target_sha": target,
+        "applied": bool(args.apply),
+        "requirements": projection,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        for requirement_id, suggestion in projection.items():
+            print(
+                f"{requirement_id}: {suggestion['current_status']} -> "
+                f"{suggestion['recommended_status']} ({suggestion['reason']})"
+            )
     return 0
 
 
@@ -29095,8 +32192,12 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("role agents are still running")
     if unsafe_dirty_paths(repo):
         errors.append("Manager checkout has non-loop dirty files")
-    if not last_validation_passed(state):
-        errors.append("current completion target lacks passing validation")
+    if not release_validation_is_current(repo, state, target):
+        errors.append(
+            "current completion target lacks fresh authenticated L3 validation"
+            if normalize_int(state.get("schema_revision"), 0) >= 3
+            else "current completion target lacks passing validation"
+        )
     errors.extend(_finish_accepted_risk_errors(repo, state, target))
     if not review_gate_passed(state):
         errors.append("current completion target lacks a closed review gate")
@@ -29217,7 +32318,7 @@ def build_outcome_report(
         str(item.get("log") or item.get("command") or "validation")
         for item in validation_results
     ]
-    validation_status = "passed" if last_validation_passed(state) else (
+    validation_status = "passed" if release_validation_is_current(repo, state, target) else (
         "failed"
         if any(validation_result_failed(item.get("result")) for item in validation_results)
         else "pending"
@@ -29400,7 +32501,11 @@ def build_outcome_report(
     kwargs = {
         "run_id": str(state.get("run_id") or "local"),
         "goal": str(state.get("goal") or state.get("goal_id") or "HLoop goal"),
-        "generated_at": now_iso(),
+        "generated_at": (
+            str(state.get("finished_at") or "")
+            if kind == "FINAL"
+            else now_iso()
+        ),
         "requirement_progress": requirement_progress,
         "gates": tuple(gates),
         "integration_target_sha": target,
@@ -29422,6 +32527,15 @@ def build_outcome_report(
         ),
         "blocking_reason": blocking_reason,
     }
+    if kind == "FINAL":
+        kwargs.update(
+            {
+                "phase": str(state.get("phase") or ""),
+                "final_target_sha": str(state.get("final_target_sha") or ""),
+                "finished_at": str(state.get("finished_at") or ""),
+                "terminal_outcome": dict(state.get("terminal_outcome") or {}),
+            }
+        )
     kwargs.update(hloop_reports.report_projections_from_state(state))
     try:
         if kind == "FINAL":
@@ -29446,7 +32560,53 @@ def write_outcome_report(repo: Path, report: hloop_reports.OutcomeReport) -> Pat
     return path
 
 
+def terminal_finish_snapshot_error(
+    state: Mapping[str, Any], target_sha: str
+) -> str:
+    """Return a deterministic recovery error for a persisted done snapshot."""
+
+    if str(state.get("phase") or "") != "done":
+        return "terminal phase is not done"
+    if str(state.get("final_target_sha") or "") != target_sha:
+        return "terminal final target does not match the integration target"
+    finished_at = str(state.get("finished_at") or "")
+    if _parse_metric_timestamp(finished_at) is None:
+        return "terminal finished_at is missing or invalid"
+    terminal = state.get("terminal_outcome")
+    expected = {
+        "status": "done",
+        "target_sha": target_sha,
+        "recorded_at": finished_at,
+        "report": (LOOP_DIR / "reports" / "FINAL.md").as_posix(),
+    }
+    if not isinstance(terminal, Mapping) or dict(terminal) != expected:
+        return "terminal outcome does not match phase, target, finished_at, and report"
+    return ""
+
+
+def recover_or_confirm_final_report(
+    repo: Path, state: dict[str, Any], target_sha: str
+) -> tuple[Path, bool]:
+    """Converge a persisted done snapshot to its exact FINAL projection."""
+
+    snapshot_error = terminal_finish_snapshot_error(state, target_sha)
+    if snapshot_error:
+        raise HLoopError(f"cannot recover finished run: {snapshot_error}")
+    outcome = build_outcome_report(repo, state, kind="FINAL")
+    report_path = loop_path(repo) / "reports" / "FINAL.md"
+    expected = hloop_reports.render_outcome_markdown(outcome)
+    if report_path.is_file():
+        try:
+            if read_text(report_path) == expected:
+                return report_path, False
+        except HLoopError:
+            pass
+    write_text(report_path, expected)
+    return report_path, True
+
+
 def cmd_finish(args: argparse.Namespace) -> int:
+    finish_started = time.monotonic()
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True)
     target = git(repo, ["rev-parse", str(state["integration_branch"])])
@@ -29459,7 +32619,13 @@ def cmd_finish(args: argparse.Namespace) -> int:
             commit_count=advancing_commit_count(repo, final_target, target),
         )
         if diagnostic is None:
-            print(f"already finished at {target}")
+            report_path, recovered = recover_or_confirm_final_report(
+                repo, state, target
+            )
+            if recovered:
+                print(f"recovered final report at {target}: {report_path}")
+            else:
+                print(f"already finished at {target}")
             return 0
         raise HLoopError(str(diagnostic.message))
     if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
@@ -29469,9 +32635,13 @@ def cmd_finish(args: argparse.Namespace) -> int:
         state["phase"] = "ready_to_finish" if not errors else state.get("phase", "dispatching")
         save_state(repo, state)
         raise HLoopError("cannot finish: " + "; ".join(errors))
-    outcome = build_outcome_report(repo, state, kind="FINAL")
     write_requirement_artifacts(repo, state)
     write_progress_artifact(repo, state)
+    _record_metric_duration(
+        state,
+        "finish_preparation_time_seconds",
+        time.monotonic() - finish_started,
+    )
     state["phase"] = "done"
     state["final_target_sha"] = target
     state["finished_at"] = now_iso()
@@ -29481,8 +32651,11 @@ def cmd_finish(args: argparse.Namespace) -> int:
         "recorded_at": state["finished_at"],
         "report": (LOOP_DIR / "reports" / "FINAL.md").as_posix(),
     }
-    report_path = write_outcome_report(repo, outcome)
+    # Persist one complete terminal identity before projecting FINAL.  If the
+    # report write fails, the next finish invocation reconstructs the exact
+    # report from this durable snapshot instead of minting a new timestamp.
     save_state(repo, state)
+    report_path, _recovered = recover_or_confirm_final_report(repo, state, target)
     journal(repo, f"Finished loop at `{target}` after all completion gates passed.")
     print(f"finished at {target}; report: {report_path}")
     return 0
@@ -29793,6 +32966,13 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--manifest")
             command_parser.add_argument("--fix-round", type=int)
         command_parser.set_defaults(func=func)
+    convergence_draft = convergence_sub.add_parser(
+        "draft",
+        help="project same-SHA reviewer, gap, and fresh L3 evidence without claiming final review",
+    )
+    convergence_draft.add_argument("--json", action="store_true")
+    convergence_draft.add_argument("--dry-run", action="store_true")
+    convergence_draft.set_defaults(func=cmd_review_convergence_draft)
 
     reopen = review_sub.add_parser("reopen", help="apply an explicit user-authorized review reopen transition")
     reopen.add_argument(
@@ -30085,6 +33265,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument("--recommendation")
     agent_report.add_argument("--blocked-scope", action="append")
     agent_report.add_argument("--artifact")
+    agent_report.add_argument("--artifact-digest")
     agent_report.add_argument("--head-sha")
     agent_report.add_argument("--validation-result-ref", action="append")
     agent_report.add_argument("--residual-risk", action="append")
@@ -30103,6 +33284,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_ack_resolve.add_argument("--reason", required=True)
     agent_ack_resolve.set_defaults(func=cmd_agent_ack_resolve)
+    agent_ack_status = agent_ack_sub.add_parser(
+        "status",
+        help="read or explicitly apply the persisted semantic ACK approval",
+    )
+    agent_ack_status.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    agent_ack_status.add_argument("--attempt-id")
+    ack_status_transition = agent_ack_status.add_mutually_exclusive_group()
+    ack_status_transition.add_argument("--acknowledge", action="store_true")
+    ack_status_transition.add_argument("--apply", action="store_true")
+    agent_ack_status.add_argument("--json", action="store_true")
+    agent_ack_status.set_defaults(func=cmd_agent_ack_status)
 
     runtime = sub.add_parser("runtime", help="runtime trust and identity operations")
     runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
@@ -30242,6 +33434,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     requirements_status.add_argument("--json", action="store_true")
     requirements_status.set_defaults(func=cmd_requirement_status)
+    requirements_reconcile = requirements_sub.add_parser(
+        "reconcile",
+        help="project requirement progress and apply it only with explicit authorization",
+    )
+    requirements_reconcile_mode = requirements_reconcile.add_mutually_exclusive_group()
+    requirements_reconcile_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the read-only reconciliation projection without changing artifacts or state",
+    )
+    requirements_reconcile_mode.add_argument("--apply", action="store_true")
+    requirements_reconcile.add_argument("--json", action="store_true")
+    requirements_reconcile.set_defaults(func=cmd_requirements_reconcile)
 
     context_cmd = sub.add_parser("context", help="source-linked durable Manager context")
     context_sub = context_cmd.add_subparsers(dest="context_command", required=True)
@@ -30761,6 +33966,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = sub.add_parser("validate", help="run integration validation")
     validate.add_argument("--command", dest="validation_command", action="append")
+    validate.add_argument("--level", choices=["L1", "L2", "L3"], default="L3")
+    validate.add_argument("--independent-command", action="append")
+    validate.add_argument("--validation-execution-id")
+    validate.add_argument("--validation-role-id")
+    validate.add_argument("--independent-execution-id")
+    validate.add_argument("--independent-role-id")
+    validate.add_argument("--auxiliary-command", action="append")
     validate.add_argument("--no-cleanup", action="store_true")
     validate.add_argument("--dry-run", action="store_true")
     validate.set_defaults(func=cmd_validate)
@@ -30802,6 +34014,8 @@ def build_parser() -> argparse.ArgumentParser:
     validation_sub = validation.add_subparsers(dest="validation_command_name", required=True)
     validation_configure = validation_sub.add_parser("configure")
     validation_configure.add_argument("--command", dest="validation_command", action="append", required=True)
+    validation_configure.add_argument("--independent-command", action="append")
+    validation_configure.add_argument("--auxiliary-command", action="append")
     validation_configure.set_defaults(func=cmd_validation_configure)
 
     harvest = sub.add_parser(

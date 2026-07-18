@@ -40,6 +40,24 @@ class HLoopV05IntegrationTests(unittest.TestCase):
         return repo
 
     def run_cli(self, argv):
+        argv = list(argv)
+        for index in range(len(argv) - 1):
+            if argv[index : index + 2] == ["task", "new"] and "--preserved-invariant" not in argv:
+                argv.extend(
+                    [
+                        "--preserved-invariant",
+                        "preserve integration fixture behavior",
+                        "--regression-check",
+                        "run the integration fixture regression",
+                        "--risk-class",
+                        "normal",
+                        "--required-gate",
+                        "patch_review",
+                        "--required-gate",
+                        "full_suite",
+                    ]
+                )
+                break
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -113,7 +131,7 @@ effort = "medium"
 
                 state_path = self.init_loop(repo, "config-snapshot")
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                self.assertEqual((state["state_format_version"], state["schema_revision"]), (3, 2))
+                self.assertEqual((state["state_format_version"], state["schema_revision"]), (3, 3))
                 self.assertEqual(state["max_workers"], 5)
                 self.assertEqual(state["session_cleanup"], "delete")
                 self.assertEqual(state["worker_agent_provider"], "claude")
@@ -131,26 +149,40 @@ effort = "medium"
                 state["state_format_version"] = 2
                 state.pop("schema_revision", None)
                 state["skill_version"] = "0.4.0"
+                state.pop("first_v053_mutation_at", None)
+                state.pop("first_v053_mutation_command", None)
                 state_path.write_text(json.dumps(state), encoding="utf-8")
 
                 prefix = ["--repo", str(repo), "--namespace", "migration", "migrate"]
                 code, output, error = self.run_cli([*prefix, "--dry-run"])
                 self.assertEqual((code, error), (0, ""), output)
                 plan = json.loads(output)
-                self.assertEqual((plan["to_format"], plan["to_revision"]), (3, 2))
+                self.assertEqual((plan["to_format"], plan["to_revision"]), (3, 3))
                 self.assertEqual(
                     plan["applied_steps"],
-                    ["format-2-to-3", "format-3-revision-1", "format-3-revision-2"],
+                    [
+                        "format-2-to-3",
+                        "format-3-revision-1",
+                        "format-3-revision-2",
+                        "format-3-revision-3",
+                    ],
                 )
                 code, output, error = self.run_cli([*prefix, "--apply"])
                 self.assertEqual((code, error), (0, ""), output)
                 migrated = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(
                     (migrated["state_format_version"], migrated["schema_revision"]),
-                    (3, 2),
+                    (3, 3),
                 )
                 self.assertIn("artifact_policy", migrated)
-                self.assertEqual(len(list((state_path.parent / "migration").glob("STATE.v2.r0.*.json"))), 1)
+                marker = hloop.load_migration_marker(repo)
+                self.assertEqual(marker["status"], "committed")
+                archived_state = (
+                    hloop.migration_generation_root(repo, marker["migration_generation"])
+                    / "archive"
+                    / state_path.relative_to(repo)
+                )
+                self.assertTrue(archived_state.is_file())
 
     def test_format_three_revision_zero_migrates_and_current_contract_requires_revision(self):
         skill_root = SCRIPT.parents[1]
@@ -172,6 +204,8 @@ effort = "medium"
                 state_path = self.init_loop(repo, "revision-zero")
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 state.pop("schema_revision")
+                state.pop("first_v053_mutation_at", None)
+                state.pop("first_v053_mutation_command", None)
                 state_path.write_text(json.dumps(state), encoding="utf-8")
 
                 prefix = ["--repo", str(repo), "--namespace", "revision-zero", "migrate"]
@@ -181,7 +215,11 @@ effort = "medium"
                 self.assertEqual((plan["from_format"], plan["from_revision"]), (3, 0))
                 self.assertEqual(
                     plan["applied_steps"],
-                    ["format-3-revision-1", "format-3-revision-2"],
+                    [
+                        "format-3-revision-1",
+                        "format-3-revision-2",
+                        "format-3-revision-3",
+                    ],
                 )
 
                 code, output, error = self.run_cli([*prefix, "--apply"])
@@ -189,12 +227,16 @@ effort = "medium"
                 migrated = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(
                     (migrated["state_format_version"], migrated["schema_revision"]),
-                    (3, 2),
+                    (3, 3),
                 )
-                self.assertEqual(
-                    len(list((state_path.parent / "migration").glob("STATE.v3.r0.*.json"))),
-                    1,
+                marker = hloop.load_migration_marker(repo)
+                self.assertEqual(marker["status"], "committed")
+                archived_state = (
+                    hloop.migration_generation_root(repo, marker["migration_generation"])
+                    / "archive"
+                    / state_path.relative_to(repo)
                 )
+                self.assertTrue(archived_state.is_file())
 
     def test_selftest_rejects_revision_missing_from_schema_and_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -236,20 +278,20 @@ effort = "medium"
                     capture_output=True,
                 )
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                state["schema_revision"] = 3
+                state["schema_revision"] = 4
                 state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
                 journal_path = state_path.parent / "JOURNAL.md"
                 prefix = ["--repo", str(repo), "--namespace", "future-state"]
 
                 code, output, error = self.run_cli([*prefix, "status", "--raw-state"])
                 self.assertEqual((code, error), (0, ""), output)
-                self.assertEqual(json.loads(output)["schema_revision"], 3)
+                self.assertEqual(json.loads(output)["schema_revision"], 4)
                 before_migrate = (state_path.read_bytes(), journal_path.read_bytes())
-                code, _, error = self.run_cli([*prefix, "migrate", "--dry-run"])
+                code, output, error = self.run_cli([*prefix, "migrate", "--dry-run"])
                 self.assertEqual(code, 2)
                 self.assertIn(
-                    "state format-3.revision-3 is newer than runtime format-3.revision-2",
-                    error,
+                    "state format-3.revision-4 is newer than runtime format-3.revision-3",
+                    output + error,
                 )
                 self.assertEqual(
                     (state_path.read_bytes(), journal_path.read_bytes()),
@@ -327,8 +369,8 @@ effort = "medium"
                             code, _, error = self.run_cli([*prefix, *command])
                             self.assertEqual(code, 2)
                             self.assertIn(
-                                "state format-3.revision-3 is newer than runtime "
-                                "format-3.revision-2",
+                                "state format-3.revision-4 is newer than runtime "
+                                "format-3.revision-3",
                                 error,
                             )
                             self.assertEqual(snapshot(), before)
@@ -697,6 +739,7 @@ effort = "medium"
                     capture_output=True,
                 )
                 task_meta = {
+                    "contract_schema_revision": 2,
                     "id": "T001",
                     "run_id": "run-validation",
                     "kind": "fix",
@@ -713,6 +756,7 @@ effort = "medium"
                 hloop.write_text(hloop.task_file(worktree, "T001"), task_text)
                 result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
                 result_meta = {
+                    "contract_schema_revision": 2,
                     "task_id": "T001",
                     "run_id": "run-validation",
                     "skill_version": hloop.SKILL_VERSION,
@@ -882,6 +926,7 @@ effort = "medium"
         )
         run_id = f"run-{namespace}"
         task_meta = {
+            "contract_schema_revision": 2,
             "id": "T001",
             "run_id": run_id,
             "kind": "fix",
@@ -901,6 +946,7 @@ effort = "medium"
         (worktree / "new.txt").write_text("untracked\n", encoding="utf-8")
         result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
         result_meta = {
+            "contract_schema_revision": 2,
             "task_id": "T001",
             "run_id": run_id,
             "skill_version": hloop.SKILL_VERSION,
@@ -1179,6 +1225,7 @@ effort = "medium"
                 )
                 run_id = "run-rename-source"
                 task_meta = {
+                    "contract_schema_revision": 2,
                     "id": "T001",
                     "run_id": run_id,
                     "kind": "fix",
@@ -1197,6 +1244,7 @@ effort = "medium"
                 (worktree / "secret.txt").rename(worktree / "allowed.txt")
                 result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
                 result_meta = {
+                    "contract_schema_revision": 2,
                     "task_id": "T001",
                     "run_id": run_id,
                     "skill_version": hloop.SKILL_VERSION,
@@ -2711,6 +2759,7 @@ effort = "medium"
                 )
                 run_id = f"run-{namespace}"
                 task_meta = {
+                    "contract_schema_revision": 2,
                     "id": "T001",
                     "run_id": run_id,
                     "kind": "fix",
@@ -2728,6 +2777,7 @@ effort = "medium"
                 (worktree / "link.txt").symlink_to("target.txt")
                 result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
                 result_meta = {
+                    "contract_schema_revision": 2,
                     "task_id": "T001",
                     "run_id": run_id,
                     "skill_version": hloop.SKILL_VERSION,
@@ -3352,6 +3402,7 @@ effort = "medium"
                 )
                 run_id = f"run-{namespace}"
                 task_meta = {
+                    "contract_schema_revision": 2,
                     "id": "T001",
                     "run_id": run_id,
                     "kind": "fix",
@@ -3369,6 +3420,7 @@ effort = "medium"
                 (worktree / "keep.txt").write_text("changed\n", encoding="utf-8")
                 result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
                 result_meta = {
+                    "contract_schema_revision": 2,
                     "task_id": "T001",
                     "run_id": run_id,
                     "skill_version": hloop.SKILL_VERSION,
@@ -3763,6 +3815,7 @@ effort = "medium"
                 )
                 run_id = "run-rename-ok"
                 task_meta = {
+                    "contract_schema_revision": 2,
                     "id": "T001",
                     "run_id": run_id,
                     "kind": "fix",
@@ -4108,6 +4161,7 @@ effort = "medium"
         )
         run_id = f"run-{namespace}"
         task_meta = {
+            "contract_schema_revision": 2,
             "id": "T001",
             "run_id": run_id,
             "kind": "fix",
@@ -4143,6 +4197,7 @@ effort = "medium"
 
         result_rel = hloop.LOOP_DIR / "results" / "T001" / "result.md"
         result_meta = {
+            "contract_schema_revision": 2,
             "task_id": "T001",
             "run_id": run_id,
             "skill_version": hloop.SKILL_VERSION,

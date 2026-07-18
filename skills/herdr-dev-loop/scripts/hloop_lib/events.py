@@ -37,6 +37,9 @@ _REPORT_FIELDS = frozenset(
         "scope",
         "acceptance",
         "approach",
+        "completion_mode",
+        "completion_mode_probe",
+        "approval_application",
         "risks",
         "impact",
         "attempted",
@@ -44,6 +47,7 @@ _REPORT_FIELDS = frozenset(
         "recommendation",
         "blocked_scope",
         "artifact",
+        "artifact_digest",
         "head_sha",
         "validation_results",
         "residual_risks",
@@ -225,6 +229,9 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
     scope = report.get("scope", [])
     acceptance = report.get("acceptance", [])
     approach = report.get("approach", "")
+    completion_mode = report.get("completion_mode", "")
+    completion_mode_probe = report.get("completion_mode_probe", {})
+    approval_application = report.get("approval_application")
     risks = report.get("risks", [])
     impact = report.get("impact", "")
     attempted = report.get("attempted", [])
@@ -232,6 +239,7 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
     recommendation = report.get("recommendation", "")
     blocked_scope = report.get("blocked_scope", [])
     artifact = report.get("artifact", "")
+    artifact_digest = report.get("artifact_digest", "")
     head_sha = report.get("head_sha", "")
     validation_results = report.get("validation_results", [])
     residual_risks = report.get("residual_risks", [])
@@ -255,13 +263,18 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
         },
     }
     type_specific_fields = set().union(
+        {"completion_mode", "completion_mode_probe"},
+        {"approval_application"},
         required_by_type["milestone"],
         required_by_type["attention"],
         required_by_type["completion"],
     )
-    unexpected_type_fields = (set(report) & type_specific_fields) - required_by_type[
-        report_type
-    ]
+    allowed_type_fields = set(required_by_type[report_type])
+    if report_type == "ack":
+        allowed_type_fields.update({"completion_mode", "completion_mode_probe"})
+    if report_type == "attention":
+        allowed_type_fields.add("approval_application")
+    unexpected_type_fields = (set(report) & type_specific_fields) - allowed_type_fields
     if unexpected_type_fields:
         raise ReportValidationError(
             f"{report_type} reports contain fields for another type: "
@@ -334,6 +347,127 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
             allow_newlines=False,
         ),
     }
+    if report_type == "ack" and (completion_mode or completion_mode_probe):
+        mode = _text(
+            completion_mode,
+            field="completion_mode",
+            maximum=16,
+            allow_newlines=False,
+        )
+        if mode not in {"commit", "handoff"}:
+            raise ReportValidationError("completion_mode must be commit or handoff")
+        if not isinstance(completion_mode_probe, Mapping):
+            raise ReportValidationError("completion_mode_probe must be an object")
+        required_probe = {
+            "version",
+            "mode",
+            "status",
+            "checked_at",
+            "git_metadata_paths",
+            "checks",
+        }
+        missing_probe = required_probe - set(completion_mode_probe)
+        if missing_probe:
+            raise ReportValidationError(
+                "completion_mode_probe is missing: " + ", ".join(sorted(missing_probe))
+            )
+        if completion_mode_probe.get("version") != 1:
+            raise ReportValidationError("completion_mode_probe.version must be 1")
+        probe_mode = _text(
+            completion_mode_probe.get("mode"),
+            field="completion_mode_probe.mode",
+            maximum=16,
+            allow_newlines=False,
+        )
+        if probe_mode != mode:
+            raise ReportValidationError(
+                "completion_mode_probe.mode must match completion_mode"
+            )
+        status = _text(
+            completion_mode_probe.get("status"),
+            field="completion_mode_probe.status",
+            maximum=32,
+            allow_newlines=False,
+        )
+        if status not in {"writable", "unwritable", "unknown"}:
+            raise ReportValidationError(
+                "completion_mode_probe.status must be writable, unwritable, or unknown"
+            )
+        if (status == "writable") != (mode == "commit"):
+            raise ReportValidationError(
+                "commit completion mode requires a writable probe; all other probes require handoff"
+            )
+        checked_at = _text(
+            completion_mode_probe.get("checked_at"),
+            field="completion_mode_probe.checked_at",
+            maximum=64,
+            allow_newlines=False,
+        )
+        parse_rfc3339(checked_at, field="completion_mode_probe.checked_at")
+        paths = list(
+            dict.fromkeys(
+                _string_list(
+                    completion_mode_probe.get("git_metadata_paths"),
+                    field="completion_mode_probe.git_metadata_paths",
+                    item_maximum=MAX_REFERENCE_LENGTH,
+                    allow_newlines=False,
+                )
+            )
+        )
+        if not paths:
+            raise ReportValidationError(
+                "completion_mode_probe.git_metadata_paths must not be empty"
+            )
+        checks = completion_mode_probe.get("checks")
+        if not isinstance(checks, list) or not checks:
+            raise ReportValidationError("completion_mode_probe.checks must be a non-empty array")
+        normalized_checks: list[dict[str, Any]] = []
+        for index, check in enumerate(checks):
+            if not isinstance(check, Mapping):
+                raise ReportValidationError(
+                    f"completion_mode_probe.checks[{index}] must be an object"
+                )
+            check_status = _text(
+                check.get("status"),
+                field=f"completion_mode_probe.checks[{index}].status",
+                maximum=32,
+                allow_newlines=False,
+            )
+            if check_status not in {"writable", "unwritable", "unknown"}:
+                raise ReportValidationError(
+                    f"completion_mode_probe.checks[{index}].status is invalid"
+                )
+            normalized_check = {
+                    "resource": _text(
+                        check.get("resource"),
+                        field=f"completion_mode_probe.checks[{index}].resource",
+                        maximum=128,
+                        allow_newlines=False,
+                    ),
+                    "path": _text(
+                        check.get("path"),
+                        field=f"completion_mode_probe.checks[{index}].path",
+                        maximum=MAX_REFERENCE_LENGTH,
+                        allow_newlines=False,
+                    ),
+                    "status": check_status,
+                    "detail": _text(
+                        str(check.get("detail") or ""),
+                        field=f"completion_mode_probe.checks[{index}].detail",
+                        maximum=MAX_TEXT_LENGTH,
+                        allow_empty=True,
+                    ),
+                }
+            normalized_checks.append(normalized_check)
+        normalized["completion_mode"] = mode
+        normalized["completion_mode_probe"] = {
+            "version": completion_mode_probe.get("version"),
+            "mode": probe_mode,
+            "status": status,
+            "checked_at": checked_at,
+            "git_metadata_paths": paths,
+            "checks": normalized_checks,
+        }
     if report_type == "milestone":
         normalized["risks"] = _string_list(
             risks, field="risks", item_maximum=MAX_TEXT_LENGTH
@@ -362,7 +496,54 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             }
         )
+        if approval_application is not None:
+            if not isinstance(approval_application, Mapping):
+                raise ReportValidationError("approval_application must be an object")
+            expected_application_fields = {
+                "message_id",
+                "decision_ack_event_id",
+                "requested_status",
+            }
+            if set(approval_application) != expected_application_fields:
+                raise ReportValidationError(
+                    "approval_application must contain exactly: "
+                    + ", ".join(sorted(expected_application_fields))
+                )
+            requested_status = _text(
+                approval_application.get("requested_status"),
+                field="approval_application.requested_status",
+                maximum=32,
+                allow_newlines=False,
+            )
+            if requested_status not in {"acknowledged", "applied"}:
+                raise ReportValidationError(
+                    "approval_application.requested_status must be acknowledged or applied"
+                )
+            normalized["approval_application"] = {
+                "message_id": _text(
+                    approval_application.get("message_id"),
+                    field="approval_application.message_id",
+                    maximum=MAX_IDENTIFIER_LENGTH,
+                    allow_newlines=False,
+                ),
+                "decision_ack_event_id": normalize_event_id(
+                    approval_application.get("decision_ack_event_id")
+                ),
+                "requested_status": requested_status,
+            }
     elif report_type == "completion":
+        normalized_artifact_digest = ""
+        if artifact_digest:
+            normalized_artifact_digest = _text(
+                artifact_digest,
+                field="artifact_digest",
+                maximum=71,
+                allow_newlines=False,
+            ).lower()
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", normalized_artifact_digest):
+                raise ReportValidationError(
+                    "artifact_digest must be a sha256: prefixed 64-character digest"
+                )
         normalized.update(
             {
                 "artifact": _text(
@@ -370,6 +551,11 @@ def validate_report(report: Mapping[str, Any]) -> dict[str, Any]:
                     field="artifact",
                     maximum=MAX_REFERENCE_LENGTH,
                     allow_newlines=False,
+                ),
+                **(
+                    {"artifact_digest": normalized_artifact_digest}
+                    if normalized_artifact_digest
+                    else {}
                 ),
                 "head_sha": _text(
                     head_sha,

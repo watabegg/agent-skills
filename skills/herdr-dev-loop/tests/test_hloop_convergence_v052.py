@@ -74,6 +74,21 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_cli(self, *args: str) -> tuple[int, str, str]:
+        args = tuple(args)
+        if args[:2] == ("task", "new") and "--preserved-invariant" not in args:
+            args = (
+                *args,
+                "--preserved-invariant",
+                "preserve fixture behavior",
+                "--regression-check",
+                "run fixture regression",
+                "--risk-class",
+                "normal",
+                "--required-gate",
+                "patch_review",
+                "--required-gate",
+                "full_suite",
+            )
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -205,15 +220,13 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             ["git", "rev-parse", "main"], cwd=self.repo, text=True
         ).strip()
         state["tasks"] = {"T001": {"status": "merged"}}
-        state["last_validation"] = {
-            "head_sha": target,
-            "results": [{"command": "true", "result": "passed"}],
-        }
         state["integration_head_sha"] = target
         state["completion_target_sha"] = target
         state["batches"] = {}
         state["current_batch_id"] = ""
         self.save_state(state)
+        code, out, err = self.run_cli("validate", "--level", "L3", "--no-cleanup")
+        self.assertEqual((code, err), (0, ""), out)
 
     def prepare_convergence(self) -> None:
         code, out, err = self.run_cli("review", "readiness", "--json")
@@ -1744,10 +1757,6 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             }
         }
         state["current_batch_id"] = ""
-        state["last_validation"] = {
-            "head_sha": target,
-            "results": [{"command": "true", "result": "passed"}],
-        }
         self.save_state(state)
         with mock.patch.object(hloop, "_changed_file_inventory", return_value=[]):
             code, out, err = self.run_cli("review", "readiness", "--json")
