@@ -2144,6 +2144,7 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             commands = [
                 ["inbox", "ack", str(uuid.uuid4())],
                 ["manager", "next"],
+                ["validate", "--dry-run"],
             ]
 
             for command in commands:
@@ -3469,6 +3470,7 @@ class ReviewGroupRuntimeTests(unittest.TestCase):
                     "mode": "dual-swarm",
                     "providers": ["codex", "claude"],
                     "probes_per_provider": 8,
+                    "protocol": "codex-review-multi-v2",
                 }
             }
             state["review_capacity_limits"] = {"codex": 20, "claude": 20}

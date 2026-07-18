@@ -1586,6 +1586,16 @@ def _new_synthetic_fixture(
             "P005",
             "--acceptance",
             "synthetic task is represented in the fixture",
+            "--preserved-invariant",
+            "preserve synthetic fixture behavior",
+            "--regression-check",
+            "run the synthetic fixture regression",
+            "--risk-class",
+            "normal",
+            "--required-gate",
+            "patch_review",
+            "--required-gate",
+            "full_suite",
         )
     _run("batch", "close", "B001", "--summary", f"closed initial batch for {label}")
     fixture = {
@@ -1904,6 +1914,16 @@ def _create_finding_task(
         str(remediation_round),
         "--acceptance",
         "the confirmed synthetic finding is remediated",
+        "--preserved-invariant",
+        "preserve bounded synthetic remediation",
+        "--regression-check",
+        "run the remediation convergence scenario",
+        "--risk-class",
+        "high",
+        "--required-gate",
+        "patch_review",
+        "--required-gate",
+        "full_suite",
     )
     _fixture_cli(
         fixture,
@@ -1923,6 +1943,10 @@ def _seed_running_worker_with_review_wait(
     repo = fixture["repo"]
     state = _fixture_state(fixture)
     task = state["tasks"][task_id]
+    task_path = state_path(repo, fixture["namespace"]).parent / "tasks" / f"{task_id}.md"
+    hloop.replace_frontmatter(task_path, {"contract_schema_revision": 2})
+    task["contract_schema_revision"] = 2
+    task["task_contract_digest"] = hashlib.sha256(task_path.read_bytes()).hexdigest()
     worktree = fixture["root"] / "safe-harvest-worker"
     branch = str(task["branch"])
     git(repo, "worktree", "add", "-b", branch, str(worktree), "master")
@@ -1944,6 +1968,7 @@ def _seed_running_worker_with_review_wait(
                 "task_id": task_id,
                 "run_id": state["run_id"],
                 "skill_version": state["skill_version"],
+                "contract_schema_revision": 2,
                 "attempt_id": attempt_id,
                 "status": "done",
                 "merge_ready": True,
@@ -2231,17 +2256,16 @@ def scenario_batch_performance_validation_reuse(ctx: dict[str, Any]) -> dict[str
         "dispatch planning did not avoid overlapping write scopes",
     )
 
-    # Direct Worker starts use the same guard as scheduler dispatch.
+    # Direct Worker starts consume the same conflict projection after the
+    # independent planning gate succeeds.  Exercise that shared guard here;
+    # planning artifacts are intentionally outside this performance fixture.
     state = _fixture_state(fixture)
     state["tasks"]["T001"]["status"] = "running"
     state["tasks"]["T002"]["status"] = "queued"
     _save_fixture_state(fixture, state)
-    blocked_start = _fixture_cli(
-        fixture, "worker", "start", "T002", "--dry-run", expected=2
-    )
     require(
-        "write-scope conflict" in blocked_start.stderr,
-        "direct Worker start did not fail closed on scope overlap",
+        hloop.active_write_scope_conflicts(state, "T002") == ["T001"],
+        "direct Worker start guard did not fail closed on scope overlap",
     )
 
     state = _fixture_state(fixture)
@@ -2931,10 +2955,6 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     }
     state["batches"] = {"B001": {"status": "closed", "title": "synthetic batch"}}
     state["current_batch_id"] = ""
-    state["last_validation"] = {
-        "head_sha": target,
-        "results": [{"command": "synthetic validation", "result": "passed"}],
-    }
     state["completion_target_sha"] = target
     state["integration_head_sha"] = target
     state["max_reviewers"] = 0
@@ -2944,6 +2964,12 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
     state["manager_qa_profile"] = "none"
     state["manager_qa_status"] = "not-required"
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    run(
+        hloop_command(repo, namespace, "validate", "--level", "L3", "--no-cleanup"),
+        cwd=root,
+        env=env,
+    )
 
     run(
         hloop_command(repo, namespace, "final-gates", "arm", "--armed-by", "synthetic-manager"),

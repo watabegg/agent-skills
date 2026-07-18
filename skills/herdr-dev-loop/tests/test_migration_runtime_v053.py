@@ -334,6 +334,137 @@ class MigrationRuntimeV053Tests(unittest.TestCase):
         with self.assertRaisesRegex(hloop.HLoopError, "requires schema-3.3"):
             hloop.assert_worker_finalize_schema_compatible(legacy, current, 3)
 
+    def test_queued_contract_migrates_when_runtime_state_is_already_terminal(self):
+        state = self.write_legacy_loop(task_status="queued")
+        state["tasks"]["T001"]["status"] = "merged"
+        hloop.state_path(self.repo).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(hloop.cmd_migrate(migrate_args(self.repo, "apply")), 0)
+        migrated_state = json.loads(
+            hloop.state_path(self.repo).read_text(encoding="utf-8")
+        )
+        migrated_task = hloop.parse_frontmatter_text(
+            hloop.task_file(self.repo, "T001").read_text(encoding="utf-8")
+        )
+        self.assertEqual(migrated_state["tasks"]["T001"]["status"], "merged")
+        self.assertEqual(migrated_task["status"], "queued")
+        self.assertEqual(migrated_task["contract_schema_revision"], 2)
+
+    def test_queued_contract_migrates_across_supported_runtime_lifecycle(self):
+        for runtime_status in ("running", "result_reported", "done", "merged"):
+            with self.subTest(runtime_status=runtime_status):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    subprocess.run(
+                        ["git", "init", "--initial-branch=main"],
+                        cwd=repo,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    hloop.loop_path(repo).mkdir(parents=True)
+                    state = self.legacy_state(task_status="queued")
+                    state["tasks"]["T001"]["status"] = runtime_status
+                    hloop.state_path(repo).write_text(
+                        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    path = hloop.task_file(repo, "T001")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(
+                        hloop.frontmatter({"id": "T001", "status": "queued"})
+                        + "\n\n# Legacy task\n",
+                        encoding="utf-8",
+                    )
+
+                    self.assertEqual(hloop.cmd_migrate(migrate_args(repo, "apply")), 0)
+                    migrated_state = json.loads(
+                        hloop.state_path(repo).read_text(encoding="utf-8")
+                    )
+                    migrated_task = hloop.parse_frontmatter_text(
+                        path.read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        migrated_state["tasks"]["T001"]["status"], runtime_status
+                    )
+                    self.assertEqual(migrated_task["status"], "queued")
+                    self.assertEqual(migrated_task["contract_schema_revision"], 2)
+
+    def test_queued_task_and_result_resume_and_rollback_as_one_exact_transaction(self):
+        state = self.write_legacy_loop(task_status="queued")
+        state["tasks"]["T001"]["status"] = "merged"
+        hloop.state_path(self.repo).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        result = hloop.result_file(self.repo, "T001")
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text(
+            hloop.frontmatter(
+                {
+                    "task_id": "T001",
+                    "run_id": "run-v052",
+                    "skill_version": "0.5.2",
+                    "attempt_id": "T001-A001",
+                    "status": "done",
+                    "merge_ready": True,
+                    "branch": "ai/T001",
+                    "head_sha": "b" * 40,
+                    "base_sha": "a" * 40,
+                    "changed_files": ["src/task.py"],
+                    "validation_recorded": True,
+                    "validation_commands": ["python3 -m unittest"],
+                    "validation_results": ["passed"],
+                    "validation_summary": "passed",
+                    "blocking_questions": [],
+                    "handoff": False,
+                }
+            )
+            + "\n\n# Legacy result\n",
+            encoding="utf-8",
+        )
+        originals = {
+            path.relative_to(self.repo).as_posix(): path.read_bytes()
+            for path in (
+                hloop.state_path(self.repo),
+                hloop.task_file(self.repo, "T001"),
+                result,
+            )
+        }
+        plan, pairs, _steps = hloop.prepare_migration_transaction(self.repo, state)
+        expected_paths = sorted(originals)
+        self.assertEqual(sorted(plan.changed_paths), expected_paths)
+        self.assertEqual(sorted(pairs), expected_paths)
+        hloop.persist_prepared_migration(self.repo, plan, pairs)
+
+        task_rel = hloop.task_file(self.repo, "T001").relative_to(self.repo).as_posix()
+        hloop.write_bytes_durable(hloop.task_file(self.repo, "T001"), pairs[task_rel][1])
+        self.assertEqual(hloop.cmd_migrate(migrate_args(self.repo, "resume")), 0)
+
+        migrated_state = json.loads(hloop.state_path(self.repo).read_text(encoding="utf-8"))
+        migrated_task = hloop.parse_frontmatter_text(
+            hloop.task_file(self.repo, "T001").read_text(encoding="utf-8")
+        )
+        migrated_result = hloop.parse_frontmatter_text(result.read_text(encoding="utf-8"))
+        marker = hloop.load_migration_marker(self.repo)
+        self.assertEqual(migrated_state["schema_revision"], 3)
+        self.assertEqual(migrated_state["tasks"]["T001"]["status"], "merged")
+        self.assertEqual(migrated_task["status"], "queued")
+        self.assertEqual(migrated_task["contract_schema_revision"], 2)
+        self.assertEqual(migrated_result["contract_schema_revision"], 2)
+        self.assertEqual(marker["status"], "committed")
+        self.assertEqual(
+            sorted(item["path"] for item in marker["artifacts"]), expected_paths
+        )
+
+        self.assertEqual(hloop.cmd_migrate(migrate_args(self.repo, "rollback")), 0)
+        for relative, source in originals.items():
+            self.assertEqual((self.repo / relative).read_bytes(), source)
+        self.assertEqual(hloop.load_migration_marker(self.repo)["status"], "rolled-back")
+
 
 if __name__ == "__main__":
     unittest.main()
