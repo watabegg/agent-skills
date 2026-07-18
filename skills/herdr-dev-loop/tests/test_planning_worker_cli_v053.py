@@ -238,6 +238,16 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             unrun_check=[],
         )
 
+    def patch_finding(self, label: str):
+        return hloop.hloop_worker_candidate.PatchReviewFinding.from_evidence(
+            scope="unresolved",
+            file_path="src/task.py",
+            symbol=f"task_{label}",
+            trigger=f"Trigger {label}",
+            product_impact=f"Impact {label}",
+            proposed_fix=f"Fix {label}",
+        )
+
     def submit_candidate(
         self,
         repo: Path,
@@ -527,7 +537,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             state, task_state = self.write_fixture(repo, base_sha)
             (repo / "src" / "task.py").write_text("VALUE = 4\n", encoding="utf-8")
             candidate1, seal1 = self.submit_candidate(repo, state, task_state)
-            finding1 = hloop.hloop_worker_candidate.canonical_digest({"finding": 1})
+            finding1 = self.patch_finding("one")
             review1 = hloop.hloop_worker_candidate.record_patch_review(
                 seal1,
                 review_attempt_id="PR-T001-R001",
@@ -536,7 +546,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                 reviewer_model="gpt-5.6-sol",
                 reviewer_effort="xhigh",
                 verdict="fix_required",
-                unresolved_finding_fingerprints=(finding1,),
+                findings=(finding1,),
             )
             decision1 = hloop.apply_patch_review_record(
                 repo, state, "T001", task_state, review1
@@ -550,7 +560,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
 
             (repo / "src" / "task.py").write_text("VALUE = 5\n", encoding="utf-8")
             candidate2, seal2 = self.submit_candidate(repo, state, task_state)
-            finding2 = hloop.hloop_worker_candidate.canonical_digest({"finding": 2})
+            finding2 = self.patch_finding("two")
             review2 = hloop.hloop_worker_candidate.record_patch_review(
                 seal2,
                 review_attempt_id="PR-T001-R002",
@@ -559,7 +569,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                 reviewer_model="gpt-5.6-sol",
                 reviewer_effort="xhigh",
                 verdict="fix_required",
-                unresolved_finding_fingerprints=(finding2,),
+                findings=(finding2,),
             )
             decision2 = hloop.apply_patch_review_record(
                 repo, state, "T001", task_state, review2
@@ -570,6 +580,228 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             self.assertEqual(task_state["active_attempt_id"], "T001-A001")
             self.assertEqual(decision2.last_candidate_sha, seal2.candidate_sha)
             self.assertEqual(decision2.automatic_task_ids, ())
+
+    def test_patch_review_record_rejects_mixed_identity_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base_sha = self.make_repo(Path(directory))
+            state, task_state = self.write_fixture(repo, base_sha)
+            (repo / "src" / "task.py").write_text("VALUE = 6\n", encoding="utf-8")
+            _candidate, seal = self.submit_candidate(repo, state, task_state)
+            retained = hloop.hloop_worker_candidate.record_patch_review(
+                seal,
+                review_attempt_id="PR-T001-R001",
+                review_round=1,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="fix_required",
+                findings=(self.patch_finding("legacy-retained"),),
+            ).to_record()
+            retained.pop("finding_identity_contract")
+            retained.pop("findings")
+            task_state["patch_review_history"] = [retained]
+            state_path = repo / hloop.LOOP_DIR / "STATE.json"
+            hloop.write_text(
+                state_path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+            patch_root = repo / hloop.LOOP_DIR / "patch-reviews"
+            artifact_bytes_before = {
+                path.relative_to(patch_root).as_posix(): path.read_bytes()
+                for path in patch_root.rglob("*")
+                if path.is_file()
+            } if patch_root.exists() else {}
+            state_before = state_path.read_bytes()
+            prospective = hloop.patch_review_file(
+                repo, "T001", "T001-A001", "PR-T001-R002"
+            )
+            args = argparse.Namespace(
+                repo=str(repo),
+                task_id="T001",
+                review_attempt_id="PR-T001-R002",
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="fix_required",
+                unresolved_finding_evidence=[
+                    (
+                        "src/task.py",
+                        "task_semantic",
+                        "Trigger semantic",
+                        "Impact semantic",
+                        "Fix semantic",
+                    )
+                ],
+                follow_up_finding_evidence=[],
+                unresolved_finding_fingerprint=[],
+                follow_up_finding_fingerprint=[],
+            )
+
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                self.assertRaisesRegex(
+                    hloop.HLoopError, "legacy and canonical.*cannot be mixed"
+                ),
+            ):
+                hloop.cmd_patch_review_record(args)
+
+            artifact_bytes_after = {
+                path.relative_to(patch_root).as_posix(): path.read_bytes()
+                for path in patch_root.rglob("*")
+                if path.is_file()
+            } if patch_root.exists() else {}
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(artifact_bytes_after, artifact_bytes_before)
+            self.assertFalse(prospective.exists())
+
+    def test_patch_review_harvest_rejects_mixed_identity_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base_sha = self.make_repo(root)
+            state, task_state = self.write_fixture(repo, base_sha)
+            (repo / "src" / "task.py").write_text("VALUE = 7\n", encoding="utf-8")
+            _candidate, seal = self.submit_candidate(repo, state, task_state)
+            canonical_retained = hloop.hloop_worker_candidate.record_patch_review(
+                seal,
+                review_attempt_id="PR-T001-R001",
+                review_round=1,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="fix_required",
+                findings=(self.patch_finding("legacy-retained-harvest"),),
+            )
+            retained = canonical_retained.to_record()
+            retained.pop("finding_identity_contract")
+            retained.pop("findings")
+            task_state["patch_review_history"] = [retained]
+
+            review_attempt_id = "PR-T001-R002"
+            review = hloop.hloop_worker_candidate.record_patch_review(
+                seal,
+                review_attempt_id=review_attempt_id,
+                review_round=2,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="passed",
+            )
+            review_worktree = root / "patch-review-worktree"
+            self.git(root, "clone", str(repo), str(review_worktree))
+            source = hloop.patch_review_file(
+                review_worktree,
+                "T001",
+                seal.attempt_id,
+                review_attempt_id,
+            )
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source_payload = hloop.exact_json_bytes(review.to_record())
+            source.write_bytes(source_payload)
+            state["patch_reviews"] = {
+                review_attempt_id: {
+                    "status": "running",
+                    "gate_status": "running",
+                    "task_id": "T001",
+                    "task_attempt_id": seal.attempt_id,
+                    "review_attempt_id": review_attempt_id,
+                    "review_round": 2,
+                    "finding_identity_contract": (
+                        hloop.hloop_worker_candidate.PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
+                    ),
+                    "candidate_sha": seal.candidate_sha,
+                    "candidate_artifact_digest": seal.candidate_artifact_digest,
+                    "sealed_task_contract_digest": seal.task_contract_digest,
+                    "agent_provider": "codex",
+                    "agent_model": "gpt-5.6-sol",
+                    "agent_effort": "xhigh",
+                    "worktree": str(review_worktree),
+                    "baseline_dirty_files": [],
+                }
+            }
+            state_path = repo / hloop.LOOP_DIR / "STATE.json"
+            hloop.write_text(
+                state_path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+            patch_root = repo / hloop.LOOP_DIR / "patch-reviews"
+            artifact_bytes_before = {
+                path.relative_to(patch_root).as_posix(): path.read_bytes()
+                for path in patch_root.rglob("*")
+                if path.is_file()
+            } if patch_root.exists() else {}
+            state_before = state_path.read_bytes()
+            target = hloop.patch_review_file(
+                repo,
+                "T001",
+                seal.attempt_id,
+                review_attempt_id,
+            )
+            args = argparse.Namespace(
+                repo=str(repo),
+                review_attempt_id=review_attempt_id,
+                keep_pane=False,
+                session_cleanup="none",
+            )
+
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(
+                    hloop, "semantic_ack_barrier_blocking", return_value=""
+                ),
+                self.assertRaisesRegex(
+                    hloop.HLoopError, "legacy and canonical.*cannot be mixed"
+                ),
+            ):
+                hloop.cmd_patch_review_harvest(args)
+
+            artifact_bytes_after = {
+                path.relative_to(patch_root).as_posix(): path.read_bytes()
+                for path in patch_root.rglob("*")
+                if path.is_file()
+            } if patch_root.exists() else {}
+            self.assertEqual(source.read_bytes(), source_payload)
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(artifact_bytes_after, artifact_bytes_before)
+            self.assertFalse(target.exists())
+
+            task_state["patch_review_history"] = [canonical_retained.to_record()]
+            hloop.write_text(
+                state_path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+            real_git = hloop.git
+
+            def preserve_registered_test_worktree(cwd: Path, git_args: list[str]) -> str:
+                if cwd == repo and git_args[:3] == ["worktree", "remove", "--force"]:
+                    return ""
+                return real_git(cwd, git_args)
+
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(
+                    hloop, "semantic_ack_barrier_blocking", return_value=""
+                ),
+                mock.patch.object(hloop, "cleanup_completed_agent_pane"),
+                mock.patch.object(hloop, "revoke_active_role_report_identity"),
+                mock.patch.object(
+                    hloop, "git", side_effect=preserve_registered_test_worktree
+                ),
+            ):
+                self.assertEqual(hloop.cmd_patch_review_harvest(args), 0)
+
+            harvested = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(source.read_bytes(), source_payload)
+            self.assertEqual(target.read_bytes(), source_payload)
+            self.assertEqual(
+                harvested["tasks"]["T001"]["current_patch_review"][
+                    "review_attempt_id"
+                ],
+                review_attempt_id,
+            )
+            self.assertEqual(
+                harvested["patch_reviews"][review_attempt_id]["status"],
+                "reported",
+            )
 
     def test_finalize_requires_independent_full_suite_and_exact_reviewed_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

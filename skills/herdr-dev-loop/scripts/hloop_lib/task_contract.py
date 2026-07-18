@@ -232,6 +232,7 @@ class LegacyTaskMigration:
     record: Mapping[str, Any]
     status: str
     action: str
+    contract_schema_revision: int = LEGACY_CONTRACT_SCHEMA_REVISION
     migration_blocker: str = ""
     may_finish_legacy_attempt: bool = False
     may_accept_legacy_result: bool = False
@@ -244,7 +245,7 @@ class LegacyTaskMigration:
     def to_record(self) -> dict[str, Any]:
         return {
             "status": self.status,
-            "contract_schema_revision": LEGACY_CONTRACT_SCHEMA_REVISION,
+            "contract_schema_revision": self.contract_schema_revision,
             "action": self.action,
             "migration_blocker": self.migration_blocker,
             "may_finish_legacy_attempt": self.may_finish_legacy_attempt,
@@ -825,6 +826,98 @@ def validate_task_contract(record: Mapping[str, Any]) -> ContractValidation:
     return ContractValidation(revision=revision, issues=tuple(issues))
 
 
+def validate_task_state_projection(record: Mapping[str, Any]) -> ContractValidation:
+    """Strictly validate the revision-3 contract fields copied into STATE.
+
+    Runtime task state deliberately contains lifecycle, pane, candidate, and
+    cleanup fields that are not part of the immutable task artifact.  A mixed
+    schema-3.2 namespace can therefore validate the embedded revision-3
+    discriminator and every required contract projection without pretending
+    the runtime record itself is a task artifact or accepting unknown future
+    contract revisions.
+    """
+
+    if not isinstance(record, Mapping):
+        return ContractValidation(
+            None, (_issue("contract-not-object", "task state must be an object"),)
+        )
+    revision, issues = _revision_issues(record)
+    if revision != V053_CONTRACT_SCHEMA_REVISION:
+        if revision is not None:
+            issues.append(
+                _issue(
+                    "state-task-revision-invalid",
+                    "task state projection must declare contract_schema_revision 3",
+                    "contract_schema_revision",
+                )
+            )
+        return ContractValidation(revision=revision, issues=tuple(issues))
+
+    # Validate every contract field that survives in the runtime projection.
+    # Runtime-only lifecycle fields remain outside the artifact schema and are
+    # intentionally ignored here.
+    artifact_fields = {key: value for key, value in record.items() if key != "status"}
+    issues.extend(_revision_three_task_schema_issues(artifact_fields))
+    status = record.get("status")
+    if not isinstance(status, str) or status not in LEGACY_RUNTIME_TASK_STATUSES:
+        issues.append(
+            _issue(
+                "contract-field-unsupported",
+                f"unsupported task state status: {status!r}",
+                "status",
+            )
+        )
+    task_contract_digest = record.get("task_contract_digest")
+    if not isinstance(task_contract_digest, str) or re.fullmatch(
+        r"[0-9a-f]{64}", task_contract_digest
+    ) is None:
+        issues.append(
+            _issue(
+                "contract-field-invalid",
+                "task_contract_digest must be a canonical raw SHA-256 digest",
+                "task_contract_digest",
+            )
+        )
+    issues.extend(
+        _string_list_issues(
+            record, "preserved_invariants", required=True, min_items=1
+        )
+    )
+    issues.extend(
+        _string_list_issues(record, "regression_checks", required=True, min_items=1)
+    )
+    risk_class = record.get("risk_class")
+    if not isinstance(risk_class, str) or risk_class not in RISK_CLASSES:
+        issues.append(
+            _issue(
+                "contract-field-unsupported",
+                f"unsupported risk_class: {risk_class!r}",
+                "risk_class",
+            )
+        )
+    issues.extend(
+        _string_list_issues(
+            record,
+            "required_gates",
+            required=True,
+            allowed=REQUIRED_GATES,
+            unique=True,
+        )
+    )
+    problem = _required_text(record, "worker_agent_effort")
+    if problem:
+        issues.append(problem)
+    if record.get("migration_blocker") not in {None, ""}:
+        issues.append(
+            _issue(
+                "revision-3-legacy-blocker",
+                "revision 3 task state must clear migration_blocker",
+                "migration_blocker",
+            )
+        )
+    return ContractValidation(revision=revision, issues=tuple(issues))
+
+
 def validate_result_contract(record: Mapping[str, Any]) -> ContractValidation:
     """Validate common result fields and revision-3 completion evidence."""
 
@@ -990,13 +1083,18 @@ def validate_result_contract(record: Mapping[str, Any]) -> ContractValidation:
     return ContractValidation(revision=revision, issues=tuple(issues))
 
 
-def migrate_legacy_task_contract(record: Mapping[str, Any]) -> LegacyTaskMigration:
+def migrate_legacy_task_contract(
+    record: Mapping[str, Any],
+    *,
+    record_type: str | None = None,
+) -> LegacyTaskMigration:
     """Return a revision-2 copy and the required status-sensitive migration gate.
 
     The function is idempotent for an already-labeled revision-2 record and
-    rejects revision 3 or unknown revisions.  It never upgrades a legacy task
-    automatically, because doing so would retroactively apply new gates or
-    bypass the fresh semantic ACK required for a running-task rebind.
+    validates revision 3 according to explicit caller provenance.  It never
+    upgrades a legacy task automatically, because doing so would retroactively
+    apply new gates or bypass the fresh semantic ACK required for a
+    running-task rebind.
     """
 
     if not isinstance(record, Mapping):
@@ -1004,6 +1102,35 @@ def migrate_legacy_task_contract(record: Mapping[str, Any]) -> LegacyTaskMigrati
             (_issue("contract-not-object", "legacy task must be an object"),)
         )
     existing_revision = record.get("contract_schema_revision")
+    if existing_revision == V053_CONTRACT_SCHEMA_REVISION:
+        if record_type not in {"artifact", "state"}:
+            raise ContractValidationError(
+                (
+                    _issue(
+                        "task-record-type-required",
+                        "revision 3 task migration requires explicit artifact or state provenance",
+                        "record_type",
+                    ),
+                )
+            )
+        validation_record = deepcopy(dict(record))
+        if record_type == "artifact":
+            for field in ("release_scope_revision", "remediation_round"):
+                value = validation_record.get(field)
+                if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+                    validation_record[field] = int(value)
+        validation = (
+            validate_task_contract(validation_record)
+            if record_type == "artifact"
+            else validate_task_state_projection(validation_record)
+        )
+        validation.raise_for_errors()
+        return LegacyTaskMigration(
+            record=deepcopy(dict(record)),
+            status=str(record.get("status") or ""),
+            action="preserve-revision-3",
+            contract_schema_revision=V053_CONTRACT_SCHEMA_REVISION,
+        )
     if existing_revision is not None and existing_revision != LEGACY_CONTRACT_SCHEMA_REVISION:
         raise ContractValidationError(
             (
@@ -1117,6 +1244,10 @@ def migrate_legacy_result_contract(record: Mapping[str, Any]) -> dict[str, Any]:
             (_issue("contract-not-object", "legacy result must be an object"),)
         )
     existing_revision = record.get("contract_schema_revision")
+    if existing_revision == V053_CONTRACT_SCHEMA_REVISION:
+        migrated = deepcopy(dict(record))
+        validate_result_contract(migrated).raise_for_errors()
+        return migrated
     if existing_revision is not None and existing_revision != LEGACY_CONTRACT_SCHEMA_REVISION:
         raise ContractValidationError(
             (
