@@ -949,30 +949,665 @@ def cmd_namespace_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def assert_migration_safe(repo: Path, state: dict[str, Any]) -> None:
-    running = [
-        role_id
-        for role_kind, role_id, role_state in iter_all_roles(state)
-        if role_kind != "worker"
-        and agent_gate_status(role_state)
-        in {"starting", "running", "waiting", "waiting-agent", "waiting-manager", "reported"}
-    ]
-    if running:
+MIGRATION_ROLE_TERMINAL_LIFECYCLES = {
+    "reviewer": frozenset(
+        {
+            ("reported", "reported"),
+            ("triaged", "triaged"),
+            ("aborted", "aborted"),
+        }
+    ),
+    "patch-reviewer": frozenset(
+        {("reported", "reported"), ("aborted", "aborted")}
+    ),
+    "gap": frozenset(
+        {
+            ("reported", "reported"),
+            ("triaged", "triaged"),
+            ("aborted", "aborted"),
+        }
+    ),
+    "advisor": frozenset(
+        {
+            ("reported", "reported"),
+            ("consumed", "consumed"),
+            ("aborted", "aborted"),
+        }
+    ),
+    "specification-scout": frozenset(
+        {
+            ("reported", "reported"),
+            ("completed", "completed"),
+            ("aborted", "aborted"),
+        }
+    ),
+    "decision-liaison": frozenset({("responded", "responded")}),
+}
+
+
+MIGRATION_SKIPPED_SCOUT_SENTINEL_FIELDS = frozenset(
+    {"status", "gate_status", "policy", "reasons", "completed_at"}
+)
+MIGRATION_CANONICAL_LIFECYCLE_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00"
+)
+
+
+def migration_canonical_timestamp(value: Any) -> bool:
+    """Return whether a lifecycle timestamp has the runtime's text shape."""
+
+    return bool(
+        isinstance(value, str)
+        and value
+        and MIGRATION_CANONICAL_LIFECYCLE_TIMESTAMP.fullmatch(value) is not None
+        and _parse_metric_timestamp(value) is not None
+    )
+
+
+def migration_canonical_text(value: Any) -> bool:
+    """Return whether lifecycle provenance is runtime-storable non-empty text."""
+
+    return bool(isinstance(value, str) and value)
+
+
+def migration_skipped_scout_was_not_dispatched(
+    role_state: Mapping[str, Any],
+    *,
+    expected_policy: str,
+) -> bool:
+    """Recognize only the exact sentinel emitted by a skipped Scout start."""
+
+    reasons = role_state.get("reasons")
+    return bool(
+        set(role_state) == MIGRATION_SKIPPED_SCOUT_SENTINEL_FIELDS
+        and role_state.get("status") == "skipped"
+        and role_state.get("gate_status") == "skipped"
+        and expected_policy in SPECIFICATION_SCOUT_MODES
+        and role_state.get("policy") == expected_policy
+        and isinstance(reasons, list)
+        and all(isinstance(reason, str) and reason for reason in reasons)
+        and len(reasons) == len(set(reasons))
+        and migration_canonical_timestamp(role_state.get("completed_at"))
+    )
+
+
+def canonical_active_worker_attempt_for_migration(
+    task_id: str,
+    task_state: Mapping[str, Any],
+) -> str:
+    """Validate the active Worker identity before classifying old reviews."""
+
+    active = str(task_state.get("active_attempt_id") or "")
+    match = re.fullmatch(rf"{re.escape(task_id)}-A([0-9]{{3}})", active)
+    attempt_no = int(match.group(1)) if match else 0
+    mismatches: list[str] = []
+    if not match or attempt_no < 1:
+        mismatches.append("active_attempt_id")
+    if (
+        "attempt_id" in task_state
+        and str(task_state.get("attempt_id") or "") != active
+    ):
+        mismatches.append("attempt_id")
+    recorded_attempt_no = task_state.get("attempt_no")
+    if (
+        not isinstance(recorded_attempt_no, int)
+        or isinstance(recorded_attempt_no, bool)
+        or recorded_attempt_no != attempt_no
+    ):
+        mismatches.append("attempt_no")
+    if mismatches:
         raise HLoopError(
-            "cannot migrate while audit/advisory roles are running; harvest or abort them first: "
-            + ", ".join(running)
+            f"cannot migrate task {task_id} with noncanonical active "
+            "task-attempt identity: " + ", ".join(mismatches)
         )
+    return active
+
+
+def assert_migration_historical_patch_review(
+    repo: Path,
+    state: Mapping[str, Any],
+    task_id: str,
+    task_attempt_id: str,
+    task_state: Mapping[str, Any],
+    review: hloop_worker_candidate.PatchReview,
+) -> None:
+    """Prove a zero-history Patch Review belongs to one archived task attempt."""
+
+    current_attempt_id = canonical_active_worker_attempt_for_migration(
+        task_id, task_state
+    )
+    if task_attempt_id == current_attempt_id:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: "
+            "active task attempt is missing its canonical history entry"
+        )
+
+    expected_ref = candidate_artifact_ref(
+        task_id, task_attempt_id, review.candidate_revision
+    )
+    if review.candidate_artifact_ref != expected_ref:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: "
+            "candidate_artifact_ref is not canonical"
+        )
+    try:
+        candidate, candidate_payload = load_candidate_artifact(
+            repo, task_id, task_attempt_id, review.candidate_revision
+        )
+    except HLoopError as exc:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: {exc}"
+        ) from exc
+    observed_digest = _sha256_labelled(candidate_payload)
+    if observed_digest != review.candidate_artifact_digest:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: "
+            "candidate artifact digest mismatch"
+        )
+    candidate_projection = (
+        ("run_id", review.run_id, candidate.run_id),
+        ("skill_version", review.skill_version, candidate.skill_version),
+        ("task_id", review.task_id, candidate.task_id),
+        ("attempt_id", review.attempt_id, candidate.attempt_id),
+        (
+            "candidate_revision",
+            review.candidate_revision,
+            candidate.candidate_revision,
+        ),
+        (
+            "task_contract_digest",
+            review.task_contract_digest,
+            candidate.task_contract_digest,
+        ),
+        (
+            "semantic_ack_event_id",
+            review.semantic_ack_event_id,
+            candidate.semantic_ack_event_id,
+        ),
+        ("base_sha", review.base_sha, candidate.base_sha),
+        (
+            "candidate_artifact_ref",
+            review.candidate_artifact_ref,
+            candidate.candidate_artifact_ref,
+        ),
+    )
+    candidate_mismatches = sorted(
+        field
+        for field, expected_value, observed_value in candidate_projection
+        if observed_value != expected_value
+    )
+    if candidate_mismatches:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: "
+            "candidate/Patch Review identity mismatch: "
+            + ", ".join(candidate_mismatches)
+        )
+
+    attempts = task_state.get("attempts")
+    archived_attempts = attempts if isinstance(attempts, list) else []
+    matching_attempts = [
+        item
+        for item in archived_attempts
+        if isinstance(item, Mapping)
+        and str(item.get("attempt_id") or "") == task_attempt_id
+    ]
+    if len(matching_attempts) != 1:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: "
+            "expected exactly one archived task-attempt record"
+        )
+    archived_attempt = matching_attempts[0]
+    attempt_match = re.fullmatch(
+        rf"{re.escape(task_id)}-A([0-9]+)", task_attempt_id
+    )
+    attempt_no = int(attempt_match.group(1)) if attempt_match else 0
+    canonical_attempt_id = bool(
+        attempt_match
+        and attempt_no > 0
+        and attempt_match.group(1) == f"{attempt_no:03d}"
+    )
+    branch = str(archived_attempt.get("branch") or "")
+    archive_provenance_mismatches = []
+    if not canonical_attempt_id:
+        archive_provenance_mismatches.append("attempt_id")
+    if str(archived_attempt.get("agent_id") or "") != task_id:
+        archive_provenance_mismatches.append("agent_id")
+    if str(archived_attempt.get("role") or "") != "worker":
+        archive_provenance_mismatches.append("role")
+    archived_attempt_no = archived_attempt.get("attempt_no")
+    if (
+        not isinstance(archived_attempt_no, int)
+        or isinstance(archived_attempt_no, bool)
+        or archived_attempt_no != attempt_no
+    ):
+        archive_provenance_mismatches.append("attempt_no")
+    for field in ("previous_status", "reason", "branch", "worktree", "pane_id"):
+        if not str(archived_attempt.get(field) or "").strip():
+            archive_provenance_mismatches.append(field)
+    if _parse_metric_timestamp(archived_attempt.get("at")) is None:
+        archive_provenance_mismatches.append("at")
+    archived_worker_base_sha = archived_attempt.get("worker_base_sha")
+    canonical_archived_worker_base_sha = ""
+    if isinstance(archived_worker_base_sha, str):
+        try:
+            canonical_archived_worker_base_sha = (
+                hloop_worker_candidate.canonical_git_object_id(
+                    archived_worker_base_sha, "worker_base_sha"
+                )
+            )
+        except hloop_worker_candidate.WorkerCandidateError:
+            pass
+        if canonical_archived_worker_base_sha != archived_worker_base_sha:
+            canonical_archived_worker_base_sha = ""
+    if canonical_archived_worker_base_sha != review.base_sha:
+        archive_provenance_mismatches.append("worker_base_sha")
+    archived_branch = str(archived_attempt.get("archived_branch") or "")
+    expected_archived_branch = re.compile(
+        rf"{re.escape(branch)}-archive-a{attempt_no:03d}-[0-9]{{14}}"
+    )
+    if not branch or not expected_archived_branch.fullmatch(archived_branch):
+        archive_provenance_mismatches.append("archived_branch")
+    if archive_provenance_mismatches:
+        raise HLoopError(
+            f"cannot migrate historical patch-reviewer {review.review_attempt_id}: "
+            "noncanonical archived task-attempt provenance: "
+            + ", ".join(sorted(set(archive_provenance_mismatches)))
+        )
+
+
+def assert_migration_role_artifact(
+    repo: Path,
+    state: dict[str, Any],
+    role_kind: str,
+    role_id: str,
+    role_state: dict[str, Any],
+) -> None:
+    """Require one canonical harvested role artifact before schema migration."""
+
+    artifact_roles = {
+        "reviewer": "reviewer",
+        "gap": "gap",
+        "advisor": "advisor",
+    }
+    artifact_role = artifact_roles.get(role_kind)
+    if artifact_role:
+        path = agent_artifact_path(repo, state, role_id, artifact_role, role_state)
+        ready, reason = artifact_readiness(
+            repo, state, role_id, artifact_role, role_state, path
+        )
+        if not ready:
+            raise HLoopError(
+                f"cannot migrate {role_kind} {role_id} with noncanonical artifact: "
+                f"{reason}: {path}"
+            )
+        meta = read_frontmatter(path)
+        recorded_status = str(role_state.get("artifact_status") or "")
+        if not recorded_status or recorded_status != str(meta.get("status") or ""):
+            raise HLoopError(
+                f"cannot migrate {role_kind} {role_id} with mismatched artifact status"
+            )
+        recorded_digest = str(role_state.get("artifact_digest") or "")
+        if recorded_digest and recorded_digest != _sha256_labelled(path.read_bytes()):
+            raise HLoopError(
+                f"cannot migrate {role_kind} {role_id} with mismatched artifact digest"
+            )
+        return
+
+    if role_kind == "patch-reviewer":
+        task_id = str(role_state.get("task_id") or "")
+        task_attempt_id = str(role_state.get("task_attempt_id") or "")
+        if (
+            not task_id
+            or not task_attempt_id
+            or str(role_state.get("review_attempt_id") or "") != role_id
+        ):
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} without task identity"
+            )
+        tasks = state.get("tasks")
+        task_state = tasks.get(task_id) if isinstance(tasks, Mapping) else None
+        if not isinstance(task_state, Mapping):
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id}: "
+                f"Patch Review task is missing: {task_id}"
+            )
+        path = patch_review_file(repo, task_id, task_attempt_id, role_id)
+        if not path.is_file():
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} with missing artifact: {path}"
+            )
+        recorded_path = str(role_state.get("artifact_path") or "")
+        artifact_rel = path.relative_to(repo)
+        recorded_parts = Path(recorded_path).parts
+        if (
+            not recorded_path
+            or len(recorded_parts) < len(artifact_rel.parts)
+            or recorded_parts[-len(artifact_rel.parts) :] != artifact_rel.parts
+        ):
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} with mismatched artifact path"
+            )
+        try:
+            review = hloop_worker_candidate.PatchReview.from_record(
+                json.loads(path.read_bytes())
+            )
+        except (
+            json.JSONDecodeError,
+            hloop_worker_candidate.WorkerCandidateError,
+        ) as exc:
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} with invalid artifact: {exc}"
+            ) from exc
+        role_projection = (
+            ("review_attempt_id", role_id, review.review_attempt_id),
+            ("run_id", str(state.get("run_id") or ""), review.run_id),
+            (
+                "skill_version",
+                str(
+                    role_state.get("skill_version")
+                    or state.get("skill_version")
+                    or ""
+                ),
+                review.skill_version,
+            ),
+            ("task_id", task_id, review.task_id),
+            ("attempt_id", task_attempt_id, review.attempt_id),
+            ("review_round", role_state.get("review_round"), review.review_round),
+            (
+                "candidate_sha",
+                str(role_state.get("candidate_sha") or ""),
+                review.candidate_sha,
+            ),
+            (
+                "candidate_artifact_digest",
+                str(role_state.get("candidate_artifact_digest") or ""),
+                review.candidate_artifact_digest,
+            ),
+            (
+                "task_contract_digest",
+                str(role_state.get("sealed_task_contract_digest") or ""),
+                review.task_contract_digest,
+            ),
+            (
+                "reviewer_provider",
+                str(role_state.get("agent_provider") or ""),
+                review.reviewer_provider,
+            ),
+            (
+                "reviewer_model",
+                str(role_state.get("agent_model") or ""),
+                review.reviewer_model,
+            ),
+            (
+                "reviewer_effort",
+                str(role_state.get("agent_effort") or ""),
+                review.reviewer_effort,
+            ),
+            ("verdict", str(role_state.get("verdict") or ""), review.verdict),
+        )
+        role_mismatches = sorted(
+            field
+            for field, expected_value, observed_value in role_projection
+            if expected_value in {None, ""} or observed_value != expected_value
+        )
+        expected_finding_contract = str(
+            role_state.get("finding_identity_contract") or ""
+        )
+        if review.legacy_finding_identity:
+            if expected_finding_contract:
+                role_mismatches.append("finding_identity_contract")
+        elif (
+            not expected_finding_contract
+            or review.finding_identity_contract != expected_finding_contract
+        ):
+            role_mismatches.append("finding_identity_contract")
+        if role_mismatches:
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} with mismatched artifact: "
+                + ", ".join(sorted(set(role_mismatches)))
+            )
+        history = task_patch_review_history(task_state)
+        canonical_history = [
+            item for item in history if item.review_attempt_id == role_id
+        ]
+        if len(canonical_history) == 0:
+            assert_migration_historical_patch_review(
+                repo,
+                state,
+                task_id,
+                task_attempt_id,
+                task_state,
+                review,
+            )
+            return
+        if len(canonical_history) != 1:
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} without exactly one "
+                "canonical task patch-review history entry"
+            )
+        canonical_record = canonical_history[0].to_record()
+        artifact_record = review.to_record()
+        history_mismatches = sorted(
+            field
+            for field in set(canonical_record) | set(artifact_record)
+            if canonical_record.get(field) != artifact_record.get(field)
+        )
+        if history_mismatches:
+            raise HLoopError(
+                f"cannot migrate patch-reviewer {role_id} with artifact/history "
+                "identity mismatch: "
+                + ", ".join(history_mismatches)
+            )
+        return
+
+    if role_kind == "specification-scout":
+        path = specification_scout_file(repo)
+        if not path.is_file() or not read_text(path).strip():
+            raise HLoopError(
+                f"cannot migrate Specification Scout with missing artifact: {path}"
+            )
+        meta = read_frontmatter(path)
+        identity_error = decision_role_artifact_identity_error(
+            state,
+            role_id=role_id,
+            role_state=role_state,
+            meta=meta,
+        )
+        if identity_error or str(meta.get("status") or "") != "reported":
+            detail = identity_error or "status must be reported"
+            raise HLoopError(
+                f"cannot migrate Specification Scout with noncanonical artifact: {detail}"
+            )
+        return
+
+    if role_kind == "decision-liaison":
+        decision_id = str(role_state.get("decision_id") or role_id.removeprefix("L-"))
+        path = decision_liaison_file(repo, decision_id)
+        if not path.is_file() or not read_text(path).strip():
+            raise HLoopError(
+                f"cannot migrate Decision Liaison {role_id} with missing artifact: {path}"
+            )
+        text = read_text(path)
+        meta = parse_frontmatter_text(text)
+        identity_error = decision_role_artifact_identity_error(
+            state,
+            role_id=role_id,
+            role_state=role_state,
+            meta=meta,
+            decision_id=decision_id,
+        )
+        provenance_error = decision_liaison_response_provenance_error(meta)
+        body = re.sub(r"^# 回答\s*", "", markdown_body_after_frontmatter(text)).strip()
+        if identity_error or provenance_error or not body:
+            detail = identity_error or provenance_error or "response body is empty"
+            raise HLoopError(
+                f"cannot migrate Decision Liaison {role_id} with noncanonical artifact: "
+                f"{detail}"
+            )
+        return
+
+    raise HLoopError(f"cannot migrate unsupported non-Worker role kind: {role_kind}")
+
+
+def migration_product_dirty_paths(worktree: Path) -> list[str]:
+    """Prove one extant role worktree is Git-backed and product-clean."""
+
+    try:
+        observed_root = Path(
+            git(worktree, ["rev-parse", "--show-toplevel"])
+        ).resolve()
+        if observed_root != worktree.resolve():
+            raise HLoopError(
+                f"Git top-level mismatch: expected {worktree.resolve()} "
+                f"but observed {observed_root}"
+            )
+        paths = porcelain_paths(worktree)
+    except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
+        raise HLoopError(
+            f"cannot migrate role worktree without a valid Git status proof: {worktree}: {exc}"
+        ) from exc
+    loop_root = LOOP_DIR.as_posix()
+    loop_prefix = loop_root + "/"
+    return [
+        path
+        for path in paths
+        if path != loop_root and not path.startswith(loop_prefix)
+    ]
+
+
+def assert_migration_patch_review_identity_sets(
+    repo: Path,
+    state: Mapping[str, Any],
+) -> None:
+    """Validate every task's complete retained Patch Review identity mode."""
+
+    retained_by_task: dict[str, list[hloop_worker_candidate.PatchReview]] = {}
+    tasks = state.get("tasks")
+    if isinstance(tasks, Mapping):
+        for task_id, task_state in tasks.items():
+            if not isinstance(task_state, Mapping):
+                continue
+            history = task_patch_review_history(task_state)
+            if history:
+                retained_by_task.setdefault(str(task_id), []).extend(history)
+    patch_reviews = state.get("patch_reviews")
+    if isinstance(patch_reviews, Mapping):
+        for role_id, role_state in patch_reviews.items():
+            if not isinstance(role_state, Mapping):
+                continue
+            task_id = str(role_state.get("task_id") or "")
+            task_attempt_id = str(role_state.get("task_attempt_id") or "")
+            path = patch_review_file(
+                repo, task_id, task_attempt_id, str(role_id)
+            )
+            try:
+                review = hloop_worker_candidate.PatchReview.from_record(
+                    json.loads(path.read_bytes())
+                )
+            except (
+                OSError,
+                json.JSONDecodeError,
+                hloop_worker_candidate.WorkerCandidateError,
+            ) as exc:
+                raise HLoopError(
+                    f"cannot validate retained Patch Review identity for task "
+                    f"{task_id or 'missing'}: {exc}"
+                ) from exc
+            retained_by_task.setdefault(task_id, []).append(review)
+    for task_id, reviews in sorted(retained_by_task.items()):
+        try:
+            hloop_worker_candidate.require_uniform_patch_review_finding_identity(
+                reviews
+            )
+        except hloop_worker_candidate.WorkerCandidateError as exc:
+            raise HLoopError(
+                f"cannot migrate task {task_id} Patch Review audit set: {exc}"
+            ) from exc
+
+
+def assert_migration_safe(repo: Path, state: dict[str, Any]) -> None:
+    active_statuses = {
+        "starting",
+        "running",
+        "waiting",
+        "waiting-agent",
+        "waiting-manager",
+        "prepared",
+        "pending",
+        "requested",
+    }
+    for role_kind, role_id, role_state in iter_all_roles(state):
+        if role_kind == "worker":
+            continue
+        if (
+            role_kind == "specification-scout"
+            and migration_skipped_scout_was_not_dispatched(
+                role_state,
+                expected_policy=str(
+                    state.get("specification_scout")
+                    or DEFAULT_SPECIFICATION_SCOUT
+                ),
+            )
+        ):
+            continue
+        status = str(role_state.get("status") or "")
+        gate_status = str(role_state.get("gate_status") or "")
+        if status in active_statuses or gate_status in active_statuses:
+            raise HLoopError(
+                "cannot migrate while audit/advisory roles are running; "
+                f"harvest or abort them first: {role_id}"
+            )
+        terminal_lifecycles = MIGRATION_ROLE_TERMINAL_LIFECYCLES.get(role_kind)
+        if terminal_lifecycles is None or (status, gate_status) not in terminal_lifecycles:
+            raise HLoopError(
+                f"cannot migrate noncanonical role lifecycle: {role_kind} {role_id} "
+                f"status={status or 'missing'} gate_status={gate_status or 'missing'}"
+            )
+        harvested_at = role_state.get("harvested_at")
+        if not bool(harvested_at):
+            raise HLoopError(
+                f"cannot migrate unharvested role: {role_kind} {role_id}"
+            )
+        if not migration_canonical_timestamp(harvested_at):
+            raise HLoopError(
+                f"cannot migrate noncanonical harvested_at for {role_kind} {role_id}"
+            )
+        if (status, gate_status) == ("aborted", "aborted"):
+            aborted_at = role_state.get("aborted_at")
+            abort_reason = role_state.get("abort_reason")
+            if not aborted_at or not abort_reason:
+                raise HLoopError(
+                    f"cannot migrate aborted {role_kind} without abort provenance: {role_id}"
+                )
+            if not migration_canonical_timestamp(aborted_at):
+                raise HLoopError(
+                    f"cannot migrate noncanonical aborted_at for {role_kind} {role_id}"
+                )
+            if not migration_canonical_text(abort_reason):
+                raise HLoopError(
+                    f"cannot migrate noncanonical abort_reason for {role_kind} {role_id}"
+                )
+        if str(role_state.get("pane_id") or ""):
+            raise HLoopError(
+                f"cannot migrate role with a live pane: {role_kind} {role_id}"
+            )
+        failures = role_cleanup_failures(role_state)
+        if failures:
+            raise HLoopError(
+                f"cannot migrate cleanup-failed role: {role_kind} {role_id} "
+                + ", ".join(sorted(failures))
+            )
+        worktree_raw = str(role_state.get("worktree") or "")
+        if worktree_raw and Path(worktree_raw).exists():
+            dirty_paths = migration_product_dirty_paths(Path(worktree_raw))
+            if dirty_paths:
+                raise HLoopError(
+                    f"cannot migrate dirty role worktree: {role_kind} {role_id}"
+                )
+        assert_migration_role_artifact(repo, state, role_kind, role_id, role_state)
+    assert_migration_patch_review_identity_sets(repo, state)
     if state.get("active_merge"):
         raise HLoopError("cannot migrate while a merge transaction is active")
-    for role_kind, role_id, role_state in iter_all_roles(state):
-        worktree_raw = str(role_state.get("worktree") or "")
-        if (
-            role_kind != "worker"
-            and worktree_raw
-            and Path(worktree_raw).exists()
-            and product_dirty_paths_for_agent(Path(worktree_raw))
-        ):
-            raise HLoopError(f"cannot migrate dirty role worktree: {role_kind} {role_id}")
 
 
 def migrate_format_one_to_two(state: dict[str, Any]) -> dict[str, Any]:
@@ -1414,6 +2049,26 @@ def migration_artifact_pairs(
         )
     for task_id, task_record in sorted(tasks.items(), key=lambda item: str(item[0])):
         task_id = str(task_id)
+        if not isinstance(task_record, Mapping):
+            raise HLoopError(f"task state record must be an object during migration: {task_id}")
+        try:
+            state_task_migration = hloop_task_contract.migrate_legacy_task_contract(
+                task_record,
+                record_type="state",
+            )
+        except hloop_task_contract.ContractValidationError as exc:
+            raise HLoopError(f"cannot migrate task state {task_id}: {exc}") from exc
+        state_contract_revision = state_task_migration.contract_schema_revision
+        if (
+            state_contract_revision
+            == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+        ):
+            try:
+                exact_task_contract_digest(repo, task_id, task_record)
+            except HLoopError as exc:
+                raise HLoopError(
+                    f"cannot migrate revision 3 task identity {task_id}: {exc}"
+                ) from exc
         path = task_file(repo, task_id)
         if path.is_file():
             source = path.read_bytes()
@@ -1434,11 +2089,76 @@ def migration_artifact_pairs(
             if status_mismatch and not immutable_queued_history:
                 raise HLoopError(f"task state/artifact status mismatch during migration: {task_id}")
             try:
-                migrated_meta = hloop_task_contract.migrate_legacy_task_contract(meta).record
+                artifact_task_migration = (
+                    hloop_task_contract.migrate_legacy_task_contract(
+                        meta,
+                        record_type="artifact",
+                    )
+                )
             except hloop_task_contract.ContractValidationError as exc:
                 raise HLoopError(f"cannot migrate task artifact {task_id}: {exc}") from exc
+            if (
+                artifact_task_migration.contract_schema_revision
+                != state_contract_revision
+            ):
+                raise HLoopError(
+                    f"task state/artifact contract revision mismatch during migration: {task_id}"
+                )
+            if (
+                state_contract_revision
+                == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+            ):
+                expected_run_id = str(source_state.get("run_id") or "")
+                if str(meta.get("run_id") or "") != expected_run_id:
+                    raise HLoopError(
+                        "task artifact run identity mismatch during migration: "
+                        f"{task_id}"
+                    )
+                expected_projection = revision_three_complete_state_projection(meta)
+                historical_fields_present = frozenset(
+                    REVISION_THREE_TASK_POST_HISTORICAL_STATE_FIELDS
+                    & set(task_record)
+                )
+                missing_historical_fields = (
+                    REVISION_THREE_TASK_POST_HISTORICAL_STATE_FIELDS
+                    - historical_fields_present
+                )
+                invalid_historical_shape = bool(missing_historical_fields) and (
+                    historical_fields_present
+                    not in REVISION_THREE_TASK_HISTORICAL_PRESENT_FIELD_SETS
+                )
+                compared_fields = (
+                    REVISION_THREE_TASK_COMPLETE_STATE_FIELDS
+                    - missing_historical_fields
+                )
+                mismatched_fields = sorted(
+                    set(missing_historical_fields)
+                    if invalid_historical_shape
+                    else {
+                        field
+                        for field in compared_fields
+                        if (field in task_record) != (field in expected_projection)
+                        or (
+                            field in task_record
+                            and task_record[field] != expected_projection[field]
+                        )
+                    }
+                )
+                if mismatched_fields:
+                    raise HLoopError(
+                        "task state/artifact immutable projection mismatch during "
+                        f"migration: {task_id}: " + ", ".join(mismatched_fields)
+                    )
             rel = path.relative_to(repo).as_posix()
-            pairs[rel] = (source, migration_frontmatter_bytes(source, migrated_meta))
+            output = (
+                source
+                if state_contract_revision
+                == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+                else migration_frontmatter_bytes(
+                    source, artifact_task_migration.record
+                )
+            )
+            pairs[rel] = (source, output)
 
         result_path = result_file(repo, task_id)
         if not result_path.is_file():
@@ -1457,10 +2177,19 @@ def migration_artifact_pairs(
             )
         except hloop_task_contract.ContractValidationError as exc:
             raise HLoopError(f"cannot migrate result artifact {task_id}: {exc}") from exc
+        result_revision = hloop_task_contract.contract_schema_revision_of(
+            migrated_result
+        )
+        if result_revision != state_contract_revision:
+            raise HLoopError(
+                f"task state/result contract revision mismatch during migration: {task_id}"
+            )
         result_rel = result_path.relative_to(repo).as_posix()
         pairs[result_rel] = (
             result_source,
-            migration_frontmatter_bytes(result_source, migrated_result),
+            result_source
+            if result_revision == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+            else migration_frontmatter_bytes(result_source, migrated_result),
         )
     return pairs
 
@@ -1741,6 +2470,13 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 2
         raise HLoopError("migration recovery blocked: " + "; ".join(decision.issues))
+    recovering_prepared_apply = bool(
+        marker is not None
+        and str(marker.get("status") or "") in {"prepared", "running"}
+        and decision.action in {"resume-apply", "write-committed-marker"}
+    )
+    if decision.action != "complete" and (args.resume or recovering_prepared_apply):
+        assert_migration_safe(repo, state)
     if not (args.apply or args.resume or args.rollback):
         print(
             json.dumps(
@@ -5606,7 +6342,10 @@ def runtime_worker_task_preflight(
     task_state = (state.get("tasks") or {}).get(task_id) or {}
     legacy_record["status"] = str(task_state.get("status") or task_meta.get("status") or "")
     try:
-        migration = hloop_task_contract.migrate_legacy_task_contract(legacy_record)
+        migration = hloop_task_contract.migrate_legacy_task_contract(
+            legacy_record,
+            record_type="artifact",
+        )
     except hloop_task_contract.ContractValidationError as exc:
         raise HLoopError(f"invalid legacy task contract for {task_id}: {exc}") from exc
     if migration.action == "reclassify-to-revision-3":
@@ -18008,20 +18747,115 @@ def revision_three_task_fields(
 def revision_three_projection(fields: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: fields[key]
-        for key in (
-            "contract_schema_revision",
-            "preserved_invariants",
-            "regression_checks",
-            "risk_class",
-            "required_gates",
-            "worker_agent_effort",
-            "investigation_goal",
-            "implementation_ready_evidence",
-            "exploration_budget_minutes",
-            "history_search_allowed",
-        )
+        for key in REVISION_THREE_TASK_STATE_FIELDS
         if key in fields
     }
+
+
+REVISION_THREE_TASK_STATE_FIELDS = (
+    "contract_schema_revision",
+    "created_from",
+    "acceptance",
+    "priority",
+    "validation_minimum",
+    "preserved_invariants",
+    "regression_checks",
+    "risk_class",
+    "required_gates",
+    "worker_agent_effort",
+    "investigation_goal",
+    "implementation_ready_evidence",
+    "exploration_budget_minutes",
+    "history_search_allowed",
+)
+# Revision-3 tasks created while the STATE projection was landing have two
+# canonical historical shapes: the earliest records omit all four fields,
+# while the next generation already retained acceptance and validation.  Keep
+# both exact shapes auditable and reject every other partial shape or mismatch.
+REVISION_THREE_TASK_POST_HISTORICAL_STATE_FIELDS = frozenset(
+    {"created_from", "acceptance", "priority", "validation_minimum"}
+)
+REVISION_THREE_TASK_HISTORICAL_PRESENT_FIELD_SETS = frozenset(
+    {
+        frozenset(),
+        frozenset({"acceptance", "validation_minimum"}),
+    }
+)
+TASK_PROVENANCE_STATE_FIELDS = (
+    "task_origin",
+    "release_scope_revision",
+    "plan_item_refs",
+    "requirement_refs",
+    "scope_refs",
+    "source_finding",
+    "authorization_input_id",
+    "why_fix_now",
+    "operational_reason",
+    "origin",
+    "contract_relation",
+    "release_effect",
+    "remediation_round",
+    "fact_status",
+    "disposition",
+    "severity",
+    "decision_requirement",
+    "scope_expanding",
+)
+REVISION_THREE_TASK_IMMUTABLE_STATE_FIELDS = frozenset(
+    (*REVISION_THREE_TASK_STATE_FIELDS, *TASK_PROVENANCE_STATE_FIELDS)
+)
+REVISION_THREE_TASK_OPERATIONAL_STATE_FIELD_MAP = (
+    ("depends_on", "depends_on"),
+    ("write_allow", "write_allow"),
+    ("write_deny", "write_deny"),
+    ("worker_protocol", "worker_protocol"),
+    ("worker_qa_profile", "worker_qa_profile"),
+    ("agent_provider", "worker_agent_provider"),
+    ("agent_model", "worker_agent_model"),
+    ("batch_id", "batch_id"),
+)
+REVISION_THREE_TASK_COMPLETE_STATE_FIELDS = frozenset(
+    (
+        *REVISION_THREE_TASK_IMMUTABLE_STATE_FIELDS,
+        *(state_field for state_field, _ in REVISION_THREE_TASK_OPERATIONAL_STATE_FIELD_MAP),
+    )
+)
+
+
+def revision_three_immutable_state_projection(
+    fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the canonical immutable task-contract projection stored in STATE."""
+
+    normalized = dict(fields)
+    for key in ("release_scope_revision", "remediation_round"):
+        value = normalized.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            normalized[key] = int(value)
+    projection = revision_three_projection(normalized)
+    if normalized.get("task_origin"):
+        try:
+            provenance = hloop_release_scope.TaskProvenance.from_record(
+                normalized
+            ).to_record()
+        except hloop_release_scope.ReleaseScopeError as exc:
+            raise HLoopError(f"invalid task provenance projection: {exc}") from exc
+        projection.update(provenance)
+    return projection
+
+
+def revision_three_complete_state_projection(
+    fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return every immutable or operational task-contract field stored in STATE."""
+
+    projection = revision_three_immutable_state_projection(fields)
+    for state_field, artifact_field in REVISION_THREE_TASK_OPERATIONAL_STATE_FIELD_MAP:
+        if artifact_field in fields:
+            projection[state_field] = fields[artifact_field]
+    if "worker_qa_profile" not in projection and "qa_profile" in fields:
+        projection["worker_qa_profile"] = fields["qa_profile"]
+    return projection
 
 
 def create_loop_task(
@@ -18157,8 +18991,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         "worker_qa_profile": fields["worker_qa_profile"],
         "agent_provider": fields["worker_agent_provider"],
         "agent_model": fields["worker_agent_model"],
-        **revision_three_projection(fields),
-        **normalized_provenance.to_record(),
+        **revision_three_complete_state_projection(fields),
         "task_contract_digest": task_contract_digest,
         "created_at": now_iso(),
     }
@@ -18312,8 +19145,7 @@ Use the HLoop Worker Protocol from `{LOOP_DIR.as_posix()}/PROFILE.md` and your r
         "worker_qa_profile": fields["worker_qa_profile"],
         "agent_provider": fields["worker_agent_provider"],
         "agent_model": fields["worker_agent_model"],
-        **revision_three_projection(fields),
-        **normalized_provenance.to_record(),
+        **revision_three_complete_state_projection(fields),
         "task_contract_digest": task_contract_digest,
         "created_at": now_iso(),
     }
@@ -19162,6 +19994,10 @@ def apply_patch_review_record(
     task_state: dict[str, Any],
     review: hloop_worker_candidate.PatchReview,
 ) -> hloop_worker_candidate.PatchReviewDecision:
+    if review.legacy_finding_identity:
+        raise HLoopError(
+            "legacy digest-only Patch Review is audit history and cannot drive a new decision"
+        )
     candidate, seal, _ = current_candidate_evidence(
         repo, state, task_id, task_state
     )
@@ -19323,9 +20159,13 @@ review and do not edit product files.
 - regression checks: {json.dumps(normalize_list(task_meta.get('regression_checks')), ensure_ascii=False)}
 
 Write one strict Patch Review JSON record. Use verdict `passed` only when no
-task-local finding remains. Use `fix_required` with one or more labelled
-SHA-256 unresolved finding fingerprints otherwise. Put task-external findings
-only in `follow_up_finding_fingerprints`; `automatic_task_ids` must remain [].
+task-local finding remains. For every finding, add one `findings` entry with
+scope (`unresolved` or `follow_up`), file_path, symbol, trigger,
+product_impact, proposed_fix, and the fingerprint produced by the native
+semantic contract over those five evidence fields. The two fingerprint arrays
+must exactly equal the fingerprints derived from matching-scope entries;
+digest-only free text is invalid. Put task-external findings only in
+`follow_up` evidence; `automatic_task_ids` must remain [].
 
 Immutable record fields:
 ```json
@@ -19370,6 +20210,9 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
         "candidate_artifact_digest": seal.candidate_artifact_digest,
         "review_attempt_id": review_attempt_id,
         "review_round": round_number,
+        "finding_identity_contract": (
+            hloop_worker_candidate.PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
+        ),
     }
     review_contract_digest = hashlib.sha256(
         hloop_worker_candidate.canonical_json(contract_material).encode("utf-8")
@@ -19501,6 +20344,9 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
         "task_attempt_id": seal.attempt_id,
         "review_attempt_id": review_attempt_id,
         "review_round": round_number,
+        "finding_identity_contract": (
+            hloop_worker_candidate.PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
+        ),
         "candidate_sha": seal.candidate_sha,
         "candidate_artifact_digest": seal.candidate_artifact_digest,
         "task_contract_digest": review_contract_digest,
@@ -19566,6 +20412,22 @@ def cmd_patch_review_record(args: argparse.Namespace) -> int:
         raise HLoopError(f"task {task_id} has no pending Patch Review")
     review_round = existing.review_round if existing is not None else len(history) + 1
     review_attempt_id = requested_attempt or f"PR-{task_id}-R{review_round:03d}"
+    findings = []
+    for scope, values in (
+        ("unresolved", getattr(args, "unresolved_finding_evidence", None) or []),
+        ("follow_up", getattr(args, "follow_up_finding_evidence", None) or []),
+    ):
+        for file_path, symbol, trigger, product_impact, proposed_fix in values:
+            findings.append(
+                hloop_worker_candidate.PatchReviewFinding.from_evidence(
+                    scope=scope,
+                    file_path=file_path,
+                    symbol=symbol,
+                    trigger=trigger,
+                    product_impact=product_impact,
+                    proposed_fix=proposed_fix,
+                )
+            )
     try:
         review = hloop_worker_candidate.record_patch_review(
             seal,
@@ -19575,24 +20437,16 @@ def cmd_patch_review_record(args: argparse.Namespace) -> int:
             reviewer_model=args.reviewer_model,
             reviewer_effort=args.reviewer_effort,
             verdict=args.verdict,
+            findings=findings,
             unresolved_finding_fingerprints=normalize_list(
-                args.unresolved_finding_fingerprint
+                getattr(args, "unresolved_finding_fingerprint", None)
             ),
             follow_up_finding_fingerprints=normalize_list(
-                args.follow_up_finding_fingerprint
+                getattr(args, "follow_up_finding_fingerprint", None)
             ),
         )
     except hloop_worker_candidate.WorkerCandidateError as exc:
         raise HLoopError(f"invalid Patch Review: {exc}") from exc
-    path = patch_review_file(
-        repo, task_id, seal.attempt_id, review.review_attempt_id
-    )
-    payload = exact_json_bytes(review.to_record())
-    if path.exists() and path.read_bytes() != payload:
-        raise HLoopError(
-            f"Patch Review attempt already has different artifact bytes: {path}"
-        )
-    write_text(path, payload.decode("utf-8"), durable=True)
     decision = apply_patch_review_record(
         repo, state, task_id, task_state, review
     )
@@ -19663,6 +20517,16 @@ def cmd_patch_review_harvest(args: argparse.Namespace) -> int:
         raise HLoopError(f"invalid Patch Review artifact {source}: {exc}") from exc
     if review.review_attempt_id != review_attempt_id:
         raise HLoopError("Patch Review attempt identity mismatch")
+    expected_finding_contract = str(
+        review_state.get("finding_identity_contract") or ""
+    )
+    if (
+        review.legacy_finding_identity
+        or review.finding_identity_contract != expected_finding_contract
+    ):
+        raise HLoopError(
+            "Patch Review finding identity is not the canonical durable-evidence contract"
+        )
     if review.review_round != int(review_state.get("review_round") or 0):
         raise HLoopError("Patch Review round identity mismatch")
     reviewer_identity = (
@@ -19693,7 +20557,8 @@ def cmd_patch_review_harvest(args: argparse.Namespace) -> int:
     target = patch_review_file(
         repo, task_id, seal.attempt_id, review_attempt_id
     )
-    write_text(target, payload.decode("utf-8"), durable=True)
+    if payload != exact_json_bytes(review.to_record()):
+        raise HLoopError("Patch Review artifact is not canonical exact JSON")
     decision = apply_patch_review_record(
         repo, state, task_id, task_state, review
     )
@@ -27837,33 +28702,7 @@ Implement only the canonical findings approved in the remediation write-ahead pl
             "remediation_task_contract": dict(contract),
             "created_at": now_iso(),
         }
-        projection.update(revision_three_projection(dict(contract)))
-        projection.update(
-            {
-                key: contract.get(key)
-                for key in (
-                    "task_origin",
-                    "release_scope_revision",
-                    "plan_item_refs",
-                    "requirement_refs",
-                    "scope_refs",
-                    "source_finding",
-                    "authorization_input_id",
-                    "why_fix_now",
-                    "operational_reason",
-                    "origin",
-                    "contract_relation",
-                    "release_effect",
-                    "remediation_round",
-                    "fact_status",
-                    "disposition",
-                    "severity",
-                    "decision_requirement",
-                    "scope_expanding",
-                )
-                if key in contract
-            }
-        )
+        projection.update(revision_three_complete_state_projection(contract))
         state["tasks"][task_id] = projection
     links = remediation_source_links(state)
     for source in planned.source_refs:
@@ -34162,6 +35001,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     patch_review_record.add_argument(
         "--follow-up-finding-fingerprint", action="append"
+    )
+    patch_review_record.add_argument(
+        "--unresolved-finding-evidence",
+        action="append",
+        nargs=5,
+        metavar=("FILE", "SYMBOL", "TRIGGER", "IMPACT", "PROPOSED_FIX"),
+        help="record one task-local finding from canonical semantic evidence",
+    )
+    patch_review_record.add_argument(
+        "--follow-up-finding-evidence",
+        action="append",
+        nargs=5,
+        metavar=("FILE", "SYMBOL", "TRIGGER", "IMPACT", "PROPOSED_FIX"),
+        help="record one task-external finding from canonical semantic evidence",
     )
     patch_review_record.set_defaults(func=cmd_patch_review_record)
     patch_review_harvest = patch_review_sub.add_parser("harvest")

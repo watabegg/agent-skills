@@ -56,6 +56,11 @@
     "reviewer_model": {"type": "string", "minLength": 1},
     "reviewer_effort": {"type": "string", "minLength": 1},
     "verdict": {"enum": ["passed", "fix_required"]},
+    "finding_identity_contract": {"const": "semantic-v1"},
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/findingEvidence"}
+    },
     "unresolved_finding_fingerprints": {
       "type": "array",
       "uniqueItems": true,
@@ -93,6 +98,21 @@
           "unresolved_finding_fingerprints": {"minItems": 1}
         }
       }
+    },
+    {
+      "oneOf": [
+        {
+          "required": ["finding_identity_contract", "findings"]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["finding_identity_contract"]},
+              {"required": ["findings"]}
+            ]
+          }
+        }
+      ]
     }
   ],
   "additionalProperties": false,
@@ -104,6 +124,28 @@
     "gitObject": {
       "type": "string",
       "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "findingEvidence": {
+      "type": "object",
+      "required": [
+        "scope",
+        "fingerprint",
+        "file_path",
+        "symbol",
+        "trigger",
+        "product_impact",
+        "proposed_fix"
+      ],
+      "properties": {
+        "scope": {"enum": ["unresolved", "follow_up"]},
+        "fingerprint": {"$ref": "#/$defs/digest"},
+        "file_path": {"type": "string", "minLength": 1},
+        "symbol": {"type": "string", "minLength": 1},
+        "trigger": {"type": "string", "minLength": 1},
+        "product_impact": {"type": "string", "minLength": 1},
+        "proposed_fix": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
     }
   }
 }
