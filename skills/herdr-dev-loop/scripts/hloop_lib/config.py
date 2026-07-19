@@ -115,10 +115,10 @@ _REVIEWER_ROLE_KEYS = (
     "lane_count",
     "protocol",
     "required_capabilities",
-    # 0.5.0--0.5.2 compatibility aliases.  They are never retained in a
+    "providers",
+    # 0.5.0--0.5.2 compatibility count aliases.  They are never retained in a
     # canonical resolved mapping.
     "probe_count",
-    "providers",
     "probes_per_provider",
     *COORDINATOR_COMPONENT_NAMES,
 )

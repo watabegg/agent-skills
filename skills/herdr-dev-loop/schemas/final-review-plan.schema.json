@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Herdr Dev Loop Manual Final Review Plan",
+  "$comment": "Offline public wrapper for the canonical manual-final plan schema.",
   "$ref": "../references/schemas/final-review-plan.schema.json"
 }

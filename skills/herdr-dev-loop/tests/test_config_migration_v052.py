@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 from hloop_lib.config import (  # noqa: E402
     ConfigValidationError,
     REVIEW_POLICY_DEFAULTS,
+    V053_REVIEW_POLICY_DEFAULTS,
     load_config_file,
     resolve_config,
     validate_config,
@@ -101,7 +102,7 @@ class ReviewPolicyConfigTests(unittest.TestCase):
     def test_example_config_contains_the_approved_review_defaults(self):
         example = load_config_file(Path(__file__).parents[1] / "examples" / "config.toml")
         validate_config(example)
-        self.assertEqual(example["defaults"]["review"], REVIEW_POLICY_DEFAULTS)
+        self.assertEqual(example["defaults"]["review"], V053_REVIEW_POLICY_DEFAULTS)
 
 
 def legacy_state() -> dict:

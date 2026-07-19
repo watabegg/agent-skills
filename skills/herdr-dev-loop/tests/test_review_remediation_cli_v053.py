@@ -218,6 +218,40 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
             ),
         )
 
+    def external_epoch_plan(self, head: str) -> ReviewEpochPlan:
+        plan = self.epoch_plan(head)
+        reviewer = replace(
+            plan.required_executions[0], protocol="codex-review-multi-v2"
+        )
+        return replace(
+            plan, required_executions=(reviewer, plan.required_executions[1])
+        )
+
+    def ready_release_dependency(self) -> dict:
+        record = json.loads(
+            (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
+        )
+        record["release"]["release_ready"] = True
+        dependency = record["dependencies"][0]
+        dependency.update(
+            {
+                "availability": "available",
+                "blocking_reason": "",
+                "minimum_compatible_version": "2.1.0",
+                "distribution_identity": {
+                    "source": "https://example.invalid/codex-review-multi-v2.git",
+                    "immutable_id": "a" * 40,
+                    "version": "2.1.0",
+                    "digest_algorithm": "sha256-tree-v1",
+                    "content_digest": "sha256:" + "b" * 64,
+                },
+            }
+        )
+        dependency["capability_manifest"]["relative_path"] = (
+            "capabilities/externally-planned-v1.json"
+        )
+        return record
+
     def namespace_args(self, repo: Path, **kwargs) -> argparse.Namespace:
         return argparse.Namespace(repo=str(repo), **kwargs)
 
@@ -503,6 +537,337 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
             validate_externally_planned_review_manifest(
                 manifest.to_record(), expected_plan=other, adapter=adapter
             )
+
+    def test_external_epoch_is_blocked_by_canonical_unavailable_release_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill_root = Path(directory)
+            (skill_root / "release-dependencies.json").write_text(
+                (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
+                with self.assertRaisesRegex(
+                    hloop.HLoopError, "release dependency state.*release_ready"
+                ):
+                    hloop.validate_epoch_protocol_capabilities(
+                        self.external_epoch_plan("a" * 40), []
+                    )
+
+    def test_external_epoch_binds_capability_to_exact_release_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill_root = Path(directory)
+            release = self.ready_release_dependency()
+            (skill_root / "release-dependencies.json").write_text(
+                json.dumps(release), encoding="utf-8"
+            )
+            adapter = hloop.hloop_release_dependency.validate_release_dependencies(
+                release
+            )
+            capability = skill_root / "capability.json"
+            capability.write_text(json.dumps(adapter.to_record()), encoding="utf-8")
+            with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
+                observed = hloop.validate_epoch_protocol_capabilities(
+                    self.external_epoch_plan("a" * 40), [str(capability)]
+                )
+            self.assertEqual(
+                observed["codex-review-multi-v2"], adapter.to_record()
+            )
+
+    def test_external_epoch_rejects_all_release_pin_identity_drift(self):
+        release = self.ready_release_dependency()
+        expected = hloop.hloop_release_dependency.validate_release_dependencies(
+            release
+        ).to_record()
+        mutations = {
+            "source": lambda record: record.update(
+                {"source": "https://mirror.invalid/review.git@" + "a" * 40}
+            ),
+            "immutable-id": lambda record: record.update(
+                {
+                    "source": "https://example.invalid/codex-review-multi-v2.git@"
+                    + "c" * 40
+                }
+            ),
+            "version": lambda record: record.update({"version": "2.2.0"}),
+            "digest": lambda record: record.update(
+                {"content_digest": "sha256:" + "c" * 64}
+            ),
+            "capabilities": lambda record: record.update(
+                {
+                    "capabilities": [
+                        "externally-planned-v1",
+                        "synthetic-extra-capability",
+                    ]
+                }
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                skill_root = Path(directory)
+                (skill_root / "release-dependencies.json").write_text(
+                    json.dumps(release), encoding="utf-8"
+                )
+                observed = dict(expected)
+                observed["capabilities"] = list(expected["capabilities"])
+                mutate(observed)
+                capability = skill_root / "capability.json"
+                capability.write_text(json.dumps(observed), encoding="utf-8")
+                with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
+                    with self.assertRaisesRegex(
+                        hloop.HLoopError, "capability pin mismatch"
+                    ):
+                        hloop.validate_epoch_protocol_capabilities(
+                            self.external_epoch_plan("a" * 40), [str(capability)]
+                        )
+
+    def test_external_epoch_revalidates_canonical_pin_before_reserve_and_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, head, state = self.make_repo(Path(directory))
+            plan = self.external_epoch_plan(head)
+            collection = hloop.hloop_review_epoch.ReviewEpochCollection.create(plan)
+            hloop.store_review_epoch_collection(state, collection)
+            release = self.ready_release_dependency()
+            adapter = hloop.hloop_release_dependency.validate_release_dependencies(
+                release
+            )
+            state["review_protocol"] = "codex-review-multi-v2"
+            state["review_epochs"]["protocol_capabilities"][plan.plan_digest] = {
+                adapter.protocol: adapter.to_record()
+            }
+            reviewer = plan.execution("R001")
+            process_ids = [item.process_id for item in reviewer.processes]
+            reserve_args = self.namespace_args(
+                repo,
+                epoch_id="E001",
+                revision=1,
+                lease_id="lease-R001",
+                execution_id="R001",
+                process_id=process_ids,
+                expires_at="2026-07-19T08:00:00Z",
+            )
+            unavailable = hloop.hloop_release_dependency.ReleaseDependencyUnavailable(
+                "0.5.3 release_ready is false"
+            )
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(
+                    hloop.hloop_release_dependency,
+                    "load_release_dependencies",
+                    side_effect=unavailable,
+                ),
+                self.assertRaisesRegex(
+                    hloop.HLoopError, "canonical release dependency state.*release_ready"
+                ),
+            ):
+                hloop.cmd_review_epoch_reserve(reserve_args)
+            self.assertEqual(collection.capacity.reserved_slots, 0)
+
+            capacity = collection.capacity.reserve(
+                plan,
+                lease_id="lease-R001",
+                execution_id="R001",
+                process_ids=process_ids,
+                expires_at="2026-07-19T08:00:00Z",
+            )
+            hloop.store_review_epoch_collection(
+                state, collection.with_capacity(capacity)
+            )
+            drifted = replace(
+                adapter, content_digest="sha256:" + "c" * 64
+            )
+            with (
+                mock.patch.object(
+                    hloop.hloop_release_dependency,
+                    "load_release_dependencies",
+                    return_value=drifted,
+                ),
+                self.assertRaisesRegex(
+                    hloop.HLoopError, "does not match the canonical release dependency"
+                ),
+            ):
+                hloop.epoch_execution_start_binding(
+                    state,
+                    role_id="R001",
+                    attempt_id="R001-A001",
+                    source_kind="reviewer",
+                    target_sha=head,
+                )
+
+    def test_external_epoch_runtime_pin_rejects_every_identity_drift(self):
+        plan = self.external_epoch_plan("a" * 40)
+        release = self.ready_release_dependency()
+        adapter = hloop.hloop_release_dependency.validate_release_dependencies(
+            release
+        )
+        state = {
+            "review_epochs": {
+                "active_epoch_id": "E001",
+                "records": {},
+                "protocol_capabilities": {
+                    plan.plan_digest: {adapter.protocol: adapter.to_record()}
+                },
+            }
+        }
+        mutations = (
+            replace(adapter, source="https://mirror.invalid/review.git@" + "a" * 40),
+            replace(adapter, version="2.2.0"),
+            replace(adapter, content_digest="sha256:" + "c" * 64),
+            replace(
+                adapter,
+                capabilities=(
+                    "externally-planned-v1",
+                    "synthetic-extra-capability",
+                ),
+            ),
+        )
+        for expected in mutations:
+            with (
+                self.subTest(expected=expected.to_record()),
+                mock.patch.object(
+                    hloop.hloop_release_dependency,
+                    "load_release_dependencies",
+                    return_value=expected,
+                ),
+                self.assertRaisesRegex(
+                    hloop.HLoopError, "does not match the canonical release dependency"
+                ),
+            ):
+                hloop.validate_epoch_runtime_protocol_capabilities(state, plan)
+
+    def test_idempotent_successor_revalidates_canonical_release_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, head, state = self.make_repo(Path(directory))
+            parent_plan = self.external_epoch_plan(head)
+            parent = hloop.hloop_review_epoch.ReviewEpochCollection.create(
+                parent_plan
+            )
+            additional = replace(
+                self.execution(
+                    "R002", source_kind="reviewer", process_kind="discovery"
+                ),
+                protocol="codex-review-multi-v2",
+            )
+            successor_plan = hloop.hloop_review_epoch.create_successor_revision(
+                parent_plan, additional_executions=(additional,)
+            )
+            release = self.ready_release_dependency()
+            adapter = hloop.hloop_release_dependency.validate_release_dependencies(
+                release
+            )
+            state["review_epochs"] = {
+                "active_epoch_id": "E001",
+                "records": {
+                    "E001": {
+                        "active_revision": 2,
+                        "revisions": {
+                            "1": parent.to_record(),
+                            "2": {"stored": "successor"},
+                        },
+                    }
+                },
+                "protocol_capabilities": {
+                    successor_plan.plan_digest: {
+                        adapter.protocol: adapter.to_record()
+                    }
+                },
+            }
+            plan_path = repo / "successor.json"
+            plan_path.write_text(
+                json.dumps(successor_plan.to_record()), encoding="utf-8"
+            )
+            sentinel_successor = object()
+            unavailable = hloop.hloop_release_dependency.ReleaseDependencyUnavailable(
+                "0.5.3 release_ready is false"
+            )
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(
+                    hloop, "require_review_epoch_collection", return_value=parent
+                ),
+                mock.patch.object(
+                    hloop.hloop_review_epoch,
+                    "create_successor_collection",
+                    return_value=(parent, sentinel_successor),
+                ),
+                mock.patch.object(
+                    hloop.hloop_review_epoch.ReviewEpochCollection,
+                    "from_record",
+                    return_value=sentinel_successor,
+                ),
+                mock.patch.object(
+                    hloop.hloop_release_dependency,
+                    "load_release_dependencies",
+                    side_effect=unavailable,
+                ),
+                self.assertRaisesRegex(
+                    hloop.HLoopError, "canonical release dependency state.*release_ready"
+                ),
+            ):
+                hloop.cmd_review_epoch_successor(
+                    self.namespace_args(
+                        repo,
+                        plan=str(plan_path),
+                        protocol_capability=[],
+                    )
+                )
+
+    def test_manual_final_reuse_binds_successful_epoch_reviewer_artifact(self):
+        target = "a" * 40
+        plan = self.external_epoch_plan(target)
+        reviewer = plan.execution("R001")
+        outcome = EpochExecutionOutcome.for_plan(
+            plan,
+            reviewer.execution_id,
+            artifact_digest="sha256:" + "d" * 64,
+            artifact_complete=True,
+            completed_process_ids=tuple(
+                process.process_id for process in reviewer.processes
+            ),
+            status="succeeded",
+            terminal_at="2026-07-19T00:00:00+00:00",
+        )
+        collection = argparse.Namespace(plan=plan, execution_outcomes=(outcome,))
+        state = {
+            "review_policy": {
+                **hloop.hloop_config.V053_REVIEW_POLICY_DEFAULTS,
+                "manual_final_execution": "reuse_epoch_reviewer",
+            },
+            "review_epochs": {
+                "active_epoch_id": "E001",
+                "records": {},
+                "protocol_capabilities": {},
+            },
+        }
+        release = self.ready_release_dependency()
+        adapter = hloop.hloop_release_dependency.validate_release_dependencies(
+            release
+        )
+        state["review_epochs"]["protocol_capabilities"][plan.plan_digest] = {
+            adapter.protocol: adapter.to_record()
+        }
+        with (
+            mock.patch.object(
+                hloop.hloop_release_dependency,
+                "load_release_dependencies",
+                return_value=adapter,
+            ),
+            mock.patch.object(
+                hloop, "require_review_epoch_collection", return_value=collection
+            ),
+        ):
+            provenance = hloop._manual_final_execution_provenance(
+                Path("/unused"),
+                state,
+                target,
+                argparse.Namespace(protocol_capability=[]),
+            )
+        self.assertEqual(provenance.execution_policy, "reuse_epoch_reviewer")
+        self.assertEqual(provenance.execution_id, reviewer.execution_id)
+        self.assertEqual(provenance.source_execution_id, reviewer.execution_id)
+        self.assertEqual(provenance.source_artifact_ref, outcome.artifact_ref)
+        self.assertEqual(provenance.source_artifact_digest, outcome.artifact_digest)
+        self.assertEqual(provenance.protocol_adapter, adapter)
 
     def test_triage_approval_consumes_once_then_materializes_exact_plan(self):
         with tempfile.TemporaryDirectory() as directory:

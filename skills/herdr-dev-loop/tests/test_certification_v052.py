@@ -11,14 +11,17 @@ import unittest
 try:
     import jsonschema
     from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
 except ImportError:  # pragma: no cover - minimal installations skip schema tests
     jsonschema = None
     Registry = None
     Resource = None
+    DRAFT202012 = None
 
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
 SCHEMAS = Path(__file__).parents[1] / "references" / "schemas"
+PUBLIC_SCHEMAS = Path(__file__).parents[1] / "schemas"
 sys.path.insert(0, str(SCRIPTS))
 
 from hloop_lib import decisions as hloop_decisions  # noqa: E402
@@ -28,6 +31,7 @@ from hloop_lib.certification import (  # noqa: E402
     CertificationPlan,
     FinalReviewLane,
     FinalReviewManifest,
+    ManualFinalExecutionProvenance,
     VerificationPolicy,
     canonical_digest,
     reopen_review,
@@ -36,6 +40,7 @@ from hloop_lib.certification import (  # noqa: E402
     validate_reopen_transition,
 )
 from hloop_lib.review import (  # noqa: E402
+    ExternalReviewProtocolAdapter,
     FindingCandidate,
     ReviewManifest,
     VerificationRecord,
@@ -48,6 +53,13 @@ from hloop_lib.review import (  # noqa: E402
 HEAD = "target-sha"
 BASE = "base-sha"
 SOURCE_DIGEST = "a" * 64
+ADAPTER = ExternalReviewProtocolAdapter(
+    protocol=MANUAL_FINAL_PROTOCOL,
+    source="https://example.invalid/codex-review-multi-v2.git@" + "c" * 40,
+    version="2.1.0",
+    content_digest="sha256:" + "d" * 64,
+    capabilities=("externally-planned-v1",),
+)
 
 
 def review_plan(*, mode: str = "single", max_verifications: int = 64, verifier_pool_size: int = 2):
@@ -85,6 +97,16 @@ def certification_plan(group, *, target_sha: str = HEAD) -> CertificationPlan:
             max_verifications=group.budget.max_verifications,
             time_limit_seconds=group.budget.time_limit_seconds,
             provider_limits=group.budget.provider_limits,
+        ),
+        execution=ManualFinalExecutionProvenance(
+            execution_policy="independent",
+            execution_id="R001",
+            source_kind="pre-final-review",
+            source_execution_id="R000",
+            source_artifact_ref="reviews/convergence/MANIFEST.json",
+            source_artifact_digest="sha256:" + "e" * 64,
+            target_sha=target_sha,
+            protocol_adapter=ADAPTER,
         ),
     )
 
@@ -178,7 +200,11 @@ class PlanIdentityTests(unittest.TestCase):
         plan = certification_plan(group)
         mutations = (
             replace(plan, base_sha="another-base"),
-            replace(plan, target_sha="another-target"),
+            replace(
+                plan,
+                target_sha="another-target",
+                execution=replace(plan.execution, target_sha="another-target"),
+            ),
             replace(plan, scope_revision=2),
             replace(plan, source_snapshot_revision=2),
             replace(plan, source_digest="b" * 64),
@@ -198,6 +224,32 @@ class PlanIdentityTests(unittest.TestCase):
         self.assertEqual(restored, manifest)
         self.assertEqual(restored.to_record()["target_sha"], HEAD)
         self.assertEqual(restored.to_record()["prepared_plan_digest"], plan.digest)
+        self.assertEqual(restored.execution, plan.execution)
+
+    def test_execution_policy_rejects_duplicate_or_synthetic_source_identity(self):
+        base = certification_plan(review_plan()).execution
+        assert base is not None
+        with self.assertRaisesRegex(
+            ValueError, "independent manual-final execution must differ"
+        ):
+            replace(base, source_execution_id=base.execution_id)
+        with self.assertRaisesRegex(ValueError, "source_kind must be pre-final-review"):
+            replace(base, source_kind="review-epoch-reviewer")
+
+    def test_reuse_policy_requires_exact_epoch_execution_identity(self):
+        base = certification_plan(review_plan()).execution
+        assert base is not None
+        reused = replace(
+            base,
+            execution_policy="reuse_epoch_reviewer",
+            source_kind="review-epoch-reviewer",
+            source_execution_id=base.execution_id,
+        )
+        self.assertEqual(
+            reused.execution_id, reused.source_execution_id
+        )
+        with self.assertRaisesRegex(ValueError, "reuse the exact source execution"):
+            replace(reused, source_execution_id="R002")
 
 
 class FinalManifestCompletenessTests(unittest.TestCase):
@@ -398,16 +450,68 @@ class FinalManifestCompletenessTests(unittest.TestCase):
         migrated = validate_final_review(plan, legacy, allow_legacy=True)
         self.assertTrue(migrated.passed)
 
+    def test_legacy_execution_compatibility_requires_both_artifacts_to_omit_provenance(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        manifest = final_manifest(plan, group)
+        legacy_plan = replace(plan, execution=None)
+        legacy_manifest = replace(
+            manifest,
+            prepared_plan_digest=legacy_plan.digest,
+            execution=None,
+        )
+
+        self.assertTrue(
+            validate_final_review(
+                legacy_plan, legacy_manifest, allow_legacy=True
+            ).passed
+        )
+        for prepared, evidence in (
+            (plan, replace(manifest, execution=None)),
+            (
+                legacy_plan,
+                replace(manifest, prepared_plan_digest=legacy_plan.digest),
+            ),
+        ):
+            with self.subTest(
+                plan_execution=prepared.execution is not None,
+                manifest_execution=evidence.execution is not None,
+            ):
+                result = validate_final_review(
+                    prepared, evidence, allow_legacy=True
+                )
+                self.assertFalse(result.passed)
+                self.assertIn(
+                    "identity-mismatch:execution-provenance", result.issues
+                )
+
     def test_identity_and_target_drift_are_rejected(self):
         group = review_plan()
         plan = certification_plan(group)
         manifest = final_manifest(plan, group)
-        drifted_plan = replace(plan, target_sha="new-target")
+        drifted_plan = replace(
+            plan,
+            target_sha="new-target",
+            execution=replace(plan.execution, target_sha="new-target"),
+        )
         result = validate_final_review(drifted_plan, manifest)
         self.assertFalse(result.passed)
         self.assertIn("identity-mismatch:target-sha", result.issues)
         current_drift = validate_final_review(plan, manifest, current_target_sha="new-target")
         self.assertIn("target-sha-drift", current_drift.issues)
+
+        assert manifest.execution is not None
+        provenance_drift = replace(
+            manifest,
+            execution=replace(
+                manifest.execution,
+                source_artifact_digest="sha256:" + "f" * 64,
+            ),
+        )
+        provenance_result = validate_final_review(plan, provenance_drift)
+        self.assertIn(
+            "identity-mismatch:execution-provenance", provenance_result.issues
+        )
 
     def test_scope_identity_change_rejects_the_old_manifest(self):
         group = review_plan()
@@ -763,6 +867,7 @@ class FinalReviewSchemaTests(unittest.TestCase):
         for schema_path in (
             SCHEMAS / "review-manifest.schema.json",
             SCHEMAS / "review-finding.schema.json",
+            SCHEMAS / "final-review-plan.schema.json",
             path,
         ):
             registry = registry.with_resource(
@@ -771,6 +876,28 @@ class FinalReviewSchemaTests(unittest.TestCase):
                     json.loads(schema_path.read_text(encoding="utf-8"))
                 ),
             )
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        jsonschema.Draft202012Validator.check_schema(schema)
+        return jsonschema.Draft202012Validator(
+            {"$schema": schema["$schema"], "$ref": path.resolve().as_uri()},
+            registry=registry,
+        )
+
+    def _offline_validator(self, path: Path):
+        def retrieve(uri: str):
+            if not uri.startswith("file://"):
+                raise AssertionError(
+                    f"offline final-review validator attempted network retrieval: {uri}"
+                )
+            from urllib.parse import unquote, urlparse
+
+            local_path = Path(unquote(urlparse(uri).path))
+            return Resource.from_contents(
+                json.loads(local_path.read_text(encoding="utf-8")),
+                default_specification=DRAFT202012,
+            )
+
+        registry = Registry(retrieve=retrieve)
         schema = json.loads(path.read_text(encoding="utf-8"))
         jsonschema.Draft202012Validator.check_schema(schema)
         return jsonschema.Draft202012Validator(
@@ -798,6 +925,46 @@ class FinalReviewSchemaTests(unittest.TestCase):
             )
         )
         self.assertEqual(errors, [])
+
+    def test_public_wrappers_match_canonical_execution_semantics_offline(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        records = {
+            "final-review-plan.schema.json": plan.to_record(),
+            "final-review-manifest.schema.json": final_manifest(
+                plan, group
+            ).to_record(),
+        }
+        for filename, record in records.items():
+            with self.subTest(filename=filename):
+                wrapper = json.loads(
+                    (PUBLIC_SCHEMAS / filename).read_text(encoding="utf-8")
+                )
+                self.assertNotIn("$id", wrapper)
+                self.assertEqual(
+                    wrapper["$ref"], f"../references/schemas/{filename}"
+                )
+                canonical = self._validator(SCHEMAS / filename)
+                public = self._offline_validator(PUBLIC_SCHEMAS / filename)
+                self.assertEqual(list(canonical.iter_errors(record)), [])
+                self.assertEqual(list(public.iter_errors(record)), [])
+
+                invalid = json.loads(json.dumps(record))
+                invalid["execution"]["execution_policy"] = "synthetic"
+                self.assertTrue(list(canonical.iter_errors(invalid)))
+                self.assertTrue(list(public.iter_errors(invalid)))
+
+                missing_execution = json.loads(json.dumps(record))
+                del missing_execution["execution"]
+                self.assertTrue(list(canonical.iter_errors(missing_execution)))
+                self.assertTrue(list(public.iter_errors(missing_execution)))
+
+                leading_zero_version = json.loads(json.dumps(record))
+                leading_zero_version["execution"]["protocol_adapter"]["version"] = (
+                    "02.1.0"
+                )
+                self.assertTrue(list(canonical.iter_errors(leading_zero_version)))
+                self.assertTrue(list(public.iter_errors(leading_zero_version)))
 
 
 if __name__ == "__main__":

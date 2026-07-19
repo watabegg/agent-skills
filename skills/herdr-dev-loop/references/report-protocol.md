@@ -1,6 +1,6 @@
 # Agent Report And Manager Wake Contract
 
-herdr-dev-loop 0.5.2 treats role progress as structured input to the Manager. Reports do not prove completion: harvest still verifies the artifact, target SHA, write scope, and validation evidence. Review convergence and manual-final certification likewise require their committed JSON/Markdown artifacts; a report cannot substitute for a complete manifest or fixed-target evidence.
+herdr-dev-loop 0.5.3 treats role progress as structured input to the Manager. Reports do not prove completion: candidate sealing, Patch Review, harvest, review-epoch collection, and final certification still verify the durable artifact, exact SHA, write scope, and validation evidence. A report cannot substitute for a complete manifest or fixed-target evidence.
 
 ## Report types
 

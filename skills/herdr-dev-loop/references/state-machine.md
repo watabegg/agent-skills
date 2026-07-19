@@ -16,7 +16,7 @@ For `persistence: local-only`, committed snapshot checks are replaced by copying
 
 An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again with a new attempt id. The original attempt base is immutable; an unmerged branch with commits is archived instead of silently reused or deleted. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
 
-State format 3 revision 2 is required by herdr-dev-loop 0.5.2. The migration path is format 1 -> 2 -> 3.0 -> 3.1 -> 3.2; first run `hloop migrate --dry-run`, inspect the complete revision path, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a backup, and refuses to run while agents, an active merge, or dirty role worktrees exist. Legacy migrated loops retain their merge-count cadence and are marked so manual-final certification is not required for that historical run. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
+State format 3 revision 3 is required by herdr-dev-loop 0.5.3. The migration path is format 1 -> 2 -> 3.0 -> 3.1 -> 3.2 -> 3.3; first run `hloop migrate --dry-run`, inspect the complete transaction, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a digest-bound archive and marker, and refuses active, unharvested, live, dirty, or cleanup-failed role/merge/remediation state. Use `--resume` after interruption. Rollback is allowed only before the first recorded 0.5.3 mutation. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
 
 ## Phases
 
@@ -80,13 +80,14 @@ Then run, at most, one material transition:
 
 Prefer a small number of obvious transitions over attempting to finish a goal in one tick.
 
-For a new 0.5.2 loop, the review transition is itself bounded and artifact-driven:
+For a new 0.5.3 loop, the review transition is bounded by planning, candidate, epoch, and artifact gates:
 
-1. close the current task batch and verify the release-scope snapshot, current validation, clean Manager checkout, and no active role or merge;
-2. enter `review_readiness`, then prepare `reviews/convergence/PLAN.json` and an intentionally incomplete `MANIFEST.json` at one base/target SHA;
-3. collect fixed-target lane and verification evidence and record the manifest; if actionable findings remain, keep dispatch frozen while the Manager performs at most two automatic fix rounds;
-4. when convergence records zero verified actionable findings, prepare `reviews/final/PLAN.json`, `MANIFEST.json`, and `FINAL.md`, then record the independent manual-final certification;
-5. permit `hloop review reopen` only for an exhausted, failed, or incomplete review state, with explicit user-input provenance and the selected remediation, scope amendment, feature action, retry, or abort policy.
+1. close the current task batch and verify current planning, release-scope, candidate, Patch Review, full-suite, clean-checkout, and role/merge prerequisites;
+2. create an immutable review epoch at one target SHA, reserve shared capacity before each required Reviewer/Gap process, record every terminal outcome, and close the collection barrier only when all required executions are complete;
+3. register every normalized candidate, stop on classification conflict, then approve and materialize at most one deterministic write-ahead remediation batch; a changed target starts a new epoch;
+4. after a clean epoch, enter fixed-target convergence and record complete lane and verification evidence; if actionable findings remain, keep dispatch frozen while the Manager performs at most two automatic fix rounds;
+5. when convergence records zero verified actionable findings, prepare `reviews/final/PLAN.json`, `MANIFEST.json`, and `FINAL.md`, then record the independent manual-final certification;
+6. permit `hloop review reopen` only for an exhausted, failed, or incomplete review state, with explicit user-input provenance and the selected remediation, scope amendment, feature action, retry, or abort policy.
 
 The convergence and manual-final artifacts are not interchangeable. A new task,
 scope amendment, target SHA drift, or source snapshot drift invalidates the
@@ -112,7 +113,7 @@ policy-driven:
 - `max_workers: 3`
 - `max_reviewers: 1`
 - `max_gap_auditors: 1`
-- `review_policy.cadence: batch` for new 0.5.2 loops
+- `review_policy.cadence: batch` for new 0.5.3 loops
 - `review_policy.pre_final_protocol: codex-review-multi-v2`
 - `review_policy.manual_final_protocol: codex-review-multi-v2`
 - `review_policy.max_fix_rounds: 2`
@@ -120,14 +121,17 @@ policy-driven:
 - `review_after_merges: 1` and `gap_after_merges: 3` remain legacy/merge-count knobs
 - `branch_strategy: integration`
 - `worker_protocol: native`
-- `review_protocol: native`
+- `review_protocol: codex-review-multi-v2` for fresh ordinary review
+- canonical Reviewer topology: six lanes
 - role agent providers/models: Codex `auto` by default
 - `worker_qa_profile: repo-default`
 - `manager_qa_profile: none`
 
+Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = "codex-review-multi-v2"` with the canonical six-lane Reviewer topology. `--review-protocol native` is an explicit override for ordinary review only. Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = "native"`. Manual-final has no native override; `manual_final_protocol` accepts only `codex-review-multi-v2`.
+
 The manual-final policy is fail-closed: its schema accepts only the implemented
-`codex-review-multi-v2` protocol. The ordinary `review_protocol: native` setting
-describes the Worker/Reviewer contract and does not make `native` valid for
+`codex-review-multi-v2` protocol. Neither an ordinary `--review-protocol native`
+override nor a separate native pre-final setting makes `native` valid for
 manual-final certification.
 
 For new loops, ordinary review waits for a closed batch and the Manager explicitly

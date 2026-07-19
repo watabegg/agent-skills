@@ -11,7 +11,7 @@ Assume Reviewer runs are long-running. Manager should inspect progress with `hlo
 The Reviewer prompt must say:
 
 - make the first progress message identify `herdr-dev-loop <version> / namespace <namespace> / Reviewer <review-id>`
-- follow the HLoop Native Review Protocol by default
+- follow the resolved ordinary review protocol; when it is `native`, follow the HLoop Native Review Protocol
 - do not edit code
 - do not commit, merge, rebase, switch branches, run formatters, or run automatic fixes
 - review base branch vs integration branch plus task/result/validation artifacts
@@ -57,14 +57,13 @@ Each finding must include:
 
 Prefer no finding over weak or speculative findings.
 
-## 0.5.2 Convergence contract
+## 0.5.3 Review epoch and convergence contract
 
-For new loops, Reviewer runs are scheduled at a closed batch boundary or when
-the Manager explicitly prepares a fixed-target convergence plan. The plan
-pins `base_sha`, `target_sha`, the release-scope snapshot, the selected lanes,
-and the verification policy. Every lane, finding, and verification record
-must target that same SHA; a stale target or incomplete manifest keeps the
-convergence gate open.
+For new loops, Reviewer and Gap executions are scheduled in one immutable review epoch after a batch closes. The plan pins `base_sha`, `target_sha`, release-scope and planning snapshots, selected protocol, lane identity, provider/model/effort, required capability adapter, and verification policy. Every lane, finding, verification, and execution outcome must target that plan revision. A stale target, incomplete required execution, or unmatched adapter keeps the collection gate open.
+
+Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = "codex-review-multi-v2"` with the canonical six-lane Reviewer topology. `--review-protocol native` is an explicit override for ordinary review only. Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = "native"`. Manual-final has no native override; `manual_final_protocol` accepts only `codex-review-multi-v2`.
+
+The default external execution uses one HLoop Coordinator and six exact lanes. The companion must expose `externally-planned-v1` with the source, version, and content digest pinned by `release-dependencies.json`; it must not start its own default Coordinator or child lanes. Native fallback is allowed only when the execution kind's own resolved policy explicitly selects it. Capacity is reserved before process start and remains consumed by an expired quarantined process until exit or forced abort is confirmed.
 
 The Reviewer reports evidence. The Manager owns the seven finding axes
 (`fact_status`, `origin`, `contract_relation`, `decision_requirement`,
@@ -75,7 +74,7 @@ follow-up. A Reviewer must not create a Worker task from a candidate merely
 because it found the candidate. `hloop follow-up add` is the first-class path
 for deferred work and deduplicates using the stable semantic issue key.
 
-Convergence is bounded to two automatic fix rounds for new loops. After the
+Manager triage begins only after required Reviewer and Gap execution outcomes are collected. It registers all normalized candidates, preserves classification conflicts as blockers, and approves one deterministic write-ahead remediation batch. Convergence is bounded to two automatic fix rounds for new loops. After the
 manifest is complete and the verified actionable finding count reaches zero,
 the Manager prepares a separate manual-final review. Manual final is a fresh
 certification of the fixed target, not another ordinary Reviewer run: its
@@ -113,7 +112,7 @@ See [Review Swarm And Dual Review Contract](review-swarm.md) for the normalized 
 
 ## Compatibility Mode
 
-Use `review_protocol: codex-review-multi-v2` only when Manager intentionally wants `$codex-review-multi-v2`. Even then, Reviewer must still produce the HLoop artifact, action labels, and `Fix Task Candidates`.
+Use the fresh `reviewer.protocol: codex-review-multi-v2` default only with the pinned `externally-planned-v1` adapter. The companion executes only the HLoop-planned lanes and returns them one-to-one; HLoop retains ownership of epoch identity, capacity, normalization, triage, and gates. Missing capability evidence fails closed. `--review-protocol native` changes only ordinary review and does not alter pre-final or manual-final policy.
 
 ## Manager Action Labels
 

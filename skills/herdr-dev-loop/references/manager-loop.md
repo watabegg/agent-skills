@@ -64,10 +64,14 @@ Use `hloop checkpoint --batch BNNN --rollup --message "ai-loop(BNNN): ..."` for 
 
 ## Default Cadence
 
-For new 0.5.2 loops, keep implementation work bounded by task batches:
+For new 0.5.3 loops, keep implementation work bounded by task batches and current planning evidence:
+
+Before the first Worker in a planning revision, run `hloop planning check --json`. It validates the Repository Impact Map, Task Risk Graph, coverage ledger, and Plan Gap artifact against one identity made from plan, requirements, release scope, and source digests. A stale or incomplete artifact blocks dispatch; do not replace it with a Manager assertion.
 
 - dispatch up to `max_workers: 3` Workers when write scopes do not overlap
 - close the current batch before opening ordinary review work (`review_policy.cadence: batch`)
+- create one immutable review epoch for the target SHA, reserve capacity before each required Reviewer/Gap process, record every terminal outcome, and close the collection barrier before triage
+- register all canonical candidates, resolve classification conflicts, then approve and materialize one deterministic remediation batch
 - run fixed-target convergence explicitly with `hloop review readiness` and `hloop review convergence prepare|record`
 - prepare a complete manual final certification after convergence, rather than treating a zero finding count as sufficient
 - preserve `review_after_merges`/`gap_after_merges` for explicitly configured `merge-count` and migrated legacy loops
@@ -127,12 +131,16 @@ Use `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md` as the Manager-owned polic
 
 - branch strategy: default `integration`, or product-specific `pr-per-task` / `custom`
 - Worker protocol: default `native`, or compatibility `codex-impl`
-- Reviewer protocol: default `native`, or compatibility `codex-review-multi-v2`
+- ordinary Reviewer protocol: fresh 0.5.3 default `codex-review-multi-v2`, or explicit `native` override
+- pre-final protocol: default `codex-review-multi-v2`, with a separate supported `native` setting
+- manual-final protocol: only `codex-review-multi-v2`; no `native` override
 - Worker / Reviewer / Gap Auditor / Advisor agent provider and model
-- review lanes
+- review lanes: canonical fresh Reviewer topology is six lanes
 - Worker QA profile
 - Manager final QA profile
 - Advisor policy: disabled by default; explicit request only
+
+Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = "codex-review-multi-v2"` with the canonical six-lane Reviewer topology. `--review-protocol native` is an explicit override for ordinary review only. Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = "native"`. Manual-final has no native override; `manual_final_protocol` accepts only `codex-review-multi-v2`.
 
 If `branch_strategy` is `pr-per-task` or `custom`, update `PLAN.md` with the exact merge, PR, release, and QA handoff before dispatching Workers. `hloop` can still coordinate tasks, panes, artifacts, review, gap checks, and triage, but Manager must not silently apply the default integration-branch assumptions.
 
@@ -220,6 +228,8 @@ P0/P1 findings normally create a provenance-linked fix task only after Manager v
 
 `hloop triage` separates valid and rejected Fix Task Candidates. Rejected candidates are written to the triage draft with reasons such as missing `write_allow`, `acceptance`, `rationale`, or invalid priority. Do not rerun with `--create-tasks` expecting rejected candidates to become tasks; either fix the source artifact/candidate block, create a task manually, or record why the finding is not actionable.
 
+For revision-3 review, use the epoch collection barrier before triage. Record all required Reviewer and Gap execution outcomes, including failures, then register every canonical candidate. Resolve classification conflicts before `triage epoch <epoch> --approve-batch`; approval is a single transition bound to the exact candidate set, scope, round, authorization, and artifact paths. `--materialize-batch` writes its plan before creating tasks and an exact retry repairs only digest-matching partial work.
+
 Do not mark the loop done only because a review artifact exists. Manager must close the review gate after triage.
 
 Gap findings are not generic review findings. `missing`, `partial`, and `needs-decision` items that affect `MISSION.md` done criteria normally create a fix task or a decision. `obsolete-spec` items should update or explicitly retire the stale plan/spec source before closing the gap gate.
@@ -236,7 +246,7 @@ Worker QA is task-local. Manager final QA is a separate combined-implementation 
 
 When `manager_qa_profile` is `none`, no separate final QA gate is required.
 
-This setting is separate from 0.5.2 manual final certification. Even when `manager_qa_profile: none`, a new loop must complete the fixed-target convergence and `final-review` evidence required by `review_policy.final_required`. Manual final is the review certification gate; Manager QA is product-environment QA.
+This setting is separate from 0.5.3 review-epoch and manual-final certification. Even when `manager_qa_profile: none`, a new loop must complete required epoch collection, bounded remediation, fixed-target convergence, and `final-review` evidence. Manual final is the review certification gate; Manager QA is product-environment QA.
 
 When `manager_qa_profile` is `local`, `preview`, `staging`, `repo-default`, or `custom`:
 

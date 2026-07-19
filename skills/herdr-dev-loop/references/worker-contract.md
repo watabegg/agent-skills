@@ -2,9 +2,11 @@
 
 Worker receives one task and one worktree.
 
-After committing product changes and completing validation, use `hloop worker finalize` to generate and commit `result.md`. Do not hand-copy `task_id`, `run_id`, `skill_version`, `base_sha`, `head_sha`, `changed_files`, or `merge_ready` when the helper is available.
+The initial semantic ACK probes Git metadata and binds one completion mode to the attempt. Apply the approved ACK with `hloop agent ack status <task-id> --attempt-id <attempt-id> --apply`; do not infer the mode from the current filesystem. A contract re-ACK keeps the original attempt mode.
 
-A Codex `workspace-write` Worker that cannot write Git metadata at all uses `hloop worker finalize <task-id> --handoff` instead: it writes `result.md` marked `handoff: true` and performs no Git metadata writes, even when in-scope product changes are still dirty. Ask the Manager to run `hloop worker seal <task-id>` to validate and commit the handoff; do not attempt to commit it yourself.
+Revision-3 work is submitted as a nonterminal implementation candidate before finalization. In commit mode, commit the product changes first and run `hloop worker submit <task-id> --completion-mode commit` with validation, invariant, regression, self-review, residual-risk, and unrun-check evidence. In handoff mode, do not stage or commit; run the same command with `--completion-mode handoff`. The candidate keeps `merge_ready: false` and is bound to the attempt, task contract, semantic ACK, base, exact product tree, and candidate revision.
+
+When the task requires Patch Review, wait for a review of that exact candidate. A fix creates a new candidate revision and invalidates the older review. After every required gate passes, commit mode runs `hloop worker finalize` without `--handoff`; handoff mode runs it with `--handoff` and asks Manager to seal the quiesced worktree. Do not hand-copy result identity fields or switch completion mode at submit/finalize time.
 
 Default runner: interactive role-agent TUI. Codex is the default provider, but Manager may select Claude or a specific model in `PROFILE.md`, task frontmatter, or `hloop worker start`. This keeps the Worker visible in Herdr so the Manager can add requirements, inspect progress, or interrupt the Worker before it finishes. Use `--runner exec` only for well-bounded automation tasks that should complete without interaction.
 
@@ -17,7 +19,7 @@ The Worker prompt must say:
 - do not edit Manager-owned loop files
 - write `results/<task-id>/result.md`
 - include the prompt-provided `skill_version` in the result artifact
-- commit the branch
+- obey the attempt-bound commit or handoff result path
 - print `HERDR_LOOP_TASK_DONE:<task-id>:<done|blocked|failed|partial>`
 - submit a semantic `ack` report after read-only investigation and before material edits
 - submit `milestone` only when achievement, risk, or next action changes; use `attention` when Manager action is required
@@ -37,8 +39,9 @@ Worker must:
 6. Self-review the diff for correctness, product behavior, security/privacy, data integrity, UX, and validation risk.
 7. Run validation commands that fit the task and repository.
 8. Apply the Worker QA profile from `PROFILE.md` or task frontmatter.
-9. Write the result artifact with flat frontmatter fields.
-10. Commit the work on the Worker branch and submit a completion report. The report does not replace the committed artifact.
+9. Learn and apply the Manager-approved completion mode, then submit the exact revision-3 implementation candidate with all five QA evidence classes.
+10. Resolve required Patch Review and full-suite gates against that candidate; a changed candidate must be resubmitted and reviewed again.
+11. Finalize through the approved commit or handoff path, then submit a completion report. The report does not replace the candidate, Patch Review, final result, or Manager seal.
 
 ## Worker QA Profile
 

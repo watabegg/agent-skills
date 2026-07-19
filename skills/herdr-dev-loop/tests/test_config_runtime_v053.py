@@ -114,6 +114,35 @@ class ConfigProjectionRuntimeV053Tests(unittest.TestCase):
 
         self.assertEqual(rendered, hloop.BUILT_IN_CONFIG_DEFAULTS)
 
+    def test_fresh_init_without_protocol_override_uses_v053_reviewer_topology(self):
+        args = hloop.build_parser().parse_args(["init", "--goal", "fresh-v053"])
+        self.assertIsNone(args.review_protocol)
+        self.assertNotIn(
+            "protocol", (hloop.init_config_override(args).get("reviewer") or {})
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            hloop.hloop_config, "find_config_file", return_value=None
+        ):
+            resolution, candidate = hloop.resolve_init_config(args, Path(directory))
+
+        self.assertIsNone(candidate)
+        self.assertEqual(
+            resolution.get("reviewer", "protocol"), "codex-review-multi-v2"
+        )
+        self.assertEqual(resolution.get("reviewer", "lane_count"), 6)
+
+    def test_explicit_native_init_protocol_remains_an_override(self):
+        args = hloop.build_parser().parse_args(
+            ["init", "--goal", "fresh-native", "--review-protocol", "native"]
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            hloop.hloop_config, "find_config_file", return_value=None
+        ):
+            resolution, _candidate = hloop.resolve_init_config(args, Path(directory))
+
+        self.assertEqual(resolution.get("reviewer", "protocol"), "native")
+        self.assertEqual(resolution.get("reviewer", "lane_count"), 6)
+
     def test_unknown_config_leaf_marks_validation_and_audit_identity_stale(self):
         state = self.canonical_state()
         state["resolved_config"]["future"] = {"toggle": True}

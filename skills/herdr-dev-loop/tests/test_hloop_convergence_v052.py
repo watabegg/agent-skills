@@ -29,6 +29,17 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.protocol_adapter = hloop_review.ExternalReviewProtocolAdapter(
+            protocol="codex-review-multi-v2",
+            source="https://example.invalid/codex-review-multi-v2.git@" + "a" * 40,
+            version="2.1.0",
+            content_digest="sha256:" + "b" * 64,
+            capabilities=("externally-planned-v1",),
+        )
+        self.protocol_capability_path = self.root / "review-capability.json"
+        self.protocol_capability_path.write_text(
+            json.dumps(self.protocol_adapter.to_record()), encoding="utf-8"
+        )
         self.repo = self.root / "repo"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True)
@@ -75,6 +86,12 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
 
     def run_cli(self, *args: str) -> tuple[int, str, str]:
         args = tuple(args)
+        if args[:2] == ("final-review", "prepare") and "--protocol-capability" not in args:
+            args = (
+                *args,
+                "--protocol-capability",
+                str(self.protocol_capability_path),
+            )
         if args[:2] == ("task", "new") and "--preserved-invariant" not in args:
             args = (
                 *args,
@@ -91,7 +108,15 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             )
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            mock.patch.object(
+                hloop.hloop_release_dependency,
+                "load_release_dependencies",
+                return_value=self.protocol_adapter,
+            ),
+        ):
             code = hloop.main(
                 ["--repo", str(self.repo), "--namespace", self.namespace, *args]
             )
@@ -436,7 +461,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             for assignment in verification_plan.assignments
         )
         review_manifest = hloop_review.ReviewManifest(
-            review_id="R001",
+            review_id=(plan.execution.execution_id if plan.execution else "R001"),
             plan=group,
             lane_results=tuple(
                 lane.result(
@@ -767,6 +792,72 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual((code, err), (0, ""), out)
         self.assertEqual(self.state()["manual_final_review"]["target_sha"], target)
 
+    def test_independent_final_prepare_rejects_recorded_convergence_source_drift(self):
+        self.prepare_convergence()
+        self.complete_convergence_manifest()
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        state = self.state()
+        self.assertEqual(state["review_convergence"]["status"], "converged")
+        recorded_digest = state["review_convergence"]["recorded_manifest_digest"]
+
+        manifest_path = (
+            self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        )
+        replacement = json.loads(manifest_path.read_text(encoding="utf-8"))
+        replacement["review_id"] = "R009"
+        manifest_path.write_text(
+            json.dumps(replacement, indent=2) + "\n", encoding="utf-8"
+        )
+        self.assertNotEqual(
+            hloop.hloop_certification.canonical_digest(replacement),
+            recorded_digest,
+        )
+
+        code, out, err = self.run_cli("final-review", "prepare", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("recorded convergence manifest digest", err)
+        self.assertNotEqual(self.state()["manual_final_review"]["status"], "prepared")
+
+    def test_reused_reviewer_manifest_cannot_replace_source_findings(self):
+        self.prepare_convergence()
+        self.write_policy_manifest(outside_release=False)
+        source_path = (
+            self.state_path.parent / "reviews" / "convergence" / "MANIFEST.json"
+        )
+        source = hloop_review.ReviewManifest.from_record(
+            json.loads(source_path.read_text(encoding="utf-8"))
+        )
+        self.assertTrue(source.findings)
+        replacement = hloop_review.ReviewManifest(
+            review_id=source.review_id,
+            plan=source.plan,
+            lane_results=tuple(lane.result() for lane in source.plan.expected_lanes),
+            findings=(),
+            verification_plan=hloop_review.plan_verification(source.plan, ()),
+            verifications=(),
+        )
+        self.assertTrue(replacement.completeness.complete)
+        execution = hloop.hloop_certification.ManualFinalExecutionProvenance(
+            execution_policy="reuse_epoch_reviewer",
+            execution_id=source.review_id,
+            source_kind="review-epoch-reviewer",
+            source_execution_id=source.review_id,
+            source_artifact_ref="reviews/convergence/MANIFEST.json",
+            source_artifact_digest=hloop._sha256_labelled(source_path.read_bytes()),
+            target_sha=source.plan.head_sha,
+            protocol_adapter=self.protocol_adapter,
+        )
+        with self.assertRaisesRegex(
+            hloop.HLoopError, "must exactly match the validated source artifact"
+        ):
+            hloop._validate_manual_final_source_artifact(
+                self.repo,
+                execution,
+                submitted_manifest=replacement,
+            )
+
     def test_readiness_fails_closed_without_changed_file_and_special_verification(self):
         target = self.state()["integration_head_sha"]
         state = self.state()
@@ -1071,7 +1162,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         current_record = json.loads(manifest_path.read_text(encoding="utf-8"))
         group = hloop_review.ReviewGroupPlan.from_record(current_record)
         review = hloop_review.ReviewManifest(
-            review_id="R001",
+            review_id=(plan.execution.execution_id if plan.execution else "R001"),
             plan=group,
             lane_results=tuple(lane.result() for lane in group.expected_lanes),
             findings=(),
@@ -1085,6 +1176,57 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual((code, err), (0, ""), out)
         self.assertEqual(json.loads(out)["status"], "passed")
         self.assertEqual(self.state()["manual_final_review"]["status"], "passed")
+
+    def test_legacy_manual_final_rejects_asymmetric_execution_provenance_atomically(self):
+        self.prepare_convergence()
+        self.complete_convergence_manifest()
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        code, out, err = self.run_cli("final-review", "prepare", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+
+        loop = self.state_path.parent
+        plan = CertificationPlan.from_record(
+            json.loads(
+                (loop / "reviews" / "final" / "PLAN.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+        manifest_path = loop / "reviews" / "final" / "MANIFEST.json"
+        group = hloop_review.ReviewGroupPlan.from_record(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        review = hloop_review.ReviewManifest(
+            review_id=plan.execution.execution_id,
+            plan=group,
+            lane_results=tuple(lane.result() for lane in group.expected_lanes),
+            findings=(),
+            verification_plan=hloop_review.plan_verification(group, ()),
+            verifications=(),
+        )
+        record = FinalReviewManifest.from_review_manifest(plan, review).to_record()
+        record.pop("execution")
+        manifest_path.write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
+        )
+        state = self.state()
+        state["release_scope"] = {
+            "status": "legacy-unlocked",
+            "source_refs": [],
+            "source_digests": {},
+            "scope_revision": 0,
+            "source_snapshot_revision": 0,
+            "amendment_refs": [],
+        }
+        self.save_state(state)
+        before = self.state()
+
+        code, out, err = self.run_cli("final-review", "record", "--json")
+
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("missing plan-bound execution provenance", err)
+        self.assertEqual(self.state(), before)
 
     def _assert_manual_final_policy_rejected(self, **kwargs):
         self.write_final_policy_manifest(**kwargs)
