@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +15,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -198,6 +202,174 @@ class ConfigProjectionRuntimeV053Tests(unittest.TestCase):
         self.assertEqual(
             [item["source"] for item in explicit["provenance"]["model"]],
             ["built-in-default", "scope:tree:/repo", "start-override"],
+        )
+
+    def test_config_apply_persists_provenance_only_drift_and_stales_review(self):
+        defaults = copy.deepcopy(hloop.BUILT_IN_CONFIG_DEFAULTS)
+        worker_model = defaults["worker"]["model"]
+        previous = hloop.hloop_config.merge_config_layers(
+            [
+                ("built-in-default", defaults),
+                ("config-defaults", {"worker": {"model": worker_model}}),
+            ]
+        )
+        next_resolution = hloop.hloop_config.merge_config_layers(
+            [
+                ("built-in-default", defaults),
+                (
+                    "scope:tree:/repo",
+                    {"worker": {"model": worker_model}},
+                ),
+            ]
+        )
+        state: dict = {
+            "phase": "running",
+            "integration_branch": "main",
+            "config_source": {"kind": "built-in-default", "path": ""},
+        }
+        hloop.apply_resolved_config_to_state(
+            state,
+            previous.as_dict(),
+            None,
+            provenance=previous.explain_provenance(),
+        )
+        args = SimpleNamespace(repo=".", apply=False)
+        with (
+            mock.patch.object(hloop, "repo_root", return_value=Path(".")),
+            mock.patch.object(hloop, "load_state", return_value=state),
+            mock.patch.object(hloop.hloop_config, "find_config_file", return_value=None),
+            mock.patch.object(
+                hloop.hloop_config,
+                "load_and_resolve",
+                return_value=(next_resolution, None),
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            hloop.cmd_config_apply(args)
+        preview = json.loads(output.getvalue())
+        self.assertEqual(preview["changes"], [])
+        self.assertFalse(preview["source_changed"])
+        self.assertTrue(preview["provenance_changed"])
+        self.assertTrue(preview["changed"])
+
+        args.apply = True
+        with (
+            mock.patch.object(hloop, "repo_root", return_value=Path(".")),
+            mock.patch.object(hloop, "load_state", return_value=state),
+            mock.patch.object(hloop.hloop_config, "find_config_file", return_value=None),
+            mock.patch.object(
+                hloop.hloop_config,
+                "load_and_resolve",
+                return_value=(next_resolution, None),
+            ),
+            mock.patch.object(hloop, "running_agent_ids", return_value=[]),
+            mock.patch.object(hloop, "assert_manager_identity"),
+            mock.patch.object(
+                hloop, "current_integration_target", return_value="a" * 40
+            ),
+            mock.patch.object(hloop, "save_state"),
+            mock.patch.object(hloop, "journal"),
+            mock.patch.object(hloop, "invalidate_review_gates_for_change") as stale,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            hloop.cmd_config_apply(args)
+        self.assertEqual(
+            state["config_resolution_provenance"],
+            next_resolution.explain_provenance(),
+        )
+        stale.assert_called_once_with(
+            state,
+            reason="config-provenance-change",
+            target_sha="a" * 40,
+        )
+
+    def test_config_apply_rejects_running_coverage_scout(self):
+        state = self.canonical_state()
+        state.update(
+            {
+                "phase": "running",
+                "integration_branch": "main",
+                "plan_gap_scout_run": {
+                    "status": "running",
+                    "gate_status": "running",
+                },
+                "specification_scout_run": {},
+                "tasks": {},
+                "reviews": {},
+                "patch_reviews": {},
+                "gaps": {},
+                "advice": {},
+                "decision_liaisons": {},
+            }
+        )
+        resolution = hloop.hloop_config.resolve_config(
+            hloop.BUILT_IN_CONFIG_DEFAULTS, target_dir=Path(".")
+        )
+        with (
+            mock.patch.object(hloop, "repo_root", return_value=Path(".")),
+            mock.patch.object(hloop, "load_state", return_value=state),
+            mock.patch.object(hloop.hloop_config, "find_config_file", return_value=None),
+            mock.patch.object(
+                hloop.hloop_config,
+                "load_and_resolve",
+                return_value=(resolution, None),
+            ),
+            self.assertRaisesRegex(hloop.HLoopError, "S001"),
+        ):
+            hloop.cmd_config_apply(SimpleNamespace(repo=".", apply=True))
+
+    def test_tick_and_pump_forward_complete_role_overrides(self):
+        for command in ("tick", "pump"):
+            omitted = hloop.build_parser().parse_args([command])
+            for role in ("worker", "reviewer", "gap", "advisor"):
+                for field in ("provider", "model", "effort"):
+                    self.assertIsNone(
+                        getattr(omitted, f"{role}_agent_{field}"),
+                        f"{command} {role}.{field}",
+                    )
+
+        scheduled = hloop.build_parser().parse_args(
+            [
+                "pump",
+                "--advisor-agent-provider",
+                "claude",
+                "--advisor-agent-model",
+                "opus",
+                "--advisor-agent-effort",
+                "max",
+                "--worker-agent-effort",
+                "high",
+                "--reviewer-agent-effort",
+                "xhigh",
+                "--gap-agent-effort",
+                "max",
+            ]
+        )
+        hloop.apply_scheduler_agent_overrides(scheduled, "advisor")
+        self.assertEqual(
+            (
+                scheduled.agent_provider,
+                scheduled.agent_model,
+                scheduled.agent_effort,
+            ),
+            ("claude", "opus", "max"),
+        )
+        config = hloop.role_agent_config(
+            self.canonical_state(),
+            "advisor",
+            start_override={
+                "agent_provider": scheduled.agent_provider,
+                "agent_model": scheduled.agent_model,
+                "agent_effort": scheduled.agent_effort,
+            },
+        )
+        self.assertEqual(
+            config["sources"],
+            {
+                "provider": "start-override",
+                "model": "start-override",
+                "effort": "start-override",
+            },
         )
 
     def test_explicit_native_init_protocol_remains_an_override(self):
