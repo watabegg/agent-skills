@@ -1410,7 +1410,7 @@ def assert_migration_role_artifact(
         meta = read_frontmatter(path)
         identity_error = decision_role_artifact_identity_error(
             state,
-            role_id=role_id,
+            role_id="S001",
             role_state=role_state,
             meta=meta,
         )
@@ -3214,6 +3214,13 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
             "start",
             "record",
             "harvest",
+            "authorize-extra-round",
+        }
+    if command == "specification-scout":
+        return getattr(args, "specification_scout_command", "") in {
+            "start",
+            "harvest",
+            "close",
         }
     if command == "reviewer":
         return getattr(args, "reviewer_command", "") in {"start", "harvest", "close", "message"}
@@ -8332,6 +8339,288 @@ def task_patch_review_history(
         ]
     except hloop_worker_candidate.WorkerCandidateError as exc:
         raise HLoopError(f"stored Patch Review history is invalid: {exc}") from exc
+
+
+def task_patch_review_extra_round_authorization(
+    task_state: Mapping[str, Any],
+) -> hloop_worker_candidate.PatchReviewExtraRoundAuthorization | None:
+    raw = task_state.get("patch_review_extra_round_authorization")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise HLoopError("patch_review_extra_round_authorization must be an object")
+    try:
+        return hloop_worker_candidate.PatchReviewExtraRoundAuthorization.from_record(
+            raw
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"stored extra-round authorization is invalid: {exc}") from exc
+
+
+def require_patch_review_authorization_input(
+    repo: Path, state: Mapping[str, Any], input_id: str
+) -> hloop_requirements.InputRecord:
+    index = state.get("inputs_index")
+    if not isinstance(index, Mapping):
+        raise HLoopError("inputs_index must be an object")
+    indexed = index.get(input_id)
+    if not isinstance(indexed, Mapping):
+        raise HLoopError(f"authorization input is not indexed: {input_id}")
+    input_path = local_sensitive_input_dir(repo) / f"{input_id}.json"
+    if not input_path.is_file():
+        raise HLoopError(f"authorization input artifact is missing: {input_id}")
+    try:
+        record = hloop_requirements.InputRecord.from_record(
+            json.loads(input_path.read_text(encoding="utf-8"))
+        )
+    except (
+        OSError,
+        json.JSONDecodeError,
+        hloop_requirements.RequirementModelError,
+    ) as exc:
+        raise HLoopError(f"authorization input artifact is invalid: {input_id}: {exc}") from exc
+    if record.input_id != input_id:
+        raise HLoopError("authorization input artifact identity mismatch")
+    if record.source != "user" or indexed.get("source") != "user":
+        raise HLoopError("extra-round authorization requires a user input artifact")
+    if record.prompt_digest != indexed.get("prompt_digest"):
+        raise HLoopError("authorization input prompt digest does not match inputs_index")
+    return record
+
+
+def validate_patch_review_extra_round_decision(
+    state: Mapping[str, Any],
+    *,
+    task_id: str,
+    decision_id: str,
+    blocking_fingerprints: tuple[str, ...],
+) -> DecisionRecord:
+    raw = (state.get("decisions") or {}).get(decision_id)
+    if not isinstance(raw, Mapping):
+        raise HLoopError(f"unknown extra-round authorization decision: {decision_id}")
+    try:
+        decision = DecisionRecord.from_record(raw)
+    except DecisionValidationError as exc:
+        raise HLoopError(f"invalid extra-round authorization decision: {exc}") from exc
+    response = decision.response
+    resolution = decision.resolution
+    if decision.status != DECISION_ACCEPTED:
+        raise HLoopError("extra-round authorization decision is not accepted")
+    if response is None or response.responded_by != "user":
+        raise HLoopError("extra-round authorization requires a user response")
+    if (
+        resolution is None
+        or not response.selected_option
+        or response.selected_option != resolution.selected_option
+    ):
+        raise HLoopError(
+            "extra-round authorization decision response and resolution do not match"
+        )
+    if decision.affected_task_ids != (task_id,):
+        raise HLoopError(
+            "extra-round authorization decision must affect exactly the requested task"
+        )
+    if decision.source_findings != blocking_fingerprints:
+        raise HLoopError(
+            "extra-round authorization decision findings do not match blocking evidence"
+        )
+    return decision
+
+
+def require_decision_authorization_input_binding(
+    state: Mapping[str, Any],
+    decision: DecisionRecord,
+    authorization_input_id: str,
+) -> None:
+    response = decision.response
+    if response is None:
+        raise HLoopError("extra-round authorization decision response is missing")
+    responded_at = _parse_metric_timestamp(response.responded_at)
+    if responded_at is None:
+        raise HLoopError(
+            "extra-round authorization decision response timestamp is invalid"
+        )
+    index = state.get("inputs_index")
+    if not isinstance(index, Mapping):
+        raise HLoopError("inputs_index must be an object")
+    eligible: list[tuple[datetime, str]] = []
+    for input_id, raw in index.items():
+        if not isinstance(raw, Mapping) or raw.get("source") != "user":
+            continue
+        received_at = _parse_metric_timestamp(raw.get("received_at"))
+        if received_at is None:
+            raise HLoopError(
+                f"indexed user input has an invalid received_at: {input_id}"
+            )
+        if received_at <= responded_at:
+            eligible.append((received_at, str(input_id)))
+    if not eligible:
+        raise HLoopError(
+            "extra-round authorization decision has no preceding indexed user input"
+        )
+    latest_at = max(received_at for received_at, _input_id in eligible)
+    latest_ids = sorted(
+        input_id for received_at, input_id in eligible if received_at == latest_at
+    )
+    if len(latest_ids) != 1:
+        raise HLoopError(
+            "extra-round authorization decision input binding is ambiguous: "
+            + ", ".join(latest_ids)
+        )
+    if authorization_input_id != latest_ids[0]:
+        raise HLoopError(
+            "authorization input is not the unique latest indexed user input "
+            "at or before the decision response"
+        )
+
+
+def require_current_patch_review_extra_round_authorization(
+    repo: Path,
+    state: Mapping[str, Any],
+    task_id: str,
+    task_state: Mapping[str, Any],
+) -> hloop_worker_candidate.PatchReviewExtraRoundAuthorization | None:
+    authorization = task_patch_review_extra_round_authorization(task_state)
+    if authorization is None:
+        return None
+    history = task_patch_review_history(task_state)
+    if len(history) < authorization.base_round_limit:
+        raise HLoopError("extra-round authorization base history is missing")
+    blocked = history[authorization.base_round_limit - 1]
+    decision = validate_patch_review_extra_round_decision(
+        state,
+        task_id=task_id,
+        decision_id=authorization.decision_id,
+        blocking_fingerprints=blocked.unresolved_finding_fingerprints,
+    )
+    if (
+        hloop_worker_candidate.canonical_digest(decision.to_record())
+        != authorization.decision_digest
+    ):
+        raise HLoopError("extra-round authorization decision digest changed")
+    require_decision_authorization_input_binding(
+        state, decision, authorization.authorization_input_id
+    )
+    input_record = require_patch_review_authorization_input(
+        repo, state, authorization.authorization_input_id
+    )
+    if input_record.prompt_digest != authorization.input_prompt_digest:
+        raise HLoopError("extra-round authorization input digest changed")
+    _, contract_digest = exact_task_contract_digest(repo, task_id, task_state)
+    if authorization.task_contract_digest != contract_digest:
+        raise HLoopError("extra-round authorization task contract changed")
+    if authorization.run_id != str(state.get("run_id") or ""):
+        raise HLoopError("extra-round authorization run identity changed")
+    if authorization.attempt_id != str(
+        task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""
+    ):
+        raise HLoopError("extra-round authorization attempt identity changed")
+    return authorization
+
+
+def cmd_patch_review_authorize_extra_round(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(
+        repo, require_integration_branch=True, mark_blocked=False
+    )
+    task_id = args.task_id
+    task_state = (state.get("tasks") or {}).get(task_id)
+    if not isinstance(task_state, dict):
+        raise HLoopError(f"unknown task: {task_id}")
+    if task_patch_review_extra_round_authorization(task_state) is not None:
+        raise HLoopError(f"extra Patch Review round was already authorized for {task_id}")
+
+    base_limit = patch_review_round_limit(state)
+    if base_limit != hloop_worker_candidate.DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK:
+        raise HLoopError("extra-round authorization requires the configured base limit of 2")
+    history = task_patch_review_history(task_state)
+    if len(history) != base_limit:
+        raise HLoopError("extra-round authorization requires exactly two counted reviews")
+    blocked = history[-1]
+    if blocked.verdict != "fix_required" or not blocked.unresolved_finding_fingerprints:
+        raise HLoopError("last Patch Review does not retain blocking findings")
+    blocking = blocked.unresolved_finding_fingerprints
+    if task_state.get("blocking_patch_review_candidate_sha") != blocked.candidate_sha:
+        raise HLoopError("retained blocking candidate SHA does not match review history")
+    if tuple(task_state.get("blocking_patch_review_findings") or ()) != blocking:
+        raise HLoopError("retained blocking findings do not match review history")
+
+    lifecycle = str(task_state.get("candidate_lifecycle_status") or "")
+    candidate, seal, _ = current_candidate_evidence(repo, state, task_id, task_state)
+    if lifecycle == "blocked_patch_review":
+        if seal.candidate_sha != blocked.candidate_sha:
+            raise HLoopError("blocked Patch Review candidate no longer matches history")
+    elif lifecycle == "patch_review_pending":
+        if (
+            candidate.candidate_revision != blocked.candidate_revision + 1
+            or seal.candidate_sha == blocked.candidate_sha
+        ):
+            raise HLoopError(
+                "pending bootstrap authorization requires the next sealed candidate revision"
+            )
+    else:
+        raise HLoopError(
+            f"extra-round authorization is not allowed from lifecycle {lifecycle or 'missing'}"
+        )
+
+    decision = validate_patch_review_extra_round_decision(
+        state,
+        task_id=task_id,
+        decision_id=args.decision_id,
+        blocking_fingerprints=blocking,
+    )
+    require_decision_authorization_input_binding(
+        state, decision, args.authorization_input_id
+    )
+    input_record = require_patch_review_authorization_input(
+        repo, state, args.authorization_input_id
+    )
+    _, contract_digest = exact_task_contract_digest(repo, task_id, task_state)
+    try:
+        authorization = hloop_worker_candidate.PatchReviewExtraRoundAuthorization(
+            run_id=str(state.get("run_id") or ""),
+            task_id=task_id,
+            attempt_id=seal.attempt_id,
+            task_contract_digest=contract_digest,
+            base_round_limit=base_limit,
+            blocked_review_attempt_id=blocked.review_attempt_id,
+            blocked_candidate_sha=blocked.candidate_sha,
+            blocking_finding_fingerprints=blocking,
+            decision_id=decision.decision_id,
+            decision_digest=hloop_worker_candidate.canonical_digest(
+                decision.to_record()
+            ),
+            authorization_input_id=input_record.input_id,
+            input_prompt_digest=input_record.prompt_digest,
+            granted_review_round=base_limit + 1,
+            status="active",
+            authorized_at=now_iso(),
+        )
+        hloop_worker_candidate.evaluate_patch_review_rounds(
+            seal,
+            history,
+            current_task_contract_digest=contract_digest,
+            max_rounds=base_limit,
+            extra_round_authorization=authorization,
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"extra-round authorization rejected: {exc}") from exc
+
+    task_state["patch_review_extra_round_authorization"] = authorization.to_record()
+    if lifecycle == "blocked_patch_review":
+        task_state["candidate_lifecycle_status"] = "patch_fix_running"
+        state["phase"] = "running"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Authorized exactly Patch Review round {authorization.granted_review_round} "
+        f"for `{task_id}` from `{decision.decision_id}` / `{input_record.input_id}`.",
+    )
+    print(
+        f"authorized Patch Review round {authorization.granted_review_round} for {task_id}: "
+        f"decision={decision.decision_id} input={input_record.input_id}"
+    )
+    return 0
 
 
 def fresh_passed_patch_review(
@@ -21470,12 +21759,28 @@ def apply_patch_review_record(
     else:
         history.append(review)
     _, labelled_contract_digest = exact_task_contract_digest(repo, task_id, task_state)
+    authorization = require_current_patch_review_extra_round_authorization(
+        repo, state, task_id, task_state
+    )
+    base_limit = patch_review_round_limit(state)
+    if review.review_round > base_limit:
+        if authorization is None:
+            raise HLoopError("Patch Review round exceeds the configured base limit")
+        try:
+            authorization = authorization.consume(
+                review_attempt_id=review.review_attempt_id,
+                candidate_sha=review.candidate_sha,
+                consumed_at=now_iso(),
+            )
+        except hloop_worker_candidate.WorkerCandidateError as exc:
+            raise HLoopError(f"extra-round authorization rejected: {exc}") from exc
     try:
         decision = hloop_worker_candidate.evaluate_patch_review_rounds(
             seal,
             history,
             current_task_contract_digest=labelled_contract_digest,
-            max_rounds=patch_review_round_limit(state),
+            max_rounds=base_limit,
+            extra_round_authorization=authorization,
         )
     except hloop_worker_candidate.WorkerCandidateError as exc:
         raise HLoopError(f"Patch Review transition rejected: {exc}") from exc
@@ -21489,6 +21794,10 @@ def apply_patch_review_record(
         )
     write_text(review_path, review_payload.decode("utf-8"), durable=True)
     task_state["patch_review_history"] = [item.to_record() for item in history]
+    if authorization is not None:
+        task_state["patch_review_extra_round_authorization"] = (
+            authorization.to_record()
+        )
     task_state["current_patch_review"] = review.to_record()
     task_state["patch_review_decision"] = decision.to_record()
     task_state["candidate_lifecycle_status"] = {
@@ -21619,8 +21928,29 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
     initial_candidate_artifact_digest = seal.candidate_artifact_digest
     history = task_patch_review_history(task_state)
     round_number = len(history) + 1
-    if round_number > patch_review_round_limit(state):
+    base_limit = patch_review_round_limit(state)
+    authorization = require_current_patch_review_extra_round_authorization(
+        repo, state, task_id, task_state
+    )
+    try:
+        hloop_worker_candidate.evaluate_patch_review_rounds(
+            seal,
+            history,
+            current_task_contract_digest=seal.task_contract_digest,
+            max_rounds=base_limit,
+            extra_round_authorization=authorization,
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"Patch Review start rejected: {exc}") from exc
+    if round_number > base_limit and (
+        authorization is None
+        or authorization.status != "active"
+        or authorization.granted_review_round != round_number
+    ):
         raise HLoopError(f"Patch Review round limit reached for {task_id}")
+    authorization_digest = (
+        authorization.authorization_digest if authorization is not None else ""
+    )
     review_attempt_id = args.review_attempt_id or f"PR-{task_id}-R{round_number:03d}"
     existing_reviews = state.setdefault("patch_reviews", {})
     if review_attempt_id in existing_reviews:
@@ -21636,6 +21966,7 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
         "finding_identity_contract": (
             hloop_worker_candidate.PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
         ),
+        "extra_round_authorization_digest": authorization_digest,
     }
     review_contract_digest = hashlib.sha256(
         hloop_worker_candidate.canonical_json(contract_material).encode("utf-8")
@@ -21705,6 +22036,28 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
     current_round = len(task_patch_review_history(task_state)) + 1
     if current_round != round_number:
         raise HLoopError(f"Patch Review round changed before start: {task_id}")
+    current_authorization = require_current_patch_review_extra_round_authorization(
+        repo, state, task_id, task_state
+    )
+    current_authorization_digest = (
+        current_authorization.authorization_digest
+        if current_authorization is not None
+        else ""
+    )
+    if current_authorization_digest != authorization_digest:
+        raise HLoopError(
+            f"Patch Review extra-round authorization changed before start: {task_id}"
+        )
+    try:
+        hloop_worker_candidate.evaluate_patch_review_rounds(
+            seal,
+            task_patch_review_history(task_state),
+            current_task_contract_digest=seal.task_contract_digest,
+            max_rounds=patch_review_round_limit(state),
+            extra_round_authorization=current_authorization,
+        )
+    except hloop_worker_candidate.WorkerCandidateError as exc:
+        raise HLoopError(f"Patch Review start rejected: {exc}") from exc
     if review_attempt_id in (state.get("patch_reviews") or {}):
         raise HLoopError(f"Patch Review already exists: {review_attempt_id}")
     state.setdefault("patch_reviews", {})
@@ -21770,6 +22123,7 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
         "finding_identity_contract": (
             hloop_worker_candidate.PATCH_REVIEW_FINDING_IDENTITY_CONTRACT
         ),
+        "extra_round_authorization_digest": authorization_digest,
         "candidate_sha": seal.candidate_sha,
         "candidate_artifact_digest": seal.candidate_artifact_digest,
         "task_contract_digest": review_contract_digest,
@@ -21907,13 +22261,22 @@ def cmd_patch_review_harvest(args: argparse.Namespace) -> int:
     _, seal, _ = current_candidate_evidence(repo, state, task_id, task_state)
     if str(review_state.get("candidate_sha") or "") != seal.candidate_sha:
         raise HLoopError(f"Patch Review target candidate is stale: {review_attempt_id}")
+    authorization = require_current_patch_review_extra_round_authorization(
+        repo, state, task_id, task_state
+    )
     expected_review_projection = {
         "task_attempt_id": seal.attempt_id,
         "candidate_artifact_digest": seal.candidate_artifact_digest,
         "sealed_task_contract_digest": seal.task_contract_digest,
+        "extra_round_authorization_digest": (
+            authorization.authorization_digest if authorization is not None else ""
+        ),
     }
     for field, expected in expected_review_projection.items():
-        if review_state.get(field) != expected:
+        observed = review_state.get(field)
+        if field == "extra_round_authorization_digest":
+            observed = str(observed or "")
+        if observed != expected:
             raise HLoopError(
                 f"Patch Review target projection is stale: {field} changed"
             )
@@ -22042,6 +22405,9 @@ def cmd_patch_review_status(args: argparse.Namespace) -> int:
         "active_patch_review_id": task_state.get("active_patch_review_id", ""),
         "history": task_state.get("patch_review_history", []),
         "decision": task_state.get("patch_review_decision", {}),
+        "extra_round_authorization": task_state.get(
+            "patch_review_extra_round_authorization", {}
+        ),
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -26655,10 +27021,10 @@ def iter_all_roles(state: dict[str, Any]):
             yield "advisor", f"{advice_id}/{participant_id}", participant
     scout = state.get("specification_scout_run")
     if isinstance(scout, dict) and scout:
-        yield "specification-scout", "S001", scout
+        yield "specification-scout", "S001/decision", scout
     coverage_scout = state.get("plan_gap_scout_run")
     if isinstance(coverage_scout, dict) and coverage_scout:
-        yield "coverage-specification-scout", "S001", coverage_scout
+        yield "coverage-specification-scout", "S001/coverage", coverage_scout
     for decision_id, liaison in (state.get("decision_liaisons") or {}).items():
         if isinstance(liaison, dict):
             yield "decision-liaison", f"L-{decision_id}", liaison
@@ -26706,6 +27072,34 @@ def unresolved_cleanup_failures(role_state: dict[str, Any]) -> dict[str, tuple[s
 
 
 def find_role_for_cleanup(state: dict[str, Any], role_id: str) -> tuple[str, str, dict[str, Any]]:
+    scout_roles = {
+        "S001/decision": (
+            "specification-scout",
+            state.get("specification_scout_run"),
+        ),
+        "S001/coverage": (
+            "coverage-specification-scout",
+            state.get("plan_gap_scout_run"),
+        ),
+    }
+    if role_id in scout_roles:
+        role_kind, role_state = scout_roles[role_id]
+        if isinstance(role_state, dict) and role_state:
+            return role_kind, role_id, role_state
+        raise HLoopError(f"unknown role id: {role_id}")
+    if role_id == "S001":
+        available = [
+            (role_kind, qualified_id, role_state)
+            for qualified_id, (role_kind, role_state) in scout_roles.items()
+            if isinstance(role_state, dict) and role_state
+        ]
+        if len(available) == 1:
+            return available[0]
+        if len(available) > 1:
+            raise HLoopError(
+                "Scout role `S001` is ambiguous; specify `S001/decision` or "
+                "`S001/coverage`"
+            )
     if role_id in state.get("tasks", {}):
         return "worker", role_id, state["tasks"][role_id]
     if role_id in state.get("reviews", {}):
@@ -26759,6 +27153,22 @@ def retry_role_cleanup(
         elif role_kind == "advisor":
             advice_id, _, _participant_id = role_id.partition("/")
             cleanup_advisor_worktree(repo, advice_id, role_state, best_effort=True)
+        elif role_kind == "specification-scout":
+            cleanup_decision_role_worktree(
+                repo,
+                "S001",
+                role_state,
+                prompt_suffix="scout",
+                best_effort=True,
+            )
+        elif role_kind == "coverage-specification-scout":
+            cleanup_decision_role_worktree(
+                repo,
+                "S001",
+                role_state,
+                prompt_suffix="plan-gap-scout",
+                best_effort=True,
+            )
 
 
 def cmd_cleanup_resolve(args: argparse.Namespace) -> int:
@@ -31400,6 +31810,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
             "patch_review_history",
             "current_patch_review",
             "patch_review_decision",
+            "patch_review_extra_round_authorization",
             "active_patch_review_id",
             "blocking_patch_review_findings",
             "blocking_patch_review_candidate_sha",
@@ -36494,6 +36905,18 @@ def build_parser() -> argparse.ArgumentParser:
     patch_review_start.add_argument("--agent-effort")
     patch_review_start.add_argument("--dry-run", action="store_true")
     patch_review_start.set_defaults(func=cmd_patch_review_start)
+    patch_review_authorize = patch_review_sub.add_parser(
+        "authorize-extra-round",
+        help="authorize exactly one task-local third round from accepted evidence",
+    )
+    patch_review_authorize.add_argument("task_id")
+    patch_review_authorize.add_argument("--decision-id", required=True)
+    patch_review_authorize.add_argument(
+        "--authorization-input-id", required=True
+    )
+    patch_review_authorize.set_defaults(
+        func=cmd_patch_review_authorize_extra_round
+    )
     patch_review_record = patch_review_sub.add_parser(
         "record", help="record a strict Patch Review artifact and transition its task"
     )

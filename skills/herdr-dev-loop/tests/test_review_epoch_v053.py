@@ -1041,6 +1041,50 @@ class ReviewEpochSchemaTests(unittest.TestCase):
             case_name="unknown-property",
         )
 
+    def test_legacy_or_canonical_execution_identity_has_runtime_schema_parity(self):
+        canonical = epoch_plan()
+        reviewer = canonical.execution("R001")
+        legacy = replace(
+            canonical,
+            required_executions=(
+                replace(reviewer, execution_kind="", protocol_key=""),
+                canonical.execution("G001"),
+            ),
+        )
+        validators = tuple(
+            offline_validator(schema_path)
+            for schema_path in (REFERENCE_SCHEMA, PUBLIC_SCHEMA)
+        )
+        for plan in (canonical, legacy):
+            record = plan.to_record()
+            self.assertEqual(ReviewEpochPlan.from_record(record), plan)
+            for validator in validators:
+                self.assertEqual(list(validator.iter_errors(record)), [])
+
+        canonical_execution = reviewer.to_record()
+        for missing_field in ("execution_kind", "protocol_key"):
+            invalid_execution = deepcopy(canonical_execution)
+            invalid_execution.pop(missing_field)
+            with self.subTest(missing_field=missing_field), self.assertRaisesRegex(
+                ReviewEpochError, missing_field
+            ):
+                EpochExecutionPlan.from_record(invalid_execution)
+            invalid_plan = canonical.to_record()
+            invalid_plan["required_executions"][0] = invalid_execution
+            for validator in validators:
+                self.assertTrue(list(validator.iter_errors(invalid_plan)))
+
+        gap_with_canonical_identity = canonical.execution("G001").to_record()
+        gap_with_canonical_identity.update(
+            {"execution_kind": "ordinary", "protocol_key": "reviewer.protocol"}
+        )
+        with self.assertRaisesRegex(ReviewEpochError, "no review protocol identity"):
+            EpochExecutionPlan.from_record(gap_with_canonical_identity)
+        invalid_plan = canonical.to_record()
+        invalid_plan["required_executions"][1] = gap_with_canonical_identity
+        for validator in validators:
+            self.assertTrue(list(validator.iter_errors(invalid_plan)))
+
     def test_plan_nested_record_property_sets_match_canonical_schema(self):
         validators = tuple(
             (schema_path, offline_validator(schema_path))
