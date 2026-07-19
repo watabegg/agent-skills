@@ -230,12 +230,47 @@ def harvested_review_group_state() -> dict:
                     raise AssertionError("runtime reviewer start fixture failed")
 
             review_state = state["reviews"][review_id]
+            fixture_ack_event_id = "11111111-1111-4111-8111-111111111111"
             runtime_hloop.resolve_semantic_ack_barrier(
                 review_state,
                 decision="approve",
                 reason="runtime schema fixture",
-                latest_ack={"event_id": "fixture-ack", "sequence": 1},
+                latest_ack={"event_id": fixture_ack_event_id, "sequence": 1},
             )
+            barrier = review_state["semantic_ack_barrier"]
+            application_report = runtime_hloop.hloop_events.validate_report(
+                {
+                    "run_id": state["run_id"],
+                    "role_id": review_id,
+                    "attempt_id": review_state["attempt_id"],
+                    "task_contract_digest": barrier["digest"],
+                    "type": "attention",
+                    "stage": "semantic-ack-application",
+                    "summary": "apply runtime schema fixture ACK",
+                    "impact": "review harvest remains blocked until application",
+                    "attempted": ["read the approved fixture decision"],
+                    "options": ["Manager applies the exact event"],
+                    "recommendation": "apply the authenticated fixture event",
+                    "blocked_scope": ["runtime review harvest fixture"],
+                    "approval_application": {
+                        "message_id": barrier["message_id"],
+                        "decision_ack_event_id": fixture_ack_event_id,
+                        "requested_status": "applied",
+                    },
+                    "next": "harvest the applied runtime review fixture",
+                    "needs_manager": True,
+                    "evidence_refs": [f"semantic-ack:{fixture_ack_event_id}"],
+                    "created_at": "2026-07-20T00:00:00+00:00",
+                }
+            )
+            application_event = runtime_hloop.hloop_events.assign_broker_sequence(
+                runtime_hloop.hloop_events.prepare_client_event(application_report),
+                2,
+            )
+            if not runtime_hloop.apply_semantic_ack_application_event(
+                state, application_event
+            ):
+                raise AssertionError("runtime schema fixture ACK application failed")
             runtime_hloop.save_state(repo, state)
 
             plan = runtime_hloop.hloop_review.ReviewGroupPlan.from_record(

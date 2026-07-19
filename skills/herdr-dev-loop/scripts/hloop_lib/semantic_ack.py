@@ -45,6 +45,21 @@ class ExchangeApproval:
     completion_mode_probe: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ApplicationIdentity:
+    event_id: str
+    event_sequence: int
+    payload_digest: str
+
+    def __post_init__(self) -> None:
+        if not self.event_id.strip():
+            raise ValueError("event_id must not be empty")
+        if isinstance(self.event_sequence, bool) or self.event_sequence <= 0:
+            raise ValueError("event_sequence must be a positive broker sequence")
+        if not _DIGEST_RE.fullmatch(self.payload_digest):
+            raise ValueError("payload_digest must be a 64-character SHA-256 digest")
+
+
 class ExchangeFailure(RuntimeError):
     """A structured terminal or fail-closed exchange outcome."""
 
@@ -243,6 +258,126 @@ def wait_for_approval(
                 "wait-timeout",
                 "timed_out",
                 "semantic ACK exchange timed out waiting for a Manager decision",
+                retryable=True,
+            )
+        sleep(min(poll_interval_seconds, remaining))
+
+
+def inspect_application_snapshot(
+    *,
+    observed_run_id: str,
+    observed_role_id: str,
+    active_attempt_id: str,
+    active_contract_digest: str,
+    agent_state: Mapping[str, Any],
+    identity: ExchangeIdentity,
+    application_identity: ApplicationIdentity,
+) -> dict[str, Any] | None:
+    """Return the exact Manager-applied binding, or ``None`` while pending."""
+
+    inspect_exchange_snapshot(
+        observed_run_id=observed_run_id,
+        observed_role_id=observed_role_id,
+        active_attempt_id=active_attempt_id,
+        active_contract_digest=active_contract_digest,
+        agent_state=agent_state,
+        identity=identity,
+    )
+    barrier = agent_state.get("semantic_ack_barrier")
+    application = (
+        barrier.get("approval_application")
+        if isinstance(barrier, Mapping)
+        else None
+    )
+    if not isinstance(application, Mapping):
+        _fail(
+            "missing-application",
+            "semantic ACK exchange approval application state is missing",
+        )
+    status = str(application.get("status") or "")
+    if status in {
+        "pending",
+        "delivered",
+        "acknowledged",
+        "undelivered",
+        "unknown",
+    }:
+        return None
+    if status == "superseded":
+        raise ExchangeFailure(
+            "superseded",
+            "superseded",
+            "semantic ACK exchange approval application was superseded",
+        )
+    if status != "applied":
+        _fail(
+            "invalid-application-status",
+            f"semantic ACK exchange application status is invalid: {status or 'missing'}",
+        )
+    observed = {
+        "ack_event_id": str(application.get("ack_event_id") or ""),
+        "application_event_id": str(application.get("application_event_id") or ""),
+        "application_event_digest": str(
+            application.get("application_event_digest") or ""
+        ),
+        "application_attempt_id": str(
+            application.get("application_attempt_id") or ""
+        ),
+        "application_task_contract_digest": str(
+            application.get("application_task_contract_digest") or ""
+        ),
+    }
+    expected = {
+        "ack_event_id": identity.ack_event_id,
+        "application_event_id": application_identity.event_id,
+        "application_event_digest": application_identity.payload_digest,
+        "application_attempt_id": identity.attempt_id,
+        "application_task_contract_digest": identity.task_contract_digest,
+    }
+    if observed != expected:
+        _fail(
+            "application-identity-mismatch",
+            "semantic ACK exchange Manager-applied application identity is inconsistent",
+        )
+    return dict(application)
+
+
+def wait_for_application(
+    load_snapshot: Callable[[], tuple[str, str, str, str, Mapping[str, Any]]],
+    identity: ExchangeIdentity,
+    application_identity: ApplicationIdentity,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Boundedly wait for the Manager-owned exact application binding."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be positive")
+    deadline = monotonic() + timeout_seconds
+    while True:
+        run_id, role_id, attempt_id, digest, agent_state = load_snapshot()
+        application = inspect_application_snapshot(
+            observed_run_id=run_id,
+            observed_role_id=role_id,
+            active_attempt_id=attempt_id,
+            active_contract_digest=digest,
+            agent_state=agent_state,
+            identity=identity,
+            application_identity=application_identity,
+        )
+        if application is not None:
+            return application
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ExchangeFailure(
+                "application-wait-timeout",
+                "timed_out",
+                "semantic ACK exchange timed out waiting for Manager application",
                 retryable=True,
             )
         sleep(min(poll_interval_seconds, remaining))

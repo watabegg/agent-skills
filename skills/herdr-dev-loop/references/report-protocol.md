@@ -51,8 +51,11 @@ $HLOOP agent ack exchange T001 \
 `exchange` appends the authenticated ACK, releases the repository lock while
 waiting, and checks the exact run, role, attempt, contract digest, barrier
 message, ACK event, approval availability, and completion-mode probe. On exact
-approval it appends an idempotent authenticated application event and returns
-exit 0. Reject, Manager timeout, supersede, wait timeout, or any identity drift
+approval it appends an idempotent authenticated application event, requires a
+positive broker sequence, and remains blocked until the Manager consumer
+applies that exact event ID, payload digest, attempt, contract digest, and ACK
+binding to `approval_application`. Fallback-spool-only evidence never opens the
+barrier. Reject, Manager timeout, supersede, wait timeout, or any identity drift
 returns non-zero and never authorizes material work. Retrying one interrupted
 exchange reuses its invocation ID; a corrected ACK after reject or timeout uses
 a new invocation ID.
@@ -62,7 +65,9 @@ The Manager resolves the newest authenticated ACK with `hloop agent ack resolve
 records `semantic_decision`, `approval_availability`, `approval_application`,
 and `pane_notification` as separate projections. The default sends no pane
 message. `--notify-pane` is an explicit advisory/debug option whose delivery
-status cannot change decision, availability, or application state. The same
+status cannot change decision, availability, or application state. Lifecycle
+commands remain blocked after decision approval until the exact Manager-owned
+application binding is `applied`. The same
 barrier applies when a later Manager message changes goal, scope, acceptance,
 or public behavior. This is an integration gate: finalize, harvest, and merge
 still verify approved work, but the barrier is not an OS sandbox.
@@ -71,7 +76,7 @@ still verify approved work, but the barrier is not an OS sandbox.
 surfaces. New role prompts use `agent ack exchange` so ACK and resume occur in
 one provider process turn without pane input.
 
-Use `hloop agent message S001 ... --contract-changing` or `hloop agent message L-DNNN ... --contract-changing` for Scout/Liaison contract changes. The common `agent ack resolve`, `agent abort`, `agent requeue`, inbox, message resolution, credential revocation, and Manager sleep paths recognize both role ID forms. Harvest and user-response cleanup remain blocked until the active barrier is approved.
+Use `hloop agent message S001 ... --contract-changing` or `hloop agent message L-DNNN ... --contract-changing` for Scout/Liaison contract changes. The common `agent ack resolve`, `agent abort`, `agent requeue`, inbox, message resolution, credential revocation, and Manager sleep paths recognize both role ID forms. Harvest and user-response cleanup remain blocked until the active barrier has an exact Manager-applied application binding.
 
 `hloop task update` applies a stronger form of the same rule to a running Worker. It hashes the updated task artifact, rebinds the active broker identity to that digest without rotating the attempt token, and replaces the prior barrier with a `task-contract` barrier. Only an authenticated ACK carrying the new digest and a sequence newer than the prior ACK can be approved. The canonical Manager state is authoritative for finalize, harvest, and merge, even when the Worker's local-only startup snapshot is older.
 

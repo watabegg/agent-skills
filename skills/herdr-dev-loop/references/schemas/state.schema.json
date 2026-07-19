@@ -322,7 +322,28 @@
             "approval_application": {
               "type": "object",
               "required": ["status"],
-              "properties": {"status": {"type": "string", "enum": ["pending", "delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"]}},
+              "properties": {
+                "status": {"type": "string", "enum": ["pending", "delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"]},
+                "ack_event_id": {"type": "string", "minLength": 1},
+                "application_event_id": {"type": "string", "minLength": 1},
+                "application_event_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "application_attempt_id": {"type": "string", "minLength": 1},
+                "application_task_contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "allOf": [
+                {
+                  "if": {"properties": {"status": {"const": "applied"}}},
+                  "then": {
+                    "required": [
+                      "ack_event_id",
+                      "application_event_id",
+                      "application_event_digest",
+                      "application_attempt_id",
+                      "application_task_contract_digest"
+                    ]
+                  }
+                }
+              ],
               "additionalProperties": true
             },
             "approval_availability": {
