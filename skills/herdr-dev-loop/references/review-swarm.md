@@ -1,6 +1,6 @@
 # Review Swarm And Dual Review Contract
 
-herdr-dev-loop 0.5.2 supports `single`, `swarm`, `dual`, and `dual-swarm`. A **review group** pins every discovery lane and verifier to one integration head SHA. A Coordinator owns the provider-native sub-agents and returns one manifest; individual sub-agents do not write HLoop artifacts or close gates.
+herdr-dev-loop 0.5.3 supports `single`, `swarm`, `dual`, and `dual-swarm`. A **review epoch** pins every required Reviewer and Gap execution, discovery lane, verifier, protocol capability, and capacity lease to one integration head SHA and immutable plan revision. A Coordinator owns the provider-native sub-agents; individual sub-agents do not write HLoop artifacts or close gates.
 
 ## Discovery topology
 
@@ -31,7 +31,7 @@ The Manager triages confirmed findings into a fix task, user decision, accepted-
 
 ## Independent finding axes and follow-ups
 
-0.5.2 serializes the Manager's disposition as seven independent axes:
+The seven-axis disposition contract inherited from 0.5.2 remains canonical:
 
 - `fact_status`: `confirmed`, `refuted`, or `insufficient_evidence`
 - `origin`: `introduced`, `diff-expanded-pre-existing`, `unrelated-pre-existing`, or `unknown`
@@ -45,8 +45,12 @@ These axes are checked independently before a finding can become a task. A refut
 
 ## Bounded convergence and manual final
 
-For a new 0.5.2 loop, ordinary review waits for the current batch to close. The Manager then prepares a fixed-target convergence plan and records a complete manifest for each bounded remediation round. A convergence manifest that is incomplete, stale, or still contains verified actionable findings cannot pass; the automatic fix-round limit is at most two unless an explicit reopen authorizes additional work.
+For a new 0.5.3 loop, ordinary review waits for the current batch to close. The Manager creates an epoch plan, reserves shared capacity before each process start, records every required Reviewer and Gap execution, and closes the collection barrier before remediation. A same-SHA extra pass is a successor revision with inherited artifact digests; a changed target SHA starts a new epoch.
 
-After convergence reaches zero verified actionable findings, the Manager prepares a separate manual-final plan and manifest at the same fixed target SHA. Manual final recomputes lane completion, independent verification, shortfalls, plan/manifest identity, release-scope snapshot, report presence, and the actionable-finding count. A self-reported zero count or a passing pre-final swarm alone is insufficient. `hloop review reopen --action <action> --user-input-id <id>` is the only supported recovery from exhausted convergence or incomplete/failed manual final; the atomic transition invalidates stale evidence and applies the selected remediation, scope, or abort policy.
+The default Reviewer protocol is `codex-review-multi-v2` with six externally planned lanes. Its pinned adapter must prove `externally-planned-v1`; a missing or mismatched companion record fails closed instead of spawning the companion's independent default Coordinator. Gap uses four requirement-audit lanes and one coverage challenge. The epoch-wide Agent budget includes Coordinators, lanes, verifiers, and Patch Reviewers, while an expired process remains quarantined until exit or forced abort is confirmed.
+
+After collection, the Manager records all normalized candidates before approving one deterministic remediation batch. Classification conflicts stop approval. A convergence manifest that is incomplete, stale, or still contains verified actionable findings cannot pass; normal remediation and task-local Patch Review each have a two-round limit unless exact user authorization permits an additional round.
+
+After convergence reaches zero verified actionable findings, the Manager prepares a separate manual-final plan and manifest at the same fixed target SHA. Both artifacts bind the configured independent/reuse policy, execution and source execution IDs, source artifact ref/digest, target, and pinned adapter. Independent mode must use an execution ID distinct from the complete pre-final source. Reuse mode must point to the exact complete fixed-target epoch Reviewer outcome; it cannot relabel a synthetic or duplicate source as independent work. Manual final recomputes those identities, lane completion, independent verification, shortfalls, release-scope snapshot, report presence, and the actionable-finding count. A self-reported zero count or a passing pre-final swarm alone is insufficient. `hloop review reopen --action <action> --user-input-id <id>` is the only supported recovery from exhausted convergence or incomplete/failed manual final; the atomic transition invalidates stale evidence and applies the selected remediation, scope, or abort policy.
 
 Strict final review is armed only after the current batch closes, review triage is complete, no fix-task draft remains, and `hloop final-gates arm` pins the target SHA. Creating a new task disarms that record. This stability barrier prevents a full swarm and final gap audit from repeating after every incremental fix.

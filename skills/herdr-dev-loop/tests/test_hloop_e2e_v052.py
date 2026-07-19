@@ -13,15 +13,157 @@ import unittest
 
 
 RUNNER = Path(__file__).with_name("run_synthetic_e2e.py")
+SKILL_ROOT = RUNNER.parents[1]
+
+
+AVAILABLE_RELEASE_DEPENDENCY = {
+    "record_type": "herdr_dev_loop_release_dependencies",
+    "schema_version": 1,
+    "release": {
+        "name": "herdr-dev-loop",
+        "version": "0.5.3",
+        "release_ready": True,
+    },
+    "required_release_evidence": [
+        "hloop_codex_install_parity",
+        "hloop_claude_install_parity",
+        "companion_codex_install_parity",
+        "companion_claude_install_parity",
+        "codex_fresh_session_handshake",
+        "claude_fresh_session_handshake",
+    ],
+    "dependencies": [
+        {
+            "name": "codex-review-multi-v2",
+            "kind": "external_review_protocol",
+            "required": True,
+            "availability": "available",
+            "blocking_reason": "",
+            "minimum_compatible_version": "2.1.0",
+            "distribution_identity": {
+                "source": "https://example.invalid/codex-review-multi-v2.git",
+                "immutable_id": "a" * 40,
+                "version": "2.1.0",
+                "digest_algorithm": "sha256-tree-v1",
+                "content_digest": "sha256:" + "b" * 64,
+            },
+            "capability_manifest": {
+                "relative_path": "capabilities/externally-planned-v1.json",
+                "record_type": "external_review_protocol_adapter",
+                "protocol": "codex-review-multi-v2",
+                "required_capabilities": ["externally-planned-v1"],
+            },
+            "install_destinations": {
+                "codex": "${CODEX_HOME:-$HOME/.codex}/skills/codex-review-multi-v2",
+                "claude": "${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/codex-review-multi-v2",
+            },
+        }
+    ],
+}
+
+PROTOCOL_CAPABILITY = {
+    "record_type": "external_review_protocol_adapter",
+    "protocol": "codex-review-multi-v2",
+    "source": "https://example.invalid/codex-review-multi-v2.git@" + "a" * 40,
+    "version": "2.1.0",
+    "content_digest": "sha256:" + "b" * 64,
+    "capabilities": ["externally-planned-v1"],
+}
+
+SYNTHETIC_BOOTSTRAP = """\
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import sys
+
+runner = Path(sys.argv[1])
+capability = sys.argv[2]
+loader = importlib.machinery.SourceFileLoader("hloop_v052_synthetic_proxy", str(runner))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+synthetic = importlib.util.module_from_spec(spec)
+loader.exec_module(synthetic)
+
+def prepare_final_review(fixture):
+    synthetic._fixture_cli(
+        fixture,
+        "final-review",
+        "prepare",
+        "--protocol-capability",
+        capability,
+        "--json",
+    )
+
+original_write_final_manifest = synthetic._write_final_manifest
+
+def write_final_manifest(fixture, **kwargs):
+    manifest = original_write_final_manifest(fixture, **kwargs)
+    execution = manifest.execution
+    if execution is not None and manifest.review_manifest.review_id != execution.execution_id:
+        review_manifest = synthetic.replace(
+            manifest.review_manifest,
+            review_id=execution.execution_id,
+        )
+        manifest = synthetic.replace(manifest, review_manifest=review_manifest)
+        loop = synthetic.state_path(fixture["repo"], fixture["namespace"]).parent
+        (loop / "reviews" / "final" / "MANIFEST.json").write_text(
+            synthetic.json.dumps(manifest.to_record(), ensure_ascii=False, indent=2) + "\\n",
+            encoding="utf-8",
+        )
+    return manifest
+
+synthetic._prepare_final_review = prepare_final_review
+synthetic._write_final_manifest = write_final_manifest
+sys.argv = [str(runner), *sys.argv[3:]]
+raise SystemExit(synthetic.main())
+"""
 
 
 class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.release_fixture = tempfile.TemporaryDirectory(
+            prefix="hloop-v052-release-pin-"
+        )
+        fixture_root = Path(cls.release_fixture.name)
+        cls.skill_root = fixture_root / "herdr-dev-loop"
+        shutil.copytree(
+            SKILL_ROOT,
+            cls.skill_root,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        cls.runner = cls.skill_root / "tests" / RUNNER.name
+        (cls.skill_root / "release-dependencies.json").write_text(
+            json.dumps(AVAILABLE_RELEASE_DEPENDENCY, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        capability_dir = cls.skill_root / "capabilities"
+        capability_dir.mkdir(exist_ok=True)
+        cls.protocol_capability = capability_dir / "externally-planned-v1.json"
+        cls.protocol_capability.write_text(
+            json.dumps(PROTOCOL_CAPABILITY, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        cls.bootstrap = fixture_root / "run_synthetic_proxy.py"
+        cls.bootstrap.write_text(SYNTHETIC_BOOTSTRAP, encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.release_fixture.cleanup()
+
     def run_scenario(self, name: str) -> dict:
         env = os.environ.copy()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(
-            [sys.executable, str(RUNNER), "--json", "--scenario", name],
-            cwd=RUNNER.parents[2],
+            [
+                sys.executable,
+                str(self.bootstrap),
+                str(self.runner),
+                str(self.protocol_capability),
+                "--json",
+                "--scenario",
+                name,
+            ],
+            cwd=self.runner.parents[2],
             env=env,
             text=True,
             capture_output=True,
@@ -119,7 +261,7 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
 
     def test_finish_projects_manual_risks_and_all_finding_axis_maps(self):
         loader = importlib.machinery.SourceFileLoader(
-            "hloop_t018_synthetic_e2e_runtime", str(RUNNER)
+            "hloop_t018_synthetic_e2e_runtime", str(self.runner)
         )
         spec = importlib.util.spec_from_loader(loader.name, loader)
         self.assertIsNotNone(spec)
@@ -128,9 +270,49 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
 
         root = Path(tempfile.mkdtemp(prefix="hloop-t018-final-outcome-"))
         original_review_manifest = synthetic._write_review_manifest
-        original_final_manifest = synthetic._write_final_manifest
+        raw_final_manifest = synthetic._write_final_manifest
+        original_prepare_final_review = synthetic._prepare_final_review
         captured: dict[str, object] = {}
         try:
+            def prepare_final_review(fixture):
+                synthetic._fixture_cli(
+                    fixture,
+                    "final-review",
+                    "prepare",
+                    "--protocol-capability",
+                    str(self.protocol_capability),
+                    "--json",
+                )
+
+            synthetic._prepare_final_review = prepare_final_review
+
+            def write_bound_final_manifest(fixture, **kwargs):
+                manifest = raw_final_manifest(fixture, **kwargs)
+                execution = manifest.execution
+                if (
+                    execution is not None
+                    and manifest.review_manifest.review_id != execution.execution_id
+                ):
+                    review_manifest = synthetic.replace(
+                        manifest.review_manifest,
+                        review_id=execution.execution_id,
+                    )
+                    manifest = synthetic.replace(
+                        manifest, review_manifest=review_manifest
+                    )
+                    loop = synthetic.state_path(
+                        fixture["repo"], fixture["namespace"]
+                    ).parent
+                    (loop / "reviews" / "final" / "MANIFEST.json").write_text(
+                        json.dumps(
+                            manifest.to_record(), ensure_ascii=False, indent=2
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                return manifest
+
+            original_final_manifest = write_bound_final_manifest
             repo = synthetic.make_repo(root)
             env = os.environ.copy()
             env.update(
@@ -254,7 +436,8 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
             self.assertIn("Finding disposition counts: discard=2", report)
         finally:
             synthetic._write_review_manifest = original_review_manifest
-            synthetic._write_final_manifest = original_final_manifest
+            synthetic._write_final_manifest = raw_final_manifest
+            synthetic._prepare_final_review = original_prepare_final_review
             shutil.rmtree(root, ignore_errors=True)
 
 

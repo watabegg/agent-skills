@@ -1,46 +1,115 @@
-# herdr-dev-loop 0.5.2 configuration example.
+# herdr-dev-loop 0.5.3 configuration example.
 # Copy to one of the locations shown by `hloop config path --json`.
-# New loops use batch review cadence and complete-zero manual-final
-# certification by default. Legacy loops retain their stored cadence after
-# migration.
+# Every layer uses these canonical keys; legacy aliases are normalized only at
+# their source layer and do not override a canonical value silently.
 version = 1
 
 [defaults]
 max_workers = 3
 session_cleanup = "archive"
+specification_scout = "auto"
+
+[defaults.manager]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "max"
+identity_policy = "warn-unavailable"
 
 [defaults.worker]
 provider = "codex"
-model = "auto"
-effort = "auto"
+model = "gpt-5.6-terra"
+effort = "max"
 
 [defaults.reviewer]
-mode = "swarm"
 provider = "codex"
-model = "auto"
-effort = "auto"
-probe_count = 6
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "swarm"
+lane_count = 6
+protocol = "codex-review-multi-v2"
+required_capabilities = ["externally-planned-v1"]
+
+[defaults.reviewer.coordinator]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.reviewer.lane]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.reviewer.verifier]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.gap]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "swarm"
+lane_count = 4
+
+[defaults.gap.coordinator]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.gap.lane]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.gap.verifier]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.plan_gap]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.patch_reviewer]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[defaults.final_coordinator]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "max"
+
+[defaults.advisor]
+provider = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
 
 [defaults.review]
 cadence = "batch"
 pre_final_protocol = "codex-review-multi-v2"
-# Manual-final certification currently has no native implementation.
 manual_final_protocol = "codex-review-multi-v2"
+manual_final_execution = "independent"
 max_fix_rounds = 2
 scope_expansion_action = "follow_up"
 final_required = "complete_zero_verified_actionable_findings"
-lane_count = "auto"
+
+[defaults.audit]
+agent_budget = 12
+max_patch_review_rounds_per_task = 2
 
 # `match = "repo"` is the default. The canonical repository root is matched,
-# so running hloop from a nested directory does not change the result.
+# so invoking hloop from a nested directory does not change this scope.
 [[scope]]
 path = "~/src"
 
 [scope.worker]
 provider = "claude"
 model = "sonnet"
+effort = "xhigh"
 
-# Use cwd matching only when invocation-directory-specific behavior is wanted.
+# Use cwd matching only for invocation-directory-specific policy.
 [[scope]]
 path = "~/src/high-risk-service"
 match = "cwd"
@@ -49,4 +118,4 @@ max_workers = 2
 [scope.reviewer]
 mode = "dual-swarm"
 providers = ["codex", "claude"]
-probes_per_provider = 4
+lane_count = 4

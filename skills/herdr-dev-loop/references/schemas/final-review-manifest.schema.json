@@ -19,6 +19,7 @@
     "source_snapshot_revision",
     "source_digest",
     "protocol",
+    "execution",
     "manifest_complete",
     "verified_actionable_findings",
     "patch_verdict"
@@ -49,6 +50,7 @@
     "source_snapshot_revision": {"type": "integer", "minimum": 0},
     "source_digest": {"$ref": "#/$defs/digest"},
     "protocol": {"const": "codex-review-multi-v2"},
+    "execution": {"$ref": "final-review-plan.schema.json#/$defs/execution"},
     "manifest_complete": {"type": "boolean"},
     "verified_actionable_findings": {"type": "integer", "minimum": 0},
     "patch_verdict": {"enum": ["passed", "failed", "incomplete"]}

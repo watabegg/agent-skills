@@ -45,6 +45,7 @@ from hloop_lib import hooks as hloop_hooks
 from hloop_lib import providers as hloop_providers
 from hloop_lib import requirements as hloop_requirements
 from hloop_lib import release_scope as hloop_release_scope
+from hloop_lib import release_dependency as hloop_release_dependency
 from hloop_lib import reports as hloop_reports
 from hloop_lib import review as hloop_review
 from hloop_lib import review_epoch as hloop_review_epoch
@@ -10617,6 +10618,15 @@ def validate_epoch_protocol_capabilities(
                 "protocol capability evidence was supplied for a native-only epoch"
             )
         return {}
+    try:
+        expected = hloop_release_dependency.load_release_dependencies(
+            SKILL_ROOT / "release-dependencies.json"
+        )
+    except hloop_release_dependency.ReleaseDependencyError as exc:
+        raise HLoopError(
+            "codex-review-multi-v2 is blocked by release dependency state: "
+            f"{exc}"
+        ) from exc
     adapters: dict[str, dict[str, Any]] = {}
     for path in capability_paths:
         try:
@@ -10625,12 +10635,70 @@ def validate_epoch_protocol_capabilities(
             )
         except hloop_review.ReviewModelError as exc:
             raise HLoopError(f"invalid external review capability: {exc}") from exc
+        try:
+            hloop_release_dependency.validate_runtime_adapter(adapter, expected)
+        except hloop_release_dependency.ReleaseDependencyError as exc:
+            raise HLoopError(f"external review capability pin mismatch: {exc}") from exc
         adapters[adapter.protocol] = adapter.to_record()
     if "codex-review-multi-v2" not in adapters:
         raise HLoopError(
             "codex-review-multi-v2 epoch execution requires externally-planned-v1 capability evidence"
         )
     return adapters
+
+
+def validate_epoch_runtime_protocol_capabilities(
+    state: dict[str, Any],
+    plan: hloop_review_epoch.ReviewEpochPlan,
+    *,
+    execution_ids: Sequence[str] | None = None,
+) -> None:
+    """Revalidate persisted external adapters against the canonical release pin."""
+
+    selected_ids = set(execution_ids) if execution_ids is not None else None
+    external_protocols = sorted(
+        {
+            execution.protocol
+            for execution in plan.required_executions
+            if selected_ids is None or execution.execution_id in selected_ids
+            if execution.protocol == "codex-review-multi-v2"
+        }
+    )
+    if not external_protocols:
+        return
+    capabilities = review_epoch_store(state)["protocol_capabilities"].get(
+        plan.plan_digest
+    )
+    if not isinstance(capabilities, Mapping):
+        raise HLoopError(
+            "external review epoch lacks persisted protocol capability evidence"
+        )
+    try:
+        expected = hloop_release_dependency.load_release_dependencies(
+            SKILL_ROOT / "release-dependencies.json"
+        )
+    except hloop_release_dependency.ReleaseDependencyError as exc:
+        raise HLoopError(
+            "external review epoch is blocked by canonical release dependency state: "
+            f"{exc}"
+        ) from exc
+    for protocol in external_protocols:
+        record = capabilities.get(protocol)
+        if not isinstance(record, Mapping):
+            raise HLoopError(
+                f"external review epoch lacks persisted {protocol} adapter evidence"
+            )
+        try:
+            adapter = hloop_review.ExternalReviewProtocolAdapter.from_record(record)
+            hloop_release_dependency.validate_runtime_adapter(adapter, expected)
+        except (
+            hloop_review.ReviewModelError,
+            hloop_release_dependency.ReleaseDependencyError,
+        ) as exc:
+            raise HLoopError(
+                "external review epoch adapter does not match the canonical "
+                f"release dependency: {exc}"
+            ) from exc
 
 
 def cmd_review_epoch_create(args: argparse.Namespace) -> int:
@@ -10651,6 +10719,7 @@ def cmd_review_epoch_create(args: argparse.Namespace) -> int:
     if plan.epoch_id in store["records"]:
         existing = require_review_epoch_collection(state, plan.epoch_id, 1)
         if existing == collection:
+            validate_epoch_runtime_protocol_capabilities(state, plan)
             print(f"review epoch already exists: {plan.epoch_id} revision 1")
             return 0
         raise HLoopError(
@@ -10734,6 +10803,7 @@ def cmd_review_epoch_successor(args: argparse.Namespace) -> int:
     if existing is not None:
         try:
             if hloop_review_epoch.ReviewEpochCollection.from_record(existing) == successor:
+                validate_epoch_runtime_protocol_capabilities(state, plan)
                 print(
                     f"review epoch successor already exists: {plan.epoch_id} revision {plan.epoch_revision}"
                 )
@@ -10799,6 +10869,9 @@ def cmd_review_epoch_reserve(args: argparse.Namespace) -> int:
             "cannot reserve capacity for a stale review epoch: "
             f"epoch={collection.plan.target_sha} integration={target}"
         )
+    validate_epoch_runtime_protocol_capabilities(
+        state, collection.plan, execution_ids=(args.execution_id,)
+    )
     if collection.status != "collecting":
         raise HLoopError(f"review epoch cannot reserve while {collection.status}")
     try:
@@ -11035,6 +11108,9 @@ def epoch_execution_start_binding(
             f"{source_kind} execution protocol {execution.protocol!r} does not "
             f"match configured protocol {expected_protocol!r}"
         )
+    validate_epoch_runtime_protocol_capabilities(
+        state, collection.plan, execution_ids=(execution.execution_id,)
+    )
     required_start_ids = {process.process_id for process in execution.processes}
     starting_leases = tuple(
         lease
@@ -11880,6 +11956,228 @@ def _scope_certification_identity(repo: Path, state: dict[str, Any]) -> tuple[in
     )
 
 
+def _manual_final_protocol_adapter(
+    args: argparse.Namespace,
+    *,
+    stored_adapter: Any = None,
+) -> hloop_review.ExternalReviewProtocolAdapter:
+    try:
+        expected = hloop_release_dependency.load_release_dependencies(
+            SKILL_ROOT / "release-dependencies.json"
+        )
+    except hloop_release_dependency.ReleaseDependencyError as exc:
+        raise HLoopError(
+            "manual-final execution is blocked by release dependency state: "
+            f"{exc}"
+        ) from exc
+    paths = normalize_list(getattr(args, "protocol_capability", None))
+    if len(paths) > 1:
+        raise HLoopError("manual-final accepts exactly one protocol capability")
+    supplied: Any = stored_adapter
+    if paths:
+        supplied = load_json_object(
+            paths[0], label="manual-final external review capability"
+        )
+    if supplied is None:
+        raise HLoopError(
+            "manual-final requires exact external review adapter evidence"
+        )
+    try:
+        adapter = hloop_review.ExternalReviewProtocolAdapter.from_record(supplied)
+        hloop_release_dependency.validate_runtime_adapter(adapter, expected)
+    except (
+        hloop_review.ReviewModelError,
+        hloop_release_dependency.ReleaseDependencyError,
+    ) as exc:
+        raise HLoopError(f"manual-final protocol adapter is invalid: {exc}") from exc
+    if paths and stored_adapter is not None:
+        try:
+            stored = hloop_review.ExternalReviewProtocolAdapter.from_record(
+                stored_adapter
+            )
+        except hloop_review.ReviewModelError as exc:
+            raise HLoopError(f"stored review epoch adapter is invalid: {exc}") from exc
+        if adapter != stored:
+            raise HLoopError(
+                "manual-final supplied adapter does not match review epoch adapter"
+            )
+    return adapter
+
+
+def _next_manual_final_execution_id(
+    state: Mapping[str, Any], source_execution_id: str
+) -> str:
+    used = {source_execution_id}
+    for key in ("reviews",):
+        value = state.get(key)
+        if isinstance(value, Mapping):
+            used.update(str(item) for item in value)
+    manual = state.get("manual_final_review")
+    if isinstance(manual, Mapping):
+        execution_id = manual.get("execution_id")
+        if isinstance(execution_id, str) and execution_id:
+            used.add(execution_id)
+    for index in range(1, 1000):
+        candidate = f"R{index:03d}"
+        if candidate not in used:
+            return candidate
+    raise HLoopError("manual-final execution ID space is exhausted")
+
+
+def _manual_final_execution_provenance(
+    repo: Path,
+    state: dict[str, Any],
+    target: str,
+    args: argparse.Namespace,
+) -> hloop_certification.ManualFinalExecutionProvenance:
+    policy = str(review_policy_record(state).get("manual_final_execution") or "")
+    if policy == "independent":
+        source_ref = "reviews/convergence/MANIFEST.json"
+        source_path = loop_path(repo) / source_ref
+        try:
+            source_record = load_json_object(
+                str(source_path), label="pre-final review source manifest"
+            )
+            source_manifest = hloop_review.ReviewManifest.from_record(source_record)
+        except hloop_review.ReviewModelError as exc:
+            raise HLoopError(f"invalid pre-final review source manifest: {exc}") from exc
+        if source_manifest.plan.head_sha != target or not source_manifest.completeness.complete:
+            raise HLoopError(
+                "independent manual-final source must be complete for the fixed target"
+            )
+        convergence = state.get("review_convergence")
+        if not isinstance(convergence, Mapping):
+            raise HLoopError("independent manual-final requires recorded convergence state")
+        canonical_source_ref = str(source_path.relative_to(repo))
+        if normalize_list(convergence.get("artifact_refs")) != [canonical_source_ref]:
+            raise HLoopError(
+                "independent manual-final requires the canonical convergence manifest artifact"
+            )
+        recorded_round = convergence.get("recorded_round")
+        if (
+            isinstance(recorded_round, bool)
+            or not isinstance(recorded_round, int)
+            or recorded_round < 0
+            or recorded_round != _canonical_review_fix_round(convergence)
+        ):
+            raise HLoopError(
+                "independent manual-final requires the recorded canonical convergence round"
+            )
+        if (
+            str(convergence.get("status") or "") != "converged"
+            or str(convergence.get("recorded_status") or "") != "converged"
+        ):
+            raise HLoopError(
+                "independent manual-final requires recorded converged status"
+            )
+        recorded_digest = str(convergence.get("recorded_manifest_digest") or "")
+        source_digest = hloop_certification.canonical_digest(
+            source_manifest.to_record()
+        )
+        if not recorded_digest or recorded_digest != source_digest:
+            raise HLoopError(
+                "independent manual-final source digest does not match recorded convergence manifest digest"
+            )
+        adapter = _manual_final_protocol_adapter(args)
+        return hloop_certification.ManualFinalExecutionProvenance(
+            execution_policy=policy,
+            execution_id=_next_manual_final_execution_id(
+                state, source_manifest.review_id
+            ),
+            source_kind="pre-final-review",
+            source_execution_id=source_manifest.review_id,
+            source_artifact_ref=source_ref,
+            source_artifact_digest=_sha256_labelled(source_path.read_bytes()),
+            target_sha=target,
+            protocol_adapter=adapter,
+        )
+    if policy != "reuse_epoch_reviewer":
+        raise HLoopError(f"unsupported manual-final execution policy: {policy or 'missing'}")
+
+    store = review_epoch_store(state)
+    epoch_id = str(store.get("active_epoch_id") or "")
+    if not epoch_id:
+        raise HLoopError("reuse_epoch_reviewer requires an active review epoch")
+    collection = require_review_epoch_collection(state, epoch_id)
+    if collection.plan.target_sha != target:
+        raise HLoopError("reused review epoch does not match the manual-final target")
+    reviewers = [
+        execution
+        for execution in collection.plan.required_executions
+        if execution.source_kind == "reviewer"
+        and execution.protocol == hloop_certification.MANUAL_FINAL_PROTOCOL
+    ]
+    if len(reviewers) != 1:
+        raise HLoopError(
+            "reuse_epoch_reviewer requires exactly one external Reviewer execution"
+        )
+    reviewer = reviewers[0]
+    outcomes = {
+        outcome.execution_id: outcome for outcome in collection.execution_outcomes
+    }
+    outcome = outcomes.get(reviewer.execution_id)
+    if outcome is None or not outcome.successful or not outcome.artifact_digest:
+        raise HLoopError(
+            "reuse_epoch_reviewer requires a complete successful Reviewer artifact"
+        )
+    capabilities = store["protocol_capabilities"].get(collection.plan.plan_digest)
+    stored_adapter = (
+        capabilities.get(hloop_certification.MANUAL_FINAL_PROTOCOL)
+        if isinstance(capabilities, Mapping)
+        else None
+    )
+    adapter = _manual_final_protocol_adapter(args, stored_adapter=stored_adapter)
+    return hloop_certification.ManualFinalExecutionProvenance(
+        execution_policy=policy,
+        execution_id=reviewer.execution_id,
+        source_kind="review-epoch-reviewer",
+        source_execution_id=reviewer.execution_id,
+        source_artifact_ref=outcome.artifact_ref,
+        source_artifact_digest=outcome.artifact_digest,
+        target_sha=target,
+        protocol_adapter=adapter,
+    )
+
+
+def _validate_manual_final_source_artifact(
+    repo: Path,
+    execution: hloop_certification.ManualFinalExecutionProvenance,
+    *,
+    submitted_manifest: hloop_review.ReviewManifest | None = None,
+) -> hloop_review.ReviewManifest:
+    source_path = (loop_path(repo) / execution.source_artifact_ref).resolve()
+    try:
+        source_path.relative_to(loop_path(repo).resolve())
+    except ValueError as exc:
+        raise HLoopError("manual-final source artifact escapes the loop directory") from exc
+    if not source_path.is_file():
+        raise HLoopError(f"manual-final source artifact is missing: {source_path}")
+    if _sha256_labelled(source_path.read_bytes()) != execution.source_artifact_digest:
+        raise HLoopError("manual-final source artifact digest has drifted")
+    try:
+        source_manifest = hloop_review.ReviewManifest.from_record(
+            load_json_object(str(source_path), label="manual-final source artifact")
+        )
+    except hloop_review.ReviewModelError as exc:
+        raise HLoopError(f"manual-final source artifact is invalid: {exc}") from exc
+    if (
+        source_manifest.review_id != execution.source_execution_id
+        or source_manifest.plan.head_sha != execution.target_sha
+        or not source_manifest.completeness.complete
+    ):
+        raise HLoopError(
+            "manual-final source artifact provenance does not match its fixed execution"
+        )
+    if (
+        execution.execution_policy == "reuse_epoch_reviewer"
+        and submitted_manifest != source_manifest
+    ):
+        raise HLoopError(
+            "reuse_epoch_reviewer final manifest must exactly match the validated source artifact"
+        )
+    return source_manifest
+
+
 def _final_certification_plan(
     repo: Path,
     state: dict[str, Any],
@@ -11891,6 +12189,7 @@ def _final_certification_plan(
     providers: Sequence[str] | None = None,
     probe_count: int | None = None,
     probes_per_provider: int | None = None,
+    execution: hloop_certification.ManualFinalExecutionProvenance | None = None,
 ) -> tuple[hloop_certification.CertificationPlan, hloop_review.ReviewGroupPlan]:
     protocol_selection = canonical_review_protocol(state, "manual-final")
     manual_final_protocol = str(protocol_selection.protocol or "")
@@ -11938,6 +12237,7 @@ def _final_certification_plan(
         protocol=manual_final_protocol,
         lane_plan=lanes,
         verification_policy=policy,
+        execution=execution,
     )
     return plan, group
 
@@ -12901,6 +13201,7 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
     )
     certification_id = str(getattr(args, "certification_id", None) or _next_certification_id(state))
     paths = _final_paths(repo)
+    execution = _manual_final_execution_provenance(repo, state, target, args)
     plan, group = _final_certification_plan(
         repo,
         state,
@@ -12911,9 +13212,10 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
         providers=getattr(args, "providers", None),
         probe_count=getattr(args, "probe_count", None),
         probes_per_provider=getattr(args, "probes_per_provider", None),
+        execution=execution,
     )
     review_manifest = hloop_review.ReviewManifest(
-        review_id="R001",
+        review_id=execution.execution_id,
         plan=group,
         lane_results=(),
         findings=(),
@@ -12939,6 +13241,12 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                     "scope_revision": plan.scope_revision,
                     "source_snapshot_revision": plan.source_snapshot_revision,
                     "source_digest": plan.source_digest,
+                    "execution_policy": execution.execution_policy,
+                    "execution_id": execution.execution_id,
+                    "source_execution_id": execution.source_execution_id,
+                    "source_artifact_ref": execution.source_artifact_ref,
+                    "source_artifact_digest": execution.source_artifact_digest,
+                    "protocol_adapter_digest": execution.protocol_adapter.content_digest,
                     "lane_count": len(plan.lane_plan),
                     "lane_names": [],
                     "lane_outcomes": [],
@@ -12984,6 +13292,12 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                 "lane_completed_count": 0,
                 "lane_count": len(plan.lane_plan),
                 "prepared_at": now_iso(),
+                "execution_policy": execution.execution_policy,
+                "execution_id": execution.execution_id,
+                "source_execution_id": execution.source_execution_id,
+                "source_artifact_ref": execution.source_artifact_ref,
+                "source_artifact_digest": execution.source_artifact_digest,
+                "protocol_adapter": execution.protocol_adapter.to_record(),
                 "protocol_selection": {
                     "execution_kind": protocol_selection.execution_kind,
                     "key": protocol_selection.key,
@@ -13006,6 +13320,7 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
         "manifest": str(paths["manifest"].relative_to(repo)),
         "report": str(paths["report"].relative_to(repo)),
         "plan_digest": plan.digest,
+        "execution": execution.to_record(),
         "automatic_reviewer_started": False,
         "dry_run": bool(args.dry_run),
     }
@@ -13038,9 +13353,41 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         )
     except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError, hloop_certification.CertificationModelError) as exc:
         raise HLoopError(f"invalid manual final review artifact: {exc}") from exc
+    if str(manual.get("prepared_plan_digest") or "") != plan.digest:
+        raise HLoopError(
+            "manual final review plan no longer matches the prepared state identity"
+        )
+    if (
+        str(manual.get("certification_id") or "") != plan.certification_id
+        or str(manual.get("target_sha") or "") != plan.target_sha
+    ):
+        raise HLoopError(
+            "manual final review certification or target no longer matches prepared state"
+        )
     current = current_integration_target(repo, state)
     scope = release_scope_from_state(state)
     allow_legacy = scope.status == "legacy-unlocked"
+    if plan.execution is not None and evidence.execution is None:
+        raise HLoopError(
+            "manual final review manifest is missing plan-bound execution provenance"
+        )
+    if evidence.execution is not None:
+        _validate_manual_final_source_artifact(
+            repo,
+            evidence.execution,
+            submitted_manifest=evidence.review_manifest,
+        )
+        try:
+            current_adapter = hloop_release_dependency.load_release_dependencies(
+                SKILL_ROOT / "release-dependencies.json"
+            )
+            hloop_release_dependency.validate_runtime_adapter(
+                evidence.execution.protocol_adapter, current_adapter
+            )
+        except hloop_release_dependency.ReleaseDependencyError as exc:
+            raise HLoopError(
+                f"manual-final release dependency identity is invalid: {exc}"
+            ) from exc
     accepted_risk_authorizations = _resolve_review_accepted_risk_authorizations(
         state, evidence.review_manifest
     )
@@ -13109,6 +13456,13 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
         manual["shortfall_count"] = len(evidence.review_manifest.verification_plan.shortfalls)
         manual["verified_actionable_findings"] = actionable
         manual["release_blocking_findings"] = release_blocking
+        if evidence.execution is not None:
+            manual["execution_policy"] = evidence.execution.execution_policy
+            manual["execution_id"] = evidence.execution.execution_id
+            manual["source_execution_id"] = evidence.execution.source_execution_id
+            manual["source_artifact_ref"] = evidence.execution.source_artifact_ref
+            manual["source_artifact_digest"] = evidence.execution.source_artifact_digest
+            manual["protocol_adapter"] = evidence.execution.protocol_adapter.to_record()
         manual["accepted_risk_authorizations"] = {
             fingerprint: authorization.to_record()
             for fingerprint, authorization in accepted_risk_authorizations.items()
@@ -14769,11 +15123,12 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             continue
         schemas[path.name] = data
 
-    # 0.5.2 publishes the manual-final PLAN/MANIFEST entry points beside the
-    # runtime review schemas.  Keep the public wrappers lightweight while
-    # checking that they resolve to the canonical reference schemas; older
-    # installed copies are allowed to retain their historical layout.
-    if version_text.startswith("0.5.2"):
+    # 0.5.2 and 0.5.3 publish the manual-final PLAN/MANIFEST entry points
+    # beside the runtime review schemas. Keep the public wrappers lightweight
+    # while requiring each filename to resolve to its exact canonical schema;
+    # older installed copies may retain their historical layout.
+    publication_version = version_text.split("-", 1)[0].split("+", 1)[0]
+    if publication_version in {"0.5.2", "0.5.3"}:
         runtime_schema_dir = skill_root / "schemas"
         for name in (
             "final-review-plan.schema.json",
@@ -14781,16 +15136,21 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         ):
             path = runtime_schema_dir / name
             if not path.is_file():
-                errors.append(f"schemas/{name} is missing from the 0.5.2 publication")
+                errors.append(
+                    f"schemas/{name} is missing from the {publication_version} publication"
+                )
                 continue
             try:
                 runtime_schema = json.loads(read_text(path))
             except json.JSONDecodeError as exc:
                 errors.append(f"schemas/{name} is invalid JSON: {exc}")
                 continue
+            if not isinstance(runtime_schema, dict):
+                errors.append(f"schemas/{name} is not a JSON object")
+                continue
             check(
-                runtime_schema.get("$ref", "").startswith("../references/schemas/final-review-"),
-                f"schemas/{name} does not point to the canonical final-review schema",
+                runtime_schema.get("$ref") == f"../references/schemas/{name}",
+                f"schemas/{name} does not point to its exact canonical schema",
             )
 
     state_schema = schemas.get("state.schema.json", {})
@@ -15373,6 +15733,17 @@ acceptance:
 def cmd_init(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     config_resolution, config_candidate = resolve_init_config(args, repo)
+    init_review_protocol = str(
+        config_resolution.get("reviewer", "protocol") or DEFAULT_REVIEW_PROTOCOL
+    )
+    reviewer_lane_count = int(
+        config_resolution.get(
+            "reviewer", "lane_count", default=len(DEFAULT_REVIEW_LANES)
+        )
+    )
+    init_review_lanes = args.review_lane or list(
+        hloop_review.DEFAULT_DISCOVERY_LANES[:reviewer_lane_count]
+    )
     archived_loop: Path | None = None
     base = args.base or current_branch(repo) or "main"
     goal_id = args.goal_id or slugify(args.goal, 32)
@@ -15468,7 +15839,7 @@ TBD by Manager.
 """,
         )
     if not profile.exists() or args.force:
-        lanes = args.review_lane or DEFAULT_REVIEW_LANES
+        lanes = init_review_lanes
         write_text(
             profile,
             f"""# Loop Profile
@@ -15503,7 +15874,7 @@ Execution outcomes accumulate in `{EXPERIENCE_DIR.as_posix()}/worktree-setup.jso
 - `codex-impl`: compatibility mode only; use when Manager intentionally wants the external skill's preflight/review/QA behavior.
 
 ## Review Protocol
-{args.review_protocol}
+{init_review_protocol}
 
 - `native`: Reviewers use HLoop review lanes tuned for Manager gating, task artifacts, validation evidence, and product risk.
 - `codex-review-multi-v2`: compatibility mode only; still require HLoop artifact shape and Fix Task Candidates.
@@ -15650,7 +16021,7 @@ None.
         "manager_qa_status": "not-required" if manager_qa_profile == "none" else "pending",
         "manager_qa_evidence_path": (LOOP_DIR / "qa" / "FINAL.md").as_posix(),
         "worker_protocol": args.worker_protocol,
-        "review_protocol": args.review_protocol,
+        "review_protocol": init_review_protocol,
         "worker_agent_provider": worker_agent_provider,
         "worker_agent_model": worker_agent_model,
         "worker_agent_effort": args.worker_agent_effort,
@@ -15670,7 +16041,7 @@ None.
         "advisor_agent_model": advisor_agent_model,
         "advisor_agent_effort": args.advisor_agent_effort,
         "advisor_claude_permission_mode": args.advisor_claude_permission_mode,
-        "review_lanes": args.review_lane or DEFAULT_REVIEW_LANES,
+        "review_lanes": init_review_lanes,
         "worker_runner": args.worker_runner,
         "reviewer_runner": args.reviewer_runner,
         "gap_runner": args.gap_runner,
@@ -15873,7 +16244,7 @@ None.
             "not-required" if state_manager_qa_profile(old) == "none" else "pending",
         )
         old.setdefault("worker_protocol", args.worker_protocol)
-        old.setdefault("review_protocol", args.review_protocol)
+        old.setdefault("review_protocol", init_review_protocol)
         old.setdefault("worker_agent_provider", worker_agent_provider)
         old.setdefault("worker_agent_model", worker_agent_model)
         old.setdefault("reviewer_agent_provider", reviewer_agent_provider)
@@ -15886,7 +16257,7 @@ None.
         old.setdefault("advisor_agent_provider", advisor_agent_provider)
         old.setdefault("advisor_agent_model", advisor_agent_model)
         old.setdefault("advice", {})
-        old.setdefault("review_lanes", args.review_lane or DEFAULT_REVIEW_LANES)
+        old.setdefault("review_lanes", init_review_lanes)
         old.setdefault("review_after_merges", args.review_after_merges)
         old.setdefault(
             "review_policy",
@@ -33623,7 +33994,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="deprecated alias for --worker-qa-profile",
     )
     init.add_argument("--worker-protocol", choices=sorted(WORKER_PROTOCOLS), default=DEFAULT_WORKER_PROTOCOL)
-    init.add_argument("--review-protocol", choices=sorted(REVIEW_PROTOCOLS), default=DEFAULT_REVIEW_PROTOCOL)
+    init.add_argument("--review-protocol", choices=sorted(REVIEW_PROTOCOLS))
     init.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
     init.add_argument("--worker-agent-model")
     init.add_argument("--worker-agent-effort")
@@ -33861,6 +34232,11 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--dry-run", action="store_true")
         if command_name == "prepare":
             command_parser.add_argument("--certification-id")
+            command_parser.add_argument(
+                "--protocol-capability",
+                action="append",
+                help="exact external review adapter evidence for manual-final execution",
+            )
         else:
             command_parser.add_argument("--manifest")
             command_parser.add_argument("--report")

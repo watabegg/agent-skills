@@ -1,0 +1,40 @@
+{
+  "record_type": "herdr_dev_loop_release_dependencies",
+  "schema_version": 1,
+  "release": {
+    "name": "herdr-dev-loop",
+    "version": "0.5.3",
+    "release_ready": false
+  },
+  "required_release_evidence": [
+    "hloop_codex_install_parity",
+    "hloop_claude_install_parity",
+    "companion_codex_install_parity",
+    "companion_claude_install_parity",
+    "codex_fresh_session_handshake",
+    "claude_fresh_session_handshake"
+  ],
+  "dependencies": [
+    {
+      "name": "codex-review-multi-v2",
+      "kind": "external_review_protocol",
+      "required": true,
+      "availability": "unavailable",
+      "blocking_reason": "A compatible immutable distribution identity has not been supplied to this release candidate.",
+      "minimum_compatible_version": null,
+      "distribution_identity": null,
+      "capability_manifest": {
+        "relative_path": null,
+        "record_type": "external_review_protocol_adapter",
+        "protocol": "codex-review-multi-v2",
+        "required_capabilities": [
+          "externally-planned-v1"
+        ]
+      },
+      "install_destinations": {
+        "codex": "${CODEX_HOME:-$HOME/.codex}/skills/codex-review-multi-v2",
+        "claude": "${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/codex-review-multi-v2"
+      }
+    }
+  ]
+}

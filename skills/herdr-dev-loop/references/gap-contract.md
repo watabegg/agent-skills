@@ -37,6 +37,8 @@ Use `git diff <base-branch>...<integration-branch>` only as supporting evidence 
 
 If no extra `spec_sources` are configured, audit the durable loop files and task/result artifacts as the contract. Do not guess hidden product requirements.
 
+For a revision-3 review epoch, Gap uses one Coordinator, four requirement-audit lanes, and one coverage challenge. Each lane maps accepted requirements to implementation evidence and must not turn into a generic code-review lane. The epoch plan fixes target SHA, lane identity, provider/model/effort, audit-process identity, and capacity reservation. Manager collects the Gap execution with the required Reviewer execution before approving remediation; a missing lane, missing challenge, stale plan revision, or incomplete execution stops the collection barrier.
+
 ## Manager Action Labels
 
 Each gap should recommend one action:

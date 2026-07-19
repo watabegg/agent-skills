@@ -2,7 +2,7 @@
 
 `herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/herdr-dev-loop/loops/<namespace>` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
 
-このREADMEは0.5.2運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、厳格なreviewは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。release checklistは[`docs/RELEASE-0.5.2.md`](docs/RELEASE-0.5.2.md)です。
+このREADMEは0.5.3運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、review epochは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。release gateは[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)と[`release-dependencies.json`](release-dependencies.json)を正本にします。
 
 ## 最初に確認すること
 
@@ -36,14 +36,14 @@ Skillを使うManagerは、ほかの調査や変更より先に `hloop version` 
 新しいloopでは、初期化時の版を `STATE.json.skill_version` に固定します。Worker、Reviewer、Gap Auditor、Advisorは起動時の版を各agent状態とartifactの `skill_version` に記録し、最初の進捗にも版とrole IDを出します。`hloop doctor` はインストール済みの版とloopに固定された版が異なる場合に警告し、harvestはrole起動時の版とartifactの版が異なる場合に拒否します。
 
 ```text
-herdr-dev-loop 0.5.2 / namespace <namespace> を使用します（loop_skill_version: 0.5.2, run_id: 20260716T...-goal）
+herdr-dev-loop 0.5.3 / namespace <namespace> を使用します（loop_skill_version: 0.5.3, run_id: 20260717T...-goal）
 ```
 
 `hloop namespaces` は同居するloopを列挙し、旧 `.ai/loop` が存在する場合は `legacy ignored` と表示します。
 
 ## `config.toml` の設定
 
-0.5.2はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
+0.5.3はPython 3.11以上を要求し、標準ライブラリの`tomllib`で設定を読みます。設定ファイルがなくても既定値で動作します。利用中のパスと解決結果は次のコマンドで確認できます。
 
 ```bash
 hloop config path --json
@@ -55,13 +55,13 @@ hloop config explain --repo <repo> --json
 
 `[defaults]`にWorkerとReviewerのprovider、model、effort、同時Worker数、session cleanupを設定できます。`[[scope]]`は既定でcanonicalなrepository rootに一致し、同じrepository内のsubdirectoryから起動しても結果が変わりません。起動directory固有の設定だけ`match = "cwd"`を明示します。設定例は[`examples/config.toml`](examples/config.toml)にあります。
 
-新規loopの`[defaults.review]`は、`cadence = "batch"`、`pre_final_protocol = "codex-review-multi-v2"`、`manual_final_protocol = "codex-review-multi-v2"`、`max_fix_rounds = 2`、`scope_expansion_action = "follow_up"`、`final_required = "complete_zero_verified_actionable_findings"`、`lane_count = "auto"`です。manual-finalは実装済みの`codex-review-multi-v2`だけを受理し、`native`は黙って置換せず拒否します。legacy loopをmigrationしても、保存済みのmerge-count cadenceや既存のfinish semanticsは暗黙に変更されません。
+新規0.5.3 loopは、ordinary reviewの`reviewer.protocol`、`review.pre_final_protocol`、`review.manual_final_protocol`をすべて`codex-review-multi-v2`にし、canonicalなReviewer topologyを6 laneにします。Gapは4 lane、epoch全体のAgent budgetは12、taskごとのPatch Reviewは最大2 roundです。`--review-protocol native`が変更するのはordinary reviewだけです。pre-finalでサポート済みのnative pathを使う場合は、`[defaults.review]`または一致するscopeで`pre_final_protocol = "native"`を別途設定します。manual-finalにnative overrideはなく、`manual_final_protocol`は`codex-review-multi-v2`だけを受理します。external protocolを選択した実行にはpin済みの`externally-planned-v1` companion capabilityが必要であり、欠落やdigest不一致からnativeへ黙ってfallbackしません。shipped recordの`release_ready=false`はimmutable companion distributionが供給されるまでpublicationをblockします。legacy loopをmigrationしても保存済みのmerge-count cadenceやfinish semanticsは暗黙に変更されません。
 
-解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、task override、role start overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
+解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、loop snapshot、task override、role start override、participant overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
 
 ## 永続化とworktree初期化経験
 
-既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。format 2、format 3 revision 0/1のstateを再開するときは、`hloop migrate --dry-run`で確認してから`hloop migrate --apply`を実行します。0.5.2の新規stateはformat 3、revision 2です。
+既定の `persistence` は `local-only` です。Managerのloop stateはrole worktreeへコピーされ、integration branchへloop artifactをcommitしなくても起動できます。Workerのproduct変更をsquash mergeするときは、namespace配下のartifactをstageから外してproduct commitへ混ぜません。loop artifact自体をbranch履歴へ残すリポジトリだけ `--persistence branch-history` を選びます。0.5.3の新規stateはformat 3、revision 3です。古いstateは`hloop migrate --dry-run`で全transactionを確認してから`--apply`し、中断時は`--resume`を使います。`--rollback`は最初の0.5.3 mutation前に限られます。
 
 worktreeごとに必要な依存導入や生成処理は、初期化時に繰り返し指定できます。
 
@@ -81,7 +81,7 @@ hloop experience show
 
 明示的なsetup commandを付けずに次のloopを初期化すると、recommended commandsが引き継がれます。
 
-## 0.5.2のrelease scopeとbounded review
+## 0.5.3のrelease scopeと上流gate
 
 新規loopでは、実装をdispatchする前にrelease scope contractを固定します。scopeはsource fileのdigest、`scope_revision`、`source_snapshot_revision`、plan item、requirement、対応環境、trust boundaryを含む正本です。
 
@@ -106,6 +106,35 @@ hloop dispatch unfreeze --user-input-id U0002
 ```
 
 freeze中もvalidation、harvest、merge、follow-up記録、report、pauseは可能ですが、新しいtaskと新しいWorker/Reviewer/Gap Auditor/Advisorの起動は拒否されます。
+
+### Planning evidence
+
+Worker dispatch前にRepository Impact Map、Task Risk Graph、coverage ledger、Plan Gap artifactを同じplanning identityへ固定します。planning identityはplan、requirements、release scope、sourceのrevisionとdigestを含みます。artifactの不足、identity drift、coverage不足がある状態ではWorkerを開始できません。
+
+```bash
+hloop planning identity --json
+hloop planning check --json
+hloop planning status --json
+```
+
+### Worker candidateとPatch Review
+
+revision 3 Workerは、実装直後にterminal resultを作りません。`worker submit`がinvariant、regression、self-review、residual risk、unrun checkをexact candidateへ束縛し、承認済みcompletion modeに応じてcommit sealまたはhandoff sealを作ります。taskが`patch_review`を要求する場合、Patch Reviewerは同じattempt、task contract、candidate SHA、candidate artifact digestを対象にしなければなりません。候補を修正したら新revisionをsubmitし、古いPatch Reviewを再利用しません。
+
+```bash
+hloop worker submit T001 --completion-mode commit --candidate-revision 1 ...
+hloop worker candidate-seal T001 --candidate-revision 1
+hloop patch-review start T001
+hloop patch-review status T001 --json
+```
+
+初回semantic ACKはGit metadataのcreate、fsync、unlink probeを実行し、そのattemptを`commit`または`handoff`へ固定します。contract re-ACKでcompletion modeを再probeせず、別attemptのmodeや改ざんされたsealを受け入れません。
+
+### Review epochとremediation
+
+ReviewerとGap Auditorは同じtarget SHAのimmutable epochへ集めます。Coordinator、lane、verifier、Patch Reviewerは共有capacity ledgerへ予約し、timeoutしたprocessは終了またはforced abort確認までquarantineとしてbudgetを消費します。必要なexecutionが一つでも未完了ならcollection barrierは閉じません。
+
+`hloop triage epoch`は全findingをcanonical fingerprintで登録し、classification conflictを解消してからbatchを一度だけ承認します。task materializationはwrite-ahead planとreconcileを使い、途中停止後も同じtask identityを再利用します。通常remediationは最大2 roundであり、追加roundには未使用の明示user authorizationが必要です。
 
 ### Findingの分類とfollow-up
 
@@ -150,13 +179,14 @@ manifestが不完全、またはverified actionable findingが残る場合は、
 convergenceが`converged`になったら、freshなmanual final reviewを準備します。
 
 ```bash
-hloop final-review prepare --mode swarm --json
+hloop final-review prepare --mode swarm \
+  --protocol-capability /path/to/pinned-adapter.json --json
 # 固定SHA、PLAN.json、MANIFEST.json、reportへ手動review結果を記録
 hloop final-review record --json
 hloop final-review status --json
 ```
 
-manual finalは、finding数が0という自己申告だけでは合格しません。全lane完了、必要な独立verification、shortfallなし、manifest completeness、PLAN/MANIFESTのidentityとdigest、scope snapshot、固定target SHA、report存在を検証し、verified actionable findingが0件であることを要求します。complete-zeroにならないmanual finalは`finish`を通過できません。
+manual finalは、finding数が0という自己申告だけでは合格しません。PLAN/MANIFESTは`manual_final_execution`、execution ID、source execution、source artifact ref/digest、固定target、pinned adapter identityを共有します。`independent`はcompleteなpre-final sourceとは別のReviewer execution IDを要求し、`reuse_epoch_reviewer`は同じtargetの成功済みepoch Reviewer executionとartifactだけを再利用できます。全lane完了、必要な独立verification、shortfallなし、manifest completeness、scope snapshot、report存在、verified actionable finding 0件も必要です。duplicate/synthetic source、artifact drift、adapter drift、complete-zeroにならないmanual finalは`finish`を通過できません。shipped dependencyが`release_ready: false`の間はprepare自体がpublication blockerとして停止します。
 
 PLAN/MANIFESTの公開schemaは[`schemas/final-review-plan.schema.json`](schemas/final-review-plan.schema.json)と[`schemas/final-review-manifest.schema.json`](schemas/final-review-manifest.schema.json)です。
 
@@ -206,11 +236,11 @@ paneは閉じられ、再投入時は古いworktreeを整理します。product�
 
 この3つは別の設定です。
 
-- **protocol**：agentの作業契約です。通常は `native` を使います。
+- **protocol**：agentの作業契約です。Workerは既定で`native`を使い、review executionはordinary、pre-final、manual-finalごとに独立したcanonical keyを使います。
 - **provider**：agentを起動するCLIです。`codex` または `claude` を指定します。
 - **model**：provider内で使うモデルです。`auto` はCLIの既定値です。
 
-たとえば `worker_protocol: native` と `worker_agent_provider: codex` は別々に指定します。`$codex-impl` と `$codex-review-multi-v2` は互換protocolで、通常の既定値ではありません。
+たとえば `worker_protocol: native` と `worker_agent_provider: codex` は別々に指定します。`$codex-impl`は任意のWorker互換protocolです。新規0.5.3 loopではordinary review、pre-final、manual-finalがすべて`$codex-review-multi-v2`を既定にし、canonicalなReviewer topologyは6 laneです。`--review-protocol native`はordinary reviewだけを変更します。pre-finalのnative pathは`pre_final_protocol = "native"`で別途選択できます。manual-finalにnative overrideはなく、`manual_final_protocol`は`codex-review-multi-v2`だけを受理します。external protocolにはpin済みの`externally-planned-v1` companion capabilityが必要であり、shipped recordの`release_ready=false`がpublicationをblockしている間は実行可能と扱いません。
 
 ### QAの2段階
 
@@ -258,7 +288,7 @@ hloop decision new \
 
 ## Agent報告とevent-driven Manager
 
-0.5.2のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。invocation IDはASCII英数字で始め、以降もASCII英数字または`.`、`_`、`:`、`/`、`-`だけを使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
+0.5.3のlong-running roleは`ack`、`milestone`、`attention`、`completion`を`hloop agent report`で送ります。各論理reportでは新しい`--invocation-id`を生成し、応答が不明な同一reportのretryでは同じ値を使います。invocation IDはASCII英数字で始め、以降もASCII英数字または`.`、`_`、`:`、`/`、`-`だけを使います。retryは新しい論理reportより先に行います。outboxは最新64件のbounded retentionであり、保持期間外のexactly-onceを保証しません。`--invocation-id`を省略したlegacy pending retryと、`--event-id`による互換retryも維持します。`ack`はmaterial edit前のgoal、scope、acceptance、approachを固定します。`milestone`は通常inbox-only、`attention`はManager対応、`completion`はartifactとSHAの検証開始を知らせます。completion report自体は完了証拠ではありません。
 
 Managerはpaneを巡回する前にdurable inboxを処理します。
 
@@ -387,6 +417,8 @@ hloop --repo <repo> init \
 
 `--create-branch` はintegration branchの準備も行います。未commitの変更がある場合は、先に状態を確認してください。ループ以外のdirty fileがあるとmutating commandが停止することがあります。
 
+この例の`--review-protocol native`はordinary reviewだけを上書きします。pre-finalのprotocolは`[defaults.review]`の`pre_final_protocol`で別途設定し、manual-finalにはnative overrideがありません。
+
 `--worktree-root` を指定すると、Worker、Reviewer、Gap Auditor、Advisorのworktreeがすべてその配下へ作られます。相対パスは対象リポジトリを基準に解決されます。`init --force`で再初期化した場合、旧loopは`.ai/herdr-dev-loop/archive/<namespace>/`へ退避され、新しい`run_id`が発行されます。
 
 ### 3. Quick Start: 要件からbatchとtaskを作る
@@ -450,16 +482,24 @@ hloop reviewer message R001 --file review-followup.md
 hloop gap message G001 --file gap-followup.md
 ```
 
-Workerはproduct変更をcommitした後、成果物を次のように確定します。branch、base SHA、変更ファイル、`run_id`、`merge_ready`はhloopが生成します。
+revision-3 Workerは承認済みcompletion modeを確認し、まずnonterminal candidateを提出します。commit modeではproduct変更を先にcommitしてcandidate sealを作り、handoff modeではstage/commitせず同じworktree treeを提出します。validationと5分類のQA evidenceはcandidate identityへ固定します。
 
 ```bash
-hloop worker finalize T001 \
+hloop agent ack status T001 --attempt-id T001-A001 --apply
+hloop worker submit T001 --completion-mode commit --candidate-revision 1 \
   --validation-command 'pnpm test --filter target' \
   --validation-result passed \
-  --validation-summary 'targeted test passed'
+  --validation-summary 'targeted test passed' \
+  --invariant-evidence 'existing API behavior is preserved' \
+  --regression-evidence 'targeted regression suite passed' \
+  --self-review-summary 'scope and failure paths reviewed'
+hloop worker candidate-seal T001 --candidate-revision 1
+hloop patch-review start T001
+hloop patch-review status T001 --json
+hloop worker finalize T001 --status done
 ```
 
-`--validation-result`は`passed`、`failed`、`blocked`のいずれかです。`--status done`では全件`passed`でなければならず、失敗またはblockedを含む成果物はharvest時にmerge-readyと認められず、mergeでも再検査されます。harvest済みartifactの正本はManager側のnamespaced result pathです。
+`--validation-result`は`passed`、`failed`、`blocked`のいずれかです。candidateまたはtask contractが変わればPatch Reviewはstaleになり、新revisionのsubmitとreviewが必要です。`--status done`ではrequired gateとvalidationが全件passingでなければならず、失敗またはblockedを含む成果物はharvest時にmerge-readyと認められません。handoff modeは`worker finalize T001 --handoff`を使い、Managerがsealします。harvest済みartifactの正本はManager側のnamespaced result pathです。
 
 `wait --harvest`、`tick`、`pump`は、Worker成果物がHEADへcommitされるまでreadyと扱いません。Reviewer、Gap Auditor、Advisorは`run_id`と監査対象`head_sha`が一致する場合だけ回収されます。
 
@@ -496,7 +536,7 @@ Managerがdraftを確認した後、必要なものだけ `--create-tasks` でqu
 
 Managerは mission、plan、profile、state、decisionを所有します。Workerは自分のブランチと自分のresult artifactだけを書きます。Reviewerは `reviews/`、Gap Auditorは `gaps/`、Advisorは `advice/` の自分のartifactだけを書きます。
 
-Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.2 CLIは`requirements/`、`progress/`、`context/`、`decisions/`の個別directoryを生成しません。release scopeとfollow-upは、それぞれ`STATE.json.release_scope`と`STATE.json.follow_ups`、およびnamespaced artifactへ保存されます。
+Accepted requirement、progress、machine-readable decisionは`STATE.json.requirements`と`STATE.json.decisions`に保存されます。`DECISIONS.md`は人が読む判断台帳です。0.5.3の`requirements reconcile`はdry-run projectionと明示applyを分け、source SHA、validation identity、review epoch、artifact digestが一致する証拠だけをprogressへ反映します。release scopeとfollow-upは、それぞれ`STATE.json.release_scope`と`STATE.json.follow_ups`、およびnamespaced artifactへ保存されます。
 
 Workerの結果をManagerが書き換えて `done` にすることはできません。`partial`、`blocked`、`failed`、`merge_ready: false` の場合は、原因を記録して再実行またはfix taskへ進みます。
 
@@ -551,7 +591,7 @@ python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
 python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
 ```
 
-通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.2表示を確認します。fresh provider discoveryやprovider E2Eを実施していない場合は成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。移行済みnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/RELEASE-0.5.2.md`](docs/RELEASE-0.5.2.md)にあります。なお、今回のrepository taskではinstalled Codex/Claude copyを同期しません。
+通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.3表示を確認します。続いて[`release-dependencies.json`](release-dependencies.json)がpinする`codex-review-multi-v2`を両providerへ同期し、fresh sessionから`externally-planned-v1` capability、version、content digestをhandshakeします。repository、Codex、Claudeのbyte parityとlive handshakeを実施していない場合は成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。schema 3.3へ移行済みのnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)にあります。
 
 ## 公開時の注意
 

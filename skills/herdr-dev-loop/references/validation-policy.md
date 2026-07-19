@@ -39,9 +39,9 @@ Manager final QA quality floor:
 5. If final QA cannot run, record `blocked` with the exact missing credential, URL, service, migration, or data dependency.
 6. If final QA fails, record `failed` and create fix tasks or ask for a decision before marking the loop done.
 
-## 0.5.2 release and review evidence
+## 0.5.3 release and review evidence
 
-Validation for a new 0.5.2 loop must be tied to the locked release scope and
+Validation for a new 0.5.3 loop must be tied to current planning identity, the locked release scope, and
 one concrete integration target SHA. Task artifacts record `task_origin`, the
 matching `release_scope_revision`, and the plan, requirement, finding, user
 input, or operational references that authorize the task. A review candidate
@@ -74,7 +74,7 @@ atomic `hloop review reopen` with explicit user-input provenance.
 The public schema entry points for these artifacts are
 `schemas/final-review-plan.schema.json` and
 `schemas/final-review-manifest.schema.json`. They resolve to the canonical
-reference schemas and are checked by the 0.5.2 selftest. Provider E2E is
+reference schemas and are checked by the 0.5.3 selftest. Provider E2E is
 reported separately: `--allow-skip --skip-reason <reason>` proves that the
 probe was intentionally not run, but it never turns into a provider pass.
 

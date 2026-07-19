@@ -606,16 +606,16 @@ require_clean_worktree
                 self.assertEqual(result.returncode, expected_status)
 
 
-class CurrentV052ReleaseArtifactTests(unittest.TestCase):
+class CurrentV053ReleaseArtifactTests(unittest.TestCase):
     def test_current_version_docs_and_public_final_review_schemas(self):
         self.assertEqual(
             (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
-            "0.5.2",
+            "0.5.3",
         )
         for relative_path in (
             "README.md",
             "SKILL.md",
-            "docs/RELEASE-0.5.2.md",
+            "docs/2026-07-17-v0.5.3-release-notes.md",
             "references/artifact-contract.md",
             "references/cli-notes.md",
             "references/configuration.md",
@@ -629,7 +629,12 @@ class CurrentV052ReleaseArtifactTests(unittest.TestCase):
         ):
             with self.subTest(relative_path=relative_path):
                 text = (SKILL_ROOT / relative_path).read_text(encoding="utf-8")
-                self.assertIn("0.5.2", text)
+                self.assertIn("0.5.3", text)
+
+        historical_release = (
+            SKILL_ROOT / "docs" / "RELEASE-0.5.2.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("0.5.2", historical_release)
 
         for schema_name in (
             "final-review-plan.schema.json",
@@ -649,7 +654,9 @@ class CurrentV052ReleaseArtifactTests(unittest.TestCase):
 
     def test_current_config_example_matches_review_policy_defaults(self):
         data = config.load_config_file(SKILL_ROOT / "examples" / "config.toml")
-        self.assertEqual(data["defaults"]["review"], config.REVIEW_POLICY_DEFAULTS)
+        self.assertEqual(
+            data["defaults"]["review"], config.V053_REVIEW_POLICY_DEFAULTS
+        )
 
 
 def _extract_hloop_function_snippets(text):
