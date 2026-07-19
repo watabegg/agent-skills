@@ -80,6 +80,31 @@ Use `hloop agent message S001 ... --contract-changing` or `hloop agent message L
 
 `hloop task update` applies a stronger form of the same rule to a running Worker. It hashes the updated task artifact, rebinds the active broker identity to that digest without rotating the attempt token, and replaces the prior barrier with a `task-contract` barrier. Only an authenticated ACK carrying the new digest and a sequence newer than the prior ACK can be approved. The canonical Manager state is authoritative for finalize, harvest, and merge, even when the Worker's local-only startup snapshot is older.
 
+A `--contract-changing` Manager message also carries a newly rendered
+`agent ack exchange` command. Before delivery, HLoop binds that command, the
+semantic barrier, the role's `active_report_contract_digest`, and the broker's
+active attempt/token registration to one exact digest. A pending Worker
+`task-contract` barrier keeps the digest created by `hloop task update`; other
+contract-changing messages use the digest of the enveloped contract message.
+The re-ACK invocation ID is message-specific, so it cannot collide with the
+initial attempt ACK. HLoop persists the new non-approved barrier before broker
+rebinding. If broker rebinding or the final state write fails, the visible
+projection remains blocked and no old approval authorizes material work.
+
+Manager application consumers distinguish these cases without weakening
+authentication or identity checks:
+
+- A broker-sequenced event matching the current attempt, digest, message, and
+  decision ACK follows the ordinary `acknowledged` or `applied` transition.
+- A broker-sequenced event that exactly matches a recorded superseded barrier,
+  prior decision, or archived attempt is appended to
+  `semantic_ack_obsolete_applications` with terminal disposition `obsolete`.
+  It does not mutate the current barrier or authorization and may then be
+  acknowledged from the inbox.
+- A malformed event, an event without broker sequence evidence, a different
+  run, an unknown role, or an identity mismatch with no exact historical
+  record remains a hard failure and is not acknowledged as obsolete.
+
 If the broker store or SQLite storage is temporarily unavailable, the client atomically writes the event to the run-specific fallback spool. `hloop broker recover` replays valid events idempotently. Idempotency conflicts, authentication failures, invalid schemas, unsupported storage schemas, and other permanent semantic/integrity errors return non-zero and are never reported as successful fallback spooling.
 
 ## Event-driven Manager

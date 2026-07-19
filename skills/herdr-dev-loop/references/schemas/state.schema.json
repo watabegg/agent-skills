@@ -254,6 +254,7 @@
         },
         "worker_agent_effort": {"type": "string", "minLength": 1},
         "agent_identity": {"$ref": "#/$defs/agentIdentityProjection"},
+        "active_report_contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "candidate_revision": {"type": "integer", "minimum": 1},
         "candidate_lifecycle_status": {
           "type": "string",
@@ -307,10 +308,16 @@
         "semantic_ack_barrier": {
           "type": "object",
           "properties": {
+            "attempt_id": {"type": "string"},
             "message_id": {"type": "string"},
             "digest": {"type": "string"},
             "kind": {"type": "string"},
             "status": {"type": "string"},
+            "report_identity_status": {"type": "string", "enum": ["rebinding", "bound", "failed"]},
+            "report_identity_attempt_id": {"type": "string"},
+            "rendered_exchange_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "report_identity_bound_at": {"type": "string", "format": "date-time"},
+            "report_identity_error": {"type": "string"},
             "armed_at": {"type": "string"},
             "resolved_at": {"type": "string"},
             "semantic_decision": {
@@ -866,6 +873,42 @@
       "additionalProperties": false
     },
     "attempt_history": {"type": "array", "items": {"type": "object"}},
+    "agent_attempt_history": {"type": "array", "items": {"type": "object"}},
+    "semantic_ack_obsolete_applications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_sequence",
+          "event_payload_digest",
+          "run_id",
+          "role_id",
+          "attempt_id",
+          "task_contract_digest",
+          "message_id",
+          "decision_ack_event_id",
+          "disposition",
+          "reason",
+          "recorded_at"
+        ],
+        "properties": {
+          "event_id": {"type": "string", "minLength": 1},
+          "event_sequence": {"type": "integer", "minimum": 1},
+          "event_payload_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "run_id": {"type": "string", "minLength": 1},
+          "role_id": {"type": "string", "minLength": 1},
+          "attempt_id": {"type": "string", "minLength": 1},
+          "task_contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "message_id": {"type": "string", "minLength": 1},
+          "decision_ack_event_id": {"type": "string", "minLength": 1},
+          "disposition": {"const": "obsolete"},
+          "reason": {"type": "string", "enum": ["superseded-barrier", "stale-attempt", "prior-decision"]},
+          "recorded_at": {"type": "string", "format": "date-time"}
+        },
+        "additionalProperties": false
+      }
+    },
     "cleanup_history": {"type": "array", "items": {"type": "object"}},
     "lifecycle_diagnostics": {"type": "array", "items": {"type": "object"}},
     "tasks": {
