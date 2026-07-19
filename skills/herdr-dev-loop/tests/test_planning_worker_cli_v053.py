@@ -249,6 +249,71 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             proposed_fix=f"Fix {label}",
         )
 
+    def install_extra_round_evidence(
+        self,
+        repo: Path,
+        state: dict,
+        finding_fingerprint: str,
+        *,
+        decision_id: str = "D007",
+        input_id: str = "U0005",
+    ) -> None:
+        decision = {
+            "id": decision_id,
+            "class": hloop.DECISION_BLOCKING_USER,
+            "status": hloop.DECISION_ACCEPTED,
+            "question": "Allow one task-local Patch Review round?",
+            "options": [
+                {
+                    "id": "opt1",
+                    "label": "Allow one round",
+                    "tradeoffs": ["The third round remains task-local."],
+                },
+                {
+                    "id": "opt2",
+                    "label": "Stop",
+                    "tradeoffs": ["The task remains blocked."],
+                },
+            ],
+            "recommendation": {
+                "option_id": "opt1",
+                "rationale": "One bounded round closes the retained findings.",
+            },
+            "affected_task_ids": ["T001"],
+            "source_findings": [finding_fingerprint],
+            "response": {
+                "responded_by": "user",
+                "responded_at": "2026-07-19T12:00:00Z",
+                "selected_option": "opt1",
+            },
+            "resolution": {
+                "outcome": "accepted",
+                "rationale": "The user accepted the bounded round.",
+                "resolved_by": "manager",
+                "resolved_at": "2026-07-19T12:00:01Z",
+                "selected_option": "opt1",
+            },
+        }
+        state.setdefault("decisions", {})[decision_id] = decision
+        input_record = hloop.hloop_requirements.InputRecord.capture(
+            input_id=input_id,
+            received_at="2026-07-19T12:00:00Z",
+            source="user",
+            raw_input="bounded authorization response",
+        )
+        input_path = hloop.local_sensitive_input_dir(repo) / f"{input_id}.json"
+        hloop.write_text(
+            input_path,
+            json.dumps(input_record.to_record(), ensure_ascii=False, indent=2)
+            + "\n",
+        )
+        state.setdefault("inputs_index", {})[input_id] = {
+            "prompt_digest": input_record.prompt_digest,
+            "redactions": [],
+            "received_at": input_record.received_at,
+            "source": "user",
+        }
+
     def submit_candidate(
         self,
         repo: Path,
@@ -295,6 +360,45 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         )
         return candidate, seal
+
+    def exhaust_patch_review_rounds(
+        self, repo: Path, state: dict, task_state: dict
+    ) -> tuple[object, object]:
+        (repo / "src" / "task.py").write_text("VALUE = 40\n", encoding="utf-8")
+        _candidate1, seal1 = self.submit_candidate(repo, state, task_state)
+        review1 = hloop.hloop_worker_candidate.record_patch_review(
+            seal1,
+            review_attempt_id="PR-T001-R001",
+            review_round=1,
+            reviewer_provider="codex",
+            reviewer_model="gpt-5.6-sol",
+            reviewer_effort="xhigh",
+            verdict="fix_required",
+            findings=(self.patch_finding("one"),),
+        )
+        hloop.apply_patch_review_record(repo, state, "T001", task_state, review1)
+        hloop.write_text(
+            repo / hloop.LOOP_DIR / "STATE.json",
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        )
+        (repo / "src" / "task.py").write_text("VALUE = 50\n", encoding="utf-8")
+        _candidate2, seal2 = self.submit_candidate(repo, state, task_state)
+        review2 = hloop.hloop_worker_candidate.record_patch_review(
+            seal2,
+            review_attempt_id="PR-T001-R002",
+            review_round=2,
+            reviewer_provider="codex",
+            reviewer_model="gpt-5.6-sol",
+            reviewer_effort="xhigh",
+            verdict="fix_required",
+            findings=(self.patch_finding("two"),),
+        )
+        hloop.apply_patch_review_record(repo, state, "T001", task_state, review2)
+        hloop.write_text(
+            repo / hloop.LOOP_DIR / "STATE.json",
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        )
+        return seal2, review2
 
     def test_planning_dispatch_uses_locked_scope_not_artifact_self_declaration(self) -> None:
         fixtures = importlib.import_module(
@@ -731,6 +835,115 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                 SimpleNamespace(repo=".", mode="decision", force=True)
             )
 
+    def test_both_scout_starts_use_the_atomic_loop_lock_boundary(self) -> None:
+        parser = hloop.build_parser()
+        for mode in ("decision", "coverage"):
+            args = parser.parse_args(
+                ["specification-scout", "start", "--mode", mode]
+            )
+            with self.subTest(mode=mode):
+                self.assertTrue(hloop.command_requires_loop_lock(args))
+                self.assertTrue(hloop.command_requires_state_schema_guard(args))
+        for command in ("harvest", "close"):
+            argv = ["specification-scout", command]
+            if command == "close":
+                argv.extend(["--verdict", "no-decision", "--reason", "clean"])
+            args = parser.parse_args(argv)
+            self.assertTrue(hloop.command_requires_loop_lock(args))
+
+    def test_scout_cleanup_ids_are_mode_qualified_and_resolve_both_outcomes(self) -> None:
+        decision = {
+            "attempt_id": "S001-A001",
+            "worktree": "/tmp/decision-scout",
+            "worktree_cleanup_status": "failed",
+            "worktree_cleanup_error": "decision cleanup failed",
+            "worktree_cleanup_error_fingerprint": "sha256:" + "a" * 64,
+        }
+        coverage = {
+            "attempt_id": "S001-C001",
+            "worktree": "/tmp/coverage-scout",
+            "worktree_cleanup_status": "failed",
+            "worktree_cleanup_error": "coverage cleanup failed",
+            "worktree_cleanup_error_fingerprint": "sha256:" + "b" * 64,
+        }
+        state = {
+            "run_id": "run-cleanup",
+            "session_cleanup": "none",
+            "tasks": {},
+            "reviews": {},
+            "patch_reviews": {},
+            "gaps": {},
+            "advice": {},
+            "decision_liaisons": {},
+            "specification_scout_run": decision,
+            "plan_gap_scout_run": coverage,
+        }
+        roles = {
+            role_id: (role_kind, role_state)
+            for role_kind, role_id, role_state in hloop.iter_all_roles(state)
+        }
+        self.assertIs(roles["S001/decision"][1], decision)
+        self.assertIs(roles["S001/coverage"][1], coverage)
+        with self.assertRaisesRegex(hloop.HLoopError, "ambiguous"):
+            hloop.find_role_for_cleanup(state, "S001")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+
+            def clear_decision(_repo, _role_id, role_state, **kwargs):
+                self.assertEqual(kwargs["prompt_suffix"], "scout")
+                role_state["worktree_cleanup_status"] = "removed"
+
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(
+                    hloop,
+                    "cleanup_decision_role_worktree",
+                    side_effect=clear_decision,
+                ),
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(hloop, "journal"),
+            ):
+                self.assertEqual(
+                    hloop.cmd_cleanup_resolve(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            role_id="S001/decision",
+                            status="cleaned",
+                            reason="retry succeeded",
+                        )
+                    ),
+                    0,
+                )
+            self.assertFalse(hloop.unresolved_cleanup_failures(decision))
+            self.assertEqual(
+                state["cleanup_history"][-1]["role_id"], "S001/decision"
+            )
+
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(hloop, "journal"),
+            ):
+                self.assertEqual(
+                    hloop.cmd_cleanup_resolve(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            role_id="S001/coverage",
+                            status="accepted-risk",
+                            reason="provider cannot remove the worktree",
+                        )
+                    ),
+                    0,
+                )
+            self.assertFalse(hloop.unresolved_cleanup_failures(coverage))
+            self.assertEqual(
+                coverage["cleanup_resolutions"]["worktree"]["role_id"],
+                "S001/coverage",
+            )
+
     def test_queued_revision_two_task_is_blocked_before_start(self) -> None:
         legacy = self.task_record("a" * 40)
         for field in (
@@ -764,6 +977,9 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                     "candidate_seal": {"record_type": "seal"},
                     "patch_review_history": [{"review_attempt_id": "PR-old"}],
                     "current_patch_review": {"review_attempt_id": "PR-old"},
+                    "patch_review_extra_round_authorization": {
+                        "record_type": "stale-authorization"
+                    },
                     "legacy_result_acceptance": {"reason": "stale"},
                 }
             )
@@ -794,6 +1010,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                 "candidate_seal",
                 "patch_review_history",
                 "current_patch_review",
+                "patch_review_extra_round_authorization",
                 "legacy_result_acceptance",
             ):
                 self.assertNotIn(field, updated)
@@ -963,6 +1180,277 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             self.assertEqual(task_state["active_attempt_id"], "T001-A001")
             self.assertEqual(decision2.last_candidate_sha, seal2.candidate_sha)
             self.assertEqual(decision2.automatic_task_ids, ())
+
+    def test_authorize_extra_round_requires_exact_decision_input_and_consumes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base_sha = self.make_repo(Path(directory))
+            state, task_state = self.write_fixture(repo, base_sha)
+            _seal2, review2 = self.exhaust_patch_review_rounds(
+                repo, state, task_state
+            )
+            self.install_extra_round_evidence(
+                repo,
+                state,
+                review2.unresolved_finding_fingerprints[0],
+            )
+            authorize_args = SimpleNamespace(
+                repo=str(repo),
+                task_id="T001",
+                decision_id="D007",
+                authorization_input_id="U0005",
+            )
+
+            state["decisions"]["D007"]["source_findings"] = [
+                "sha256:" + "0" * 64
+            ]
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                self.assertRaisesRegex(hloop.HLoopError, "blocking evidence"),
+            ):
+                hloop.cmd_patch_review_authorize_extra_round(authorize_args)
+            self.assertNotIn(
+                "patch_review_extra_round_authorization", task_state
+            )
+
+            state["decisions"]["D007"]["source_findings"] = list(
+                review2.unresolved_finding_fingerprints
+            )
+            state["inputs_index"]["U0005"]["prompt_digest"] = "0" * 64
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                self.assertRaisesRegex(hloop.HLoopError, "prompt digest"),
+            ):
+                hloop.cmd_patch_review_authorize_extra_round(authorize_args)
+            input_record = hloop.hloop_requirements.InputRecord.from_record(
+                json.loads(
+                    (
+                        hloop.local_sensitive_input_dir(repo) / "U0005.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            state["inputs_index"]["U0005"]["prompt_digest"] = (
+                input_record.prompt_digest
+            )
+
+            wrong_input = hloop.hloop_requirements.InputRecord.capture(
+                input_id="U0004",
+                received_at="2026-07-19T11:59:00Z",
+                source="user",
+                raw_input="another valid user response",
+            )
+            hloop.write_text(
+                hloop.local_sensitive_input_dir(repo) / "U0004.json",
+                json.dumps(wrong_input.to_record(), ensure_ascii=False, indent=2)
+                + "\n",
+            )
+            state["inputs_index"]["U0004"] = {
+                "prompt_digest": wrong_input.prompt_digest,
+                "redactions": [],
+                "received_at": wrong_input.received_at,
+                "source": "user",
+            }
+            authorize_args.authorization_input_id = "U0004"
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                self.assertRaisesRegex(hloop.HLoopError, "unique latest"),
+            ):
+                hloop.cmd_patch_review_authorize_extra_round(authorize_args)
+            self.assertNotIn(
+                "patch_review_extra_round_authorization", task_state
+            )
+
+            ambiguous_input = hloop.hloop_requirements.InputRecord.capture(
+                input_id="U0006",
+                received_at="2026-07-19T12:00:00Z",
+                source="user",
+                raw_input="simultaneous user response",
+            )
+            hloop.write_text(
+                hloop.local_sensitive_input_dir(repo) / "U0006.json",
+                json.dumps(
+                    ambiguous_input.to_record(), ensure_ascii=False, indent=2
+                )
+                + "\n",
+            )
+            state["inputs_index"]["U0006"] = {
+                "prompt_digest": ambiguous_input.prompt_digest,
+                "redactions": [],
+                "received_at": ambiguous_input.received_at,
+                "source": "user",
+            }
+            authorize_args.authorization_input_id = "U0005"
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                self.assertRaisesRegex(hloop.HLoopError, "ambiguous"),
+            ):
+                hloop.cmd_patch_review_authorize_extra_round(authorize_args)
+            state["inputs_index"].pop("U0006")
+
+            with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                self.assertEqual(
+                    hloop.cmd_patch_review_authorize_extra_round(authorize_args),
+                    0,
+                )
+            authorization = hloop.task_patch_review_extra_round_authorization(
+                task_state
+            )
+            self.assertIsNotNone(authorization)
+            self.assertEqual(authorization.granted_review_round, 3)
+            self.assertEqual(authorization.status, "active")
+            self.assertEqual(
+                task_state["candidate_lifecycle_status"], "patch_fix_running"
+            )
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                self.assertRaisesRegex(hloop.HLoopError, "already authorized"),
+            ):
+                hloop.cmd_patch_review_authorize_extra_round(authorize_args)
+
+            (repo / "src" / "task.py").write_text(
+                "VALUE = 60\n", encoding="utf-8"
+            )
+            _candidate3, seal3 = self.submit_candidate(repo, state, task_state)
+            review3 = hloop.hloop_worker_candidate.record_patch_review(
+                seal3,
+                review_attempt_id="PR-T001-R003",
+                review_round=3,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="passed",
+            )
+            decision3 = hloop.apply_patch_review_record(
+                repo, state, "T001", task_state, review3
+            )
+            self.assertEqual(decision3.action, "finalize_allowed")
+            consumed = hloop.task_patch_review_extra_round_authorization(
+                task_state
+            )
+            self.assertEqual(consumed.status, "consumed")
+            self.assertEqual(
+                consumed.consumed_review_attempt_id, "PR-T001-R003"
+            )
+
+            review4 = hloop.hloop_worker_candidate.record_patch_review(
+                seal3,
+                review_attempt_id="PR-T001-R004",
+                review_round=4,
+                reviewer_provider="codex",
+                reviewer_model="gpt-5.6-sol",
+                reviewer_effort="xhigh",
+                verdict="passed",
+            )
+            with self.assertRaisesRegex(hloop.HLoopError, "already consumed"):
+                hloop.apply_patch_review_record(
+                    repo, state, "T001", task_state, review4
+                )
+
+    def test_pending_next_candidate_can_bootstrap_same_extra_round_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base_sha = self.make_repo(Path(directory))
+            state, task_state = self.write_fixture(repo, base_sha)
+            _seal2, review2 = self.exhaust_patch_review_rounds(
+                repo, state, task_state
+            )
+
+            task_path = repo / hloop.LOOP_DIR / "tasks" / "T001.md"
+            task_meta = hloop.read_frontmatter(task_path)
+            task_meta["acceptance"] = [
+                *task_meta["acceptance"],
+                "accepted decision authorizes exactly one third round",
+            ]
+            hloop.replace_frontmatter_record(task_path, task_meta)
+            task_state["task_contract_digest"] = hloop.hashlib.sha256(
+                task_path.read_bytes()
+            ).hexdigest()
+            task_state["candidate_lifecycle_status"] = "patch_fix_running"
+            state["phase"] = "running"
+            hloop.write_text(
+                repo / hloop.LOOP_DIR / "STATE.json",
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+            (repo / "src" / "task.py").write_text(
+                "VALUE = 70\n", encoding="utf-8"
+            )
+            candidate3, _seal3 = self.submit_candidate(repo, state, task_state)
+            self.assertEqual(
+                task_state["candidate_lifecycle_status"], "patch_review_pending"
+            )
+            start_args = SimpleNamespace(
+                repo=str(repo),
+                task_id="T001",
+                review_attempt_id=None,
+                worktree=str(repo / "round-3-review"),
+                manager_pane=None,
+                direction="down",
+                launcher="pane",
+                runner="tui",
+                agent_provider=None,
+                agent_model=None,
+                agent_effort=None,
+                dry_run=True,
+            )
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "load_state", return_value=state),
+                self.assertRaisesRegex(hloop.HLoopError, "round limit"),
+            ):
+                hloop.cmd_patch_review_start(start_args)
+            self.install_extra_round_evidence(
+                repo,
+                state,
+                review2.unresolved_finding_fingerprints[0],
+            )
+            with mock.patch.object(hloop, "preflight_loop", return_value=state):
+                self.assertEqual(
+                    hloop.cmd_patch_review_authorize_extra_round(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            task_id="T001",
+                            decision_id="D007",
+                            authorization_input_id="U0005",
+                        )
+                    ),
+                    0,
+                )
+            authorization = hloop.task_patch_review_extra_round_authorization(
+                task_state
+            )
+            self.assertEqual(
+                authorization.task_contract_digest,
+                candidate3.task_contract_digest,
+            )
+            self.assertEqual(
+                authorization.blocked_candidate_sha, review2.candidate_sha
+            )
+            self.assertEqual(
+                task_state["candidate_lifecycle_status"], "patch_review_pending"
+            )
+            agent_config = {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+                "sources": {
+                    "provider": "defaults",
+                    "model": "defaults",
+                    "effort": "defaults",
+                },
+                "provenance": {"provider": [], "model": [], "effort": []},
+            }
+            invocation = SimpleNamespace(as_record=lambda: {"provider": "codex"})
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "load_state", return_value=state),
+                mock.patch.object(
+                    hloop, "patch_reviewer_agent_config", return_value=agent_config
+                ),
+                mock.patch.object(
+                    hloop,
+                    "role_agent_command",
+                    return_value=("codex", invocation),
+                ),
+            ):
+                self.assertEqual(hloop.cmd_patch_review_start(start_args), 0)
 
     def test_patch_review_record_rejects_mixed_identity_before_any_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
