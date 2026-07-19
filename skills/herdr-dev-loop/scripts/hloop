@@ -7328,6 +7328,45 @@ def transition_manager_message(
 SEMANTIC_ACK_DECISIONS = frozenset({"approve", "reject", "timeout"})
 
 
+def archive_semantic_ack_barrier(agent_state: dict[str, Any]) -> dict[str, Any] | None:
+    """Append the active barrier as an immutable superseded identity record."""
+
+    active = agent_state.get("semantic_ack_barrier")
+    if not isinstance(active, Mapping):
+        return None
+    previous = json.loads(json.dumps(active, ensure_ascii=False))
+    previous.setdefault(
+        "attempt_id",
+        str(
+            agent_state.get("active_attempt_id")
+            or agent_state.get("attempt_id")
+            or ""
+        ),
+    )
+    previous["status"] = "superseded"
+    superseded_at = now_iso()
+    previous_decision = previous.get("semantic_decision")
+    if isinstance(previous_decision, dict):
+        previous_decision["status"] = "superseded"
+        previous_decision["superseded_at"] = superseded_at
+    previous_application = previous.get("approval_application")
+    if isinstance(previous_application, dict):
+        previous_application["status"] = "superseded"
+        previous_application["updated_at"] = superseded_at
+    previous_availability = previous.get("approval_availability")
+    if isinstance(previous_availability, dict):
+        previous_availability["status"] = "superseded"
+        previous_availability["updated_at"] = superseded_at
+    previous_notification = previous.get("pane_notification")
+    if isinstance(previous_notification, dict):
+        previous_notification["status"] = "superseded"
+        previous_notification["updated_at"] = superseded_at
+    history = agent_state.setdefault("semantic_ack_history", [])
+    if isinstance(history, list):
+        history.append(previous)
+    return previous
+
+
 def arm_semantic_ack_barrier(
     agent_state: dict[str, Any],
     *,
@@ -7343,31 +7382,14 @@ def arm_semantic_ack_barrier(
     even if an earlier barrier had already been resolved.
     """
 
-    previous = agent_state.get("semantic_ack_barrier")
-    if isinstance(previous, Mapping):
-        previous = json.loads(json.dumps(previous, ensure_ascii=False))
-        previous["status"] = "superseded"
-        previous_decision = previous.get("semantic_decision")
-        if isinstance(previous_decision, dict):
-            previous_decision["status"] = "superseded"
-            previous_decision["superseded_at"] = now_iso()
-        previous_application = previous.get("approval_application")
-        if isinstance(previous_application, dict):
-            previous_application["status"] = "superseded"
-            previous_application["updated_at"] = now_iso()
-        previous_availability = previous.get("approval_availability")
-        if isinstance(previous_availability, dict):
-            previous_availability["status"] = "superseded"
-            previous_availability["updated_at"] = now_iso()
-        previous_notification = previous.get("pane_notification")
-        if isinstance(previous_notification, dict):
-            previous_notification["status"] = "superseded"
-            previous_notification["updated_at"] = now_iso()
-        history = agent_state.setdefault("semantic_ack_history", [])
-        if isinstance(history, list):
-            history.append(previous)
+    archive_semantic_ack_barrier(agent_state)
     armed_at = now_iso()
     agent_state["semantic_ack_barrier"] = {
+        "attempt_id": str(
+            agent_state.get("active_attempt_id")
+            or agent_state.get("attempt_id")
+            or ""
+        ),
         "message_id": message_id,
         "digest": digest,
         "kind": kind,
@@ -15092,6 +15114,7 @@ def report_contract_text(
     report_credential_file: str,
     task_contract_digest: str,
     manager_repo: str = "",
+    invocation_id: str = "",
 ) -> str:
     if not report_credential_file:
         return ""
@@ -15104,13 +15127,14 @@ def report_contract_text(
         if manager_repo
         else ""
     )
+    invocation_id = invocation_id or f"{attempt_id}:report/0001"
     return f"""
 Reporting: send ack, milestone, attention, and completion reports as your understanding, risk, or progress changes (see skills/herdr-dev-loop/references/report-protocol.md). Every report must include the exact identity below:
 ```
 python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent ack exchange {role_id} \\
   --attempt-id {attempt_id} --run-id {run_id} \\
   --task-contract-digest {task_contract_digest} --report-credential-file {credential_ref} \\
-{manager_repo_line}  --invocation-id {attempt_id}:report/0001 \\
+{manager_repo_line}  --invocation-id {invocation_id} \\
   --stage <stage> --summary '<summary>' --understood-goal '<goal>' \\
   --scope '<scope>' --acceptance '<acceptance>' --approach '<approach>' \\
   --next '<next action>' --timeout-seconds 900 --json
@@ -15217,19 +15241,19 @@ def rebind_role_report_contract_digest(
 ) -> int:
     """Append a new digest binding while preserving the attempt's secret token."""
 
+    credential = role_report_credential_path(
+        repo, state, role_id=role_id, attempt_id=attempt_id
+    )
+    credential_token = read_role_report_credential(
+        repo,
+        str(credential),
+        run_id=str(state.get("run_id") or "local"),
+        role_id=role_id,
+        attempt_id=attempt_id,
+    )
     store = _open_broker_store(repo)
     run_id = str(state.get("run_id") or "local")
     with store.transaction() as transaction:
-        current = store._latest_active_role(  # noqa: SLF001 - same-runtime storage contract
-            transaction, run_id=run_id, role_id=role_id
-        )
-        if current is None or not normalize_bool(current.get("active")):
-            raise HLoopError(f"active report identity is missing for {role_id}")
-        if str(current.get("attempt_id") or "") != attempt_id:
-            raise HLoopError(
-                f"active report identity attempt mismatch for {role_id}: "
-                f"expected {attempt_id}, got {current.get('attempt_id')}"
-            )
         latest_ack = store.latest_role_event(
             transaction,
             run_id=run_id,
@@ -15237,22 +15261,20 @@ def rebind_role_report_contract_digest(
             attempt_id=attempt_id,
             report_type="ack",
         )
-        transaction.connection.execute(
-            """
-            INSERT INTO active_roles(
-                run_id, role_id, attempt_id, task_contract_digest,
-                token_digest, active, registered_at
-            ) VALUES (?, ?, ?, ?, ?, 1, ?)
-            """,
-            (
-                run_id,
-                role_id,
-                attempt_id,
-                task_contract_digest.lower(),
-                current["token_digest"],
-                now_iso(),
-            ),
+        binding = store.rebind_active_role_contract(
+            transaction,
+            run_id=run_id,
+            role_id=role_id,
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
         )
+        if not secrets.compare_digest(
+            str(binding.get("token_digest") or ""),
+            hashlib.sha256(credential_token.encode("utf-8")).hexdigest(),
+        ):
+            raise HLoopError(
+                f"report credential token does not match active identity for {role_id}"
+            )
     return int((latest_ack or {}).get("sequence") or 0)
 
 
@@ -21183,6 +21205,7 @@ def cmd_task_update(args: argparse.Namespace) -> int:
                 f"task contract changed but report identity rebinding failed for {task_id}; "
                 "finalize, harvest, and merge remain blocked"
             ) from exc
+        task_state["active_report_contract_digest"] = task_contract_digest
         arm_semantic_ack_barrier(
             task_state,
             message_id=f"task-contract:{task_contract_digest}",
@@ -25435,6 +25458,113 @@ def cmd_worker_harvest(args: argparse.Namespace) -> int:
     return 0
 
 
+def rebind_contract_changing_manager_message(
+    repo: Path,
+    state: dict[str, Any],
+    *,
+    agent_id: str,
+    agent_state: dict[str, Any],
+    message_id: str,
+    message: str,
+) -> str:
+    """Bind a contract-changing message to one exact active report digest.
+
+    The Manager-owned barrier is persisted in a blocking state before the
+    broker registration changes.  Therefore a process/storage failure can
+    leave an old/new projection split only in a fail-closed state; the exact
+    binding is published only after the attempt, broker token binding,
+    canonical role digest, barrier, and rendered exchange command agree.
+    """
+
+    attempt_id = str(
+        agent_state.get("attempt_id")
+        or agent_state.get("active_attempt_id")
+        or ""
+    )
+    if not attempt_id:
+        raise HLoopError(
+            f"contract-changing message target has no active attempt: {agent_id}"
+        )
+    existing_barrier = agent_state.get("semantic_ack_barrier")
+    pending_task_contract = (
+        isinstance(existing_barrier, dict)
+        and str(existing_barrier.get("kind") or "") == "task-contract"
+        and str(existing_barrier.get("status") or "") != "approved"
+    )
+    target_digest = (
+        str(existing_barrier.get("digest") or "")
+        if pending_task_contract
+        else message_digest(message)
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", target_digest):
+        raise HLoopError(
+            f"contract-changing message digest is invalid for {agent_id}"
+        )
+    credential_file = role_report_credential_path(
+        repo,
+        state,
+        role_id=agent_id,
+        attempt_id=attempt_id,
+    )
+    exchange_text = report_contract_text(
+        agent_id,
+        attempt_id,
+        state,
+        report_credential_file=str(credential_file),
+        task_contract_digest=target_digest,
+        manager_repo=str(repo),
+        invocation_id=f"{attempt_id}:reack/{message_id}",
+    )
+    rendered_message = message.rstrip() + "\n" + exchange_text
+    if f"--task-contract-digest {target_digest}" not in rendered_message:
+        raise HLoopError(
+            f"contract-changing message exchange command is not bound for {agent_id}"
+        )
+
+    if pending_task_contract:
+        barrier = existing_barrier
+    else:
+        arm_semantic_ack_barrier(
+            agent_state,
+            message_id=message_id,
+            digest=target_digest,
+        )
+        barrier = agent_state["semantic_ack_barrier"]
+    barrier["report_identity_status"] = "rebinding"
+    barrier["report_identity_attempt_id"] = attempt_id
+    barrier["rendered_exchange_digest"] = target_digest
+    # Publish the new non-approved barrier first.  If broker rebinding fails or
+    # the process exits, lifecycle gates observe a blocked semantic decision.
+    save_state(repo, state)
+    try:
+        ack_floor = rebind_role_report_contract_digest(
+            repo,
+            state,
+            role_id=agent_id,
+            attempt_id=attempt_id,
+            task_contract_digest=target_digest,
+        )
+    except (HLoopError, hloop_broker.BrokerStorageError, OSError) as exc:
+        barrier["status"] = "identity_rebind_failed"
+        barrier["report_identity_status"] = "failed"
+        barrier["report_identity_error"] = str(exc)
+        save_state(repo, state)
+        raise HLoopError(
+            f"contract-changing message report identity rebinding failed for "
+            f"{agent_id}; material work remains blocked"
+        ) from exc
+
+    if not pending_task_contract:
+        barrier["required_reack_after_sequence"] = ack_floor
+    agent_state["active_report_contract_digest"] = target_digest
+    barrier["status"] = "awaiting_ack"
+    barrier["report_identity_status"] = "bound"
+    barrier["report_identity_bound_at"] = now_iso()
+    barrier.pop("report_identity_error", None)
+    save_state(repo, state)
+    return rendered_message
+
+
 def send_manager_message_and_record(
     repo: Path,
     state: dict[str, Any],
@@ -25459,21 +25589,14 @@ def send_manager_message_and_record(
         state, agent_id, agent_state, message, contract_changing=contract_changing
     )
     if contract_changing:
-        existing_barrier = agent_state.get("semantic_ack_barrier")
-        pending_task_contract = (
-            isinstance(existing_barrier, dict)
-            and str(existing_barrier.get("kind") or "") == "task-contract"
-            and str(existing_barrier.get("status") or "") != "approved"
+        message = rebind_contract_changing_manager_message(
+            repo,
+            state,
+            agent_id=agent_id,
+            agent_state=agent_state,
+            message_id=message_id,
+            message=message,
         )
-        if not pending_task_contract:
-            arm_semantic_ack_barrier(
-                agent_state,
-                message_id=message_id,
-                digest=message_digest(message),
-                required_reack_after_sequence=latest_semantic_ack_sequence(
-                    repo, state, role_id=agent_id, agent_state=agent_state
-                ),
-            )
     try:
         send_agent_tui_message(
             str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER),
@@ -27053,7 +27176,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             loop_path(repo) / "USER_ACTION_REQUIRED.md",
             f"\n## Merge conflict for {task_id}\n\nResolve or abort the merge for `{branch}`.\n",
         )
-        raise exc
+        raise
     if mode == "cherry-pick":
         observed = observed_merge_transaction(repo, transaction, allow_completed=True)
         validate_cherry_pick_evidence(
@@ -30095,30 +30218,27 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
     message, source = manager_message_from_args(args)
     if not message.strip():
         raise HLoopError("manager message is empty")
+    followups_before, max_rounds = enforce_advisor_message_round_limit(
+        state, advice_state, participant
+    )
     contract_changing = bool(getattr(args, "contract_changing", False))
+    advisor_role_id = f"{args.advice_id}/{args.participant_id}"
     message_id, message = manager_message_envelope(
         state,
-        f"{args.advice_id}/{args.participant_id}",
+        advisor_role_id,
         participant,
         message,
         contract_changing=contract_changing,
     )
     if contract_changing:
-        advisor_role_id = f"{args.advice_id}/{args.participant_id}"
-        arm_semantic_ack_barrier(
-            participant,
+        message = rebind_contract_changing_manager_message(
+            repo,
+            state,
+            agent_id=advisor_role_id,
+            agent_state=participant,
             message_id=message_id,
-            digest=message_digest(message),
-            required_reack_after_sequence=latest_semantic_ack_sequence(
-                repo,
-                state,
-                role_id=advisor_role_id,
-                agent_state=participant,
-            ),
+            message=message,
         )
-    followups_before, max_rounds = enforce_advisor_message_round_limit(
-        state, advice_state, participant
-    )
     try:
         send_agent_tui_message(
             str(participant.get("agent_provider") or participant.get("provider") or DEFAULT_AGENT_PROVIDER),
@@ -31959,7 +32079,10 @@ def cmd_agent_ack_exchange(args: argparse.Namespace) -> int:
             "semantic ACK exchange contract digest does not match the active barrier"
         )
     active_digest = str(
-        initial_agent.get("task_contract_digest") or initial_barrier.get("digest") or ""
+        initial_agent.get("active_report_contract_digest")
+        or initial_agent.get("task_contract_digest")
+        or initial_barrier.get("digest")
+        or ""
     )
     if active_digest != requested_digest:
         raise HLoopError(
@@ -32063,7 +32186,8 @@ def cmd_agent_ack_exchange(args: argparse.Namespace) -> int:
         )
         current_barrier = current_agent.get("semantic_ack_barrier")
         current_digest = str(
-            current_agent.get("task_contract_digest")
+            current_agent.get("active_report_contract_digest")
+            or current_agent.get("task_contract_digest")
             or (
                 current_barrier.get("digest")
                 if isinstance(current_barrier, Mapping)
@@ -32251,6 +32375,7 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
     lifecycle_status = str(agent.get("gate_status") or agent.get("status") or "")
     if lifecycle_status in {"merged", "triaged", "closed", "completed", "responded"}:
         raise HLoopError(f"cannot requeue completed {role} {args.agent_id}: {lifecycle_status}")
+    archive_semantic_ack_barrier(agent)
     previous = json.loads(json.dumps(agent))
     cleanup_completed_agent_pane(
         repo,
@@ -32274,6 +32399,8 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
         "head_sha": previous.get("head_sha"),
         "worktree": previous.get("worktree"),
         "pane_id": previous.get("pane_id"),
+        "semantic_ack_barrier": previous.get("semantic_ack_barrier"),
+        "semantic_ack_history": previous.get("semantic_ack_history") or [],
         "superseded_manager_messages": superseded_messages,
     }
     state.setdefault("agent_attempt_history", []).append(history)
@@ -32324,6 +32451,8 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
             "pending_manager_messages",
             "unknown_manager_messages",
             "semantic_ack_barrier",
+            "semantic_ack_history",
+            "active_report_contract_digest",
             "candidate_revision",
             "candidate_lifecycle_status",
             "implementation_candidate",
@@ -32400,6 +32529,8 @@ def cmd_agent_requeue(args: argparse.Namespace) -> int:
             "pending_manager_messages",
             "unknown_manager_messages",
             "semantic_ack_barrier",
+            "semantic_ack_history",
+            "active_report_contract_digest",
             "task_contract_digest",
         ):
             agent.pop(key, None)
@@ -33470,10 +33601,141 @@ def manager_consumer_preflight(args: argparse.Namespace, command: str) -> None:
     )
 
 
+def semantic_ack_barrier_application_identity(
+    barrier: Mapping[str, Any], *, default_attempt_id: str = ""
+) -> dict[str, str] | None:
+    decision = barrier.get("semantic_decision")
+    if not isinstance(decision, Mapping):
+        return None
+    identity = {
+        "attempt_id": str(barrier.get("attempt_id") or default_attempt_id),
+        "task_contract_digest": str(barrier.get("digest") or ""),
+        "message_id": str(barrier.get("message_id") or ""),
+        "decision_ack_event_id": str(decision.get("ack_event_id") or ""),
+    }
+    if not all(identity.values()):
+        return None
+    return identity
+
+
+def semantic_ack_obsolete_application_reason(
+    state: Mapping[str, Any],
+    agent: Mapping[str, Any],
+    normalized: Mapping[str, Any],
+    observed: Mapping[str, str],
+) -> str | None:
+    """Classify only broker-sequenced events with an exact historical target."""
+
+    sequence = int(normalized.get("sequence") or 0)
+    if sequence <= 0:
+        return None
+    role_id = str(normalized.get("role_id") or "")
+    event_attempt = str(normalized.get("attempt_id") or "")
+    current_attempt = str(
+        agent.get("attempt_id") or agent.get("active_attempt_id") or ""
+    )
+    candidates: list[tuple[str, Mapping[str, Any], str]] = []
+    current_barrier = agent.get("semantic_ack_barrier")
+    if isinstance(current_barrier, Mapping):
+        current_decision = current_barrier.get("semantic_decision")
+        current_application = current_barrier.get("approval_application")
+        if (
+            isinstance(current_decision, Mapping)
+            and str(current_decision.get("status") or "") == "superseded"
+        ) or (
+            isinstance(current_application, Mapping)
+            and str(current_application.get("status") or "") == "superseded"
+        ):
+            candidates.append(("superseded-barrier", current_barrier, current_attempt))
+    for barrier in agent.get("semantic_ack_history") or []:
+        if isinstance(barrier, Mapping):
+            candidates.append(("prior-decision", barrier, current_attempt))
+    for attempt in state.get("agent_attempt_history") or []:
+        if not isinstance(attempt, Mapping) or str(attempt.get("agent_id") or "") != role_id:
+            continue
+        historical_attempt = str(attempt.get("attempt_id") or "")
+        historical_barrier = attempt.get("semantic_ack_barrier")
+        if isinstance(historical_barrier, Mapping):
+            candidates.append(("stale-attempt", historical_barrier, historical_attempt))
+        for barrier in attempt.get("semantic_ack_history") or []:
+            if isinstance(barrier, Mapping):
+                candidates.append(("stale-attempt", barrier, historical_attempt))
+
+    for default_reason, barrier, fallback_attempt in candidates:
+        expected = semantic_ack_barrier_application_identity(
+            barrier, default_attempt_id=fallback_attempt
+        )
+        if expected is None or dict(observed) != expected:
+            continue
+        if event_attempt != expected["attempt_id"]:
+            continue
+        if event_attempt != current_attempt:
+            return "stale-attempt"
+        current_identity = (
+            semantic_ack_barrier_application_identity(
+                current_barrier, default_attempt_id=current_attempt
+            )
+            if isinstance(current_barrier, Mapping)
+            else None
+        )
+        if current_identity is not None and all(
+            current_identity[field] == expected[field]
+            for field in ("attempt_id", "task_contract_digest", "message_id")
+        ) and current_identity["decision_ack_event_id"] != expected[
+            "decision_ack_event_id"
+        ]:
+            return "prior-decision"
+        if current_identity is None or current_identity != expected:
+            return "superseded-barrier"
+        return default_reason
+    return None
+
+
+def record_obsolete_semantic_ack_application(
+    state: dict[str, Any],
+    normalized: Mapping[str, Any],
+    observed: Mapping[str, str],
+    *,
+    reason: str,
+) -> bool:
+    event_id = str(normalized.get("event_id") or "")
+    records = state.setdefault("semantic_ack_obsolete_applications", [])
+    if not isinstance(records, list):
+        raise HLoopError("semantic ACK obsolete application ledger is invalid")
+    if any(
+        isinstance(item, Mapping) and str(item.get("event_id") or "") == event_id
+        for item in records
+    ):
+        return False
+    records.append(
+        {
+            "event_id": event_id,
+            "event_sequence": int(normalized.get("sequence") or 0),
+            "event_payload_digest": str(normalized.get("payload_digest") or ""),
+            "run_id": str(normalized.get("run_id") or ""),
+            "role_id": str(normalized.get("role_id") or ""),
+            **dict(observed),
+            "disposition": "obsolete",
+            "reason": reason,
+            "recorded_at": now_iso(),
+        }
+    )
+    return True
+
+
+def is_recorded_obsolete_semantic_ack_application(
+    state: Mapping[str, Any], event_id: str
+) -> bool:
+    return any(
+        isinstance(item, Mapping) and str(item.get("event_id") or "") == event_id
+        for item in state.get("semantic_ack_obsolete_applications") or []
+    )
+
+
 def apply_semantic_ack_application_event(
     state: dict[str, Any], event: Mapping[str, Any]
 ) -> bool:
-    """Apply one authenticated broker event to Manager-owned ACK state."""
+    """Apply a current event or record a provably obsolete broker event."""
 
     try:
         normalized = hloop_events.validate_client_event(
@@ -33481,6 +33743,7 @@ def apply_semantic_ack_application_event(
         )
     except hloop_events.ReportValidationError as exc:
         raise HLoopError(f"invalid ACK application event: {exc}") from exc
+    normalized["sequence"] = int(event.get("sequence") or 0)
     evidence = normalized.get("approval_application")
     if evidence is None:
         return False
@@ -33491,9 +33754,33 @@ def apply_semantic_ack_application_event(
     if normalized.get("run_id") != str(state.get("run_id") or "local"):
         raise HLoopError("ACK application event belongs to a different run")
     role_id = str(normalized.get("role_id") or "")
-    _role, agent = resolve_agent_state(state, role_id)
+    observed = {
+        "attempt_id": str(normalized.get("attempt_id") or ""),
+        "task_contract_digest": str(normalized.get("task_contract_digest") or ""),
+        "message_id": str(evidence.get("message_id") or ""),
+        "decision_ack_event_id": str(evidence.get("decision_ack_event_id") or ""),
+    }
+    try:
+        _role, agent = resolve_agent_state(state, role_id)
+    except HLoopError as exc:
+        archived_agent: dict[str, Any] = {}
+        obsolete_reason = semantic_ack_obsolete_application_reason(
+            state, archived_agent, normalized, observed
+        )
+        if obsolete_reason:
+            return record_obsolete_semantic_ack_application(
+                state, normalized, observed, reason=obsolete_reason
+            )
+        raise exc
     attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
     if not attempt_id or normalized.get("attempt_id") != attempt_id:
+        obsolete_reason = semantic_ack_obsolete_application_reason(
+            state, agent, normalized, observed
+        )
+        if obsolete_reason:
+            return record_obsolete_semantic_ack_application(
+                state, normalized, observed, reason=obsolete_reason
+            )
         raise HLoopError("ACK application event belongs to a stale attempt")
     barrier = agent.get("semantic_ack_barrier")
     if not isinstance(barrier, Mapping):
@@ -33502,23 +33789,40 @@ def apply_semantic_ack_application_event(
     application = barrier.get("approval_application")
     if not isinstance(decision, Mapping) or not isinstance(application, dict):
         raise HLoopError("ACK application target lacks structured decision state")
-    if str(decision.get("status") or "") != "approved":
-        raise HLoopError("ACK application event targets a non-approved decision")
     expected = {
+        "attempt_id": attempt_id,
         "task_contract_digest": str(barrier.get("digest") or ""),
         "message_id": str(barrier.get("message_id") or ""),
         "decision_ack_event_id": str(decision.get("ack_event_id") or ""),
     }
-    observed = {
-        "task_contract_digest": str(normalized.get("task_contract_digest") or ""),
-        "message_id": str(evidence.get("message_id") or ""),
-        "decision_ack_event_id": str(evidence.get("decision_ack_event_id") or ""),
-    }
     if observed != expected:
+        obsolete_reason = semantic_ack_obsolete_application_reason(
+            state, agent, normalized, observed
+        )
+        if obsolete_reason:
+            return record_obsolete_semantic_ack_application(
+                state, normalized, observed, reason=obsolete_reason
+            )
         raise HLoopError("ACK application event identity does not match the active decision")
+    if str(decision.get("status") or "") != "approved":
+        obsolete_reason = semantic_ack_obsolete_application_reason(
+            state, agent, normalized, observed
+        )
+        if obsolete_reason:
+            return record_obsolete_semantic_ack_application(
+                state, normalized, observed, reason=obsolete_reason
+            )
+        raise HLoopError("ACK application event targets a non-approved decision")
     requested_status = str(evidence.get("requested_status") or "")
     current_status = str(application.get("status") or "")
     if current_status == "superseded":
+        obsolete_reason = semantic_ack_obsolete_application_reason(
+            state, agent, normalized, observed
+        )
+        if obsolete_reason:
+            return record_obsolete_semantic_ack_application(
+                state, normalized, observed, reason=obsolete_reason
+            )
         raise HLoopError("ACK application event targets a superseded barrier")
     if current_status == "applied" or (
         current_status == "acknowledged" and requested_status == "acknowledged"
@@ -33590,7 +33894,13 @@ def cmd_inbox_ack(args: argparse.Namespace) -> int:
         raise HLoopError(f"no such broker event: {args.event_id}")
     if apply_semantic_ack_application_event(state, event):
         save_state(repo, state)
-        journal(repo, f"Applied semantic ACK application event `{args.event_id}`.")
+        if is_recorded_obsolete_semantic_ack_application(state, args.event_id):
+            journal(
+                repo,
+                f"Recorded semantic ACK application event `{args.event_id}` as terminal obsolete.",
+            )
+        else:
+            journal(repo, f"Applied semantic ACK application event `{args.event_id}`.")
     with store.transaction() as txn:
         result = store.acknowledge_inbox(
             txn,
@@ -33736,17 +34046,30 @@ def cmd_manager_next(args: argparse.Namespace) -> int:
         print("no pending wakes")
         return 0
     applied_event_ids = []
+    obsolete_event_ids = []
     for event in events:
         if event is not None and apply_semantic_ack_application_event(state, event):
-            applied_event_ids.append(str(event.get("event_id") or ""))
-    if applied_event_ids:
+            event_id = str(event.get("event_id") or "")
+            if is_recorded_obsolete_semantic_ack_application(state, event_id):
+                obsolete_event_ids.append(event_id)
+            else:
+                applied_event_ids.append(event_id)
+    if applied_event_ids or obsolete_event_ids:
         save_state(repo, state)
-        journal(
-            repo,
-            "Applied semantic ACK application event(s): "
-            + ", ".join(f"`{event_id}`" for event_id in applied_event_ids)
-            + ".",
-        )
+        if applied_event_ids:
+            journal(
+                repo,
+                "Applied semantic ACK application event(s): "
+                + ", ".join(f"`{event_id}`" for event_id in applied_event_ids)
+                + ".",
+            )
+        if obsolete_event_ids:
+            journal(
+                repo,
+                "Recorded semantic ACK application event(s) as terminal obsolete: "
+                + ", ".join(f"`{event_id}`" for event_id in obsolete_event_ids)
+                + ".",
+            )
     for row in unread:
         print(json.dumps(row, sort_keys=True))
     return 0

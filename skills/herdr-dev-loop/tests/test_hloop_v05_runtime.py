@@ -2939,6 +2939,7 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             }
             hloop.save_state(repo, state)
             store = hloop._open_broker_store(repo)
+            report_token = "a" * 64
             with store.transaction() as transaction:
                 store.register_active_role(
                     transaction,
@@ -2946,11 +2947,19 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                     role_id="T001",
                     attempt_id="T001-A001",
                     task_contract_digest=original_digest,
-                    token="test-report-token",
+                    token=report_token,
                 )
+            hloop.write_role_report_credential(
+                repo,
+                state,
+                role_id="T001",
+                attempt_id="T001-A001",
+                token=report_token,
+            )
             hloop.cmd_agent_report(
                 self.report_args(
                     repo,
+                    report_token=report_token,
                     type="ack",
                     stage="planning",
                     summary="original contract understood",
@@ -2997,7 +3006,7 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                         role_id="T001",
                         attempt_id="T001-A001",
                         task_contract_digest=original_digest,
-                        token="test-report-token",
+                        token=report_token,
                     )
                 )
                 self.assertTrue(
@@ -3007,7 +3016,7 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                         role_id="T001",
                         attempt_id="T001-A001",
                         task_contract_digest=updated_digest,
-                        token="test-report-token",
+                        token=report_token,
                     )
                 )
 
@@ -3037,6 +3046,7 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             hloop.cmd_agent_report(
                 self.report_args(
                     repo,
+                    report_token=report_token,
                     type="ack",
                     stage="planning",
                     summary="updated contract understood",
@@ -3133,6 +3143,24 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 required_reack_after_sequence=3,
             )
             state["tasks"] = {"T001": task_state}
+            report_token = "a" * 64
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                store.register_active_role(
+                    transaction,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest="a" * 64,
+                    token=report_token,
+                )
+            hloop.write_role_report_credential(
+                repo,
+                state,
+                role_id="T001",
+                attempt_id="T001-A001",
+                token=report_token,
+            )
             hloop.save_state(repo, state)
             args = SimpleNamespace(
                 contract_changing=True,
@@ -3157,6 +3185,411 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertEqual(barrier["kind"], "task-contract")
             self.assertEqual(barrier["digest"], "a" * 64)
             self.assertEqual(barrier["required_reack_after_sequence"], 3)
+
+    def test_contract_message_rebinds_worker_reviewer_and_liaison_to_rendered_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            worker_digest = "b" * 64
+            identities = {
+                "T001": ("T001-A001", worker_digest, "a" * 64),
+                "R001": ("R001-A001", "c" * 64, "b" * 64),
+                "L-D001": ("L-D001-A001", "d" * 64, "c" * 64),
+            }
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                store.register_active_role(
+                    transaction,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest=worker_digest,
+                    token=identities["T001"][2],
+                )
+                for role_id in ("R001", "L-D001"):
+                    attempt_id, digest, token = identities[role_id]
+                    store.register_active_role(
+                        transaction,
+                        run_id="run-001",
+                        role_id=role_id,
+                        attempt_id=attempt_id,
+                        task_contract_digest=digest,
+                        token=token,
+                    )
+            for role_id, (attempt_id, _digest, token) in identities.items():
+                hloop.write_role_report_credential(
+                    repo,
+                    state,
+                    role_id=role_id,
+                    attempt_id=attempt_id,
+                    token=token,
+                )
+
+            worker = {
+                "status": "running",
+                "attempt_id": "T001-A001",
+                "active_attempt_id": "T001-A001",
+                "task_contract_digest": worker_digest,
+                "agent_provider": "codex",
+            }
+            hloop.arm_semantic_ack_barrier(
+                worker,
+                message_id=f"task-contract:{worker_digest}",
+                digest=worker_digest,
+                kind="task-contract",
+                required_reack_after_sequence=0,
+            )
+            reviewer = {
+                "status": "running",
+                "gate_status": "running",
+                "attempt_id": "R001-A001",
+                "task_contract_digest": identities["R001"][1],
+                "agent_provider": "codex",
+            }
+            liaison = {
+                "status": "running",
+                "gate_status": "running",
+                "attempt_id": "L-D001-A001",
+                "task_contract_digest": identities["L-D001"][1],
+                "agent_provider": "codex",
+            }
+            hloop.arm_initial_semantic_ack_barrier(
+                reviewer,
+                attempt_id="R001-A001",
+                contract_digest=identities["R001"][1],
+            )
+            hloop.arm_initial_semantic_ack_barrier(
+                liaison,
+                attempt_id="L-D001-A001",
+                contract_digest=identities["L-D001"][1],
+            )
+            state["tasks"] = {"T001": worker}
+            state["reviews"] = {"R001": reviewer}
+            state["decision_liaisons"] = {"D001": liaison}
+            hloop.save_state(repo, state)
+            args = SimpleNamespace(
+                contract_changing=True,
+                timeout_ms=1,
+                input_settle_ms=1,
+                submit_verify_ms=1,
+                submit_attempts=1,
+            )
+            sent_messages = {}
+            with mock.patch.object(hloop, "send_agent_tui_message") as send:
+                for role_id, role, agent in (
+                    ("T001", "Worker", worker),
+                    ("R001", "Reviewer", reviewer),
+                    ("L-D001", "Liaison", liaison),
+                ):
+                    hloop.send_manager_message_and_record(
+                        repo,
+                        state,
+                        agent,
+                        role=role,
+                        agent_id=role_id,
+                        pane_id=f"w:{role_id}",
+                        message="apply the corrected contract",
+                        source="test",
+                        args=args,
+                    )
+                    sent_messages[role_id] = send.call_args.args[2]
+
+            reloaded = hloop.load_state(repo)
+            role_states = {
+                "T001": reloaded["tasks"]["T001"],
+                "R001": reloaded["reviews"]["R001"],
+                "L-D001": reloaded["decision_liaisons"]["D001"],
+            }
+            for role_id, role_state in role_states.items():
+                attempt_id, old_digest, token = identities[role_id]
+                digest = role_state["active_report_contract_digest"]
+                barrier = role_state["semantic_ack_barrier"]
+                self.assertEqual(barrier["digest"], digest)
+                self.assertEqual(barrier["rendered_exchange_digest"], digest)
+                self.assertEqual(barrier["report_identity_status"], "bound")
+                self.assertEqual(barrier["report_identity_attempt_id"], attempt_id)
+                self.assertIn(f"--task-contract-digest {digest}", sent_messages[role_id])
+                self.assertIn(
+                    f"--invocation-id {attempt_id}:reack/", sent_messages[role_id]
+                )
+                with store.transaction() as transaction:
+                    self.assertTrue(
+                        store.authenticate_role_report(
+                            transaction,
+                            run_id="run-001",
+                            role_id=role_id,
+                            attempt_id=attempt_id,
+                            task_contract_digest=digest,
+                            token=token,
+                        )
+                    )
+                    if old_digest != digest:
+                        self.assertFalse(
+                            store.authenticate_role_report(
+                                transaction,
+                                run_id="run-001",
+                                role_id=role_id,
+                                attempt_id=attempt_id,
+                                task_contract_digest=old_digest,
+                                token=token,
+                            )
+                        )
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        role_id=role_id,
+                        attempt_id=attempt_id,
+                        task_contract_digest=digest,
+                        report_token=token,
+                        type="ack",
+                        stage="planning",
+                        summary="corrected contract understood",
+                        next="wait for approval",
+                        risk=None,
+                        understood_goal="complete the corrected contract",
+                        scope=["bounded role scope"],
+                        acceptance=["exact digest is approved"],
+                        approach="smallest safe change",
+                    )
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    hloop.cmd_agent_ack_resolve(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            agent_id=role_id,
+                            decision="approve",
+                            reason="corrected digest reviewed",
+                            notify_pane=False,
+                        )
+                    )
+            approved = hloop.load_state(repo)
+            self.assertEqual(
+                approved["tasks"]["T001"]["semantic_ack_barrier"]["status"],
+                "approved",
+            )
+            self.assertEqual(
+                approved["reviews"]["R001"]["semantic_ack_barrier"]["status"],
+                "approved",
+            )
+            self.assertEqual(
+                approved["decision_liaisons"]["D001"]["semantic_ack_barrier"]["status"],
+                "approved",
+            )
+
+    def test_contract_message_rebind_failure_persists_a_blocking_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            reviewer = {
+                "status": "running",
+                "gate_status": "running",
+                "attempt_id": "R001-A001",
+                "task_contract_digest": "c" * 64,
+                "active_report_contract_digest": "c" * 64,
+            }
+            hloop.arm_initial_semantic_ack_barrier(
+                reviewer,
+                attempt_id="R001-A001",
+                contract_digest="c" * 64,
+            )
+            reviewer["semantic_ack_barrier"]["status"] = "approved"
+            reviewer["semantic_ack_barrier"]["semantic_decision"] = {
+                "status": "approved",
+                "ack_event_id": "ack-old",
+            }
+            state["reviews"] = {"R001": reviewer}
+            hloop.save_state(repo, state)
+            with mock.patch.object(
+                hloop,
+                "rebind_role_report_contract_digest",
+                side_effect=hloop.HLoopError("synthetic broker failure"),
+            ), self.assertRaisesRegex(hloop.HLoopError, "material work remains blocked"):
+                hloop.rebind_contract_changing_manager_message(
+                    repo,
+                    state,
+                    agent_id="R001",
+                    agent_state=reviewer,
+                    message_id="11111111-1111-4111-8111-111111111111",
+                    message="contract changed",
+                )
+            failed = hloop.load_state(repo)["reviews"]["R001"]
+            self.assertEqual(
+                failed["semantic_ack_barrier"]["report_identity_status"], "failed"
+            )
+            self.assertEqual(
+                failed["semantic_ack_barrier"]["semantic_decision"]["status"],
+                "awaiting_ack",
+            )
+            self.assertTrue(hloop.semantic_ack_barrier_blocking(failed))
+            self.assertEqual(failed["active_report_contract_digest"], "c" * 64)
+
+    def test_obsolete_application_is_acknowledged_before_corrected_current_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            old_digest = hashlib.sha256(b"T001").hexdigest()
+            old_ack = "11111111-1111-4111-8111-111111111111"
+            task = {
+                "status": "running",
+                "attempt_id": "T001-A001",
+                "active_attempt_id": "T001-A001",
+                "task_contract_digest": old_digest,
+                "active_report_contract_digest": old_digest,
+            }
+            hloop.arm_initial_semantic_ack_barrier(
+                task,
+                attempt_id="T001-A001",
+                contract_digest=old_digest,
+            )
+            old_barrier = task["semantic_ack_barrier"]
+            old_barrier["status"] = "approved"
+            old_barrier["semantic_decision"] = {
+                "status": "approved",
+                "ack_event_id": old_ack,
+            }
+            state["tasks"] = {"T001": task}
+            hloop.save_state(repo, state)
+            report_token = "a" * 64
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                store.register_active_role(
+                    transaction,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest=old_digest,
+                    token=report_token,
+                )
+            hloop.write_role_report_credential(
+                repo,
+                state,
+                role_id="T001",
+                attempt_id="T001-A001",
+                token=report_token,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        type="attention",
+                        stage="semantic-ack-application",
+                        summary="apply old approval",
+                        next="manager applies",
+                        report_token=report_token,
+                        risk=None,
+                        impact="material work is waiting",
+                        attempted=["read approved decision"],
+                        option_text=["apply"],
+                        recommendation="apply",
+                        blocked_scope=["material work"],
+                        approval_application={
+                            "message_id": "initial:T001-A001",
+                            "decision_ack_event_id": old_ack,
+                            "requested_status": "applied",
+                        },
+                    )
+                )
+            with store.transaction() as transaction:
+                old_event = store.events(transaction)[-1]
+
+            new_digest = "e" * 64
+            hloop.arm_semantic_ack_barrier(
+                task,
+                message_id="contract-change-current",
+                digest=new_digest,
+                required_reack_after_sequence=0,
+            )
+            task["active_report_contract_digest"] = new_digest
+            with store.transaction() as transaction:
+                store.rebind_active_role_contract(
+                    transaction,
+                    run_id="run-001",
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest=new_digest,
+                )
+            hloop.save_state(repo, state)
+            before = json.loads(
+                json.dumps(task["semantic_ack_barrier"], ensure_ascii=False)
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_inbox_ack(
+                    SimpleNamespace(repo=str(repo), event_id=old_event["event_id"])
+                )
+            obsolete_state = hloop.load_state(repo)
+            self.assertEqual(
+                obsolete_state["tasks"]["T001"]["semantic_ack_barrier"], before
+            )
+            obsolete = obsolete_state["semantic_ack_obsolete_applications"][-1]
+            self.assertEqual(obsolete["event_id"], old_event["event_id"])
+            self.assertEqual(obsolete["reason"], "superseded-barrier")
+            with store.transaction() as transaction:
+                self.assertNotIn(
+                    old_event["event_id"],
+                    {
+                        row["event_id"]
+                        for row in store.unconsumed_inbox(
+                            transaction, run_id="run-001"
+                        )
+                    },
+                )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_agent_report(
+                    self.report_args(
+                        repo,
+                        task_contract_digest=new_digest,
+                        report_token=report_token,
+                        type="ack",
+                        stage="planning",
+                        summary="current contract understood",
+                        next="wait for approval",
+                        risk=None,
+                        understood_goal="complete the current contract",
+                        scope=["current role scope"],
+                        acceptance=["current application is exact"],
+                        approach="bounded current change",
+                    )
+                )
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="T001",
+                        decision="approve",
+                        reason="current ACK reviewed",
+                        notify_pane=False,
+                    )
+                )
+                application = hloop.cmd_agent_ack_status(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        manager_repo=str(repo),
+                        agent_id="T001",
+                        attempt_id="T001-A001",
+                        acknowledge=False,
+                        apply=True,
+                        json=False,
+                        _quiet=True,
+                        _return_payload=True,
+                    )
+                )
+            with contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_inbox_ack(
+                    SimpleNamespace(
+                        repo=str(repo), event_id=application["application_event_id"]
+                    )
+                )
+            current = hloop.load_state(repo)["tasks"]["T001"]
+            self.assertEqual(
+                current["semantic_ack_barrier"]["approval_application"]["status"],
+                "applied",
+            )
+            self.assertEqual(
+                current["semantic_ack_barrier"]["approval_application"][
+                    "application_task_contract_digest"
+                ],
+                new_digest,
+            )
 
     def test_reject_and_timeout_require_a_fresh_corrected_ack(self):
         state = {}
@@ -4326,6 +4759,22 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
     def test_agent_message_and_manager_sleep_include_scout_and_liaison(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state = self.init_repo(Path(directory))
+            scout_digest = hashlib.sha256(b"S001").hexdigest()
+            liaison_digest = hashlib.sha256(b"L-D001").hexdigest()
+            hloop.register_role_report_identity_and_ack_floor(
+                repo,
+                state,
+                role_id="S001",
+                attempt_id="S001-A001",
+                task_contract_digest=scout_digest,
+            )
+            hloop.register_role_report_identity_and_ack_floor(
+                repo,
+                state,
+                role_id="L-D001",
+                attempt_id="L-D001-A001",
+                task_contract_digest=liaison_digest,
+            )
             state["specification_scout_run"] = {
                 "role_id": "S001",
                 "status": "running",
@@ -4333,6 +4782,7 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
                 "attempt_id": "S001-A001",
                 "pane_id": "w:p2",
                 "agent_provider": "codex",
+                "task_contract_digest": scout_digest,
             }
             state["decision_liaisons"]["D001"] = {
                 "role_id": "L-D001",
@@ -4342,6 +4792,7 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
                 "attempt_id": "L-D001-A001",
                 "pane_id": "w:p3",
                 "agent_provider": "codex",
+                "task_contract_digest": liaison_digest,
             }
             hloop.save_state(repo, state)
             args = SimpleNamespace(

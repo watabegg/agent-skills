@@ -1144,6 +1144,70 @@ class BrokerStore:
             "registered_at": timestamp,
         }
 
+    def rebind_active_role_contract(
+        self,
+        transaction: BrokerTransaction,
+        *,
+        run_id: str,
+        role_id: str,
+        attempt_id: str,
+        task_contract_digest: str,
+        registered_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Rebind one active attempt to a digest without rotating its token.
+
+        The append-only registration is idempotent when the exact binding is
+        already current.  Attempt drift, revocation, and malformed identity
+        fail before a new row is written.
+        """
+
+        transaction.require_active(self)
+        run_id = _nonempty_line(run_id, "run_id")
+        role_id = _nonempty_line(role_id, "role_id")
+        attempt_id = _nonempty_line(attempt_id, "attempt_id")
+        task_contract_digest = _nonempty_line(
+            task_contract_digest, "task_contract_digest"
+        ).lower()
+        current = self._latest_active_role(
+            transaction, run_id=run_id, role_id=role_id
+        )
+        if current is None or not current["active"]:
+            raise BrokerStorageError(f"active report identity is missing for {role_id}")
+        if current["attempt_id"] != attempt_id:
+            raise BrokerStorageError(
+                f"active report identity attempt mismatch for {role_id}: "
+                f"expected {attempt_id}, got {current['attempt_id']}"
+            )
+        if current["task_contract_digest"] == task_contract_digest:
+            return current
+        timestamp = registered_at or utc_now()
+        parse_rfc3339(timestamp, field="registered_at")
+        transaction.connection.execute(
+            """
+            INSERT INTO active_roles(
+                run_id, role_id, attempt_id, task_contract_digest,
+                token_digest, active, registered_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                run_id,
+                role_id,
+                attempt_id,
+                task_contract_digest,
+                current["token_digest"],
+                timestamp,
+            ),
+        )
+        return {
+            "run_id": run_id,
+            "role_id": role_id,
+            "attempt_id": attempt_id,
+            "task_contract_digest": task_contract_digest,
+            "token_digest": current["token_digest"],
+            "active": True,
+            "registered_at": timestamp,
+        }
+
     def revoke_active_role(
         self,
         transaction: BrokerTransaction,

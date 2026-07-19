@@ -1232,6 +1232,241 @@ class SemanticAckTests(unittest.TestCase):
         with self.assertRaisesRegex(hloop.HLoopError, "stale attempt"):
             hloop.apply_semantic_ack_application_event(state, event)
 
+    def test_only_exact_broker_sequenced_application_history_is_obsolete(self):
+        def barrier(attempt_id, digest, message_id, ack_event_id):
+            return {
+                "attempt_id": attempt_id,
+                "message_id": message_id,
+                "digest": digest,
+                "status": "approved",
+                "semantic_decision": {
+                    "status": "approved",
+                    "ack_event_id": ack_event_id,
+                },
+                "approval_application": {"status": "pending"},
+            }
+
+        def application_event(
+            attempt_id,
+            digest,
+            message_id,
+            ack_event_id,
+            sequence,
+            role_id="T001",
+        ):
+            report = hloop.hloop_events.validate_report(
+                {
+                    "run_id": "run-1",
+                    "role_id": role_id,
+                    "attempt_id": attempt_id,
+                    "task_contract_digest": digest,
+                    "type": "attention",
+                    "stage": "semantic-ack-application",
+                    "summary": "apply",
+                    "impact": "approval pending",
+                    "attempted": ["read decision"],
+                    "options": ["apply"],
+                    "recommendation": "apply",
+                    "blocked_scope": ["material work"],
+                    "approval_application": {
+                        "message_id": message_id,
+                        "decision_ack_event_id": ack_event_id,
+                        "requested_status": "applied",
+                    },
+                    "next": "manager applies",
+                    "needs_manager": True,
+                    "evidence_refs": ["semantic-ack:" + ack_event_id],
+                    "created_at": "2026-07-18T00:00:00+00:00",
+                }
+            )
+            return hloop.hloop_events.assign_broker_sequence(
+                hloop.hloop_events.prepare_client_event(report), sequence
+            )
+
+        cases = []
+        stale_current = barrier(
+            "T001-A002",
+            "b" * 64,
+            "initial:T001-A002",
+            "22222222-2222-4222-8222-222222222222",
+        )
+        stale_old = barrier(
+            "T001-A001",
+            "a" * 64,
+            "initial:T001-A001",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        cases.append(
+            (
+                "stale-attempt",
+                {
+                    "run_id": "run-1",
+                    "tasks": {
+                        "T001": {
+                            "active_attempt_id": "T001-A002",
+                            "semantic_ack_barrier": stale_current,
+                        }
+                    },
+                    "agent_attempt_history": [
+                        {
+                            "agent_id": "T001",
+                            "attempt_id": "T001-A001",
+                            "semantic_ack_barrier": stale_old,
+                        }
+                    ],
+                },
+                application_event(
+                    "T001-A001",
+                    "a" * 64,
+                    "initial:T001-A001",
+                    "11111111-1111-4111-8111-111111111111",
+                    7,
+                ),
+            )
+        )
+        superseded_old = barrier(
+            "T001-A001",
+            "c" * 64,
+            "contract-old",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        cases.append(
+            (
+                "superseded-barrier",
+                {
+                    "run_id": "run-1",
+                    "tasks": {
+                        "T001": {
+                            "active_attempt_id": "T001-A001",
+                            "semantic_ack_barrier": barrier(
+                                "T001-A001",
+                                "d" * 64,
+                                "contract-new",
+                                "44444444-4444-4444-8444-444444444444",
+                            ),
+                            "semantic_ack_history": [superseded_old],
+                        }
+                    },
+                },
+                application_event(
+                    "T001-A001",
+                    "c" * 64,
+                    "contract-old",
+                    "33333333-3333-4333-8333-333333333333",
+                    8,
+                ),
+            )
+        )
+        prior_old = barrier(
+            "T001-A001",
+            "e" * 64,
+            "contract-same",
+            "55555555-5555-4555-8555-555555555555",
+        )
+        cases.append(
+            (
+                "prior-decision",
+                {
+                    "run_id": "run-1",
+                    "tasks": {
+                        "T001": {
+                            "active_attempt_id": "T001-A001",
+                            "semantic_ack_barrier": barrier(
+                                "T001-A001",
+                                "e" * 64,
+                                "contract-same",
+                                "66666666-6666-4666-8666-666666666666",
+                            ),
+                            "semantic_ack_history": [prior_old],
+                        }
+                    },
+                },
+                application_event(
+                    "T001-A001",
+                    "e" * 64,
+                    "contract-same",
+                    "55555555-5555-4555-8555-555555555555",
+                    9,
+                ),
+            )
+        )
+        for expected_reason, state, event in cases:
+            with self.subTest(expected_reason=expected_reason):
+                before = json.loads(
+                    json.dumps(
+                        state["tasks"]["T001"]["semantic_ack_barrier"],
+                        ensure_ascii=False,
+                    )
+                )
+                self.assertTrue(
+                    hloop.apply_semantic_ack_application_event(state, event)
+                )
+                self.assertEqual(
+                    state["tasks"]["T001"]["semantic_ack_barrier"], before
+                )
+                record = state["semantic_ack_obsolete_applications"][-1]
+                self.assertEqual(record["reason"], expected_reason)
+                self.assertEqual(record["disposition"], "obsolete")
+                self.assertGreater(record["event_sequence"], 0)
+
+        unknown_state = {
+            "run_id": "run-1",
+            "tasks": {
+                "T001": {
+                    "active_attempt_id": "T001-A001",
+                    "semantic_ack_barrier": barrier(
+                        "T001-A001",
+                        "f" * 64,
+                        "current",
+                        "77777777-7777-4777-8777-777777777777",
+                    ),
+                }
+            },
+        }
+        unknown = application_event(
+            "T001-A001",
+            "f" * 64,
+            "unknown",
+            "88888888-8888-4888-8888-888888888888",
+            10,
+        )
+        with self.assertRaisesRegex(hloop.HLoopError, "does not match"):
+            hloop.apply_semantic_ack_application_event(unknown_state, unknown)
+
+        archived_reviewer = barrier(
+            "R001-A001",
+            "9" * 64,
+            "review-contract-old",
+            "99999999-9999-4999-8999-999999999999",
+        )
+        archived_state = {
+            "run_id": "run-1",
+            "agent_attempt_history": [
+                {
+                    "agent_id": "R001",
+                    "attempt_id": "R001-A001",
+                    "semantic_ack_barrier": archived_reviewer,
+                }
+            ],
+        }
+        archived_event = application_event(
+            "R001-A001",
+            "9" * 64,
+            "review-contract-old",
+            "99999999-9999-4999-8999-999999999999",
+            11,
+            role_id="R001",
+        )
+        self.assertTrue(
+            hloop.apply_semantic_ack_application_event(
+                archived_state, archived_event
+            )
+        )
+        self.assertEqual(
+            archived_state["semantic_ack_obsolete_applications"][-1]["reason"],
+            "stale-attempt",
+        )
+
     def test_decision_and_application_are_separate_and_carry_completion_mode(self):
         agent = {
             "active_attempt_id": "T001-A001",
