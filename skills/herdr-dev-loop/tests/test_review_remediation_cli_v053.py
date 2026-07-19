@@ -873,6 +873,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
         )
         collection = argparse.Namespace(plan=plan, execution_outcomes=(outcome,))
         state = {
+            "review_protocol": hloop.hloop_certification.MANUAL_FINAL_PROTOCOL,
             "review_policy": {
                 **hloop.hloop_config.V053_REVIEW_POLICY_DEFAULTS,
                 "manual_final_execution": "reuse_epoch_reviewer",

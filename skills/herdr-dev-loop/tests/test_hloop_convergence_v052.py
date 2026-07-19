@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 from dataclasses import replace
 import importlib.machinery
@@ -373,7 +374,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
                 provider_coordinator.model,
                 provider_coordinator.effort,
             ),
-            ("codex", "coordinator-component-model", "high"),
+            ("codex", "lane-component-model", "high"),
         )
         self.assertEqual(
             {
@@ -387,8 +388,133 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
                 (item.provider, item.model, item.effort)
                 for item in by_kind["verifier"]
             },
-            {("claude", "verifier-component-model", "max")},
+            {("codex", "lane-component-model", "max")},
         )
+        self.assertEqual(
+            provider_coordinator.config_provenance["model"][-1]["source"],
+            "review-topology-override",
+        )
+        verifier = by_kind["verifier"][0]
+        self.assertEqual(
+            verifier.config_provenance["provider"][-1]["source"],
+            "review-topology-override",
+        )
+        self.assertEqual(
+            verifier.config_provenance["model"][-1]["source"],
+            "review-topology-override",
+        )
+
+    def test_dual_swarm_process_identities_follow_each_provider_topology(self):
+        state = self.state()
+        target = state["integration_head_sha"]
+        plan, group = hloop._final_certification_plan(
+            self.repo,
+            state,
+            target,
+            certification_id="C-dual-topology",
+            base_sha=target,
+            mode="dual-swarm",
+            providers=("codex", "claude"),
+            probe_count=4,
+        )
+        processes = {item.process_id: item for item in plan.process_plan}
+        for provider_plan in group.provider_plans:
+            coordinator = processes[
+                f"provider-{provider_plan.provider}-coordinator"
+            ]
+            self.assertEqual(
+                (coordinator.provider, coordinator.model),
+                (provider_plan.provider, provider_plan.model),
+            )
+            for lane in provider_plan.lanes:
+                process = processes[f"lane-{lane.provider}-{lane.lane_id}"]
+                self.assertEqual(
+                    (process.provider, process.model),
+                    (provider_plan.provider, provider_plan.model),
+                )
+            for index, _label in enumerate(
+                provider_plan.verifier_agents, start=1
+            ):
+                verifier = processes[
+                    f"verifier-{provider_plan.provider}-{index}"
+                ]
+                self.assertEqual(
+                    (verifier.provider, verifier.model),
+                    (provider_plan.provider, provider_plan.model),
+                )
+        claude_coordinator = processes["provider-claude-coordinator"]
+        self.assertEqual(
+            claude_coordinator.config_sources["provider"],
+            "review-topology-override",
+        )
+
+        tampered_processes = tuple(
+            replace(item, provider="codex", agent_identity={})
+            if item.process_id == "provider-claude-coordinator"
+            else item
+            for item in plan.process_plan
+        )
+        tampered = replace(plan, process_plan=tampered_processes)
+        review_manifest = hloop_review.ReviewManifest(
+            review_id="R901",
+            plan=group,
+            lane_results=tuple(lane.result() for lane in group.expected_lanes),
+            findings=(),
+            verification_plan=hloop_review.plan_verification(group, ()),
+            verifications=(),
+        )
+        evidence = FinalReviewManifest.from_review_manifest(
+            tampered, review_manifest
+        )
+        result = hloop.hloop_certification.validate_final_review(
+            tampered,
+            evidence,
+            current_target_sha=target,
+            allow_legacy=True,
+        )
+        self.assertIn(
+            "identity-mismatch:process-topology-identity:provider-claude-coordinator",
+            result.issues,
+        )
+
+    def test_reused_reviewer_epoch_rejects_current_protocol_drift(self):
+        fixtures = __import__(
+            "skills.herdr-dev-loop.tests.test_review_epoch_v053",
+            fromlist=["epoch_plan"],
+        )
+        reviewer = fixtures.reviewer_execution(
+            protocol=hloop.hloop_certification.MANUAL_FINAL_PROTOCOL
+        )
+        epoch_plan = fixtures.epoch_plan(executions=(reviewer,))
+        collection = fixtures.ReviewEpochCollection.create(epoch_plan)
+        state = self.state()
+        state["resolved_config"]["reviewer"]["protocol"] = "native"
+        state["review_policy"]["manual_final_execution"] = (
+            "reuse_epoch_reviewer"
+        )
+        state["resolved_config"]["review"]["manual_final_execution"] = (
+            "reuse_epoch_reviewer"
+        )
+        store = {
+            "active_epoch_id": epoch_plan.epoch_id,
+            "records": {},
+            "protocol_capabilities": {},
+        }
+        with (
+            mock.patch.object(hloop, "review_epoch_store", return_value=store),
+            mock.patch.object(
+                hloop,
+                "require_review_epoch_collection",
+                return_value=collection,
+            ),
+            self.assertRaisesRegex(hloop.HLoopError, "protocol identity has drifted"),
+        ):
+            hloop._manual_final_execution_provenance(
+                self.repo,
+                state,
+                epoch_plan.target_sha,
+                argparse.Namespace(protocol_capability=None),
+            )
 
     def _make_ready_state(self) -> None:
         state = self.state()
