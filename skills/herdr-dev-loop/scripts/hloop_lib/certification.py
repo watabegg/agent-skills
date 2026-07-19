@@ -1415,6 +1415,50 @@ def _manifest_identity_issues(
     review_plan = manifest.review_manifest.plan
     if review_plan.head_sha != plan.target_sha:
         issues.append("identity-mismatch:review-head-sha")
+    if plan.process_plan:
+        planned_processes = {item.process_id: item for item in plan.process_plan}
+        expected_topology: dict[str, tuple[str, str, str]] = {}
+        for provider_plan in review_plan.provider_plans:
+            if provider_plan.role == "coordinator":
+                expected_topology[
+                    f"provider-{provider_plan.provider}-coordinator"
+                ] = (
+                    provider_plan.provider,
+                    provider_plan.model,
+                    provider_plan.coordinator_label,
+                )
+            for lane in provider_plan.lanes:
+                expected_topology[f"lane-{lane.provider}-{lane.lane_id}"] = (
+                    provider_plan.provider,
+                    provider_plan.model,
+                    lane.agent_label,
+                )
+            for index, agent_label in enumerate(
+                provider_plan.verifier_agents, start=1
+            ):
+                expected_topology[
+                    f"verifier-{provider_plan.provider}-{index}"
+                ] = (
+                    provider_plan.provider,
+                    provider_plan.model,
+                    agent_label,
+                )
+        actual_topology_ids = set(planned_processes) - {"manual-final-coordinator"}
+        if actual_topology_ids != set(expected_topology):
+            issues.append("identity-mismatch:process-topology-membership")
+        for process_id in sorted(set(expected_topology).intersection(planned_processes)):
+            process = planned_processes[process_id]
+            expected_provider, expected_model, expected_label = expected_topology[
+                process_id
+            ]
+            if (
+                process.provider,
+                process.model,
+                process.agent_label,
+            ) != (expected_provider, expected_model, expected_label):
+                issues.append(
+                    f"identity-mismatch:process-topology-identity:{process_id}"
+                )
     expected_lanes = tuple(lane.to_record() for lane in plan.lane_plan)
     actual_lanes = tuple(lane.to_record() for lane in review_plan.expected_lanes)
     if expected_lanes != actual_lanes:

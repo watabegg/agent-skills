@@ -2723,6 +2723,25 @@ def config_apply_changes(
     ]
 
 
+def canonical_config_provenance(
+    rows: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Canonicalize provenance rows while preserving assignment precedence."""
+
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return []
+    normalized = [
+        json.loads(json.dumps(row)) for row in rows if isinstance(row, Mapping)
+    ]
+    return sorted(
+        normalized,
+        key=lambda row: (
+            str(row.get("key") or ""),
+            _canonical_digest(row),
+        ),
+    )
+
+
 def apply_resolved_config_to_state(
     state: dict[str, Any],
     resolved: dict[str, Any],
@@ -2828,6 +2847,13 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
 
     resolved = resolution.as_dict()
     changes = config_apply_changes(state.get("resolved_config") or {}, resolved)
+    next_provenance = resolution.explain_provenance()
+    previous_provenance = canonical_config_provenance(
+        state.get("config_resolution_provenance")
+    )
+    provenance_changed = _canonical_digest(previous_provenance) != _canonical_digest(
+        canonical_config_provenance(next_provenance)
+    )
     previous_review_policy = review_policy_record(state)
     next_review_policy = dict(hloop_config.V053_REVIEW_POLICY_DEFAULTS)
     configured_review_policy = resolved.get("review")
@@ -2847,8 +2873,14 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
         "config_source": candidate.source if candidate else "built-in-default",
         "changes": changes,
         "source_changed": source_changed,
+        "provenance_changed": provenance_changed,
         "review_policy_changed": review_policy_changed,
-        "changed": bool(changes) or source_changed or review_policy_changed,
+        "changed": (
+            bool(changes)
+            or source_changed
+            or provenance_changed
+            or review_policy_changed
+        ),
     }
     if not args.apply:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -2863,22 +2895,26 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
         raise HLoopError("cannot apply config while a merge transaction is active")
     if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
         raise HLoopError(f"cannot apply config to a terminal run: {state.get('phase')}")
-    if changes or source_changed or review_policy_changed:
+    if changes or source_changed or provenance_changed or review_policy_changed:
         apply_resolved_config_to_state(
             state,
             resolved,
             candidate,
-            provenance=resolution.explain_provenance(),
+            provenance=next_provenance,
         )
         assert_manager_identity(state)
-        if review_policy_changed:
+        if review_policy_changed or provenance_changed:
             # Review plans, convergence manifests, and manual-final
             # certification are all identified by the active policy.  A
             # policy change must invalidate those dependent artifacts before
             # the new snapshot becomes observable.
             invalidate_review_gates_for_change(
                 state,
-                reason="review-policy-config-change",
+                reason=(
+                    "review-policy-config-change"
+                    if review_policy_changed
+                    else "config-provenance-change"
+                ),
                 target_sha=current_integration_target(repo, state),
             )
         state["config_applied_at"] = now_iso()
@@ -2886,9 +2922,17 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
         journal(
             repo,
             "Applied resolved config snapshot: "
-            + (", ".join(item["key"] for item in changes) or "config_source"),
+            + (
+                ", ".join(item["key"] for item in changes)
+                or ("config_provenance" if provenance_changed else "config_source")
+            ),
         )
-    payload["applied"] = bool(changes) or source_changed or review_policy_changed
+    payload["applied"] = (
+        bool(changes)
+        or source_changed
+        or provenance_changed
+        or review_policy_changed
+    )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -4192,6 +4236,9 @@ def _metric_role_records(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     scout = state.get("specification_scout_run")
     if isinstance(scout, Mapping):
         records.append(scout)
+    coverage_scout = state.get("plan_gap_scout_run")
+    if isinstance(coverage_scout, Mapping):
+        records.append(coverage_scout)
     return records
 
 
@@ -12410,13 +12457,33 @@ def _manual_final_execution_provenance(
         execution
         for execution in collection.plan.required_executions
         if execution.source_kind == "reviewer"
-        and execution.protocol == hloop_certification.MANUAL_FINAL_PROTOCOL
     ]
     if len(reviewers) != 1:
         raise HLoopError(
-            "reuse_epoch_reviewer requires exactly one external Reviewer execution"
+            "reuse_epoch_reviewer requires exactly one Reviewer execution"
         )
     reviewer = reviewers[0]
+    ordinary_protocol = canonical_review_protocol(state, "ordinary")
+    current_protocol_identity = (
+        ordinary_protocol.execution_kind,
+        ordinary_protocol.key,
+        ordinary_protocol.protocol,
+    )
+    epoch_protocol_identity = (
+        reviewer.execution_kind,
+        reviewer.protocol_key,
+        reviewer.protocol,
+    )
+    if epoch_protocol_identity != current_protocol_identity:
+        raise HLoopError(
+            "reuse_epoch_reviewer protocol identity has drifted from the "
+            "current ordinary Reviewer selection"
+        )
+    if reviewer.protocol != hloop_certification.MANUAL_FINAL_PROTOCOL:
+        raise HLoopError(
+            "reuse_epoch_reviewer requires the current ordinary Reviewer "
+            "protocol to provide the external manual-final capability"
+        )
     outcomes = {
         outcome.execution_id: outcome for outcome in collection.execution_outcomes
     }
@@ -12583,7 +12650,12 @@ def _final_certification_plan(
     ]
     for provider_plan in group.provider_plans:
         if provider_plan.role == "coordinator":
-            coordinator_process_config = process_config(reviewer_coordinator)
+            coordinator_process_config = process_config(
+                reviewer_coordinator,
+                provider=provider_plan.provider,
+                model=provider_plan.model,
+                topology_key=f"providers.{provider_plan.provider}.coordinator",
+            )
             processes.append(
                 hloop_certification.FinalReviewProcessPlan(
                     process_id=f"provider-{provider_plan.provider}-coordinator",
@@ -12610,7 +12682,12 @@ def _final_certification_plan(
         for index, agent_label in enumerate(
             provider_plan.verifier_agents, start=1
         ):
-            verifier_process_config = process_config(reviewer_verifier)
+            verifier_process_config = process_config(
+                reviewer_verifier,
+                provider=provider_plan.provider,
+                model=provider_plan.model,
+                topology_key=f"providers.{provider_plan.provider}.verifiers.{index}",
+            )
             processes.append(
                 hloop_certification.FinalReviewProcessPlan(
                     process_id=f"verifier-{provider_plan.provider}-{index}",
@@ -18318,6 +18395,63 @@ def specification_scout_required(state: dict[str, Any]) -> tuple[bool, list[str]
     return bool(reasons), reasons
 
 
+_ACTIVE_SPECIFICATION_SCOUT_STATUSES = frozenset(
+    {"starting", "running", "awaiting_result"}
+)
+
+
+def specification_scout_runs(
+    state: Mapping[str, Any],
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    """Return decision and coverage Scout state under their shared S001 id."""
+
+    runs: list[tuple[str, dict[str, Any]]] = []
+    for mode, key in (
+        ("decision", "specification_scout_run"),
+        ("coverage", "plan_gap_scout_run"),
+    ):
+        run = state.get(key)
+        if isinstance(run, dict) and run:
+            runs.append((mode, run))
+    return tuple(runs)
+
+
+def specification_scout_run_is_active(run: Mapping[str, Any]) -> bool:
+    return str(run.get("gate_status") or run.get("status") or "") in (
+        _ACTIVE_SPECIFICATION_SCOUT_STATUSES
+    )
+
+
+def active_specification_scout_run(
+    state: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    """Resolve the unique active S001 run without crossing mode credentials."""
+
+    active = [
+        (mode, run)
+        for mode, run in specification_scout_runs(state)
+        if specification_scout_run_is_active(run)
+    ]
+    if len(active) > 1:
+        raise HLoopError(
+            "decision and coverage Specification Scouts cannot be active together"
+        )
+    return active[0] if active else None
+
+
+def require_specification_scout_start_available(
+    state: Mapping[str, Any], *, requested_mode: str
+) -> None:
+    active = active_specification_scout_run(state)
+    if active is None:
+        return
+    active_mode, _run = active
+    raise HLoopError(
+        f"{active_mode}-mode Specification Scout is already running; "
+        f"cannot start {requested_mode}-mode Scout with shared role id S001"
+    )
+
+
 def specification_scout_file(repo: Path) -> Path:
     return loop_path(repo) / "decisions" / "SCOUT.md"
 
@@ -18795,15 +18929,8 @@ def _plan_gap_input_artifacts(repo: Path) -> tuple[dict[str, Any], ...]:
 def cmd_plan_gap_scout_start(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
-    decision_run = state.get("specification_scout_run")
-    if isinstance(decision_run, Mapping) and str(decision_run.get("status") or "") in {
-        "running",
-        "starting",
-    }:
-        raise HLoopError("decision-mode Specification Scout is already running")
+    require_specification_scout_start_available(state, requested_mode="coverage")
     run = state.setdefault("plan_gap_scout_run", {})
-    if str(run.get("status") or "") in {"running", "starting"}:
-        raise HLoopError("coverage-mode Specification Scout is already running")
     dispatch_start_preflight(
         repo, state, role_id="S001", role_kind="specification-scout"
     )
@@ -18979,6 +19106,7 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
         return cmd_plan_gap_scout_start(args)
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    require_specification_scout_start_available(state, requested_mode="decision")
     required, reasons = specification_scout_required(state)
     policy = str(state.get("specification_scout") or DEFAULT_SPECIFICATION_SCOUT)
     run = state.setdefault("specification_scout_run", {})
@@ -24911,6 +25039,9 @@ def long_running_role_states(state: dict[str, Any]) -> list[dict[str, Any]]:
     scout = state.get("specification_scout_run")
     if isinstance(scout, dict) and scout:
         roles.append(scout)
+    coverage_scout = state.get("plan_gap_scout_run")
+    if isinstance(coverage_scout, dict) and coverage_scout:
+        roles.append(coverage_scout)
     roles.extend(
         liaison
         for liaison in (state.get("decision_liaisons") or {}).values()
@@ -26525,6 +26656,9 @@ def iter_all_roles(state: dict[str, Any]):
     scout = state.get("specification_scout_run")
     if isinstance(scout, dict) and scout:
         yield "specification-scout", "S001", scout
+    coverage_scout = state.get("plan_gap_scout_run")
+    if isinstance(coverage_scout, dict) and coverage_scout:
+        yield "coverage-specification-scout", "S001", coverage_scout
     for decision_id, liaison in (state.get("decision_liaisons") or {}).items():
         if isinstance(liaison, dict):
             yield "decision-liaison", f"L-{decision_id}", liaison
@@ -30327,6 +30461,14 @@ def queued_dispatchable_tasks(state: dict[str, Any]) -> list[str]:
     return dispatchable
 
 
+def apply_scheduler_agent_overrides(args: argparse.Namespace, role: str) -> None:
+    """Forward one tick/pump role override exactly as a direct start would."""
+
+    args.agent_provider = getattr(args, f"{role}_agent_provider", None)
+    args.agent_model = getattr(args, f"{role}_agent_model", None)
+    args.agent_effort = getattr(args, f"{role}_agent_effort", None)
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(
@@ -30383,6 +30525,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 "responded",
                 "completed",
             }:
+                apply_scheduler_agent_overrides(args, "advisor")
                 start_decision_liaison(repo, state, record, args)
                 state = load_state(repo)
         state["phase"] = "blocked_user_decision"
@@ -30487,8 +30630,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.spec_source = None
         args.worktree = None
         args.runner = args.gap_runner
-        args.agent_provider = getattr(args, "gap_agent_provider", None)
-        args.agent_model = getattr(args, "gap_agent_model", None)
+        apply_scheduler_agent_overrides(args, "gap")
         return cmd_gap_start(args)
 
     if (
@@ -30501,8 +30643,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.head = None
         args.worktree = None
         args.runner = args.reviewer_runner
-        args.agent_provider = getattr(args, "reviewer_agent_provider", None)
-        args.agent_model = getattr(args, "reviewer_agent_model", None)
+        apply_scheduler_agent_overrides(args, "reviewer")
         return cmd_reviewer_start(args)
 
     scout_required, scout_reasons = specification_scout_required(state)
@@ -30521,8 +30662,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.force = False
         args.worktree = None
         args.runner = "tui"
-        args.agent_provider = getattr(args, "advisor_agent_provider", None)
-        args.agent_model = getattr(args, "advisor_agent_model", None)
+        apply_scheduler_agent_overrides(args, "advisor")
         return cmd_specification_scout_start(args)
 
     running_count = sum(1 for t in state.get("tasks", {}).values() if t.get("status") == "running")
@@ -30543,8 +30683,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
         args.task_id = task_id
         args.worktree = None
         args.runner = args.worker_runner
-        args.agent_provider = getattr(args, "worker_agent_provider", None)
-        args.agent_model = getattr(args, "worker_agent_model", None)
+        apply_scheduler_agent_overrides(args, "worker")
         rc = cmd_worker_start(args)
         if rc != 0:
             return rc
@@ -30779,6 +30918,8 @@ def cmd_harvest(args: argparse.Namespace) -> int:
         args.participant_id = participant_id
         return cmd_advisor_harvest(args)
     if agent_id == "S001":
+        role, _run = resolve_agent_state(load_state(repo_root(Path(args.repo).resolve())), agent_id)
+        args.mode = "coverage" if role == "coverage-scout" else "decision"
         return cmd_specification_scout_harvest(args)
     if agent_id.startswith("L-D"):
         args.id = agent_id.removeprefix("L-")
@@ -30801,9 +30942,23 @@ def split_advice_target(agent_id: str, participant_id: str | None = None) -> tup
 
 def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict[str, Any]]:
     if agent_id == "S001":
-        agent = state.get("specification_scout_run")
-        if isinstance(agent, dict) and agent:
-            return "scout", agent
+        active = active_specification_scout_run(state)
+        if active is not None:
+            mode, agent = active
+            return ("coverage-scout" if mode == "coverage" else "scout"), agent
+        runs = specification_scout_runs(state)
+        if runs:
+            # Preserve the legacy decision-mode preference when no S001
+            # process is active; active coverage always wins above.
+            mode, agent = next(
+                (
+                    (mode, run)
+                    for mode, run in runs
+                    if mode == "decision"
+                ),
+                runs[0],
+            )
+            return ("coverage-scout" if mode == "coverage" else "scout"), agent
     if agent_id.startswith("L-D"):
         decision_id = agent_id.removeprefix("L-")
         agent = (state.get("decision_liaisons") or {}).get(decision_id)
@@ -33532,8 +33687,8 @@ def running_agent_ids(state: dict[str, Any]) -> list[str]:
         for participant in advice.get("participants", []):
             if agent_gate_status(participant) == "running":
                 ids.append(f"{advice_id}/{participant.get('participant_id', 'P1')}")
-    scout = state.get("specification_scout_run")
-    if isinstance(scout, dict) and agent_gate_status(scout) == "running":
+    scout = active_specification_scout_run(state)
+    if scout is not None:
         ids.append("S001")
     for decision_id, liaison in (state.get("decision_liaisons") or {}).items():
         if isinstance(liaison, dict) and agent_gate_status(liaison) == "running":
@@ -33557,6 +33712,17 @@ def agent_artifact_path(
     if role == "advisor":
         advice_id, participant_id = split_advice_target(agent_id)
         return advice_artifact_path(repo, advice_id, {**agent, "participant_id": participant_id})
+    if role in {"scout", "coverage-scout"}:
+        recorded = str(
+            agent.get("worktree_artifact_path") or agent.get("artifact_path") or ""
+        )
+        if recorded:
+            return Path(recorded).resolve()
+        if role == "coverage-scout":
+            return planning_artifact_file(
+                repo, hloop_planning.PLAN_GAP_RECORD_TYPE
+            )
+        return specification_scout_file(repo)
     raise HLoopError(f"unsupported agent role: {role}")
 
 
@@ -33603,6 +33769,19 @@ def artifact_readiness(
 ) -> tuple[bool, str]:
     if not path.exists() or not path.is_file():
         return False, "missing"
+    if role == "coverage-scout":
+        try:
+            record = load_json_object(str(path), label="coverage Scout PLAN-GAP")
+            validation = hloop_planning.validate_planning_artifact(
+                record,
+                expected_record_type=hloop_planning.PLAN_GAP_RECORD_TYPE,
+                expected_plan_gap_checker=plan_gap_scout_checker(state, agent),
+            )
+        except (HLoopError, OSError, ValueError) as exc:
+            return False, f"invalid:{exc}"
+        if not validation.ok:
+            return False, "invalid:coverage-scout-contract"
+        return True, "ready"
     try:
         text = read_text(path)
         meta = parse_frontmatter_text(text)
@@ -33637,6 +33816,15 @@ def artifact_readiness(
                     # terminal agent with no artifact.
                     return False, "seal-required"
                 return False, commit_state
+    elif role == "scout":
+        identity_error = decision_role_artifact_identity_error(
+            state,
+            role_id=agent_id,
+            role_state=agent,
+            meta=meta,
+        )
+        if identity_error:
+            return False, identity_error
     else:
         identity_error = artifact_identity_error(state, agent_id, role, agent, meta)
         if identity_error:
@@ -36651,10 +36839,16 @@ def build_parser() -> argparse.ArgumentParser:
     tick.add_argument("--gap-runner", choices=["exec", "tui"])
     tick.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
     tick.add_argument("--worker-agent-model")
+    tick.add_argument("--worker-agent-effort")
     tick.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS))
     tick.add_argument("--reviewer-agent-model")
+    tick.add_argument("--reviewer-agent-effort")
     tick.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS))
     tick.add_argument("--gap-agent-model")
+    tick.add_argument("--gap-agent-effort")
+    tick.add_argument("--advisor-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    tick.add_argument("--advisor-agent-model")
+    tick.add_argument("--advisor-agent-effort")
     tick.add_argument("--keep-pane", action="store_true")
     tick.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     tick.add_argument("--review-wait-ms", type=int)
@@ -36678,10 +36872,16 @@ def build_parser() -> argparse.ArgumentParser:
     pump.add_argument("--gap-runner", choices=["exec", "tui"])
     pump.add_argument("--worker-agent-provider", choices=sorted(AGENT_PROVIDERS))
     pump.add_argument("--worker-agent-model")
+    pump.add_argument("--worker-agent-effort")
     pump.add_argument("--reviewer-agent-provider", choices=sorted(AGENT_PROVIDERS))
     pump.add_argument("--reviewer-agent-model")
+    pump.add_argument("--reviewer-agent-effort")
     pump.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS))
     pump.add_argument("--gap-agent-model")
+    pump.add_argument("--gap-agent-effort")
+    pump.add_argument("--advisor-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    pump.add_argument("--advisor-agent-model")
+    pump.add_argument("--advisor-agent-effort")
     pump.add_argument("--keep-pane", action="store_true")
     pump.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     pump.add_argument("--review-wait-ms", type=int)

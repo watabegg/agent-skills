@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import importlib
 import importlib.machinery
@@ -465,6 +466,270 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                     artifact_ref=artifact,
                     artifact_digest=artifact_digest,
                 )
+
+    def test_coverage_scout_uses_common_s001_lifecycle_through_harvest(self) -> None:
+        fixtures = importlib.import_module(
+            "skills.herdr-dev-loop.tests.test_planning_v053"
+        )
+        current, impact, task_graph, coverage, plan_gap_template = (
+            fixtures.planning_bundle()
+        )
+        head_sha = plan_gap_template["checker"]["head_sha"]
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            worktree = repo / "coverage-worktree"
+            worktree.mkdir()
+            state = {
+                "run_id": "run-coverage",
+                "goal_id": "coverage-lifecycle",
+                "integration_branch": "main",
+                "session_cleanup": "none",
+                "plan_gap_scout_run": {},
+                "specification_scout_run": {"status": "completed"},
+                "tasks": {},
+                "reviews": {},
+                "patch_reviews": {},
+                "gaps": {},
+                "advice": {},
+                "decision_liaisons": {},
+            }
+            agent_config = {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+                "sources": {
+                    "provider": "config-defaults",
+                    "model": "scope:tree:/repo",
+                    "effort": "loop-snapshot",
+                },
+                "provenance": {"provider": [], "model": [], "effort": []},
+            }
+            invocation = SimpleNamespace(as_record=lambda: {"provider": "codex"})
+
+            def fake_git(_repo, command):
+                return head_sha if command[0] == "rev-parse" else ""
+
+            start_args = SimpleNamespace(
+                repo=str(repo),
+                worktree=str(worktree),
+                agent_provider=None,
+                agent_model=None,
+                agent_effort=None,
+                runner="tui",
+                dry_run=False,
+                launcher="pane",
+                direction="right",
+                manager_pane=None,
+            )
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(hloop, "git", side_effect=fake_git),
+                mock.patch.object(
+                    hloop, "current_planning_identity", return_value=current
+                ),
+                mock.patch.object(
+                    hloop,
+                    "_plan_gap_input_artifacts",
+                    return_value=(impact, task_graph, coverage),
+                ),
+                mock.patch.object(hloop, "dispatch_start_preflight"),
+                mock.patch.object(
+                    hloop, "role_agent_config", return_value=agent_config
+                ),
+                mock.patch.object(
+                    hloop,
+                    "role_agent_command",
+                    return_value=("codex", invocation),
+                ),
+                mock.patch.dict(hloop.os.environ, {"HERDR_ENV": "1"}),
+                mock.patch.object(hloop, "command_exists", return_value=True),
+                mock.patch.object(hloop, "prepare_role_worktree"),
+                mock.patch.object(hloop, "ensure_advisor_visible_in_worktree"),
+                mock.patch.object(
+                    hloop,
+                    "register_role_report_identity_and_ack_floor",
+                    return_value=(repo / "credential.json", 0),
+                ),
+                mock.patch.object(hloop, "role_scope_paths", return_value=[]),
+                mock.patch.object(
+                    hloop, "start_pane_launcher", return_value="pane-coverage"
+                ),
+                mock.patch.object(hloop, "invalidate_planning_evidence"),
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(hloop, "journal"),
+            ):
+                self.assertEqual(hloop.cmd_plan_gap_scout_start(start_args), 0)
+            run = state["plan_gap_scout_run"]
+            self.assertEqual(run["status"], "running")
+            self.assertEqual(run["attempt_id"], "S001-C001")
+
+            role, selected = hloop.resolve_agent_state(state, "S001")
+            self.assertEqual(role, "coverage-scout")
+            self.assertIs(selected, run)
+            self.assertEqual(hloop.running_agent_ids(state), ["S001"])
+            self.assertIn(run, hloop.long_running_role_states(state))
+            self.assertEqual(hloop.wait_targets(state, "next"), ["S001"])
+            wait_status = hloop.agent_wait_status(repo, state, "S001")
+            self.assertEqual(wait_status["role"], "coverage-scout")
+            self.assertEqual(wait_status["readiness_reason"], "missing")
+
+            def approve_ack(agent, **_kwargs):
+                barrier = agent["semantic_ack_barrier"]
+                barrier.update(
+                    status="approved",
+                    ack_event_id="ack-coverage",
+                    approval_application={},
+                )
+                barrier["semantic_decision"].update(
+                    status="approved", ack_event_id="ack-coverage"
+                )
+                return barrier
+
+            store = mock.MagicMock()
+            store.transaction.return_value.__enter__.return_value = mock.MagicMock()
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "load_state", return_value=state),
+                mock.patch.object(hloop, "_open_broker_store", return_value=store),
+                mock.patch.object(
+                    hloop, "resolve_semantic_ack_barrier", side_effect=approve_ack
+                ) as resolve_ack,
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(hloop, "journal"),
+                mock.patch.object(
+                    hloop, "send_manager_message_and_record", return_value=0
+                ),
+            ):
+                hloop.cmd_agent_ack_resolve(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="S001",
+                        decision="approved",
+                        reason="coverage contract understood",
+                    )
+                )
+            self.assertIs(resolve_ack.call_args.args[0], run)
+            self.assertEqual(run["semantic_ack_barrier"]["status"], "approved")
+
+            message_args = SimpleNamespace(
+                repo=str(repo),
+                agent_id="S001",
+                message="continue coverage",
+                file=None,
+                contract_changing=False,
+                timeout_ms=1000,
+                input_settle_ms=0,
+                submit_verify_ms=0,
+                submit_attempts=1,
+            )
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(
+                    hloop, "send_manager_message_and_record", return_value=0
+                ) as send_message,
+            ):
+                hloop.cmd_agent_message(message_args)
+            self.assertIs(send_message.call_args.args[2], run)
+
+            plan_gap = copy.deepcopy(plan_gap_template)
+            plan_gap["checker"] = hloop.plan_gap_scout_checker(state, run)
+            plan_gap["artifact_digest"] = hloop.hloop_planning.artifact_digest(
+                plan_gap
+            )
+            source = worktree / hloop.LOOP_DIR / "planning" / "PLAN-GAP.json"
+            hloop.write_text(
+                source, json.dumps(plan_gap, ensure_ascii=False, indent=2) + "\n"
+            )
+            completion = {
+                "event_id": "completion-coverage",
+                "artifact_digest": hloop._sha256_labelled(source.read_bytes()),
+            }
+            harvest_args = SimpleNamespace(repo=str(repo), agent_id="S001")
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "load_state", return_value=state),
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(hloop, "git", side_effect=fake_git),
+                mock.patch.object(
+                    hloop, "current_planning_identity", return_value=current
+                ),
+                mock.patch.object(
+                    hloop,
+                    "_plan_gap_input_artifacts",
+                    return_value=(impact, task_graph, coverage),
+                ),
+                mock.patch.object(
+                    hloop, "validate_decision_role_scope", return_value=[]
+                ),
+                mock.patch.object(
+                    hloop,
+                    "authenticated_plan_gap_completion",
+                    return_value=completion,
+                ) as authenticate_completion,
+                mock.patch.object(hloop, "cleanup_completed_agent_pane"),
+                mock.patch.object(hloop, "cleanup_decision_role_worktree"),
+                mock.patch.object(hloop, "revoke_active_role_report_identity"),
+                mock.patch.object(hloop, "invalidate_planning_evidence"),
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(hloop, "journal"),
+            ):
+                self.assertEqual(hloop.cmd_harvest(harvest_args), 0)
+            self.assertEqual(harvest_args.mode, "coverage")
+            authenticate_completion.assert_called_once()
+            self.assertEqual(run["status"], "completed")
+            self.assertEqual(run["completion_event_id"], "completion-coverage")
+
+            aborting_run = copy.deepcopy(run)
+            aborting_run.update(status="running", gate_status="running")
+            aborting_state = {**state, "plan_gap_scout_run": aborting_run}
+            with (
+                mock.patch.object(hloop, "repo_root", return_value=repo),
+                mock.patch.object(hloop, "load_state", return_value=aborting_state),
+                mock.patch.object(hloop, "cleanup_completed_agent_pane"),
+                mock.patch.object(hloop, "cleanup_agent_worktree_for_lifecycle"),
+                mock.patch.object(hloop, "revoke_active_role_report_identity"),
+                mock.patch.object(hloop, "supersede_pending_manager_messages"),
+                mock.patch.object(hloop, "save_state"),
+                mock.patch.object(hloop, "journal"),
+            ):
+                hloop.cmd_agent_abort(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        agent_id="S001",
+                        reason="operator abort",
+                        keep_worktree=True,
+                        force_cleanup=False,
+                    )
+                )
+            self.assertEqual(aborting_run["status"], "aborted")
+            self.assertEqual(aborting_run["gate_status"], "aborted")
+
+    def test_scout_modes_are_mutually_exclusive_in_both_directions(self) -> None:
+        decision_running = {
+            "specification_scout_run": {
+                "status": "running",
+                "gate_status": "running",
+            }
+        }
+        coverage_running = {
+            "plan_gap_scout_run": {
+                "status": "running",
+                "gate_status": "running",
+            }
+        }
+        with mock.patch.object(
+            hloop, "preflight_loop", return_value=decision_running
+        ), self.assertRaisesRegex(hloop.HLoopError, "decision-mode.*already running"):
+            hloop.cmd_plan_gap_scout_start(SimpleNamespace(repo="."))
+
+        with mock.patch.object(
+            hloop, "preflight_loop", return_value=coverage_running
+        ), self.assertRaisesRegex(hloop.HLoopError, "coverage-mode.*already running"):
+            hloop.cmd_specification_scout_start(
+                SimpleNamespace(repo=".", mode="decision", force=True)
+            )
 
     def test_queued_revision_two_task_is_blocked_before_start(self) -> None:
         legacy = self.task_record("a" * 40)
