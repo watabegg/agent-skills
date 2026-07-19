@@ -23,6 +23,7 @@ from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 
+from . import config as hloop_config
 from . import release_scope as hloop_release_scope
 from .review import (
     CRITICAL_SEVERITIES,
@@ -64,6 +65,7 @@ _REVIEW_EXECUTION_ID_RE = re.compile(r"^R[0-9]{3}$")
 MANUAL_FINAL_EXECUTION_POLICIES = frozenset(
     {"independent", "reuse_epoch_reviewer"}
 )
+FINAL_PROCESS_KINDS = frozenset({"coordinator", "discovery", "verifier"})
 
 
 class CertificationModelError(ValueError):
@@ -165,6 +167,212 @@ def canonical_digest(value: Any) -> str:
 
 def _coerce_int(value: Any, field_name: str, *, default: int) -> int:
     return default if value is None else _non_negative_int(value, field_name)
+
+
+def _canonical_agent_identity(
+    value: Mapping[str, Any] | None,
+    *,
+    requested: Mapping[str, Any],
+    field_name: str,
+) -> dict[str, Any]:
+    if not value:
+        return hloop_config.project_agent_identity(requested).as_dict()
+    record = _record(value, field_name)
+    if set(record) != {
+        "requested",
+        "observed",
+        "attested",
+        "status",
+        "verified",
+        "issues",
+    }:
+        raise CertificationModelError(f"{field_name} fields are not canonical")
+    try:
+        projected = hloop_config.project_agent_identity(
+            requested,
+            observed=_record(record["observed"], f"{field_name}.observed"),
+            attested=_record(record["attested"], f"{field_name}.attested"),
+        ).as_dict()
+    except hloop_config.ConfigValidationError as exc:
+        raise CertificationModelError(f"{field_name} is invalid: {exc}") from exc
+    if dict(record) != projected:
+        raise CertificationModelError(
+            f"{field_name} does not match requested/observed/attested evidence"
+        )
+    return projected
+
+
+@dataclass(frozen=True, slots=True)
+class FinalReviewProcessPlan:
+    """One manual-final coordinator, discovery lane, or verifier identity."""
+
+    process_id: str
+    process_kind: str
+    agent_label: str
+    provider: str
+    model: str
+    effort: str
+    config_sources: Mapping[str, str]
+    config_provenance: Mapping[str, Any]
+    agent_identity: Mapping[str, Any] = field(default_factory=dict)
+    attestation_required: bool = True
+
+    def __post_init__(self) -> None:
+        for field_name in ("process_id", "agent_label", "model", "effort"):
+            object.__setattr__(
+                self,
+                field_name,
+                _required_text(getattr(self, field_name), field_name),
+            )
+        if self.process_kind not in FINAL_PROCESS_KINDS:
+            raise CertificationModelError(
+                f"unsupported final review process kind: {self.process_kind}"
+            )
+        if self.provider not in SUPPORTED_PROVIDERS:
+            raise CertificationModelError(
+                f"unsupported final review process provider: {self.provider}"
+            )
+        if not isinstance(self.attestation_required, bool):
+            raise CertificationModelError("attestation_required must be boolean")
+        if not self.attestation_required:
+            raise CertificationModelError(
+                "manual final process plans require identity attestation"
+            )
+        expected_config_fields = {"provider", "model", "effort"}
+        sources = _record(self.config_sources, "final review process config_sources")
+        provenance = _record(
+            self.config_provenance, "final review process config_provenance"
+        )
+        if set(sources) != expected_config_fields or set(provenance) != expected_config_fields:
+            raise CertificationModelError(
+                "manual final process config sources and provenance must cover "
+                "provider/model/effort exactly"
+            )
+        canonical_sources: dict[str, str] = {}
+        canonical_provenance: dict[str, list[dict[str, Any]]] = {}
+        for field_name in sorted(expected_config_fields):
+            canonical_sources[field_name] = _required_text(
+                sources[field_name], f"config_sources.{field_name}"
+            )
+            history = provenance[field_name]
+            if not isinstance(history, Sequence) or isinstance(history, (str, bytes)):
+                raise CertificationModelError(
+                    f"config_provenance.{field_name} must be an array"
+                )
+            canonical_provenance[field_name] = [
+                json.loads(canonical_json(_record(item, f"config_provenance.{field_name}")))
+                for item in history
+            ]
+        object.__setattr__(self, "config_sources", canonical_sources)
+        object.__setattr__(self, "config_provenance", canonical_provenance)
+        requested = {
+            "provider": self.provider,
+            "model": self.model,
+            "effort": self.effort,
+        }
+        identity = _canonical_agent_identity(
+            self.agent_identity,
+            requested=requested,
+            field_name="final review process agent_identity",
+        )
+        if identity["requested"] != requested:
+            raise CertificationModelError(
+                "final review process identity does not match planned provider/model/effort"
+            )
+        if identity["status"] != "requested-only" or identity["verified"]:
+            raise CertificationModelError(
+                "final review process plans must preserve requested-only identity"
+            )
+        object.__setattr__(self, "agent_identity", identity)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "process_id": self.process_id,
+            "process_kind": self.process_kind,
+            "agent_label": self.agent_label,
+            "provider": self.provider,
+            "model": self.model,
+            "effort": self.effort,
+            "config_sources": dict(self.config_sources),
+            "config_provenance": dict(self.config_provenance),
+            "agent_identity": dict(self.agent_identity),
+            "attestation_required": self.attestation_required,
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "FinalReviewProcessPlan":
+        if isinstance(value, cls):
+            return value
+        record = _record(value, "final review process plan")
+        expected = {
+            "process_id",
+            "process_kind",
+            "agent_label",
+            "provider",
+            "model",
+            "effort",
+            "config_sources",
+            "config_provenance",
+            "agent_identity",
+            "attestation_required",
+        }
+        if set(record) != expected:
+            raise CertificationModelError(
+                "final review process plan fields are not canonical"
+            )
+        return cls(**{key: record[key] for key in expected})
+
+
+@dataclass(frozen=True, slots=True)
+class FinalReviewProcessIdentity:
+    """Observed and provider-attested identity for one manual-final process."""
+
+    process_id: str
+    agent_identity: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "process_id", _required_text(self.process_id, "process_id")
+        )
+        record = _record(self.agent_identity, "final review process identity")
+        requested = _record(
+            record.get("requested"), "final review process identity.requested"
+        )
+        object.__setattr__(
+            self,
+            "agent_identity",
+            _canonical_agent_identity(
+                record,
+                requested=requested,
+                field_name="final review process identity",
+            ),
+        )
+
+    @property
+    def verified(self) -> bool:
+        return bool(self.agent_identity.get("verified")) and str(
+            self.agent_identity.get("status") or ""
+        ) == "attested"
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "process_id": self.process_id,
+            "agent_identity": dict(self.agent_identity),
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "FinalReviewProcessIdentity":
+        if isinstance(value, cls):
+            return value
+        record = _record(value, "final review process identity")
+        if set(record) != {"process_id", "agent_identity"}:
+            raise CertificationModelError(
+                "final review process identity fields are not canonical"
+            )
+        return cls(
+            process_id=record["process_id"],
+            agent_identity=record["agent_identity"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +726,10 @@ class CertificationPlan:
     target_ref: str = ""
     scope_source: tuple[str, ...] = ()
     execution: ManualFinalExecutionProvenance | None = None
+    execution_kind: str = ""
+    protocol_key: str = ""
+    process_plan: tuple[FinalReviewProcessPlan, ...] = ()
+    final_coordinator_config: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -532,6 +744,18 @@ class CertificationPlan:
         if self.protocol != MANUAL_FINAL_PROTOCOL:
             raise CertificationModelError(
                 f"manual final protocol must be {MANUAL_FINAL_PROTOCOL}"
+            )
+        if bool(self.execution_kind) != bool(self.protocol_key):
+            raise CertificationModelError(
+                "manual final plan requires both execution_kind and protocol_key"
+            )
+        if self.execution_kind and (
+            self.execution_kind != "manual-final"
+            or self.protocol_key != "review.manual_final_protocol"
+        ):
+            raise CertificationModelError(
+                "manual final plan protocol identity must use "
+                "manual-final/review.manual_final_protocol"
             )
         object.__setattr__(
             self,
@@ -583,6 +807,71 @@ class CertificationPlan:
                     "manual-final execution target_sha must match certification target_sha"
                 )
             object.__setattr__(self, "execution", execution)
+        processes = tuple(
+            FinalReviewProcessPlan.from_record(item) for item in self.process_plan
+        )
+        if len({item.process_id for item in processes}) != len(processes):
+            raise CertificationModelError(
+                "manual final process_plan must not contain duplicate process_id values"
+            )
+        if len({item.agent_label for item in processes}) != len(processes):
+            raise CertificationModelError(
+                "manual final process_plan must not contain duplicate agent_label values"
+            )
+        object.__setattr__(self, "process_plan", processes)
+        coordinator_config = _record(
+            self.final_coordinator_config, "final_coordinator_config"
+        )
+        if coordinator_config:
+            expected_fields = {"provider", "model", "effort", "sources", "provenance"}
+            if set(coordinator_config) != expected_fields:
+                raise CertificationModelError(
+                    "final_coordinator_config fields are not canonical"
+                )
+            for field_name in ("provider", "model", "effort"):
+                _required_text(
+                    coordinator_config[field_name],
+                    f"final_coordinator_config.{field_name}",
+                )
+            if not isinstance(coordinator_config["sources"], Mapping) or not isinstance(
+                coordinator_config["provenance"], Mapping
+            ):
+                raise CertificationModelError(
+                    "final_coordinator_config sources and provenance must be objects"
+                )
+            coordinator_config = json.loads(canonical_json(coordinator_config))
+        object.__setattr__(self, "final_coordinator_config", coordinator_config)
+        if processes:
+            lane_processes = {
+                (item.provider, item.agent_label)
+                for item in processes
+                if item.process_kind == "discovery"
+            }
+            expected_lanes = {
+                (item.provider, item.agent_label) for item in self.lane_plan
+            }
+            if lane_processes != expected_lanes:
+                raise CertificationModelError(
+                    "manual final discovery process identities must exactly match lane_plan"
+                )
+        if coordinator_config:
+            coordinators = tuple(
+                item
+                for item in processes
+                if item.process_id == "manual-final-coordinator"
+            )
+            expected_coordinator = {
+                key: coordinator_config[key]
+                for key in ("provider", "model", "effort")
+            }
+            if len(coordinators) != 1 or {
+                "provider": coordinators[0].provider,
+                "model": coordinators[0].model,
+                "effort": coordinators[0].effort,
+            } != expected_coordinator:
+                raise CertificationModelError(
+                    "manual-final coordinator process does not match final_coordinator_config"
+                )
 
     def identity_record(self) -> dict[str, Any]:
         """Return exactly the fields covered by the plan digest."""
@@ -601,8 +890,15 @@ class CertificationPlan:
             "lane_plan": [lane.to_record() for lane in self.lane_plan],
             "verification_policy": self.verification_policy.to_record(),
         }
+        if self.execution_kind:
+            record["execution_kind"] = self.execution_kind
+            record["protocol_key"] = self.protocol_key
         if self.execution is not None:
             record["execution"] = self.execution.to_record()
+        if self.process_plan:
+            record["process_plan"] = [item.to_record() for item in self.process_plan]
+        if self.final_coordinator_config:
+            record["final_coordinator_config"] = dict(self.final_coordinator_config)
         return record
 
     @property
@@ -660,6 +956,13 @@ class CertificationPlan:
             source_snapshot_revision=record["source_snapshot_revision"],
             source_digest=record["source_digest"],
             protocol=record["protocol"],
+            execution_kind=record.get("execution_kind", ""),
+            protocol_key=record.get("protocol_key", ""),
+            process_plan=tuple(
+                FinalReviewProcessPlan.from_record(item)
+                for item in _items(record.get("process_plan", ()), "process_plan")
+            ),
+            final_coordinator_config=record.get("final_coordinator_config", {}),
             lane_plan=tuple(
                 _coerce_lane(item, index)
                 for index, item in enumerate(_items(record["lane_plan"], "lane_plan"))
@@ -719,6 +1022,10 @@ class FinalReviewManifest:
     verified_actionable_findings: int
     patch_verdict: str = "passed"
     execution: ManualFinalExecutionProvenance | None = None
+    execution_kind: str = ""
+    protocol_key: str = ""
+    process_identities: tuple[FinalReviewProcessIdentity, ...] = ()
+    final_coordinator_config: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -734,6 +1041,17 @@ class FinalReviewManifest:
         if self.protocol != MANUAL_FINAL_PROTOCOL:
             raise CertificationModelError(
                 f"manual final protocol must be {MANUAL_FINAL_PROTOCOL}"
+            )
+        if bool(self.execution_kind) != bool(self.protocol_key):
+            raise CertificationModelError(
+                "manual final manifest requires both execution_kind and protocol_key"
+            )
+        if self.execution_kind and (
+            self.execution_kind != "manual-final"
+            or self.protocol_key != "review.manual_final_protocol"
+        ):
+            raise CertificationModelError(
+                "manual final manifest protocol identity is not canonical"
             )
         object.__setattr__(
             self,
@@ -793,6 +1111,33 @@ class FinalReviewManifest:
                     "manual-final execution target_sha must match manifest target_sha"
                 )
             object.__setattr__(self, "execution", execution)
+        process_identities = tuple(
+            sorted(
+                (
+                    FinalReviewProcessIdentity.from_record(item)
+                    for item in self.process_identities
+                ),
+                key=lambda item: item.process_id,
+            )
+        )
+        if len({item.process_id for item in process_identities}) != len(
+            process_identities
+        ):
+            raise CertificationModelError(
+                "manual final process_identities must not contain duplicate process_id values"
+            )
+        object.__setattr__(self, "process_identities", process_identities)
+        coordinator_config = _record(
+            self.final_coordinator_config, "final_coordinator_config"
+        )
+        if coordinator_config:
+            expected_fields = {"provider", "model", "effort", "sources", "provenance"}
+            if set(coordinator_config) != expected_fields:
+                raise CertificationModelError(
+                    "final_coordinator_config fields are not canonical"
+                )
+            coordinator_config = json.loads(canonical_json(coordinator_config))
+        object.__setattr__(self, "final_coordinator_config", coordinator_config)
 
     @classmethod
     def from_review_manifest(
@@ -812,11 +1157,15 @@ class FinalReviewManifest:
             source_snapshot_revision=plan.source_snapshot_revision,
             source_digest=plan.source_digest,
             protocol=plan.protocol,
+            execution_kind=plan.execution_kind,
+            protocol_key=plan.protocol_key,
             review_manifest=review_manifest,
             manifest_complete=review_manifest.completeness.complete,
             verified_actionable_findings=verified_actionable_findings,
             patch_verdict=patch_verdict,
             execution=plan.execution,
+            process_identities=(),
+            final_coordinator_config=plan.final_coordinator_config,
         )
 
     @property
@@ -896,6 +1245,15 @@ class FinalReviewManifest:
         )
         if self.execution is not None:
             record["execution"] = self.execution.to_record()
+        if self.execution_kind:
+            record["execution_kind"] = self.execution_kind
+            record["protocol_key"] = self.protocol_key
+        if self.process_identities or self.final_coordinator_config:
+            record["process_identities"] = [
+                item.to_record() for item in self.process_identities
+            ]
+        if self.final_coordinator_config:
+            record["final_coordinator_config"] = dict(self.final_coordinator_config)
         return record
 
     @classmethod
@@ -929,6 +1287,15 @@ class FinalReviewManifest:
             source_snapshot_revision=record["source_snapshot_revision"],
             source_digest=record["source_digest"],
             protocol=record["protocol"],
+            execution_kind=record.get("execution_kind", ""),
+            protocol_key=record.get("protocol_key", ""),
+            process_identities=tuple(
+                FinalReviewProcessIdentity.from_record(item)
+                for item in _items(
+                    record.get("process_identities", ()), "process_identities"
+                )
+            ),
+            final_coordinator_config=record.get("final_coordinator_config", {}),
             review_manifest=ReviewManifest.from_record(review_record),
             manifest_complete=record["manifest_complete"],
             verified_actionable_findings=record["verified_actionable_findings"],
@@ -1003,12 +1370,37 @@ def _manifest_identity_issues(
         ),
         "source-digest": (plan.source_digest, manifest.source_digest),
         "protocol": (plan.protocol, manifest.protocol),
+        "execution-kind": (plan.execution_kind, manifest.execution_kind),
+        "protocol-key": (plan.protocol_key, manifest.protocol_key),
+        "final-coordinator-config": (
+            dict(plan.final_coordinator_config),
+            dict(manifest.final_coordinator_config),
+        ),
     }
     for label, (expected_value, actual_value) in expected.items():
         if expected_value != actual_value:
             issues.append(f"identity-mismatch:{label}")
     if current_target_sha is not None and manifest.target_sha != current_target_sha:
         issues.append("target-sha-drift")
+
+    if plan.process_plan:
+        planned = {item.process_id: item for item in plan.process_plan}
+        evidence = {item.process_id: item for item in manifest.process_identities}
+        missing = sorted(set(planned) - set(evidence))
+        unknown = sorted(set(evidence) - set(planned))
+        issues.extend(f"process-identity-missing:{item}" for item in missing)
+        issues.extend(f"process-identity-unplanned:{item}" for item in unknown)
+        for process_id in sorted(set(planned).intersection(evidence)):
+            process = planned[process_id]
+            identity = evidence[process_id]
+            if identity.agent_identity.get("requested") != process.agent_identity.get(
+                "requested"
+            ):
+                issues.append(f"process-identity-requested-mismatch:{process_id}")
+            if process.attestation_required and not identity.verified:
+                issues.append(f"process-identity-attestation-invalid:{process_id}")
+    elif manifest.process_identities:
+        issues.append("process-identity-unplanned")
 
     if plan.execution is None and manifest.execution is None:
         if not allow_legacy:

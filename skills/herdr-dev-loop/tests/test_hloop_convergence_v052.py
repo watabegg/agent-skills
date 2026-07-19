@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import importlib.machinery
 import importlib.util
 import io
@@ -15,7 +16,12 @@ from unittest import mock
 SCRIPT = Path(__file__).parents[1] / "scripts" / "hloop"
 sys.path.insert(0, str(SCRIPT.parent))
 from hloop_lib import review as hloop_review
-from hloop_lib.certification import CertificationPlan, FinalReviewManifest
+from hloop_lib.certification import (
+    CertificationPlan,
+    FinalReviewManifest,
+    FinalReviewProcessIdentity,
+)
+from hloop_lib.config import project_agent_identity
 from hloop_lib.review import FindingCandidate
 
 
@@ -23,6 +29,59 @@ loader = importlib.machinery.SourceFileLoader("hloop_convergence_v052_runtime", 
 spec = importlib.util.spec_from_loader(loader.name, loader)
 hloop = importlib.util.module_from_spec(spec)
 loader.exec_module(hloop)
+
+
+FIXTURE_OBSERVED_FINAL_IDENTITIES = {
+    "manual-final-coordinator": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "max",
+    },
+    "review-process": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+    },
+}
+FIXTURE_ATTESTED_FINAL_IDENTITIES = {
+    "manual-final-coordinator": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "max",
+    },
+    "review-process": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+    },
+}
+
+
+def with_fixture_process_identities(
+    plan: CertificationPlan, manifest: FinalReviewManifest
+) -> FinalReviewManifest:
+    identities = []
+    for process in plan.process_plan:
+        fixture_key = (
+            "manual-final-coordinator"
+            if process.process_id == "manual-final-coordinator"
+            else "review-process"
+        )
+        identities.append(
+            FinalReviewProcessIdentity(
+                process_id=process.process_id,
+                agent_identity=project_agent_identity(
+                    {
+                        "provider": process.provider,
+                        "model": process.model,
+                        "effort": process.effort,
+                    },
+                    observed=dict(FIXTURE_OBSERVED_FINAL_IDENTITIES[fixture_key]),
+                    attested=dict(FIXTURE_ATTESTED_FINAL_IDENTITIES[fixture_key]),
+                ).as_dict(),
+            )
+        )
+    return replace(manifest, process_identities=tuple(identities))
 
 
 class HLoopConvergenceV052Tests(unittest.TestCase):
@@ -238,6 +297,98 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
                     [len(provider.lanes) for provider in plans[0].provider_plans],
                     [lane_count] * len(plans[0].providers),
                 )
+
+    def test_manual_final_process_plan_consumes_complete_component_configs(self):
+        state = self.state()
+        resolution = hloop.hloop_config.resolve_config(
+            hloop.BUILT_IN_CONFIG_DEFAULTS,
+            target_dir=self.repo,
+            loop_snapshot=state["resolved_config"],
+            start_override={
+                "final_coordinator": {
+                    "provider": "claude",
+                    "model": "final-component-model",
+                    "effort": "max",
+                },
+                "reviewer": {
+                    "coordinator": {
+                        "provider": "codex",
+                        "model": "coordinator-component-model",
+                        "effort": "high",
+                    },
+                    "lane": {
+                        "provider": "codex",
+                        "model": "lane-component-model",
+                        "effort": "xhigh",
+                    },
+                    "verifier": {
+                        "provider": "claude",
+                        "model": "verifier-component-model",
+                        "effort": "max",
+                    },
+                },
+            },
+        )
+        state["resolved_config"] = resolution.as_dict()
+        state["config_resolution_provenance"] = resolution.explain_provenance()
+        target = state["integration_head_sha"]
+
+        plan, group = hloop._final_certification_plan(
+            self.repo,
+            state,
+            target,
+            certification_id="C-component-config",
+            base_sha=target,
+            mode="swarm",
+            probe_count=4,
+        )
+
+        self.assertEqual(group.provider_plans[0].model, "lane-component-model")
+        by_kind = {}
+        for process in plan.process_plan:
+            by_kind.setdefault(process.process_kind, []).append(process)
+            self.assertEqual(
+                set(process.config_sources), {"provider", "model", "effort"}
+            )
+            self.assertEqual(
+                set(process.config_provenance), {"provider", "model", "effort"}
+            )
+        final = next(
+            item
+            for item in by_kind["coordinator"]
+            if item.process_id == "manual-final-coordinator"
+        )
+        provider_coordinator = next(
+            item
+            for item in by_kind["coordinator"]
+            if item.process_id != "manual-final-coordinator"
+        )
+        self.assertEqual(
+            (final.provider, final.model, final.effort),
+            ("claude", "final-component-model", "max"),
+        )
+        self.assertEqual(
+            (
+                provider_coordinator.provider,
+                provider_coordinator.model,
+                provider_coordinator.effort,
+            ),
+            ("codex", "coordinator-component-model", "high"),
+        )
+        self.assertEqual(
+            {
+                (item.provider, item.model, item.effort)
+                for item in by_kind["discovery"]
+            },
+            {("codex", "lane-component-model", "xhigh")},
+        )
+        self.assertEqual(
+            {
+                (item.provider, item.model, item.effort)
+                for item in by_kind["verifier"]
+            },
+            {("claude", "verifier-component-model", "max")},
+        )
 
     def _make_ready_state(self) -> None:
         state = self.state()
@@ -477,11 +628,14 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             verification_plan=verification_plan,
             verifications=verifications,
         )
-        evidence = FinalReviewManifest.from_review_manifest(
+        evidence = with_fixture_process_identities(
             plan,
-            review_manifest,
-            verified_actionable_findings=len(
-                review_manifest.verified_actionable_fingerprints
+            FinalReviewManifest.from_review_manifest(
+                plan,
+                review_manifest,
+                verified_actionable_findings=len(
+                    review_manifest.verified_actionable_fingerprints
+                ),
             ),
         )
         manifest_path = loop / "reviews" / "final" / "MANIFEST.json"
@@ -1169,7 +1323,9 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             verification_plan=hloop_review.plan_verification(group, ()),
             verifications=(),
         )
-        manifest = FinalReviewManifest.from_review_manifest(plan, review)
+        manifest = with_fixture_process_identities(
+            plan, FinalReviewManifest.from_review_manifest(plan, review)
+        )
         manifest_path.write_text(json.dumps(manifest.to_record(), indent=2) + "\n", encoding="utf-8")
         self.write_complete_final_report(plan, manifest)
         code, out, err = self.run_cli("final-review", "record", "--json")
@@ -1205,7 +1361,9 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             verification_plan=hloop_review.plan_verification(group, ()),
             verifications=(),
         )
-        record = FinalReviewManifest.from_review_manifest(plan, review).to_record()
+        record = with_fixture_process_identities(
+            plan, FinalReviewManifest.from_review_manifest(plan, review)
+        ).to_record()
         record.pop("execution")
         manifest_path.write_text(
             json.dumps(record, indent=2) + "\n", encoding="utf-8"

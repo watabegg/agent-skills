@@ -18,8 +18,12 @@
     "scope_revision",
     "source_snapshot_revision",
     "source_digest",
+    "execution_kind",
+    "protocol_key",
     "protocol",
     "execution",
+    "process_identities",
+    "final_coordinator_config",
     "manifest_complete",
     "verified_actionable_findings",
     "patch_verdict"
@@ -49,8 +53,18 @@
     "scope_revision": {"type": "integer", "minimum": 0},
     "source_snapshot_revision": {"type": "integer", "minimum": 0},
     "source_digest": {"$ref": "#/$defs/digest"},
+    "execution_kind": {"const": "manual-final"},
+    "protocol_key": {"const": "review.manual_final_protocol"},
     "protocol": {"const": "codex-review-multi-v2"},
     "execution": {"$ref": "final-review-plan.schema.json#/$defs/execution"},
+    "process_identities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/processIdentity"}
+    },
+    "final_coordinator_config": {
+      "$ref": "final-review-plan.schema.json#/$defs/coordinatorConfig"
+    },
     "manifest_complete": {"type": "boolean"},
     "verified_actionable_findings": {"type": "integer", "minimum": 0},
     "patch_verdict": {"enum": ["passed", "failed", "incomplete"]}
@@ -98,6 +112,17 @@
     "digest": {
       "type": "string",
       "pattern": "^(?:sha256:)?[0-9a-f]{64}$"
+    },
+    "processIdentity": {
+      "type": "object",
+      "required": ["process_id", "agent_identity"],
+      "properties": {
+        "process_id": {"type": "string", "minLength": 1},
+        "agent_identity": {
+          "$ref": "final-review-plan.schema.json#/$defs/agentIdentity"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

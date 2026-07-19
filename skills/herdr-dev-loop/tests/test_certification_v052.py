@@ -31,6 +31,8 @@ from hloop_lib.certification import (  # noqa: E402
     CertificationPlan,
     FinalReviewLane,
     FinalReviewManifest,
+    FinalReviewProcessIdentity,
+    FinalReviewProcessPlan,
     ManualFinalExecutionProvenance,
     VerificationPolicy,
     canonical_digest,
@@ -39,6 +41,7 @@ from hloop_lib.certification import (  # noqa: E402
     validate_plan_digest,
     validate_reopen_transition,
 )
+from hloop_lib.config import project_agent_identity  # noqa: E402
 from hloop_lib.review import (  # noqa: E402
     ExternalReviewProtocolAdapter,
     FindingCandidate,
@@ -62,6 +65,30 @@ ADAPTER = ExternalReviewProtocolAdapter(
 )
 
 
+def process_config(provider: str, model: str, effort: str) -> dict:
+    return {
+        "provider": provider,
+        "model": model,
+        "effort": effort,
+        "config_sources": {
+            "provider": "fixture-config",
+            "model": "fixture-config",
+            "effort": "fixture-config",
+        },
+        "config_provenance": {
+            "provider": [
+                {"source": "fixture-config", "input_key": "provider", "value": provider}
+            ],
+            "model": [
+                {"source": "fixture-config", "input_key": "model", "value": model}
+            ],
+            "effort": [
+                {"source": "fixture-config", "input_key": "effort", "value": effort}
+            ],
+        },
+    }
+
+
 def review_plan(*, mode: str = "single", max_verifications: int = 64, verifier_pool_size: int = 2):
     return plan_review_group(
         mode,
@@ -72,6 +99,46 @@ def review_plan(*, mode: str = "single", max_verifications: int = 64, verifier_p
 
 
 def certification_plan(group, *, target_sha: str = HEAD) -> CertificationPlan:
+    processes = [
+        FinalReviewProcessPlan(
+            process_id="manual-final-coordinator",
+            process_kind="coordinator",
+            agent_label="manual-final-coordinator",
+            **process_config("codex", "gpt-5.6-sol", "max"),
+        )
+    ]
+    for provider_plan in group.provider_plans:
+        if provider_plan.role == "coordinator":
+            processes.append(
+                FinalReviewProcessPlan(
+                    process_id=f"coordinator-{provider_plan.provider}",
+                    process_kind="coordinator",
+                    agent_label=provider_plan.coordinator_label,
+                    **process_config(
+                        provider_plan.provider, provider_plan.model, "xhigh"
+                    ),
+                )
+            )
+        processes.extend(
+            FinalReviewProcessPlan(
+                process_id=f"lane-{lane.provider}-{lane.lane_id}",
+                process_kind="discovery",
+                agent_label=lane.agent_label,
+                **process_config(lane.provider, provider_plan.model, "xhigh"),
+            )
+            for lane in provider_plan.lanes
+        )
+        processes.extend(
+            FinalReviewProcessPlan(
+                process_id=f"verifier-{provider_plan.provider}-{index}",
+                process_kind="verifier",
+                agent_label=label,
+                **process_config(
+                    provider_plan.provider, provider_plan.model, "xhigh"
+                ),
+            )
+            for index, label in enumerate(provider_plan.verifier_agents, start=1)
+        )
     return CertificationPlan(
         certification_id="C001",
         base_sha=BASE,
@@ -82,7 +149,25 @@ def certification_plan(group, *, target_sha: str = HEAD) -> CertificationPlan:
         scope_revision=1,
         source_snapshot_revision=1,
         source_digest=SOURCE_DIGEST,
+        execution_kind="manual-final",
+        protocol_key="review.manual_final_protocol",
         protocol=MANUAL_FINAL_PROTOCOL,
+        process_plan=tuple(processes),
+        final_coordinator_config={
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "effort": "max",
+            "sources": {
+                "provider": "config-defaults",
+                "model": "config-defaults",
+                "effort": "config-defaults",
+            },
+            "provenance": {
+                "provider": [],
+                "model": [],
+                "effort": [],
+            },
+        },
         lane_plan=tuple(
             FinalReviewLane(
                 provider=lane.provider,
@@ -140,12 +225,36 @@ def final_manifest(
         verification_plan=plan_verification(group, findings),
         verifications=tuple(verifications),
     )
-    return FinalReviewManifest.from_review_manifest(
+    manifest = FinalReviewManifest.from_review_manifest(
         plan,
         review,
         verified_actionable_findings=verified_actionable_findings,
         patch_verdict=patch_verdict,
     )
+    identities = tuple(
+        FinalReviewProcessIdentity(
+            process_id=process.process_id,
+            agent_identity=project_agent_identity(
+                {
+                    "provider": process.provider,
+                    "model": process.model,
+                    "effort": process.effort,
+                },
+                observed={
+                    "provider": process.provider,
+                    "model": process.model,
+                    "effort": process.effort,
+                },
+                attested={
+                    "provider": process.provider,
+                    "model": process.model,
+                    "effort": process.effort,
+                },
+            ).as_dict(),
+        )
+        for process in plan.process_plan
+    )
+    return replace(manifest, process_identities=identities)
 
 
 def candidate(
@@ -208,6 +317,14 @@ class PlanIdentityTests(unittest.TestCase):
             replace(plan, scope_revision=2),
             replace(plan, source_snapshot_revision=2),
             replace(plan, source_digest="b" * 64),
+            replace(plan, execution_kind="", protocol_key=""),
+            replace(
+                plan,
+                process_plan=(
+                    replace(plan.process_plan[0], agent_label="another-coordinator"),
+                    *plan.process_plan[1:],
+                ),
+            ),
             replace(plan, lane_plan=(replace(plan.lane_plan[0], purpose="different"),)),
             replace(
                 plan,
@@ -261,6 +378,82 @@ class FinalManifestCompletenessTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.status, "passed")
         self.assertEqual(result.completeness.issues, ())
+
+    def test_process_identity_evidence_fails_closed(self):
+        group = review_plan()
+        plan = certification_plan(group)
+        manifest = final_manifest(plan, group)
+
+        missing = validate_final_review(
+            plan,
+            replace(
+                manifest,
+                process_identities=tuple(
+                    item
+                    for item in manifest.process_identities
+                    if item.process_id != "manual-final-coordinator"
+                ),
+            ),
+            current_target_sha=HEAD,
+        )
+        self.assertIn(
+            "process-identity-missing:manual-final-coordinator",
+            missing.issues,
+        )
+
+        first = next(
+            item
+            for item in manifest.process_identities
+            if item.process_id == "manual-final-coordinator"
+        )
+        remaining = tuple(
+            item
+            for item in manifest.process_identities
+            if item.process_id != "manual-final-coordinator"
+        )
+        mismatch_identity = project_agent_identity(
+            {**first.agent_identity["requested"], "model": "other-model"},
+            observed={**first.agent_identity["requested"], "model": "other-model"},
+            attested={**first.agent_identity["requested"], "model": "other-model"},
+        ).as_dict()
+        mismatched = validate_final_review(
+            plan,
+            replace(
+                manifest,
+                process_identities=(
+                    replace(first, agent_identity=mismatch_identity),
+                    *remaining,
+                ),
+            ),
+            current_target_sha=HEAD,
+        )
+        self.assertIn(
+            "process-identity-requested-mismatch:manual-final-coordinator",
+            mismatched.issues,
+        )
+
+        unattested_identity = project_agent_identity(
+            first.agent_identity["requested"],
+            observed={
+                **first.agent_identity["requested"],
+                "model": "other-model",
+            },
+        ).as_dict()
+        unattested = validate_final_review(
+            plan,
+            replace(
+                manifest,
+                process_identities=(
+                    replace(first, agent_identity=unattested_identity),
+                    *remaining,
+                ),
+            ),
+            current_target_sha=HEAD,
+        )
+        self.assertIn(
+            "process-identity-attestation-invalid:manual-final-coordinator",
+            unattested.issues,
+        )
 
     def test_missing_failed_and_timeout_lanes_are_incomplete(self):
         group = review_plan()

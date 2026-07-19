@@ -32,7 +32,12 @@ sys.path.insert(0, str(SCRIPT.parent))
 from hloop_lib.broker import spool_client_event  # noqa: E402
 from hloop_lib.events import prepare_client_event, utc_now  # noqa: E402
 from hloop_lib import review as hloop_review  # noqa: E402
-from hloop_lib.certification import CertificationPlan, FinalReviewManifest  # noqa: E402
+from hloop_lib.certification import (  # noqa: E402
+    CertificationPlan,
+    FinalReviewManifest,
+    FinalReviewProcessIdentity,
+)
+from hloop_lib.config import project_agent_identity  # noqa: E402
 from hloop_lib.lifecycle import (  # noqa: E402
     AttemptIdentity,
     MERGE_ACTIVE,
@@ -57,14 +62,70 @@ if spec is None:
 hloop = importlib.util.module_from_spec(spec)
 loader.exec_module(hloop)
 
-v053_e2e = __import__(
-    "skills.herdr-dev-loop.tests.test_hloop_v053_e2e",
-    fromlist=["run_scenario"],
-)
-
-
 class ScenarioFailure(RuntimeError):
     """Raised when a synthetic release invariant is not observed."""
+
+
+FIXTURE_OBSERVED_FINAL_IDENTITIES = {
+    "manual-final-coordinator": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "max",
+    },
+    "review-process": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+    },
+}
+FIXTURE_ATTESTED_FINAL_IDENTITIES = {
+    "manual-final-coordinator": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "max",
+    },
+    "review-process": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+    },
+}
+
+
+def _v053_e2e_module():
+    """Load v0.5.3-only scenarios lazily for copied 0.5.2 fixtures."""
+
+    return __import__(
+        "skills.herdr-dev-loop.tests.test_hloop_v053_e2e",
+        fromlist=["run_scenario"],
+    )
+
+
+def _with_fixture_process_identities(
+    plan: CertificationPlan, manifest: FinalReviewManifest
+) -> FinalReviewManifest:
+    identities = []
+    for process in plan.process_plan:
+        fixture_key = (
+            "manual-final-coordinator"
+            if process.process_id == "manual-final-coordinator"
+            else "review-process"
+        )
+        identities.append(
+            FinalReviewProcessIdentity(
+                process_id=process.process_id,
+                agent_identity=project_agent_identity(
+                    {
+                        "provider": process.provider,
+                        "model": process.model,
+                        "effort": process.effort,
+                    },
+                    observed=dict(FIXTURE_OBSERVED_FINAL_IDENTITIES[fixture_key]),
+                    attested=dict(FIXTURE_ATTESTED_FINAL_IDENTITIES[fixture_key]),
+                ).as_dict(),
+            )
+        )
+    return replace(manifest, process_identities=tuple(identities))
 
 
 def now() -> str:
@@ -1903,15 +1964,18 @@ def _write_final_manifest(
         verification_plan=verification_plan,
         verifications=verifications,
     )
-    manifest = FinalReviewManifest.from_review_manifest(
+    manifest = _with_fixture_process_identities(
         plan,
-        review_manifest,
-        verified_actionable_findings=len(
-            FinalReviewManifest.from_review_manifest(
-                plan, review_manifest, verified_actionable_findings=0
-            ).recomputed_verified_actionable_fingerprints
+        FinalReviewManifest.from_review_manifest(
+            plan,
+            review_manifest,
+            verified_actionable_findings=len(
+                FinalReviewManifest.from_review_manifest(
+                    plan, review_manifest, verified_actionable_findings=0
+                ).recomputed_verified_actionable_fingerprints
+            ),
+            patch_verdict=patch_verdict,
         ),
-        patch_verdict=patch_verdict,
     )
     (loop / "reviews" / "final" / "MANIFEST.json").write_text(
         json.dumps(manifest.to_record(), ensure_ascii=False, indent=2) + "\n",
@@ -3106,15 +3170,15 @@ def scenario_finish(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 def scenario_v053_convergence(_ctx: dict[str, Any]) -> dict[str, Any]:
-    return v053_e2e.run_scenario("v053-convergence")
+    return _v053_e2e_module().run_scenario("v053-convergence")
 
 
 def scenario_v053_fail_closed_matrix(_ctx: dict[str, Any]) -> dict[str, Any]:
-    return v053_e2e.run_scenario("v053-fail-closed-matrix")
+    return _v053_e2e_module().run_scenario("v053-fail-closed-matrix")
 
 
 def scenario_v053_migration_crash_matrix(_ctx: dict[str, Any]) -> dict[str, Any]:
-    return v053_e2e.run_scenario("v053-migration-crash-matrix")
+    return _v053_e2e_module().run_scenario("v053-migration-crash-matrix")
 
 
 SCENARIOS: tuple[tuple[str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = (
@@ -3166,11 +3230,16 @@ def parse_args() -> argparse.Namespace:
 def resolved_checkout_head() -> str:
     completed = subprocess.run(
         ["git", "-C", str(SKILL_ROOT), "rev-parse", "HEAD"],
-        check=True,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if completed.returncode != 0:
+        # Targeted compatibility fixtures copy the skill without Git metadata.
+        # ``main`` already makes missing identity release-blocking for an
+        # aggregate run, while a named scenario is intentionally portable.
+        return ""
     head = completed.stdout.strip()
     if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) is None:
         raise ScenarioFailure(f"resolved checkout HEAD is not a canonical Git SHA: {head!r}")

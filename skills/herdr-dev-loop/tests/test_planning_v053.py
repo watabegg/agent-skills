@@ -64,6 +64,20 @@ def raw_digest(record: dict) -> dict:
     return record
 
 
+def bind_plan_gap_inputs(
+    plan_gap: dict, impact: dict, task_graph: dict, coverage: dict
+) -> dict:
+    plan_gap["impact_map_digest"] = impact["artifact_digest"]
+    plan_gap["task_graph_digest"] = task_graph["artifact_digest"]
+    plan_gap["coverage_digest"] = coverage["artifact_digest"]
+    plan_gap["checker"]["input_artifact_digests"] = {
+        "impact_map": impact["artifact_digest"],
+        "task_graph": task_graph["artifact_digest"],
+        "coverage": coverage["artifact_digest"],
+    }
+    return plan_gap
+
+
 def planning_bundle(
     *, second_task: bool = False
 ) -> tuple[PlanningIdentity, dict, dict, dict, dict]:
@@ -194,6 +208,20 @@ def planning_bundle(
                 "provider": "codex",
                 "model": "gpt-5.6-sol",
                 "effort": "xhigh",
+                "attempt_id": "S001-C001",
+                "head_sha": "a" * 40,
+                "planning_identity_digest": canonical_digest(common),
+                "task_contract_digest": "b" * 64,
+                "input_artifact_digests": {
+                    "impact_map": impact["artifact_digest"],
+                    "task_graph": task_graph["artifact_digest"],
+                    "coverage": coverage["artifact_digest"],
+                },
+                "config_sources": {
+                    "provider": "config-defaults",
+                    "model": "scope:tree:/repo",
+                    "effort": "loop-snapshot",
+                },
             },
             "verdict": "clean",
             "findings": [],
@@ -228,9 +256,7 @@ def physical_overlap_bundle(
     coverage["entries"][0]["surface_refs"].append("planning-runtime")
     coverage = seal_planning_artifact(coverage)
 
-    plan_gap["impact_map_digest"] = impact["artifact_digest"]
-    plan_gap["task_graph_digest"] = graph["artifact_digest"]
-    plan_gap["coverage_digest"] = coverage["artifact_digest"]
+    bind_plan_gap_inputs(plan_gap, impact, graph, coverage)
     plan_gap = seal_planning_artifact(plan_gap)
     return current, impact, graph, coverage, plan_gap
 
@@ -453,8 +479,7 @@ class PlanningContractTests(unittest.TestCase):
         graph = seal_planning_artifact(graph)
         coverage["task_graph_digest"] = graph["artifact_digest"]
         coverage = seal_planning_artifact(coverage)
-        plan_gap["task_graph_digest"] = graph["artifact_digest"]
-        plan_gap["coverage_digest"] = coverage["artifact_digest"]
+        bind_plan_gap_inputs(plan_gap, impact, graph, coverage)
         plan_gap = seal_planning_artifact(plan_gap)
 
         result = validate_planning_bundle(
@@ -507,9 +532,7 @@ class PlanningContractTests(unittest.TestCase):
         coverage["impact_map_digest"] = impact["artifact_digest"]
         coverage["task_graph_digest"] = graph["artifact_digest"]
         coverage = seal_planning_artifact(coverage)
-        plan_gap["impact_map_digest"] = impact["artifact_digest"]
-        plan_gap["task_graph_digest"] = graph["artifact_digest"]
-        plan_gap["coverage_digest"] = coverage["artifact_digest"]
+        bind_plan_gap_inputs(plan_gap, impact, graph, coverage)
         plan_gap = seal_planning_artifact(plan_gap)
 
         result = validate_dispatch_readiness(
@@ -698,7 +721,7 @@ class PlanningContractTests(unittest.TestCase):
         self.assertIn("plan-gap-not-clean", {issue.code for issue in result.issues})
         with self.assertRaises(PlanningContractError):
             invalid_checker = copy.deepcopy(plan_gap)
-            invalid_checker["checker"]["effort"] = "max"
+            invalid_checker["checker"]["role_id"] = "S999"
             seal_planning_artifact(invalid_checker)
 
 
