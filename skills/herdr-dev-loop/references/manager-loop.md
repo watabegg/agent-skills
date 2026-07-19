@@ -115,7 +115,10 @@ Role reports are typed as `ack`, `milestone`, `attention`, or `completion`.
 Require the blocking `agent ack exchange` to return an exact approval before
 material edits for long-running work. Resolve it with `agent ack resolve`; the
 default durably publishes decision and availability without calling the pane
-message API. Use `--notify-pane` only for explicit advisory/debug notification.
+message API. The role then reports its authenticated application event and
+keeps the exchange blocked; consume that event with `inbox ack` so Manager-owned
+`approval_application` records the exact applied binding. Use `--notify-pane`
+only for explicit advisory/debug notification.
 Decision, availability, authenticated role application, and optional pane
 notification are separate audit records. Treat milestone as inbox-only unless
 its state change requires intervention. Handle attention promptly. Verify a
