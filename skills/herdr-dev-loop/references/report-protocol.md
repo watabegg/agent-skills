@@ -29,23 +29,47 @@ A Decision Liaison's approved semantic ACK authorizes it to present the question
 
 ## Sending a semantic report
 
-The role submits reports through the repository-local helper. The following ACK is the minimum material-edit barrier for a Worker:
+The role submits reports through the repository-local helper. The blocking
+exchange is the standard minimum material-edit barrier for a Worker:
 
 ```bash
-$HLOOP agent report \
-  --role-id T001 --attempt-id T001-A001 \
+$HLOOP agent ack exchange T001 \
+  --attempt-id T001-A001 --run-id <run-id> \
+  --task-contract-digest <sha256> \
   --report-credential-file /private/local-only/credential.json \
   --invocation-id T001-A001-ack-0001 \
-  --type ack --stage planning \
+  --stage planning \
   --summary '契約と実装範囲を確認した' \
   --understood-goal '対象機能を契約どおり実装する' \
   --scope 'src/feature/**' \
   --acceptance '対象テストが通る' \
   --approach '既存の境界を保った最小変更' \
-  --next 'material editを開始する'
+  --next 'Manager decisionを待つ' \
+  --timeout-seconds 900 --json
 ```
 
-After sending the initial ACK, the role enters the semantic ACK barrier and must not begin material work. The Manager approves or rejects the newest authenticated ACK with `hloop agent ack resolve <role-id> --decision approve|reject|timeout --reason <text>`. Reject and timeout remain blocking; approval then requires a newer corrected ACK event. The same rule applies when a later Manager message changes goal, scope, acceptance, or public behavior. This is an integration gate: finalize, harvest, and merge reject unapproved work, but the barrier does not use OS permissions to prevent the role's first filesystem write before approval.
+`exchange` appends the authenticated ACK, releases the repository lock while
+waiting, and checks the exact run, role, attempt, contract digest, barrier
+message, ACK event, approval availability, and completion-mode probe. On exact
+approval it appends an idempotent authenticated application event and returns
+exit 0. Reject, Manager timeout, supersede, wait timeout, or any identity drift
+returns non-zero and never authorizes material work. Retrying one interrupted
+exchange reuses its invocation ID; a corrected ACK after reject or timeout uses
+a new invocation ID.
+
+The Manager resolves the newest authenticated ACK with `hloop agent ack resolve
+<role-id> --decision approve|reject|timeout --reason <text>`. Resolution durably
+records `semantic_decision`, `approval_availability`, `approval_application`,
+and `pane_notification` as separate projections. The default sends no pane
+message. `--notify-pane` is an explicit advisory/debug option whose delivery
+status cannot change decision, availability, or application state. The same
+barrier applies when a later Manager message changes goal, scope, acceptance,
+or public behavior. This is an integration gate: finalize, harvest, and merge
+still verify approved work, but the barrier is not an OS sandbox.
+
+`agent report --type ack` and `agent ack status --apply` remain compatibility
+surfaces. New role prompts use `agent ack exchange` so ACK and resume occur in
+one provider process turn without pane input.
 
 Use `hloop agent message S001 ... --contract-changing` or `hloop agent message L-DNNN ... --contract-changing` for Scout/Liaison contract changes. The common `agent ack resolve`, `agent abort`, `agent requeue`, inbox, message resolution, credential revocation, and Manager sleep paths recognize both role ID forms. Harvest and user-response cleanup remain blocked until the active barrier is approved.
 

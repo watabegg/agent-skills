@@ -111,7 +111,16 @@ When convergence is exhausted or manual final is failed/incomplete, `hloop revie
 
 ## Event-Driven Progress
 
-Role reports are typed as `ack`, `milestone`, `attention`, or `completion`. Require semantic ACK before material edits for long-running work. Treat milestone as inbox-only unless its state change requires intervention. Handle attention promptly. Verify a completion report against the committed artifact, target SHA, write scope, and validation before harvest or requirement progress changes.
+Role reports are typed as `ack`, `milestone`, `attention`, or `completion`.
+Require the blocking `agent ack exchange` to return an exact approval before
+material edits for long-running work. Resolve it with `agent ack resolve`; the
+default durably publishes decision and availability without calling the pane
+message API. Use `--notify-pane` only for explicit advisory/debug notification.
+Decision, availability, authenticated role application, and optional pane
+notification are separate audit records. Treat milestone as inbox-only unless
+its state change requires intervention. Handle attention promptly. Verify a
+completion report against the committed artifact, target SHA, write scope, and
+validation before harvest or requirement progress changes.
 
 Use `hloop inbox list` and `hloop manager next` before reading panes. When no event needs action, use `hloop manager sleep --ttl-seconds <n>` to register a run-bound wake lease. Consume a handled wake with `hloop inbox ack <event-id>`. Delivery is at least once; event ID and lease generation are the idempotency boundary.
 
@@ -171,7 +180,17 @@ hloop reviewer message R001 --file .ai/herdr-dev-loop/loops/<namespace>/inbox/ma
 hloop advisor message A001 --participant-id P1 --file .ai/herdr-dev-loop/loops/<namespace>/inbox/manager/A001-P1-followup.md
 ```
 
-Do not send follow-ups directly with `herdr pane run` unless debugging the pane itself. `hloop ... message` refuses to send when the target pane is not Codex, is showing the trust prompt, or is still working. It then uses `send-text`, waits for the input to appear, pauses before Enter, and verifies that Codex started working or answered before reporting success. If delivery fails after Manager wrote a follow-up, `hloop` records the undelivered message under `.ai/herdr-dev-loop/loops/<namespace>/inbox/pending/` and marks it in the target state; retry that pending file when the pane is ready instead of reconstructing the instruction from memory.
+Do not use this TUI follow-up path to resume a semantic ACK. ACK resolution and
+application use the broker/state exchange above. Do not send other follow-ups
+directly with `herdr pane run` unless debugging the pane itself. `hloop ...
+message` refuses to send when the target pane is not Codex, is showing the
+trust prompt, or is still working. It then uses `send-text`, waits for the input
+to appear, pauses before Enter, and verifies that Codex started working or
+answered before reporting success. If delivery fails after Manager wrote a
+follow-up, `hloop` records the undelivered message under
+`.ai/herdr-dev-loop/loops/<namespace>/inbox/pending/` and marks it in the target
+state; retry that pending file when the pane is ready instead of reconstructing
+the instruction from memory.
 
 ## Harvest Rules
 

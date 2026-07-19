@@ -324,6 +324,18 @@
               "required": ["status"],
               "properties": {"status": {"type": "string", "enum": ["pending", "delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"]}},
               "additionalProperties": true
+            },
+            "approval_availability": {
+              "type": "object",
+              "required": ["status"],
+              "properties": {"status": {"type": "string", "enum": ["pending", "available", "unavailable", "superseded"]}},
+              "additionalProperties": true
+            },
+            "pane_notification": {
+              "type": "object",
+              "required": ["status"],
+              "properties": {"status": {"type": "string", "enum": ["not-requested", "pending", "delivered", "undelivered", "unknown", "unavailable", "superseded"]}},
+              "additionalProperties": true
             }
           },
           "additionalProperties": true

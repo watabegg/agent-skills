@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -545,6 +547,339 @@ class CompletionModeTests(unittest.TestCase):
 
 
 class SemanticAckTests(unittest.TestCase):
+    def test_exchange_identity_and_terminal_matrix_fails_closed(self):
+        identity = hloop.hloop_semantic_ack.ExchangeIdentity(
+            run_id="run-1",
+            role_id="T001",
+            attempt_id="T001-A001",
+            task_contract_digest="a" * 64,
+            message_id="initial:T001-A001",
+            ack_event_id="11111111-1111-4111-8111-111111111111",
+            ack_sequence=7,
+        )
+
+        def approved_agent():
+            return {
+                "completion_mode": "handoff",
+                "completion_mode_probe": {"mode": "handoff"},
+                "semantic_ack_barrier": {
+                    "message_id": identity.message_id,
+                    "digest": identity.task_contract_digest,
+                    "semantic_decision": {
+                        "status": "approved",
+                        "ack_event_id": identity.ack_event_id,
+                    },
+                    "approval_availability": {
+                        "status": "available",
+                        "message_id": identity.message_id,
+                        "task_contract_digest": identity.task_contract_digest,
+                        "ack_event_id": identity.ack_event_id,
+                    },
+                },
+            }
+
+        base = {
+            "observed_run_id": identity.run_id,
+            "observed_role_id": identity.role_id,
+            "active_attempt_id": identity.attempt_id,
+            "active_contract_digest": identity.task_contract_digest,
+            "identity": identity,
+        }
+        approval = hloop.hloop_semantic_ack.inspect_exchange_snapshot(
+            **base, agent_state=approved_agent()
+        )
+        self.assertEqual(approval.completion_mode, "handoff")
+
+        identity_cases = {
+            "observed_run_id": "wrong-run",
+            "observed_role_id": "T002",
+            "active_attempt_id": "T001-A002",
+            "active_contract_digest": "b" * 64,
+        }
+        for field, wrong_value in identity_cases.items():
+            with self.subTest(field=field), self.assertRaises(
+                hloop.hloop_semantic_ack.ExchangeFailure
+            ) as raised:
+                hloop.hloop_semantic_ack.inspect_exchange_snapshot(
+                    **{**base, field: wrong_value}, agent_state=approved_agent()
+                )
+            self.assertFalse(raised.exception.as_record()["material_work_authorized"])
+
+        mutations = {
+            "message": lambda agent: agent["semantic_ack_barrier"].update(
+                message_id="initial:T001-A002"
+            ),
+            "barrier-digest": lambda agent: agent["semantic_ack_barrier"].update(
+                digest="b" * 64
+            ),
+            "ack-event": lambda agent: agent["semantic_ack_barrier"][
+                "semantic_decision"
+            ].update(ack_event_id="22222222-2222-4222-8222-222222222222"),
+            "availability": lambda agent: agent["semantic_ack_barrier"][
+                "approval_availability"
+            ].update(message_id="initial:T001-A002"),
+        }
+        for name, mutate in mutations.items():
+            agent = approved_agent()
+            mutate(agent)
+            with self.subTest(name=name), self.assertRaises(
+                hloop.hloop_semantic_ack.ExchangeFailure
+            ):
+                hloop.hloop_semantic_ack.inspect_exchange_snapshot(
+                    **base, agent_state=agent
+                )
+
+        for status in ("rejected", "timed_out", "superseded"):
+            agent = approved_agent()
+            decision = agent["semantic_ack_barrier"]["semantic_decision"]
+            decision.clear()
+            decision.update(status=status, reason="terminal test")
+            agent["semantic_ack_barrier"]["required_reack_after_sequence"] = 7
+            with self.subTest(status=status), self.assertRaises(
+                hloop.hloop_semantic_ack.ExchangeFailure
+            ) as raised:
+                hloop.hloop_semantic_ack.inspect_exchange_snapshot(
+                    **base, agent_state=agent
+                )
+            self.assertEqual(raised.exception.status, status)
+
+        corrected = approved_agent()
+        corrected["semantic_ack_barrier"]["semantic_decision"] = {
+            "status": "rejected",
+            "reason": "old ACK",
+        }
+        corrected["semantic_ack_barrier"]["required_reack_after_sequence"] = 6
+        self.assertIsNone(
+            hloop.hloop_semantic_ack.inspect_exchange_snapshot(
+                **base, agent_state=corrected
+            )
+        )
+
+    def test_resolve_default_publishes_availability_without_pane_api(self):
+        agent = {
+            "active_attempt_id": "T001-A001",
+            "pane_id": "busy-pane",
+        }
+        hloop.arm_initial_semantic_ack_barrier(
+            agent,
+            attempt_id="T001-A001",
+            contract_digest="a" * 64,
+        )
+        state = {"run_id": "run-1", "tasks": {"T001": agent}}
+        store = mock.MagicMock()
+        store.transaction.return_value.__enter__.return_value = mock.MagicMock()
+        store.latest_role_event.return_value = {
+            "event_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 1,
+        }
+        with (
+            mock.patch.object(hloop, "repo_root", return_value=Path("/manager")),
+            mock.patch.object(hloop, "load_state", return_value=state),
+            mock.patch.object(hloop, "_open_broker_store", return_value=store),
+            mock.patch.object(hloop, "save_state"),
+            mock.patch.object(hloop, "journal"),
+            mock.patch.object(hloop, "send_manager_message_and_record") as pane_send,
+        ):
+            self.assertEqual(
+                hloop.cmd_agent_ack_resolve(
+                    argparse.Namespace(
+                        repo="/manager",
+                        agent_id="T001",
+                        decision="approve",
+                        reason="exact ACK approved",
+                        notify_pane=False,
+                    )
+                ),
+                0,
+            )
+        pane_send.assert_not_called()
+        barrier = agent["semantic_ack_barrier"]
+        self.assertEqual(barrier["semantic_decision"]["status"], "approved")
+        self.assertEqual(barrier["approval_availability"]["status"], "available")
+        self.assertEqual(barrier["approval_application"]["status"], "pending")
+        self.assertEqual(barrier["pane_notification"]["status"], "not-requested")
+
+    def test_blocking_exchange_subprocess_resumes_without_pane_and_is_idempotent(self):
+        previous_namespace = hloop.LOOP_NAMESPACE
+        namespace = "test-semantic-ack-exchange"
+        hloop.configure_loop_namespace(namespace)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                subprocess.run(
+                    ["git", "init", "--initial-branch=main"],
+                    cwd=repo,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                digest = "a" * 64
+                task = {
+                    "attempt_id": "T001-A001",
+                    "active_attempt_id": "T001-A001",
+                    "task_contract_digest": digest,
+                    "contract_schema_revision": 3,
+                    "pane_id": "busy-pane",
+                }
+                hloop.arm_initial_semantic_ack_barrier(
+                    task,
+                    attempt_id="T001-A001",
+                    contract_digest=digest,
+                )
+                state = {
+                    "state_format_version": hloop.STATE_FORMAT_VERSION,
+                    "schema_revision": hloop.STATE_SCHEMA_REVISION,
+                    "namespace": namespace,
+                    "run_id": "run-1",
+                    "tasks": {"T001": task},
+                }
+                hloop.save_state(repo, state)
+                credential, _floor = hloop.register_role_report_identity_and_ack_floor(
+                    repo,
+                    state,
+                    role_id="T001",
+                    attempt_id="T001-A001",
+                    task_contract_digest=digest,
+                )
+                command = [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--namespace",
+                    namespace,
+                    "--repo",
+                    str(repo),
+                    "agent",
+                    "ack",
+                    "exchange",
+                    "T001",
+                    "--attempt-id",
+                    "T001-A001",
+                    "--run-id",
+                    "run-1",
+                    "--task-contract-digest",
+                    digest,
+                    "--report-credential-file",
+                    str(credential),
+                    "--invocation-id",
+                    "T001-A001:ack-exchange/0001",
+                    "--stage",
+                    "planning",
+                    "--summary",
+                    "understood",
+                    "--understood-goal",
+                    "complete T001",
+                    "--scope",
+                    "src/**",
+                    "--acceptance",
+                    "tests pass",
+                    "--approach",
+                    "small patch",
+                    "--next",
+                    "wait for Manager",
+                    "--timeout-seconds",
+                    "5",
+                    "--poll-interval-ms",
+                    "10",
+                    "--json",
+                ]
+                environment = {
+                    **os.environ,
+                    "HLOOP_MANAGER_REPO": str(repo),
+                    "HLOOP_ROLE_CONTEXT": "1",
+                    "HLOOP_ROLE_ID": "T001",
+                    "HLOOP_ROLE_ATTEMPT_ID": "T001-A001",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+                process = subprocess.Popen(
+                    command,
+                    cwd=repo,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                store = hloop._open_broker_store(repo)
+                deadline = time.monotonic() + 3
+                latest_ack = None
+                while time.monotonic() < deadline:
+                    with store.transaction() as transaction:
+                        latest_ack = store.latest_role_event(
+                            transaction,
+                            run_id="run-1",
+                            role_id="T001",
+                            attempt_id="T001-A001",
+                            report_type="ack",
+                        )
+                    if latest_ack is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(latest_ack)
+                with mock.patch.object(
+                    hloop, "send_manager_message_and_record"
+                ) as pane_send:
+                    self.assertEqual(
+                        hloop.cmd_agent_ack_resolve(
+                            argparse.Namespace(
+                                repo=str(repo),
+                                agent_id="T001",
+                                decision="approve",
+                                reason="subprocess ACK approved",
+                                notify_pane=False,
+                            )
+                        ),
+                        0,
+                    )
+                pane_send.assert_not_called()
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr)
+                result = json.loads(stdout)
+                self.assertTrue(result["material_work_authorized"])
+                self.assertEqual(result["ack_event_id"], latest_ack["event_id"])
+                self.assertTrue(result["application_event_id"])
+
+                retry = subprocess.run(
+                    command,
+                    cwd=repo,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                retried = json.loads(retry.stdout)
+                self.assertEqual(
+                    retried["application_event_id"], result["application_event_id"]
+                )
+                wrong_credential = hloop.write_role_report_credential(
+                    repo,
+                    state,
+                    role_id="T999",
+                    attempt_id="T999-A001",
+                    token="f" * 64,
+                )
+                wrong_credential_command = list(command)
+                credential_index = wrong_credential_command.index(
+                    "--report-credential-file"
+                )
+                wrong_credential_command[credential_index + 1] = str(wrong_credential)
+                denied = subprocess.run(
+                    wrong_credential_command,
+                    cwd=repo,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                self.assertEqual(denied.returncode, 2)
+                self.assertIn("credential identity does not match", denied.stderr)
+                with store.transaction() as transaction:
+                    events = store.events(transaction)
+                self.assertEqual([event["type"] for event in events], ["ack", "attention"])
+        finally:
+            hloop.configure_loop_namespace(previous_namespace)
+
     def test_revision_three_candidate_gate_requires_exact_structured_ack_binding(self):
         probe = {
             "version": 1,

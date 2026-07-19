@@ -2684,9 +2684,10 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                     report_credential_file=str(credential_file),
                     task_contract_digest=digest,
                 )
-                self.assertIn(f"--role-id {role_id}", contract)
+                self.assertIn(f"agent ack exchange {role_id}", contract)
                 self.assertIn(f"--attempt-id {attempt_id}", contract)
                 self.assertIn("--report-credential-file", contract)
+                self.assertIn("authenticated application event", contract)
                 self.assertNotIn(token, contract)
                 self.assertIn("stop before material work", contract)
 

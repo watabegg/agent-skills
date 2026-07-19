@@ -51,6 +51,7 @@ from hloop_lib import review as hloop_review
 from hloop_lib import review_epoch as hloop_review_epoch
 from hloop_lib import review_policy as hloop_review_policy
 from hloop_lib import remediation as hloop_remediation
+from hloop_lib import semantic_ack as hloop_semantic_ack
 from hloop_lib import supervisor as hloop_supervisor
 from hloop_lib.decisions import (
     DECISION_ACCEPTED,
@@ -3229,7 +3230,15 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
     if command == "advisor":
         return getattr(args, "advisor_command", "") in {"request", "start", "harvest", "close", "message"}
     if command == "agent":
-        return getattr(args, "agent_command", "") != "report"
+        agent_command = getattr(args, "agent_command", "")
+        if agent_command == "report":
+            return False
+        if agent_command == "ack" and getattr(args, "agent_ack_command", "") == "exchange":
+            # Exchange blocks while Manager resolve must acquire this same
+            # repository-and-namespace lock. It only appends authenticated
+            # broker/outbox events and reads Manager STATE while waiting.
+            return False
+        return True
     if command == "message":
         return True
     if command == "inbox":
@@ -7346,6 +7355,14 @@ def arm_semantic_ack_barrier(
         if isinstance(previous_application, dict):
             previous_application["status"] = "superseded"
             previous_application["updated_at"] = now_iso()
+        previous_availability = previous.get("approval_availability")
+        if isinstance(previous_availability, dict):
+            previous_availability["status"] = "superseded"
+            previous_availability["updated_at"] = now_iso()
+        previous_notification = previous.get("pane_notification")
+        if isinstance(previous_notification, dict):
+            previous_notification["status"] = "superseded"
+            previous_notification["updated_at"] = now_iso()
         history = agent_state.setdefault("semantic_ack_history", [])
         if isinstance(history, list):
             history.append(previous)
@@ -7363,6 +7380,14 @@ def arm_semantic_ack_barrier(
         },
         "approval_application": {
             "status": "pending",
+            "updated_at": armed_at,
+        },
+        "approval_availability": {
+            "status": "pending",
+            "updated_at": armed_at,
+        },
+        "pane_notification": {
+            "status": "not-requested",
             "updated_at": armed_at,
         },
     }
@@ -7523,6 +7548,18 @@ def resolve_semantic_ack_barrier(
             "updated_at": resolved_at,
             "ack_event_id": latest_ack["event_id"],
         }
+        barrier["approval_availability"] = {
+            "status": "available",
+            "published_at": resolved_at,
+            "updated_at": resolved_at,
+            "message_id": str(barrier.get("message_id") or ""),
+            "task_contract_digest": str(barrier.get("digest") or ""),
+            "ack_event_id": latest_ack["event_id"],
+        }
+        barrier["pane_notification"] = {
+            "status": "not-requested",
+            "updated_at": resolved_at,
+        }
         if completion_mode and not recorded_mode:
             agent_state["completion_mode"] = completion_mode
             agent_state["completion_mode_probe"] = json.loads(
@@ -7545,6 +7582,14 @@ def resolve_semantic_ack_barrier(
         }
         barrier["approval_application"] = {
             "status": "superseded",
+            "updated_at": resolved_at,
+        }
+        barrier["approval_availability"] = {
+            "status": "unavailable",
+            "updated_at": resolved_at,
+        }
+        barrier["pane_notification"] = {
+            "status": "not-requested",
             "updated_at": resolved_at,
         }
     barrier["resolved_at"] = resolved_at
@@ -14995,17 +15040,24 @@ def report_contract_text(
     return f"""
 Reporting: send ack, milestone, attention, and completion reports as your understanding, risk, or progress changes (see skills/herdr-dev-loop/references/report-protocol.md). Every report must include the exact identity below:
 ```
-python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent report \\
-  --role-id {role_id} --attempt-id {attempt_id} --run-id {run_id} \\
+python3 {Path(__file__).resolve()} {loop_namespace_flag()} agent ack exchange {role_id} \\
+  --attempt-id {attempt_id} --run-id {run_id} \\
   --task-contract-digest {task_contract_digest} --report-credential-file {credential_ref} \\
   --invocation-id {attempt_id}:report/0001 \\
-  --type ack --stage <stage> --summary '<summary>' --next '<next action>' ...
+  --stage <stage> --summary '<summary>' --understood-goal '<goal>' \\
+  --scope '<scope>' --acceptance '<acceptance>' --approach '<approach>' \\
+  --next '<next action>' --timeout-seconds 900 --json
 ```
+Use `agent report` with the same identity for milestone, attention, and
+completion reports after the initial exchange.
 Generate a new shell-safe invocation ID for each logical report. It must start
 with an ASCII alphanumeric character and then use only ASCII alphanumerics or
 `.`, `_`, `:`, `/`, `-`. Reuse that exact ID for every retry of the same report,
 and finish its retry before sending a newer logical report.
-After the initial read-only investigation, send the semantic `ack` and stop before material work. Resume only after the Manager explicitly approves that ACK and sends the approval notice. A reject or timeout requires a corrected, new ACK event.
+After the initial read-only investigation, run the blocking semantic ACK
+exchange and stop before material work. Resume only when that same command
+returns an exact approved decision and authenticated application event. Pane
+input is not approval. A reject or timeout requires a corrected, new ACK event.
 """
 
 
@@ -15214,9 +15266,9 @@ def render_worker_prompt(
     if task_contract_revision(task_meta) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
         revision_three_notice = f"""
 Completion-mode preflight:
-- Your first semantic ACK automatically performs a real Git metadata create/fsync/unlink probe.
-- Manager approval binds `commit` or `handoff` to this attempt before material work.
-- Do not choose or change the mode at submit/finalize time. Use `hloop agent ack status {task_id} --attempt-id {str(task_meta.get('attempt_id') or '')} --apply` to learn/apply approval without relying on pane Enter delivery.
+- Your first semantic ACK exchange automatically performs a real Git metadata create/fsync/unlink probe.
+- Manager approval binds `commit` or `handoff` to this attempt and the exchange returns it before material work.
+- Do not choose or change the mode at submit/finalize time. `hloop agent ack status {task_id} --attempt-id {str(task_meta.get('attempt_id') or '')} --apply` remains a compatibility recovery path.
 - Submit the exact revision-3 implementation candidate with `hloop worker submit`; candidate and final seals must retain the approved completion mode.
 """
     if completion_mode == "handoff":
@@ -31522,7 +31574,14 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
     )
     print(f"{args.agent_id}: semantic ACK barrier {barrier['status']}")
     pane_id = str(agent.get("pane_id") or "")
-    if pane_id:
+    notify_pane = bool(getattr(args, "notify_pane", False))
+    if notify_pane and pane_id:
+        notification = barrier.get("pane_notification")
+        if isinstance(notification, dict):
+            notification["status"] = "pending"
+            notification["requested_at"] = now_iso()
+            notification["updated_at"] = notification["requested_at"]
+            save_state(repo, state)
         if barrier["status"] == "approved":
             notice = (
                 f"Semantic ACK {barrier.get('ack_event_id')} is approved. "
@@ -31557,8 +31616,8 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
         )
         refreshed_barrier = refreshed_agent.get("semantic_ack_barrier")
         if isinstance(refreshed_barrier, dict):
-            application = refreshed_barrier.get("approval_application")
-            if isinstance(application, dict):
+            notification = refreshed_barrier.get("pane_notification")
+            if isinstance(notification, dict):
                 messages = refreshed_agent.get("manager_messages") or []
                 latest_message = messages[-1] if messages else {}
                 delivery_status = str(
@@ -31566,28 +31625,29 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
                 )
                 if delivery_status not in {"delivered", "undelivered", "unknown"}:
                     delivery_status = "unknown"
-                application["status"] = delivery_status
-                application["notification_delivery_status"] = delivery_status
-                application["notification_updated_at"] = now_iso()
+                notification["status"] = delivery_status
+                notification["message_id"] = latest_message.get("message_id")
+                notification["updated_at"] = now_iso()
                 save_state(repo, refreshed)
-        # The semantic decision and application record are authoritative.
-        # Pane delivery is advisory and may be undelivered/unknown without
-        # rolling back an approved decision.
+        # The semantic decision, availability, and application records are
+        # authoritative. Optional pane delivery is advisory and never mutates
+        # those records or rolls back an approved decision.
         if delivery_code:
             print(
                 f"{args.agent_id}: approval remains available; "
                 "pane notification was not confirmed"
             )
         return 0
-    application = barrier.get("approval_application")
-    if isinstance(application, dict):
-        application["notification_delivery_status"] = "not-required"
-        application["notification_updated_at"] = now_iso()
+    if notify_pane and not pane_id:
+        notification = barrier.get("pane_notification")
+        if isinstance(notification, dict):
+            notification["status"] = "unavailable"
+            notification["updated_at"] = now_iso()
         save_state(repo, state)
     return 0
 
 
-def cmd_agent_ack_status(args: argparse.Namespace) -> int:
+def cmd_agent_ack_status(args: argparse.Namespace) -> int | dict[str, Any]:
     """Let a role learn and explicitly apply an approval without pane input."""
 
     role_repo = repo_root(Path(args.repo).resolve())
@@ -31614,6 +31674,7 @@ def cmd_agent_ack_status(args: argparse.Namespace) -> int:
         raise HLoopError("semantic ACK state predates separate decision/application records")
     acknowledge = bool(getattr(args, "acknowledge", False))
     apply = bool(getattr(args, "apply", False))
+    application_event: dict[str, Any] | None = None
     if acknowledge or apply:
         if str(decision.get("status") or "") != "approved":
             raise HLoopError("only an approved semantic ACK can be applied")
@@ -31691,8 +31752,12 @@ def cmd_agent_ack_status(args: argparse.Namespace) -> int:
                     "decision_ack_event_id": decision_ack_event_id,
                     "requested_status": requested_status,
                 },
+                _quiet=bool(getattr(args, "_quiet", False)),
+                _return_event=True,
             )
-            cmd_agent_report(report_args)
+            reported = cmd_agent_report(report_args)
+            if isinstance(reported, dict):
+                application_event = reported
     payload = {
         "role": role,
         "agent_id": args.agent_id,
@@ -31702,7 +31767,14 @@ def cmd_agent_ack_status(args: argparse.Namespace) -> int:
         "approval_application": dict(application),
         "completion_mode": agent.get("completion_mode", ""),
         "completion_mode_probe": agent.get("completion_mode_probe", {}),
+        "application_event_id": (
+            str(application_event.get("event_id") or "")
+            if application_event is not None
+            else str(application.get("application_event_id") or "")
+        ),
     }
+    if bool(getattr(args, "_return_payload", False)):
+        return payload
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -31710,6 +31782,302 @@ def cmd_agent_ack_status(args: argparse.Namespace) -> int:
             f"{args.agent_id}: decision={decision.get('status')} "
             f"application={application.get('status')} "
             f"completion_mode={agent.get('completion_mode') or 'n/a'}"
+        )
+    return 0
+
+
+def cmd_agent_ack_exchange(args: argparse.Namespace) -> int:
+    """Report an ACK, wait for its exact decision, and report application."""
+
+    role_repo = repo_root(Path(args.repo).resolve())
+    manager_repo_raw = str(
+        getattr(args, "manager_repo", None)
+        or os.environ.get(MANAGER_REPO_ENV)
+        or ""
+    ).strip()
+    if not manager_repo_raw:
+        raise HLoopError(
+            "semantic ACK exchange requires HLOOP_MANAGER_REPO or --manager-repo"
+        )
+    manager_repo = repo_root(Path(manager_repo_raw).expanduser().resolve())
+    context_manager_repo = str(os.environ.get(MANAGER_REPO_ENV) or "").strip()
+    if context_manager_repo and repo_root(
+        Path(context_manager_repo).expanduser().resolve()
+    ) != manager_repo:
+        raise HLoopError("semantic ACK exchange Manager repository context mismatch")
+    if git_common_dir(role_repo).resolve() != git_common_dir(manager_repo).resolve():
+        raise HLoopError(
+            "semantic ACK exchange role and Manager repositories do not share Git metadata"
+        )
+    requested_role_id = str(args.agent_id or "")
+    requested_attempt_id = str(args.attempt_id or "")
+    requested_digest = str(args.task_contract_digest or "").lower()
+    timeout_seconds = float(args.timeout_seconds)
+    poll_interval_ms = int(args.poll_interval_ms)
+    if (
+        timeout_seconds != timeout_seconds
+        or timeout_seconds <= 0
+        or timeout_seconds > 86_400
+    ):
+        raise HLoopError("semantic ACK exchange timeout must be in (0, 86400]")
+    if poll_interval_ms <= 0 or poll_interval_ms > 60_000:
+        raise HLoopError(
+            "semantic ACK exchange poll interval must be in [1, 60000] milliseconds"
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", requested_digest):
+        raise HLoopError(
+            "semantic ACK exchange task contract digest must be a 64-character SHA-256 digest"
+        )
+    context_role_id = str(os.environ.get(ROLE_ID_ENV) or "")
+    context_attempt_id = str(os.environ.get(ROLE_ATTEMPT_ID_ENV) or "")
+    if context_role_id and context_role_id != requested_role_id:
+        raise HLoopError("semantic ACK exchange role context mismatch")
+    if context_attempt_id and context_attempt_id != requested_attempt_id:
+        raise HLoopError("semantic ACK exchange attempt context mismatch")
+
+    initial_state = load_state(manager_repo)
+    run_id = str(initial_state.get("run_id") or "local")
+    requested_run_id = str(getattr(args, "run_id", None) or run_id)
+    if requested_run_id != run_id:
+        raise HLoopError(
+            f"semantic ACK exchange run mismatch: expected={run_id} "
+            f"requested={requested_run_id}"
+        )
+    _role, initial_agent = resolve_agent_state(initial_state, requested_role_id)
+    active_attempt_id = str(
+        initial_agent.get("attempt_id")
+        or initial_agent.get("active_attempt_id")
+        or ""
+    )
+    if active_attempt_id != requested_attempt_id:
+        raise HLoopError(
+            f"semantic ACK exchange attempt mismatch: active={active_attempt_id} "
+            f"requested={requested_attempt_id}"
+        )
+    initial_barrier = initial_agent.get("semantic_ack_barrier")
+    if not isinstance(initial_barrier, Mapping):
+        raise HLoopError("semantic ACK exchange has no active semantic barrier")
+    message_id = str(initial_barrier.get("message_id") or "")
+    if not message_id:
+        raise HLoopError("semantic ACK exchange barrier message identity is missing")
+    if str(initial_barrier.get("digest") or "") != requested_digest:
+        raise HLoopError(
+            "semantic ACK exchange contract digest does not match the active barrier"
+        )
+    active_digest = str(
+        initial_agent.get("task_contract_digest") or initial_barrier.get("digest") or ""
+    )
+    if active_digest != requested_digest:
+        raise HLoopError(
+            "semantic ACK exchange contract digest does not match active role state"
+        )
+
+    credential_file = str(getattr(args, "report_credential_file", None) or "")
+    report_token = str(getattr(args, "report_token", None) or "")
+    if not credential_file and not report_token:
+        credential_file = str(
+            role_report_credential_path(
+                role_repo,
+                initial_state,
+                role_id=requested_role_id,
+                attempt_id=requested_attempt_id,
+            )
+        )
+    use_ack_file = bool(getattr(args, "ack_file", None))
+    report_args = argparse.Namespace(
+        repo=str(role_repo),
+        role_id=requested_role_id,
+        attempt_id=requested_attempt_id,
+        run_id=run_id,
+        task_contract_digest=requested_digest,
+        report_token=report_token or None,
+        report_credential_file=credential_file or None,
+        invocation_id=getattr(args, "invocation_id", None),
+        event_id=getattr(args, "event_id", None),
+        file=str(args.ack_file) if use_ack_file else None,
+        stdin=False,
+        type=None if use_ack_file else "ack",
+        stage=None if use_ack_file else args.stage,
+        summary=None if use_ack_file else args.summary,
+        next=None if use_ack_file else args.next,
+        evidence_ref=None if use_ack_file else args.evidence_ref,
+        understood_goal=None if use_ack_file else args.understood_goal,
+        scope=None if use_ack_file else args.scope,
+        acceptance=None if use_ack_file else args.acceptance,
+        approach=None if use_ack_file else args.approach,
+        risk=None,
+        impact=None,
+        attempted=None,
+        option_text=None,
+        recommendation=None,
+        blocked_scope=None,
+        artifact=None,
+        artifact_digest=None,
+        head_sha=None,
+        validation_result_ref=None,
+        residual_risk=None,
+        handoff=None,
+        _quiet=True,
+        _return_event=True,
+    )
+    if use_ack_file:
+        ack_body = _read_agent_report_body(report_args)
+        if not isinstance(ack_body, Mapping) or ack_body.get("type") != "ack":
+            raise HLoopError("semantic ACK exchange --ack-file must contain type=ack")
+    reported = cmd_agent_report(report_args)
+    if not isinstance(reported, dict) or reported.get("type") != "ack":
+        raise HLoopError("semantic ACK exchange did not retain an ACK event")
+    expected_report_identity = {
+        "run_id": run_id,
+        "role_id": requested_role_id,
+        "attempt_id": requested_attempt_id,
+        "task_contract_digest": requested_digest,
+    }
+    if any(
+        str(reported.get(field) or "") != expected
+        for field, expected in expected_report_identity.items()
+    ):
+        raise HLoopError("semantic ACK exchange retained event identity mismatch")
+    ack_sequence = int(reported.get("sequence") or 0)
+    if ack_sequence <= 0:
+        raise HLoopError(
+            "semantic ACK exchange requires broker acceptance before waiting; "
+            "recover the spool and retry the same invocation"
+        )
+    try:
+        identity = hloop_semantic_ack.ExchangeIdentity(
+            run_id=run_id,
+            role_id=requested_role_id,
+            attempt_id=requested_attempt_id,
+            task_contract_digest=requested_digest,
+            message_id=message_id,
+            ack_event_id=str(reported.get("event_id") or ""),
+            ack_sequence=ack_sequence,
+        )
+    except ValueError as exc:
+        raise HLoopError(f"invalid semantic ACK exchange identity: {exc}") from exc
+
+    def load_exchange_snapshot() -> tuple[str, str, str, str, Mapping[str, Any]]:
+        current_state = load_state(manager_repo)
+        _current_role, current_agent = resolve_agent_state(
+            current_state, requested_role_id
+        )
+        current_attempt = str(
+            current_agent.get("attempt_id")
+            or current_agent.get("active_attempt_id")
+            or ""
+        )
+        current_barrier = current_agent.get("semantic_ack_barrier")
+        current_digest = str(
+            current_agent.get("task_contract_digest")
+            or (
+                current_barrier.get("digest")
+                if isinstance(current_barrier, Mapping)
+                else ""
+            )
+            or ""
+        )
+        return (
+            str(current_state.get("run_id") or "local"),
+            requested_role_id,
+            current_attempt,
+            current_digest,
+            current_agent,
+        )
+
+    try:
+        approval = hloop_semantic_ack.wait_for_approval(
+            load_exchange_snapshot,
+            identity,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=float(poll_interval_ms) / 1000.0,
+        )
+    except hloop_semantic_ack.ExchangeFailure as exc:
+        record = {
+            **exc.as_record(),
+            "run_id": run_id,
+            "role_id": requested_role_id,
+            "attempt_id": requested_attempt_id,
+            "message_id": message_id,
+            "task_contract_digest": requested_digest,
+            "ack_event_id": identity.ack_event_id,
+        }
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        else:
+            print(
+                f"{requested_role_id}: semantic ACK exchange {exc.status}: "
+                f"{exc.reason}"
+            )
+        return {
+            "rejected": 3,
+            "timed_out": 4,
+            "superseded": 5,
+        }.get(exc.status, 6)
+
+    if requested_role_id.startswith("T"):
+        if approval.completion_mode != str(reported.get("completion_mode") or ""):
+            raise HLoopError(
+                "semantic ACK exchange completion mode does not match the approved ACK"
+            )
+        if approval.completion_mode_probe != dict(
+            reported.get("completion_mode_probe") or {}
+        ):
+            raise HLoopError(
+                "semantic ACK exchange completion-mode probe does not match the approved ACK"
+            )
+    application = cmd_agent_ack_status(
+        argparse.Namespace(
+            repo=str(role_repo),
+            agent_id=requested_role_id,
+            attempt_id=requested_attempt_id,
+            acknowledge=False,
+            apply=True,
+            json=False,
+            _quiet=True,
+            _return_payload=True,
+        )
+    )
+    if not isinstance(application, dict) or not str(
+        application.get("application_event_id") or ""
+    ):
+        raise HLoopError(
+            "semantic ACK exchange could not retain authenticated application evidence"
+        )
+    application_decision = application.get("semantic_decision")
+    if (
+        str(application.get("agent_id") or "") != requested_role_id
+        or str(application.get("attempt_id") or "") != requested_attempt_id
+        or str(application.get("message_id") or "") != message_id
+        or not isinstance(application_decision, Mapping)
+        or str(application_decision.get("ack_event_id") or "")
+        != identity.ack_event_id
+    ):
+        raise HLoopError(
+            "semantic ACK exchange application identity changed after approval"
+        )
+    result = {
+        "status": "approved",
+        "material_work_authorized": True,
+        "run_id": run_id,
+        "role_id": requested_role_id,
+        "attempt_id": requested_attempt_id,
+        "message_id": message_id,
+        "task_contract_digest": requested_digest,
+        "ack_event_id": identity.ack_event_id,
+        "ack_sequence": identity.ack_sequence,
+        "semantic_decision": approval.decision,
+        "approval_availability": approval.availability,
+        "application_event_id": application["application_event_id"],
+        "completion_mode": approval.completion_mode,
+        "completion_mode_probe": approval.completion_mode_probe,
+    }
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"{requested_role_id}: semantic ACK exchange approved "
+            f"ack={identity.ack_event_id} application={application['application_event_id']}"
         )
     return 0
 
@@ -32543,7 +32911,7 @@ def worker_ack_completion_mode_probe(
     return probe
 
 
-def cmd_agent_report(args: argparse.Namespace) -> int:
+def cmd_agent_report(args: argparse.Namespace) -> int | dict[str, Any]:
     """Submit an agent report; spools to disk when the broker is unavailable."""
 
     repo = repo_root(Path(args.repo).resolve())
@@ -32799,7 +33167,10 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             )
         except (OSError, hloop_supervisor.SupervisorError):
             pass
-        print(f"spooled {client_event['event_id']} (broker unavailable: {exc})")
+        if not bool(getattr(args, "_quiet", False)):
+            print(f"spooled {client_event['event_id']} (broker unavailable: {exc})")
+        if bool(getattr(args, "_return_event", False)):
+            return client_event
         return 0
     except hloop_broker.BrokerStorageError as exc:
         raise HLoopError(f"report rejected by broker: {exc}") from exc
@@ -32824,7 +33195,10 @@ def cmd_agent_report(args: argparse.Namespace) -> int:
             hloop_supervisor.signal_supervisor(Path(owner["socket_path"]))
         except (OSError, hloop_supervisor.SupervisorError):
             pass
-    print(f"accepted {stored.event['event_id']} (broker)")
+    if not bool(getattr(args, "_quiet", False)):
+        print(f"accepted {stored.event['event_id']} (broker)")
+    if bool(getattr(args, "_return_event", False)):
+        return dict(stored.event)
     return 0
 
 
@@ -36036,6 +36410,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--decision", choices=["approve", "reject", "timeout"], required=True
     )
     agent_ack_resolve.add_argument("--reason", required=True)
+    agent_ack_resolve.add_argument(
+        "--notify-pane",
+        action="store_true",
+        help="optionally send an advisory pane notice after durable resolution",
+    )
     agent_ack_resolve.set_defaults(func=cmd_agent_ack_resolve)
     agent_ack_status = agent_ack_sub.add_parser(
         "status",
@@ -36048,6 +36427,41 @@ def build_parser() -> argparse.ArgumentParser:
     ack_status_transition.add_argument("--apply", action="store_true")
     agent_ack_status.add_argument("--json", action="store_true")
     agent_ack_status.set_defaults(func=cmd_agent_ack_status)
+    agent_ack_exchange = agent_ack_sub.add_parser(
+        "exchange",
+        help="submit an ACK and block for its exact durable Manager decision",
+    )
+    agent_ack_exchange.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
+    agent_ack_exchange.add_argument("--attempt-id", required=True)
+    agent_ack_exchange.add_argument("--run-id")
+    agent_ack_exchange.add_argument("--task-contract-digest", required=True)
+    agent_ack_exchange.add_argument("--manager-repo")
+    exchange_idempotency = agent_ack_exchange.add_mutually_exclusive_group(
+        required=True
+    )
+    exchange_idempotency.add_argument("--event-id")
+    exchange_idempotency.add_argument("--invocation-id")
+    exchange_credential = agent_ack_exchange.add_mutually_exclusive_group()
+    exchange_credential.add_argument("--report-token")
+    exchange_credential.add_argument("--report-credential-file")
+    agent_ack_exchange.add_argument(
+        "--ack-file",
+        help="schema-validated ACK report content JSON; otherwise use inline ACK flags",
+    )
+    agent_ack_exchange.add_argument("--stage")
+    agent_ack_exchange.add_argument("--summary")
+    agent_ack_exchange.add_argument("--next")
+    agent_ack_exchange.add_argument("--evidence-ref", action="append")
+    agent_ack_exchange.add_argument("--understood-goal")
+    agent_ack_exchange.add_argument("--scope", action="append")
+    agent_ack_exchange.add_argument("--acceptance", action="append")
+    agent_ack_exchange.add_argument("--approach")
+    agent_ack_exchange.add_argument("--timeout-seconds", type=float, default=900.0)
+    agent_ack_exchange.add_argument("--poll-interval-ms", type=int, default=100)
+    agent_ack_exchange.add_argument("--json", action="store_true")
+    agent_ack_exchange.set_defaults(func=cmd_agent_ack_exchange)
 
     runtime = sub.add_parser("runtime", help="runtime trust and identity operations")
     runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
