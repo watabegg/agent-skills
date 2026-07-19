@@ -19,12 +19,14 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
+from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 
 from . import release_scope as hloop_release_scope
 from .review import (
     CRITICAL_SEVERITIES,
+    ExternalReviewProtocolAdapter,
     ManifestCompleteness,
     ReviewManifest,
     ReviewModelError,
@@ -58,6 +60,10 @@ REOPEN_ACTIONS = frozenset(
 SCOPE_AMENDMENT_KINDS = frozenset({"editorial", "clarification", "scope-change"})
 _DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{64}$")
 _INPUT_ID_RE = re.compile(r"^U[0-9]{4}$")
+_REVIEW_EXECUTION_ID_RE = re.compile(r"^R[0-9]{3}$")
+MANUAL_FINAL_EXECUTION_POLICIES = frozenset(
+    {"independent", "reuse_epoch_reviewer"}
+)
 
 
 class CertificationModelError(ValueError):
@@ -237,6 +243,131 @@ def _coerce_lane(value: Any, index: int) -> FinalReviewLane:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualFinalExecutionProvenance:
+    """Fixed-target execution and source identity for manual-final evidence."""
+
+    execution_policy: str
+    execution_id: str
+    source_kind: str
+    source_execution_id: str
+    source_artifact_ref: str
+    source_artifact_digest: str
+    target_sha: str
+    protocol_adapter: ExternalReviewProtocolAdapter
+
+    def __post_init__(self) -> None:
+        if self.execution_policy not in MANUAL_FINAL_EXECUTION_POLICIES:
+            raise CertificationModelError(
+                f"unsupported manual-final execution_policy: {self.execution_policy}"
+            )
+        for field_name in (
+            "execution_id",
+            "source_kind",
+            "source_execution_id",
+            "source_artifact_ref",
+            "target_sha",
+        ):
+            object.__setattr__(
+                self, field_name, _required_text(getattr(self, field_name), field_name)
+            )
+        if not _REVIEW_EXECUTION_ID_RE.fullmatch(self.execution_id):
+            raise CertificationModelError("execution_id must match RNNN")
+        if not _REVIEW_EXECUTION_ID_RE.fullmatch(self.source_execution_id):
+            raise CertificationModelError("source_execution_id must match RNNN")
+        artifact_ref = PurePosixPath(self.source_artifact_ref)
+        if artifact_ref.is_absolute() or ".." in artifact_ref.parts:
+            raise CertificationModelError(
+                "source_artifact_ref must be a safe relative path"
+            )
+        object.__setattr__(
+            self,
+            "source_artifact_digest",
+            _digest(self.source_artifact_digest, "source_artifact_digest"),
+        )
+        adapter = self.protocol_adapter
+        if not isinstance(adapter, ExternalReviewProtocolAdapter):
+            try:
+                adapter = ExternalReviewProtocolAdapter.from_record(adapter)
+            except (TypeError, ValueError, ReviewModelError) as exc:
+                raise CertificationModelError(
+                    f"protocol_adapter is invalid: {exc}"
+                ) from exc
+            object.__setattr__(self, "protocol_adapter", adapter)
+        if adapter.protocol != MANUAL_FINAL_PROTOCOL:
+            raise CertificationModelError(
+                "manual-final protocol_adapter does not match the protocol"
+            )
+        if self.execution_policy == "independent":
+            if self.source_kind != "pre-final-review":
+                raise CertificationModelError(
+                    "independent manual-final source_kind must be pre-final-review"
+                )
+            if self.execution_id == self.source_execution_id:
+                raise CertificationModelError(
+                    "independent manual-final execution must differ from its source execution"
+                )
+        else:
+            if self.source_kind != "review-epoch-reviewer":
+                raise CertificationModelError(
+                    "reuse_epoch_reviewer source_kind must be review-epoch-reviewer"
+                )
+            if self.execution_id != self.source_execution_id:
+                raise CertificationModelError(
+                    "reuse_epoch_reviewer must reuse the exact source execution"
+                )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "execution_policy": self.execution_policy,
+            "execution_id": self.execution_id,
+            "source_kind": self.source_kind,
+            "source_execution_id": self.source_execution_id,
+            "source_artifact_ref": self.source_artifact_ref,
+            "source_artifact_digest": self.source_artifact_digest,
+            "target_sha": self.target_sha,
+            "protocol_adapter": self.protocol_adapter.to_record(),
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ManualFinalExecutionProvenance":
+        if isinstance(value, cls):
+            return value
+        record = _record(value, "manual-final execution provenance")
+        expected = {
+            "execution_policy",
+            "execution_id",
+            "source_kind",
+            "source_execution_id",
+            "source_artifact_ref",
+            "source_artifact_digest",
+            "target_sha",
+            "protocol_adapter",
+        }
+        if set(record) != expected:
+            raise CertificationModelError(
+                "manual-final execution provenance fields are not canonical"
+            )
+        try:
+            adapter = ExternalReviewProtocolAdapter.from_record(
+                record["protocol_adapter"]
+            )
+        except (TypeError, ValueError, ReviewModelError) as exc:
+            raise CertificationModelError(
+                f"protocol_adapter is invalid: {exc}"
+            ) from exc
+        return cls(
+            execution_policy=record["execution_policy"],
+            execution_id=record["execution_id"],
+            source_kind=record["source_kind"],
+            source_execution_id=record["source_execution_id"],
+            source_artifact_ref=record["source_artifact_ref"],
+            source_artifact_digest=record["source_artifact_digest"],
+            target_sha=record["target_sha"],
+            protocol_adapter=adapter,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class VerificationPolicy:
     """Verification rules included in the plan identity."""
 
@@ -386,6 +517,7 @@ class CertificationPlan:
     base_ref: str = ""
     target_ref: str = ""
     scope_source: tuple[str, ...] = ()
+    execution: ManualFinalExecutionProvenance | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -444,11 +576,18 @@ class CertificationPlan:
             "scope_source",
             _text_tuple(self.scope_source, "scope_source"),
         )
+        if self.execution is not None:
+            execution = ManualFinalExecutionProvenance.from_record(self.execution)
+            if execution.target_sha != self.target_sha:
+                raise CertificationModelError(
+                    "manual-final execution target_sha must match certification target_sha"
+                )
+            object.__setattr__(self, "execution", execution)
 
     def identity_record(self) -> dict[str, Any]:
         """Return exactly the fields covered by the plan digest."""
 
-        return {
+        record = {
             "certification_id": self.certification_id,
             "base_ref": self.base_ref,
             "base_sha": self.base_sha,
@@ -462,6 +601,9 @@ class CertificationPlan:
             "lane_plan": [lane.to_record() for lane in self.lane_plan],
             "verification_policy": self.verification_policy.to_record(),
         }
+        if self.execution is not None:
+            record["execution"] = self.execution.to_record()
+        return record
 
     @property
     def digest(self) -> str:
@@ -525,6 +667,11 @@ class CertificationPlan:
             verification_policy=VerificationPolicy.from_record(
                 record["verification_policy"]
             ),
+            execution=(
+                ManualFinalExecutionProvenance.from_record(record["execution"])
+                if "execution" in record
+                else None
+            ),
         )
         supplied_digest = record.get("plan_digest")
         if supplied_digest is not None:
@@ -571,6 +718,7 @@ class FinalReviewManifest:
     manifest_complete: bool
     verified_actionable_findings: int
     patch_verdict: str = "passed"
+    execution: ManualFinalExecutionProvenance | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -638,6 +786,13 @@ class FinalReviewManifest:
             raise CertificationModelError(
                 f"unsupported patch_verdict: {self.patch_verdict}"
             )
+        if self.execution is not None:
+            execution = ManualFinalExecutionProvenance.from_record(self.execution)
+            if execution.target_sha != self.target_sha:
+                raise CertificationModelError(
+                    "manual-final execution target_sha must match manifest target_sha"
+                )
+            object.__setattr__(self, "execution", execution)
 
     @classmethod
     def from_review_manifest(
@@ -661,6 +816,7 @@ class FinalReviewManifest:
             manifest_complete=review_manifest.completeness.complete,
             verified_actionable_findings=verified_actionable_findings,
             patch_verdict=patch_verdict,
+            execution=plan.execution,
         )
 
     @property
@@ -738,6 +894,8 @@ class FinalReviewManifest:
                 "patch_verdict": self.patch_verdict,
             }
         )
+        if self.execution is not None:
+            record["execution"] = self.execution.to_record()
         return record
 
     @classmethod
@@ -775,6 +933,11 @@ class FinalReviewManifest:
             manifest_complete=record["manifest_complete"],
             verified_actionable_findings=record["verified_actionable_findings"],
             patch_verdict=record["patch_verdict"],
+            execution=(
+                ManualFinalExecutionProvenance.from_record(record["execution"])
+                if "execution" in record
+                else None
+            ),
         )
 
 
@@ -825,6 +988,7 @@ def _manifest_identity_issues(
     manifest: FinalReviewManifest,
     *,
     current_target_sha: str | None = None,
+    allow_legacy: bool = False,
 ) -> list[str]:
     issues: list[str] = []
     expected = {
@@ -845,6 +1009,16 @@ def _manifest_identity_issues(
             issues.append(f"identity-mismatch:{label}")
     if current_target_sha is not None and manifest.target_sha != current_target_sha:
         issues.append("target-sha-drift")
+
+    if plan.execution is None and manifest.execution is None:
+        if not allow_legacy:
+            issues.append("execution-provenance-missing")
+    elif plan.execution is None or manifest.execution is None:
+        issues.append("identity-mismatch:execution-provenance")
+    elif plan.execution != manifest.execution:
+        issues.append("identity-mismatch:execution-provenance")
+    elif manifest.review_manifest.review_id != plan.execution.execution_id:
+        issues.append("identity-mismatch:execution-id")
 
     review_plan = manifest.review_manifest.plan
     if review_plan.head_sha != plan.target_sha:
@@ -892,7 +1066,10 @@ def validate_final_review(
 
     completeness = evidence.completeness
     issues = _manifest_identity_issues(
-        prepared, evidence, current_target_sha=current_target_sha
+        prepared,
+        evidence,
+        current_target_sha=current_target_sha,
+        allow_legacy=allow_legacy,
     )
     issues.extend(f"manifest:{issue}" for issue in completeness.issues)
     policy_issues = validate_manifest_policy(

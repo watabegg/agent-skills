@@ -90,11 +90,11 @@ Treat `pane_id` as advisory only. Re-read Herdr pane state before acting on a pa
 
 `namespace` and `loop_path` must match the Manager command's explicit `--namespace`. A command never searches another namespace or legacy `.ai/loop` when the selected `STATE.json` is missing.
 
-Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r2 state.
+Current format 3 state must include `schema_revision`. A format 3 artifact without that field is treated only as the legacy 3.r0 migration source; run `hloop migrate --dry-run` and then `hloop migrate --apply` to write current 3.r3 state.
 
-The current 0.5.2 contract is `state_format_version: 3` and `schema_revision: 2`. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned backup, and applies every declared revision rather than rebinding old evidence to the new schema. The runtime chain accepts format 1/2 and format 3 revision 0/1, then reaches format 3 revision 2.
+The current 0.5.3 contract is `state_format_version: 3` and `schema_revision: 3`. New task/result artifacts use `contract_schema_revision: 3`; revision 2 remains a labelled legacy union and cannot acquire invented revision-3 QA evidence. Mutation rejects an unknown future revision. Migration preserves `run_id`, writes a versioned digest-bound archive, and applies every declared revision through a prepared transaction rather than rebinding old evidence to the new schema.
 
-### 0.5.2 policy blocks
+### State policy and 0.5.3 execution blocks
 
 New state includes the following policy and evidence blocks:
 
@@ -105,6 +105,10 @@ New state includes the following policy and evidence blocks:
 - `manual_final_review`: certification id, PLAN/MANIFEST/report paths and digest, fixed target SHA, completeness, verified actionable finding count, and attempt history.
 - `follow_ups`: first-class artifact refs, open count, stable issue keys, aliases, and exported report paths.
 - `manager_invocation` and `execution_metrics`: Manager provider/model/reasoning effort plus task-origin, disposition, remediation-round, stale/aborted-review, and parallelism metrics.
+- `planning`: Repository Impact Map, Task Risk Graph, coverage ledger, Plan Gap artifact, and the plan/requirement/release-scope/source identity they share.
+- `review_epochs`: immutable plan revisions, required execution outcomes, inherited artifact digests, protocol capability records, and epoch-wide capacity leases.
+- `remediation_ledger`: normalized candidate registration, classification conflicts, one approval transition, write-ahead task materialization, and reconcile history.
+- per-task candidate and Patch Review state: exact attempt, task contract, completion mode, candidate SHA/artifact digest, review rounds, and terminal gate status.
 
 Legacy migration initializes these blocks with legacy-safe statuses. In particular, a migrated legacy loop keeps its stored merge-count cadence, marks existing tasks `legacy-unclassified`, and uses `not-required-for-legacy-run` for manual final certification.
 
@@ -149,7 +153,7 @@ Recommended optional fields:
 
 Raw or redacted input bodies, inbox events, broker databases, sockets, spooled reports, and provider credentials are never checkpoint-eligible. `STATE.json` may retain safe digests, IDs, counts, and resolved non-secret configuration, but not the underlying prompt or transport secret.
 
-Accepted requirements, their progress, and machine-readable decision records currently live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. The 0.5.2 CLI does not create separate `requirements/`, `progress/`, `context/`, or `decisions/` directories; release scope, convergence, manual final, and follow-up records use the namespaced paths described below.
+Accepted requirements, their progress, and machine-readable decision records live under `STATE.json.requirements` and `STATE.json.decisions`. `DECISIONS.md` remains the human-readable decision ledger. `requirements reconcile` projects evidence before explicit apply; it does not infer progress from a completion report alone. Release scope, planning, epochs, remediation, convergence, manual final, and follow-up records use the namespaced paths described below.
 
 Do not keep completed agent pane transcripts as durable state. Harvest artifacts first, then close panes and record cleanup status in `STATE.json`.
 
@@ -291,15 +295,17 @@ Only `status: done` may set `merge_ready: true`.
 
 Write non-empty list fields as multiline lists. `hloop` rejects non-empty inline lists for known list fields such as `validation_commands`, `validation_results`, `changed_files`, `blocking_questions`, `write_allow`, `write_deny`, `acceptance`, `depends_on`, and `spec_sources` because comma-splitting command strings is unsafe. Empty lists such as `blocking_questions: []` remain allowed.
 
-The result artifact must be committed on the Worker branch at `HEAD:.ai/herdr-dev-loop/loops/<namespace>/results/<task-id>/result.md`. `hloop worker harvest` rejects artifacts that exist only in the worktree or differ from the committed version.
+Revision-3 work first creates a nonterminal implementation candidate with `hloop worker submit`. The candidate binds the approved completion mode, attempt, semantic ACK, task contract digest, base, exact product tree, validation evidence, preserved invariants, regression evidence, self-review, residual risks, and unrun checks. It keeps `merge_ready: false`. Commit mode commits product changes before submit and creates a candidate seal with `hloop worker candidate-seal`; handoff mode performs neither staging nor commit.
+
+When `required_gates` includes Patch Review, `hloop patch-review` must pass against that exact candidate SHA and artifact digest. A changed candidate or task contract makes old review evidence stale. After all candidate, Patch Review, and full-suite gates pass, `hloop worker finalize` writes the terminal result. In commit mode the final result artifact is committed on the Worker branch at `HEAD:.ai/herdr-dev-loop/loops/<namespace>/results/<task-id>/result.md`; `hloop worker harvest` rejects artifacts that exist only in the worktree or differ from the committed version. The handoff exception is described below.
 
 Use `head_sha: HEAD` when writing the artifact from the Worker branch. `hloop worker harvest` resolves it to the actual branch head; writing the exact commit SHA inside the same commit is not required.
 
-Prefer `hloop worker finalize <task-id> --validation-command ... --validation-result ...` after committing product changes. It derives branch, base SHA, changed files, run ID, merge readiness, and the result path from Git and the task contract, then commits the artifact unless `--no-commit` is passed.
+Use `hloop worker submit <task-id> --completion-mode <commit|handoff> --validation-command ... --validation-result ...` for the candidate, then `hloop worker finalize <task-id>` only after every required gate passes. The helpers derive branch, base SHA, changed files, run ID, merge readiness, attempt and contract identity, and artifact paths from Git and the task contract.
 
 ### Durable handoff and Manager seal
 
-A Codex `workspace-write` Worker may not be able to run `git add`/`git commit` at all. `hloop worker finalize <task-id> --handoff` supports this: it tolerates dirty product paths that are already inside `write_allow`, writes `result.md` with `handoff: true`, and performs no Git metadata writes. Nothing is staged or committed; the Worker's product edits and `result.md` remain plain uncommitted files in the worktree.
+A Worker whose approved attempt mode is handoff must not run `git add` or `git commit`. It submits the dirty in-scope product tree with `hloop worker submit <task-id> --completion-mode handoff`, completes required Patch Review and full-suite gates for that candidate, then runs `hloop worker finalize <task-id> --handoff`. Finalize tolerates dirty product paths already inside `write_allow`, writes `result.md` with `handoff: true`, and performs no Git metadata writes. The Worker's product edits and `result.md` remain plain uncommitted files in the worktree.
 
 Manager (not the Worker) then runs `hloop worker seal <task-id> [--attempt-id <id>] [--validation-command <command>...] [--validation-summary <text>]` from the Manager checkout to turn that handoff into a normal committed Worker result. Seal fails closed, before staging or committing anything, if any of the following hold:
 
@@ -412,7 +418,7 @@ rationale: The reviewed code path can fail when ...
 
 ## Fixed-target convergence artifacts
 
-The 0.5.2 pre-final convergence commands write fixed-target JSON artifacts below:
+The fixed-target pre-final convergence commands inherited from 0.5.2 write JSON artifacts below:
 
 ```text
 reviews/convergence/PLAN.json
@@ -449,7 +455,7 @@ reviews/final/MANIFEST.json
 reviews/final/FINAL.md
 ```
 
-The plan fixes certification id, base/target SHA, base/target ref, scope source and digest, scope revisions, protocol, lane plan, and verification policy. The manifest must include lane completion, verification completeness, all normalized findings and evidence, `manifest_complete`, `verified_actionable_findings`, and `patch_verdict`. The report must be non-empty. `hloop final-review record` recomputes completeness and invalidates the certification when target SHA or plan identity drifts. `finish` accepts only a `passed` certification whose evidence is complete and whose verified actionable finding count is zero. A follow-up may remain open without failing this gate when it is non-blocking and the current contract is satisfied.
+The plan fixes certification id, base/target SHA, base/target ref, scope source and digest, scope revisions, protocol, lane plan, verification policy, and an `execution` record. The same execution record is copied into the manifest and binds execution policy/id, source kind/id, source artifact ref/digest, fixed target SHA, and exact external protocol adapter. `independent` requires a new Reviewer execution ID distinct from its complete pre-final source; `reuse_epoch_reviewer` requires the exact successful fixed-target epoch Reviewer execution and artifact. Duplicate or synthetic source identity, missing release pin, adapter drift, source artifact drift, and review ID drift fail closed. The manifest must also include lane completion, verification completeness, all normalized findings and evidence, `manifest_complete`, `verified_actionable_findings`, and `patch_verdict`. The report must be non-empty. `hloop final-review record` recomputes completeness and invalidates the certification when target SHA or plan identity drifts. `finish` accepts only a `passed` certification whose evidence is complete and whose verified actionable finding count is zero. A follow-up may remain open without failing this gate when it is non-blocking and the current contract is satisfied.
 
 ## First-class follow-up artifact
 

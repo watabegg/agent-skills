@@ -79,6 +79,32 @@ class ConfigSchemaV053Tests(unittest.TestCase):
 
 
 class LayerAliasNormalizationTests(unittest.TestCase):
+    def test_reviewer_providers_remains_canonical_while_count_aliases_normalize(self):
+        layer = {
+            "reviewer": {
+                "providers": ["codex", "claude"],
+                "probe_count": 6,
+                "probes_per_provider": 6,
+            }
+        }
+        config.validate_config({"version": 1, "defaults": layer})
+
+        normalized = config.normalize_config_layer(layer)
+        self.assertEqual(
+            normalized["reviewer"]["providers"], ["codex", "claude"]
+        )
+        self.assertEqual(normalized["reviewer"]["lane_count"], 6)
+        self.assertNotIn("probe_count", normalized["reviewer"])
+        self.assertNotIn("probes_per_provider", normalized["reviewer"])
+
+        canonical = config.merge_config_layers([("defaults", layer)]).as_dict()
+        self.assertEqual(
+            canonical["reviewer"]["providers"], ["codex", "claude"]
+        )
+        self.assertEqual(canonical["reviewer"]["lane_count"], 6)
+        self.assertIn("reviewer.providers", config.CANONICAL_CONFIG_LEAF_PATHS)
+        self.assertNotIn("reviewer.providers", config.LEGACY_CONFIG_ALIAS_PATHS)
+
     def test_equal_aliases_in_one_layer_collapse_to_one_canonical_leaf(self):
         layer = {
             "reviewer": {
