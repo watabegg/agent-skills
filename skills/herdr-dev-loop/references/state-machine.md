@@ -14,6 +14,16 @@ Before creating a role worktree, hloop verifies that the role's Manager-owned in
 
 For `persistence: local-only`, committed snapshot checks are replaced by copying the selected namespace into the role worktree. Repository-specific `worktree_setup_commands` run before pane launch. Setup or launcher failure rolls back only the worktree and branch created by that start attempt; pre-existing worktrees and branches are preserved.
 
+The initial TUI prompt remains the one transport boundary whose successful
+execution is detected by the semantic ACK timeout. After the role starts, its
+blocking `agent ack exchange` appends the ACK, waits without holding the loop
+lock, verifies the exact Manager decision and availability, appends application
+evidence, and resumes in the same provider process turn. `agent ack resolve`
+does not send pane input by default. The state machine keeps semantic decision,
+approval availability, role application, and optional pane notification as
+independent projections; reject, timeout, supersede, or identity drift keeps
+material work blocked.
+
 An artifact-less role can transition to `aborted` through `hloop agent abort`. `hloop agent requeue` archives attempt metadata and makes the Worker or role ID startable again with a new attempt id. The original attempt base is immutable; an unmerged branch with commits is archived instead of silently reused or deleted. Worktree cleanup refuses product-dirty paths unless Manager explicitly chooses `--force-cleanup`.
 
 State format 3 revision 3 is required by herdr-dev-loop 0.5.3. The migration path is format 1 -> 2 -> 3.0 -> 3.1 -> 3.2 -> 3.3; first run `hloop migrate --dry-run`, inspect the complete transaction, then run `hloop migrate --apply`. Migration preserves `run_id`, writes a digest-bound archive and marker, and refuses active, unharvested, live, dirty, or cleanup-failed role/merge/remediation state. Use `--resume` after interruption. Rollback is allowed only before the first recorded 0.5.3 mutation. Unknown future revisions allow explicit read-only inspection but reject mutation and downgrade.
