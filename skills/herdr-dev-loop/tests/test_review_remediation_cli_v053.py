@@ -48,11 +48,42 @@ from hloop_lib.review_epoch import (  # noqa: E402
     ReviewEpochPlan,
     canonical_digest,
 )
+from hloop_lib.config import project_agent_identity  # noqa: E402
 
 fixtures = __import__(
     "skills.herdr-dev-loop.tests.test_remediation_v053",
     fromlist=["candidate", "locked_scope", "remediation_task"],
 )
+
+
+FIXTURE_OBSERVED_PROCESS_IDENTITY = {
+    "provider": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "xhigh",
+}
+FIXTURE_ATTESTED_PROCESS_IDENTITY = {
+    "provider": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "xhigh",
+}
+
+
+def fixture_process_identities(execution) -> tuple[dict, ...]:
+    return tuple(
+        {
+            "process_id": process.process_id,
+            "agent_identity": project_agent_identity(
+                {
+                    "provider": process.provider,
+                    "model": process.model,
+                    "effort": process.effort,
+                },
+                observed=dict(FIXTURE_OBSERVED_PROCESS_IDENTITY),
+                attested=dict(FIXTURE_ATTESTED_PROCESS_IDENTITY),
+            ).as_dict(),
+        }
+        for process in execution.processes
+    )
 
 
 class ReviewRemediationCliV053Tests(unittest.TestCase):
@@ -140,6 +171,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     provider="codex",
                     model="gpt-5.6-sol",
                     effort="xhigh",
+                    attestation_required=True,
                 ),
                 AuditProcessPlan(
                     process_id=f"{execution_id}-verifier-01",
@@ -149,6 +181,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     model="gpt-5.6-sol",
                     effort="xhigh",
                     parent_process_id=coordinator,
+                    attestation_required=True,
                 ),
                 AuditProcessPlan(
                     process_id=f"{execution_id}-verifier-02",
@@ -158,6 +191,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     model="gpt-5.6-sol",
                     effort="xhigh",
                     parent_process_id=coordinator,
+                    attestation_required=True,
                 ),
             ]
         else:
@@ -169,6 +203,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     provider="codex",
                     model="gpt-5.6-sol",
                     effort="xhigh",
+                    attestation_required=True,
                 ),
                 AuditProcessPlan(
                     process_id=f"{execution_id}-{child_kind}",
@@ -181,12 +216,15 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     lane_id=(
                         "coverage" if child_kind == "challenge" else "correctness"
                     ),
+                    attestation_required=True,
                 ),
             ]
         return EpochExecutionPlan(
             execution_id=execution_id,
             attempt_id=f"{execution_id}-A001",
             source_kind=source_kind,
+            execution_kind="ordinary" if source_kind == "reviewer" else "",
+            protocol_key="reviewer.protocol" if source_kind == "reviewer" else "",
             protocol="native",
             independence_key=f"{source_kind}:{execution_id}",
             artifact_ref=(
@@ -333,6 +371,11 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                 artifact_digest=hloop._sha256_labelled(artifact.read_bytes()),
                 artifact_complete=status == "succeeded",
                 completed_process_ids=process_ids,
+                process_identities=(
+                    fixture_process_identities(execution)
+                    if status == "succeeded"
+                    else ()
+                ),
                 status=status,
                 terminal_at="2026-07-17T08:01:00Z",
             )
@@ -824,6 +867,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
             completed_process_ids=tuple(
                 process.process_id for process in reviewer.processes
             ),
+            process_identities=fixture_process_identities(reviewer),
             status="succeeded",
             terminal_at="2026-07-19T00:00:00+00:00",
         )

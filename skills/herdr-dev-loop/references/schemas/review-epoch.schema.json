@@ -13,6 +13,29 @@
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
     },
+    "agentIdentityValues": {
+      "type": "object",
+      "required": ["provider", "model", "effort"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "agentIdentity": {
+      "type": "object",
+      "required": ["requested", "observed", "attested", "status", "verified", "issues"],
+      "properties": {
+        "requested": {"$ref": "#/$defs/agentIdentityValues"},
+        "observed": {"$ref": "#/$defs/agentIdentityValues"},
+        "attested": {"$ref": "#/$defs/agentIdentityValues"},
+        "status": {"enum": ["attested", "requested-only", "unavailable", "mismatch"]},
+        "verified": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
     "auditProcess": {
       "type": "object",
       "required": [
@@ -22,6 +45,8 @@
         "provider",
         "model",
         "effort",
+        "agent_identity",
+        "attestation_required",
         "parent_process_id",
         "lane_id"
       ],
@@ -34,6 +59,8 @@
         "provider": {"enum": ["codex", "claude"]},
         "model": {"type": "string", "minLength": 1},
         "effort": {"type": "string", "minLength": 1},
+        "agent_identity": {"$ref": "#/$defs/agentIdentity"},
+        "attestation_required": {"const": true},
         "parent_process_id": {"type": "string"},
         "lane_id": {"type": "string"}
       },
@@ -93,6 +120,14 @@
             "manual_final"
           ]
         },
+        "execution_kind": {"enum": ["ordinary", "pre-final", "manual-final"]},
+        "protocol_key": {
+          "enum": [
+            "reviewer.protocol",
+            "review.pre_final_protocol",
+            "review.manual_final_protocol"
+          ]
+        },
         "protocol": {"type": "string", "minLength": 1},
         "independence_key": {"type": "string", "minLength": 1},
         "artifact_ref": {"type": "string", "minLength": 1},
@@ -104,6 +139,38 @@
         },
         "execution_digest": {"$ref": "#/$defs/digest"}
       },
+      "allOf": [
+        {
+          "if": {"properties": {"source_kind": {"const": "reviewer"}}, "required": ["source_kind"]},
+          "then": {
+            "required": ["execution_kind", "protocol_key"],
+            "properties": {
+              "execution_kind": {"const": "ordinary"},
+              "protocol_key": {"const": "reviewer.protocol"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"source_kind": {"enum": ["convergence", "pre_final"]}}, "required": ["source_kind"]},
+          "then": {
+            "required": ["execution_kind", "protocol_key"],
+            "properties": {
+              "execution_kind": {"const": "pre-final"},
+              "protocol_key": {"const": "review.pre_final_protocol"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"source_kind": {"const": "manual_final"}}, "required": ["source_kind"]},
+          "then": {
+            "required": ["execution_kind", "protocol_key"],
+            "properties": {
+              "execution_kind": {"const": "manual-final"},
+              "protocol_key": {"const": "review.manual_final_protocol"}
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "inheritedArtifact": {
@@ -121,6 +188,15 @@
         "artifact_ref": {"type": "string", "minLength": 1},
         "artifact_digest": {"$ref": "#/$defs/digest"},
         "source_plan_digest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "processIdentityEvidence": {
+      "type": "object",
+      "required": ["process_id", "agent_identity"],
+      "properties": {
+        "process_id": {"type": "string", "minLength": 1},
+        "agent_identity": {"$ref": "#/$defs/agentIdentity"}
       },
       "additionalProperties": false
     },
@@ -380,6 +456,7 @@
         "artifact_digest",
         "artifact_complete",
         "completed_process_ids",
+        "process_identities",
         "status",
         "terminal_at"
       ],
@@ -411,6 +488,11 @@
           "type": "array",
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
+        },
+        "process_identities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/processIdentityEvidence"}
         },
         "status": {
           "enum": [

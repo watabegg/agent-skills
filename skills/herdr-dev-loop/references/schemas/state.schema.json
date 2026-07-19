@@ -382,11 +382,16 @@
       "additionalProperties": false
     },
     "resolved_config": {"type": "object"},
+    "config_resolution_provenance": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
     "config_identity_projection": {"type": "object", "additionalProperties": true},
     "manager_identity": {"$ref": "#/$defs/agentIdentityProjection"},
     "review_protocol_selection": {"type": "object", "additionalProperties": true},
     "review_epoch_runtime_identity": {"type": "object", "additionalProperties": true},
     "planning": {"$ref": "#/$defs/planningState"},
+    "plan_gap_scout_run": {"type": "object", "additionalProperties": true},
     "release_scope": {
       "type": "object",
       "required": [
