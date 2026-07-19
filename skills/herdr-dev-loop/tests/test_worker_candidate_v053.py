@@ -24,6 +24,7 @@ from hloop_lib.worker_candidate import (  # noqa: E402
     CandidateSeal,
     ImplementationCandidate,
     PatchReview,
+    PatchReviewExtraRoundAuthorization,
     PatchReviewFinding,
     WorkerCandidateError,
     canonical_digest,
@@ -126,6 +127,36 @@ def patch_finding(
         trigger=f"Trigger {label}",
         product_impact=f"Impact {label}",
         proposed_fix=f"Fix {label}",
+    )
+
+
+def extra_round_authorization(
+    current: CandidateSeal,
+    blocked: PatchReview,
+    *,
+    status: str = "active",
+    consumed_review_attempt_id: str = "",
+    consumed_candidate_sha: str = "",
+) -> PatchReviewExtraRoundAuthorization:
+    return PatchReviewExtraRoundAuthorization(
+        run_id=current.run_id,
+        task_id=current.task_id,
+        attempt_id=current.attempt_id,
+        task_contract_digest=current.task_contract_digest,
+        base_round_limit=DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK,
+        blocked_review_attempt_id=blocked.review_attempt_id,
+        blocked_candidate_sha=blocked.candidate_sha,
+        blocking_finding_fingerprints=blocked.unresolved_finding_fingerprints,
+        decision_id="D007",
+        decision_digest=digest("D007"),
+        authorization_input_id="U0005",
+        input_prompt_digest="9" * 64,
+        granted_review_round=3,
+        status=status,
+        authorized_at="2026-07-19T12:00:00Z",
+        consumed_at="2026-07-19T12:05:00Z" if status == "consumed" else "",
+        consumed_review_attempt_id=consumed_review_attempt_id,
+        consumed_candidate_sha=consumed_candidate_sha,
     )
 
 
@@ -507,6 +538,133 @@ class PatchReviewRoundTests(unittest.TestCase):
                     current_task_contract_digest=current.task_contract_digest,
                     max_rounds=invalid,
                 )
+
+    def test_explicit_authorization_grants_exactly_one_third_round(self):
+        first_seal = sealed(candidate())
+        first_review = review(
+            first_seal,
+            verdict="fix_required",
+            unresolved=(patch_finding("first"),),
+        )
+        second_seal = sealed(
+            candidate(revision=2, tree="d" * 40), commit="e" * 40
+        )
+        second_review = review(
+            second_seal,
+            attempt="PR-T006-A002",
+            round_number=2,
+            verdict="fix_required",
+            unresolved=(patch_finding("second"),),
+        )
+        third_seal = sealed(
+            candidate(revision=3, tree="f" * 40), commit="1" * 40
+        )
+        authorization = extra_round_authorization(third_seal, second_review)
+
+        pending = evaluate_patch_review_rounds(
+            third_seal,
+            [first_review, second_review],
+            current_task_contract_digest=third_seal.task_contract_digest,
+            extra_round_authorization=authorization,
+        )
+        self.assertEqual(pending.action, "patch_review_pending")
+        self.assertEqual(pending.max_rounds, 3)
+        self.assertEqual(pending.automatic_task_ids, ())
+
+        third_review = review(
+            third_seal, attempt="PR-T006-A003", round_number=3
+        )
+        consumed = authorization.consume(
+            review_attempt_id=third_review.review_attempt_id,
+            candidate_sha=third_review.candidate_sha,
+            consumed_at="2026-07-19T12:05:00Z",
+        )
+        final = evaluate_patch_review_rounds(
+            third_seal,
+            [first_review, second_review, third_review],
+            current_task_contract_digest=third_seal.task_contract_digest,
+            extra_round_authorization=consumed,
+        )
+        self.assertEqual(final.action, "finalize_allowed")
+        self.assertEqual(final.rounds_used, 3)
+        self.assertEqual(
+            PatchReviewExtraRoundAuthorization.from_record(consumed.to_record()),
+            consumed,
+        )
+
+    def test_extra_round_fails_closed_without_exact_unconsumed_authorization(self):
+        first_seal = sealed(candidate())
+        first_review = review(
+            first_seal,
+            verdict="fix_required",
+            unresolved=(patch_finding("first"),),
+        )
+        second_seal = sealed(
+            candidate(revision=2, tree="d" * 40), commit="e" * 40
+        )
+        second_review = review(
+            second_seal,
+            attempt="PR-T006-A002",
+            round_number=2,
+            verdict="fix_required",
+            unresolved=(patch_finding("second"),),
+        )
+        third_seal = sealed(
+            candidate(revision=3, tree="f" * 40), commit="1" * 40
+        )
+        third_review = review(
+            third_seal, attempt="PR-T006-A003", round_number=3
+        )
+        with self.assertRaisesRegex(WorkerCandidateError, "round limit"):
+            evaluate_patch_review_rounds(
+                third_seal,
+                [first_review, second_review, third_review],
+                current_task_contract_digest=third_seal.task_contract_digest,
+            )
+        with self.assertRaisesRegex(WorkerCandidateError, "max_rounds"):
+            evaluate_patch_review_rounds(
+                third_seal,
+                [first_review, second_review],
+                current_task_contract_digest=third_seal.task_contract_digest,
+                max_rounds=3,
+            )
+
+        active = extra_round_authorization(third_seal, second_review)
+        bad_record = active.to_record()
+        bad_record["blocked_candidate_sha"] = "2" * 40
+        bad_record["authorization_digest"] = ""
+        wrong_sha = PatchReviewExtraRoundAuthorization.from_record(bad_record)
+        with self.assertRaisesRegex(WorkerCandidateError, "blocking evidence"):
+            evaluate_patch_review_rounds(
+                third_seal,
+                [first_review, second_review],
+                current_task_contract_digest=third_seal.task_contract_digest,
+                extra_round_authorization=wrong_sha,
+            )
+
+        consumed = active.consume(
+            review_attempt_id=third_review.review_attempt_id,
+            candidate_sha=third_review.candidate_sha,
+            consumed_at="2026-07-19T12:05:00Z",
+        )
+        with self.assertRaisesRegex(WorkerCandidateError, "already consumed"):
+            consumed.consume(
+                review_attempt_id="PR-T006-A004",
+                candidate_sha="3" * 40,
+                consumed_at="2026-07-19T12:10:00Z",
+            )
+        fourth = review(
+            third_seal,
+            attempt="PR-T006-A004",
+            round_number=4,
+        )
+        with self.assertRaisesRegex(WorkerCandidateError, "round limit"):
+            evaluate_patch_review_rounds(
+                third_seal,
+                [first_review, second_review, third_review, fourth],
+                current_task_contract_digest=third_seal.task_contract_digest,
+                extra_round_authorization=consumed,
+            )
 
     def test_idempotent_review_record_does_not_double_count_or_hide_conflict(self):
         current = candidate()

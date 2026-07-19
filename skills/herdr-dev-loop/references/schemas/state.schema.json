@@ -165,6 +165,81 @@
       },
       "additionalProperties": false
     },
+    "patchReviewExtraRoundAuthorization": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "run_id",
+        "task_id",
+        "attempt_id",
+        "task_contract_digest",
+        "base_round_limit",
+        "blocked_review_attempt_id",
+        "blocked_candidate_sha",
+        "blocking_finding_fingerprints",
+        "decision_id",
+        "decision_digest",
+        "authorization_input_id",
+        "input_prompt_digest",
+        "granted_review_round",
+        "status",
+        "authorized_at",
+        "consumed_at",
+        "consumed_review_attempt_id",
+        "consumed_candidate_sha",
+        "authorization_digest"
+      ],
+      "properties": {
+        "record_type": {"const": "patch_review_extra_round_authorization"},
+        "run_id": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "pattern": "^T[0-9]{3}$"},
+        "attempt_id": {"type": "string", "pattern": "^T[0-9]{3}-A[0-9]{3}$"},
+        "task_contract_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "base_round_limit": {"const": 2},
+        "blocked_review_attempt_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+        "blocked_candidate_sha": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "blocking_finding_fingerprints": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "decision_id": {"type": "string", "pattern": "^D[0-9]{3}$"},
+        "decision_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "authorization_input_id": {"type": "string", "pattern": "^U[0-9]{4}$"},
+        "input_prompt_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "granted_review_round": {"const": 3},
+        "status": {"enum": ["active", "consumed"]},
+        "authorized_at": {"type": "string", "minLength": 1},
+        "consumed_at": {"type": "string"},
+        "consumed_review_attempt_id": {"type": "string"},
+        "consumed_candidate_sha": {"type": "string"},
+        "authorization_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "active"}}, "required": ["status"]},
+          "then": {
+            "properties": {
+              "consumed_at": {"const": ""},
+              "consumed_review_attempt_id": {"const": ""},
+              "consumed_candidate_sha": {"const": ""}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "consumed"}}, "required": ["status"]},
+          "then": {
+            "properties": {
+              "consumed_at": {"type": "string", "minLength": 1},
+              "consumed_review_attempt_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+              "consumed_candidate_sha": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"}
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
     "workerCandidateTaskProjection": {
       "type": "object",
       "properties": {
@@ -256,6 +331,7 @@
         "patch_review_history": {"type": "array", "items": {"type": "object"}},
         "current_patch_review": {"type": "object"},
         "patch_review_decision": {"type": "object"},
+        "patch_review_extra_round_authorization": {"$ref": "#/$defs/patchReviewExtraRoundAuthorization"},
         "legacy_result_acceptance": {"type": "object"}
       },
       "additionalProperties": true

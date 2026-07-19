@@ -31,6 +31,9 @@ GIT_OBJECT_PATTERN = r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
 TASK_ID_PATTERN = r"^T[0-9]{3}$"
 ATTEMPT_ID_PATTERN = r"^T[0-9]{3}-A[0-9]{3}$"
 REVIEW_ATTEMPT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+DECISION_ID_PATTERN = r"^D[0-9]{3}$"
+INPUT_ID_PATTERN = r"^U[0-9]{4}$"
+UNLABELLED_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 
 COMPLETION_MODES = frozenset({"commit", "handoff"})
 PATCH_REVIEW_VERDICTS = frozenset({"passed", "fix_required"})
@@ -53,6 +56,9 @@ _GIT_OBJECT_RE = re.compile(GIT_OBJECT_PATTERN)
 _TASK_ID_RE = re.compile(TASK_ID_PATTERN)
 _ATTEMPT_ID_RE = re.compile(ATTEMPT_ID_PATTERN)
 _REVIEW_ATTEMPT_ID_RE = re.compile(REVIEW_ATTEMPT_ID_PATTERN)
+_DECISION_ID_RE = re.compile(DECISION_ID_PATTERN)
+_INPUT_ID_RE = re.compile(INPUT_ID_PATTERN)
+_UNLABELLED_DIGEST_RE = re.compile(UNLABELLED_DIGEST_PATTERN)
 
 IMPLEMENTATION_CANDIDATE_FIELDS = frozenset(
     {
@@ -136,6 +142,30 @@ LEGACY_PATCH_REVIEW_FIELDS = frozenset(
 )
 PATCH_REVIEW_FIELDS = LEGACY_PATCH_REVIEW_FIELDS | frozenset(
     {"finding_identity_contract", "findings"}
+)
+PATCH_REVIEW_EXTRA_ROUND_AUTHORIZATION_FIELDS = frozenset(
+    {
+        "record_type",
+        "run_id",
+        "task_id",
+        "attempt_id",
+        "task_contract_digest",
+        "base_round_limit",
+        "blocked_review_attempt_id",
+        "blocked_candidate_sha",
+        "blocking_finding_fingerprints",
+        "decision_id",
+        "decision_digest",
+        "authorization_input_id",
+        "input_prompt_digest",
+        "granted_review_round",
+        "status",
+        "authorized_at",
+        "consumed_at",
+        "consumed_review_attempt_id",
+        "consumed_candidate_sha",
+        "authorization_digest",
+    }
 )
 
 
@@ -1203,6 +1233,220 @@ def require_fresh_patch_review(
 
 
 @dataclass(frozen=True, slots=True)
+class PatchReviewExtraRoundAuthorization:
+    """One explicit, task-local grant for exactly one third Patch Review round."""
+
+    run_id: str
+    task_id: str
+    attempt_id: str
+    task_contract_digest: str
+    base_round_limit: int
+    blocked_review_attempt_id: str
+    blocked_candidate_sha: str
+    blocking_finding_fingerprints: tuple[str, ...]
+    decision_id: str
+    decision_digest: str
+    authorization_input_id: str
+    input_prompt_digest: str
+    granted_review_round: int
+    status: str
+    authorized_at: str
+    consumed_at: str = ""
+    consumed_review_attempt_id: str = ""
+    consumed_candidate_sha: str = ""
+    authorization_digest: str = ""
+    record_type: str = "patch_review_extra_round_authorization"
+
+    def __post_init__(self) -> None:
+        run_id = _required_text(self.run_id, "run_id")
+        task_id, attempt_id = _task_attempt(self.task_id, self.attempt_id)
+        contract_digest = _digest(self.task_contract_digest, "task_contract_digest")
+        base_limit = _patch_review_round_limit(self.base_round_limit)
+        if base_limit != DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK:
+            raise WorkerCandidateError(
+                "extra-round authorization requires the configured base limit of 2"
+            )
+        blocked_review_attempt_id = _required_text(
+            self.blocked_review_attempt_id, "blocked_review_attempt_id"
+        )
+        if not _REVIEW_ATTEMPT_ID_RE.fullmatch(blocked_review_attempt_id):
+            raise WorkerCandidateError("blocked_review_attempt_id is invalid")
+        blocked_candidate_sha = _git_object(
+            self.blocked_candidate_sha, "blocked_candidate_sha"
+        )
+        fingerprints = _text_tuple(
+            self.blocking_finding_fingerprints,
+            "blocking_finding_fingerprints",
+            allow_empty=False,
+        )
+        for fingerprint in fingerprints:
+            _digest(fingerprint, "blocking_finding_fingerprints")
+        decision_id = _required_text(self.decision_id, "decision_id")
+        if not _DECISION_ID_RE.fullmatch(decision_id):
+            raise WorkerCandidateError("decision_id must match D followed by 3 digits")
+        decision_digest = _digest(self.decision_digest, "decision_digest")
+        input_id = _required_text(
+            self.authorization_input_id, "authorization_input_id"
+        )
+        if not _INPUT_ID_RE.fullmatch(input_id):
+            raise WorkerCandidateError(
+                "authorization_input_id must match U followed by 4 digits"
+            )
+        input_prompt_digest = _required_text(
+            self.input_prompt_digest, "input_prompt_digest"
+        )
+        if not _UNLABELLED_DIGEST_RE.fullmatch(input_prompt_digest):
+            raise WorkerCandidateError(
+                "input_prompt_digest must be an unlabelled lowercase SHA-256 digest"
+            )
+        granted_round = _positive_int(
+            self.granted_review_round, "granted_review_round"
+        )
+        if granted_round != base_limit + 1:
+            raise WorkerCandidateError(
+                "extra-round authorization must grant exactly the next round"
+            )
+        if self.status not in {"active", "consumed"}:
+            raise WorkerCandidateError("authorization status must be active or consumed")
+        authorized_at = _required_text(self.authorized_at, "authorized_at")
+        consumed = (
+            str(self.consumed_at or "").strip(),
+            str(self.consumed_review_attempt_id or "").strip(),
+            str(self.consumed_candidate_sha or "").strip(),
+        )
+        if self.status == "active" and any(consumed):
+            raise WorkerCandidateError(
+                "active authorization cannot contain consumption evidence"
+            )
+        if self.status == "consumed" and not all(consumed):
+            raise WorkerCandidateError(
+                "consumed authorization requires complete consumption evidence"
+            )
+        if consumed[1] and not _REVIEW_ATTEMPT_ID_RE.fullmatch(consumed[1]):
+            raise WorkerCandidateError("consumed_review_attempt_id is invalid")
+        if consumed[2]:
+            _git_object(consumed[2], "consumed_candidate_sha")
+        if self.record_type != "patch_review_extra_round_authorization":
+            raise WorkerCandidateError("invalid extra-round authorization record_type")
+
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "attempt_id", attempt_id)
+        object.__setattr__(self, "task_contract_digest", contract_digest)
+        object.__setattr__(self, "blocked_review_attempt_id", blocked_review_attempt_id)
+        object.__setattr__(self, "blocked_candidate_sha", blocked_candidate_sha)
+        object.__setattr__(self, "blocking_finding_fingerprints", fingerprints)
+        object.__setattr__(self, "decision_id", decision_id)
+        object.__setattr__(self, "decision_digest", decision_digest)
+        object.__setattr__(self, "authorization_input_id", input_id)
+        object.__setattr__(self, "input_prompt_digest", input_prompt_digest)
+        object.__setattr__(self, "authorized_at", authorized_at)
+        object.__setattr__(self, "consumed_at", consumed[0])
+        object.__setattr__(self, "consumed_review_attempt_id", consumed[1])
+        object.__setattr__(self, "consumed_candidate_sha", consumed[2])
+
+        expected = canonical_digest(self._unsigned_record())
+        if self.authorization_digest:
+            supplied = _digest(self.authorization_digest, "authorization_digest")
+            if not hmac.compare_digest(supplied, expected):
+                raise WorkerCandidateError(
+                    "authorization_digest does not match the record"
+                )
+        object.__setattr__(self, "authorization_digest", expected)
+
+    def _unsigned_record(self) -> dict[str, Any]:
+        return {
+            "record_type": self.record_type,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id,
+            "task_contract_digest": self.task_contract_digest,
+            "base_round_limit": self.base_round_limit,
+            "blocked_review_attempt_id": self.blocked_review_attempt_id,
+            "blocked_candidate_sha": self.blocked_candidate_sha,
+            "blocking_finding_fingerprints": list(
+                self.blocking_finding_fingerprints
+            ),
+            "decision_id": self.decision_id,
+            "decision_digest": self.decision_digest,
+            "authorization_input_id": self.authorization_input_id,
+            "input_prompt_digest": self.input_prompt_digest,
+            "granted_review_round": self.granted_review_round,
+            "status": self.status,
+            "authorized_at": self.authorized_at,
+            "consumed_at": self.consumed_at,
+            "consumed_review_attempt_id": self.consumed_review_attempt_id,
+            "consumed_candidate_sha": self.consumed_candidate_sha,
+        }
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            **self._unsigned_record(),
+            "authorization_digest": self.authorization_digest,
+        }
+
+    @classmethod
+    def from_record(
+        cls, record: Mapping[str, Any]
+    ) -> "PatchReviewExtraRoundAuthorization":
+        _exact_fields(
+            record,
+            PATCH_REVIEW_EXTRA_ROUND_AUTHORIZATION_FIELDS,
+            "extra-round authorization",
+        )
+        return cls(
+            record_type=str(record.get("record_type") or ""),
+            run_id=str(record.get("run_id") or ""),
+            task_id=str(record.get("task_id") or ""),
+            attempt_id=str(record.get("attempt_id") or ""),
+            task_contract_digest=str(record.get("task_contract_digest") or ""),
+            base_round_limit=record.get("base_round_limit"),
+            blocked_review_attempt_id=str(record.get("blocked_review_attempt_id") or ""),
+            blocked_candidate_sha=str(record.get("blocked_candidate_sha") or ""),
+            blocking_finding_fingerprints=tuple(
+                record.get("blocking_finding_fingerprints") or ()
+            ),
+            decision_id=str(record.get("decision_id") or ""),
+            decision_digest=str(record.get("decision_digest") or ""),
+            authorization_input_id=str(record.get("authorization_input_id") or ""),
+            input_prompt_digest=str(record.get("input_prompt_digest") or ""),
+            granted_review_round=record.get("granted_review_round"),
+            status=str(record.get("status") or ""),
+            authorized_at=str(record.get("authorized_at") or ""),
+            consumed_at=str(record.get("consumed_at") or ""),
+            consumed_review_attempt_id=str(
+                record.get("consumed_review_attempt_id") or ""
+            ),
+            consumed_candidate_sha=str(record.get("consumed_candidate_sha") or ""),
+            authorization_digest=str(record.get("authorization_digest") or ""),
+        )
+
+    def consume(
+        self, *, review_attempt_id: str, candidate_sha: str, consumed_at: str
+    ) -> "PatchReviewExtraRoundAuthorization":
+        review_id = _required_text(review_attempt_id, "review_attempt_id")
+        candidate = _git_object(candidate_sha, "candidate_sha")
+        timestamp = _required_text(consumed_at, "consumed_at")
+        if self.status == "consumed":
+            if (
+                self.consumed_review_attempt_id == review_id
+                and self.consumed_candidate_sha == candidate
+            ):
+                return self
+            raise WorkerCandidateError("extra-round authorization was already consumed")
+        values = self._unsigned_record()
+        values.update(
+            {
+                "status": "consumed",
+                "consumed_at": timestamp,
+                "consumed_review_attempt_id": review_id,
+                "consumed_candidate_sha": candidate,
+            }
+        )
+        return PatchReviewExtraRoundAuthorization(**values)
+
+
+@dataclass(frozen=True, slots=True)
 class PatchReviewDecision:
     """Fail-closed next action for one task's bounded Patch Review history."""
 
@@ -1294,6 +1538,9 @@ def evaluate_patch_review_rounds(
     *,
     current_task_contract_digest: str,
     max_rounds: int = DEFAULT_MAX_PATCH_REVIEW_ROUNDS_PER_TASK,
+    extra_round_authorization: (
+        PatchReviewExtraRoundAuthorization | Mapping[str, Any] | None
+    ) = None,
 ) -> PatchReviewDecision:
     """Evaluate fresh evidence and the independent per-task review budget.
 
@@ -1307,11 +1554,68 @@ def evaluate_patch_review_rounds(
     active_contract = _digest(
         current_task_contract_digest, "current_task_contract_digest"
     )
-    limit = _patch_review_round_limit(max_rounds)
+    base_limit = _patch_review_round_limit(max_rounds)
     history = _deduplicate_review_attempts(
         reviews, run_id=current.run_id, task_id=current.task_id
     )
     require_uniform_patch_review_finding_identity(history)
+    authorization = (
+        extra_round_authorization
+        if isinstance(
+            extra_round_authorization, PatchReviewExtraRoundAuthorization
+        )
+        else PatchReviewExtraRoundAuthorization.from_record(
+            _record(extra_round_authorization, "extra_round_authorization")
+        )
+        if extra_round_authorization is not None
+        else None
+    )
+    limit = base_limit
+    if authorization is not None:
+        if (
+            authorization.run_id != current.run_id
+            or authorization.task_id != current.task_id
+            or authorization.attempt_id != current.attempt_id
+        ):
+            raise WorkerCandidateError(
+                "extra-round authorization does not belong to the current task attempt"
+            )
+        if authorization.task_contract_digest != active_contract:
+            raise WorkerCandidateError("extra-round authorization task contract is stale")
+        if authorization.base_round_limit != base_limit:
+            raise WorkerCandidateError("extra-round authorization base limit changed")
+        if len(history) < base_limit:
+            raise WorkerCandidateError(
+                "extra-round authorization requires the complete base review history"
+            )
+        blocked = history[base_limit - 1]
+        if (
+            blocked.review_attempt_id != authorization.blocked_review_attempt_id
+            or blocked.candidate_sha != authorization.blocked_candidate_sha
+            or blocked.verdict != "fix_required"
+            or blocked.unresolved_finding_fingerprints
+            != authorization.blocking_finding_fingerprints
+        ):
+            raise WorkerCandidateError(
+                "extra-round authorization does not match retained blocking evidence"
+            )
+        limit = authorization.granted_review_round
+        if len(history) >= limit:
+            granted_review = history[limit - 1]
+            if (
+                authorization.status != "consumed"
+                or authorization.consumed_review_attempt_id
+                != granted_review.review_attempt_id
+                or authorization.consumed_candidate_sha
+                != granted_review.candidate_sha
+            ):
+                raise WorkerCandidateError(
+                    "round-3 review lacks matching authorization consumption"
+                )
+        elif authorization.status != "active":
+            raise WorkerCandidateError(
+                "consumed extra-round authorization has no matching round-3 review"
+            )
     if len(history) > limit:
         raise WorkerCandidateError("Patch Review history exceeds the per-task round limit")
 

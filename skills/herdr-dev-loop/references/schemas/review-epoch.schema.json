@@ -141,34 +141,45 @@
       },
       "allOf": [
         {
-          "if": {"properties": {"source_kind": {"const": "reviewer"}}, "required": ["source_kind"]},
-          "then": {
-            "required": ["execution_kind", "protocol_key"],
-            "properties": {
-              "execution_kind": {"const": "ordinary"},
-              "protocol_key": {"const": "reviewer.protocol"}
+          "oneOf": [
+            {
+              "not": {
+                "anyOf": [
+                  {"required": ["execution_kind"]},
+                  {"required": ["protocol_key"]}
+                ]
+              }
+            },
+            {
+              "required": ["execution_kind", "protocol_key"],
+              "oneOf": [
+                {
+                  "properties": {
+                    "source_kind": {"const": "reviewer"},
+                    "execution_kind": {"const": "ordinary"},
+                    "protocol_key": {"const": "reviewer.protocol"}
+                  },
+                  "required": ["source_kind"]
+                },
+                {
+                  "properties": {
+                    "source_kind": {"enum": ["convergence", "pre_final"]},
+                    "execution_kind": {"const": "pre-final"},
+                    "protocol_key": {"const": "review.pre_final_protocol"}
+                  },
+                  "required": ["source_kind"]
+                },
+                {
+                  "properties": {
+                    "source_kind": {"const": "manual_final"},
+                    "execution_kind": {"const": "manual-final"},
+                    "protocol_key": {"const": "review.manual_final_protocol"}
+                  },
+                  "required": ["source_kind"]
+                }
+              ]
             }
-          }
-        },
-        {
-          "if": {"properties": {"source_kind": {"enum": ["convergence", "pre_final"]}}, "required": ["source_kind"]},
-          "then": {
-            "required": ["execution_kind", "protocol_key"],
-            "properties": {
-              "execution_kind": {"const": "pre-final"},
-              "protocol_key": {"const": "review.pre_final_protocol"}
-            }
-          }
-        },
-        {
-          "if": {"properties": {"source_kind": {"const": "manual_final"}}, "required": ["source_kind"]},
-          "then": {
-            "required": ["execution_kind", "protocol_key"],
-            "properties": {
-              "execution_kind": {"const": "manual-final"},
-              "protocol_key": {"const": "review.manual_final_protocol"}
-            }
-          }
+          ]
         }
       ],
       "additionalProperties": false
