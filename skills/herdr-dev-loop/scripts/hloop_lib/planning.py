@@ -172,7 +172,20 @@ _COVERAGE_ENTRY_FIELDS = frozenset(
     }
 )
 _CHECKER_FIELDS = frozenset(
-    {"role_id", "role_kind", "mode", "provider", "model", "effort"}
+    {
+        "role_id",
+        "role_kind",
+        "mode",
+        "provider",
+        "model",
+        "effort",
+        "attempt_id",
+        "head_sha",
+        "planning_identity_digest",
+        "task_contract_digest",
+        "input_artifact_digests",
+        "config_sources",
+    }
 )
 _FINDING_FIELDS = frozenset(
     {"finding_id", "category", "refs", "message"}
@@ -943,7 +956,11 @@ def _validate_coverage_shape(record: Mapping[str, Any]) -> list[PlanningIssue]:
     return issues
 
 
-def _validate_plan_gap(record: Mapping[str, Any]) -> list[PlanningIssue]:
+def _validate_plan_gap(
+    record: Mapping[str, Any],
+    *,
+    expected_checker: Mapping[str, Any] | None = None,
+) -> list[PlanningIssue]:
     issues: list[PlanningIssue] = []
     for field_name in (
         "impact_map_digest",
@@ -958,18 +975,132 @@ def _validate_plan_gap(record: Mapping[str, Any]) -> list[PlanningIssue]:
     try:
         checker = _mapping(record.get("checker"), "checker")
         issues.extend(_shape_issues(checker, _CHECKER_FIELDS, "checker"))
-        expected = {
+        fixed = {
+            "role_id": "S001",
             "role_kind": "specification_scout",
             "mode": "coverage",
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-            "effort": "xhigh",
         }
+        for field_name in (
+            "role_id",
+            "provider",
+            "model",
+            "effort",
+            "attempt_id",
+            "head_sha",
+        ):
+            try:
+                _required_text(checker.get(field_name), f"checker.{field_name}")
+            except PlanningContractError as exc:
+                issues.append(_issue_from_error(exc, f"checker.{field_name}"))
+        if checker.get("provider") not in {"codex", "claude"}:
+            issues.append(
+                PlanningIssue(
+                    "invalid-checker-identity",
+                    "checker.provider must be 'codex' or 'claude'",
+                    "checker.provider",
+                )
+            )
+        if not isinstance(checker.get("head_sha"), str) or not re.fullmatch(
+            r"[0-9a-f]{40,64}", checker["head_sha"]
+        ):
+            issues.append(
+                PlanningIssue(
+                    "invalid-checker-identity",
+                    "checker.head_sha must be a lowercase 40-64 character Git object id",
+                    "checker.head_sha",
+                )
+            )
+        for field_name in ("planning_identity_digest",):
+            try:
+                _digest(checker.get(field_name), f"checker.{field_name}")
+            except PlanningContractError as exc:
+                issues.append(_issue_from_error(exc, f"checker.{field_name}"))
         try:
-            _required_text(checker.get("role_id"), "checker.role_id")
+            expected_identity_digest = canonical_digest(
+                PlanningIdentity.from_record(record).to_dict()
+            )
+            if checker.get("planning_identity_digest") != expected_identity_digest:
+                issues.append(
+                    PlanningIssue(
+                        "checker-identity-mismatch",
+                        "checker.planning_identity_digest does not match the artifact identity",
+                        "checker.planning_identity_digest",
+                    )
+                )
+        except PlanningContractError:
+            pass
+        task_contract_digest = checker.get("task_contract_digest")
+        if not isinstance(task_contract_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", task_contract_digest
+        ):
+            issues.append(
+                PlanningIssue(
+                    "invalid-checker-identity",
+                    "checker.task_contract_digest must be an unlabelled SHA-256 digest",
+                    "checker.task_contract_digest",
+                )
+            )
+        try:
+            inputs = _mapping(
+                checker.get("input_artifact_digests"),
+                "checker.input_artifact_digests",
+            )
+            issues.extend(
+                _shape_issues(
+                    inputs,
+                    frozenset({"impact_map", "task_graph", "coverage"}),
+                    "checker.input_artifact_digests",
+                )
+            )
+            for field_name in ("impact_map", "task_graph", "coverage"):
+                try:
+                    _digest(
+                        inputs.get(field_name),
+                        f"checker.input_artifact_digests.{field_name}",
+                    )
+                except PlanningContractError as exc:
+                    issues.append(
+                        _issue_from_error(
+                            exc,
+                            f"checker.input_artifact_digests.{field_name}",
+                        )
+                    )
+            expected_inputs = {
+                "impact_map": record.get("impact_map_digest"),
+                "task_graph": record.get("task_graph_digest"),
+                "coverage": record.get("coverage_digest"),
+            }
+            if dict(inputs) != expected_inputs:
+                issues.append(
+                    PlanningIssue(
+                        "checker-input-mismatch",
+                        "checker input artifact digests do not match Plan Gap dependencies",
+                        "checker.input_artifact_digests",
+                    )
+                )
         except PlanningContractError as exc:
-            issues.append(_issue_from_error(exc, "checker.role_id"))
-        for field_name, value in expected.items():
+            issues.append(_issue_from_error(exc, "checker.input_artifact_digests"))
+        try:
+            sources = _mapping(checker.get("config_sources"), "checker.config_sources")
+            issues.extend(
+                _shape_issues(
+                    sources,
+                    frozenset({"provider", "model", "effort"}),
+                    "checker.config_sources",
+                )
+            )
+            for field_name in ("provider", "model", "effort"):
+                try:
+                    _required_text(
+                        sources.get(field_name), f"checker.config_sources.{field_name}"
+                    )
+                except PlanningContractError as exc:
+                    issues.append(
+                        _issue_from_error(exc, f"checker.config_sources.{field_name}")
+                    )
+        except PlanningContractError as exc:
+            issues.append(_issue_from_error(exc, "checker.config_sources"))
+        for field_name, value in fixed.items():
             if checker.get(field_name) != value:
                 issues.append(
                     PlanningIssue(
@@ -978,6 +1109,16 @@ def _validate_plan_gap(record: Mapping[str, Any]) -> list[PlanningIssue]:
                         f"checker.{field_name}",
                     )
                 )
+        if expected_checker is not None:
+            for field_name, value in expected_checker.items():
+                if checker.get(field_name) != value:
+                    issues.append(
+                        PlanningIssue(
+                            "checker-identity-mismatch",
+                            f"checker.{field_name} does not match the authenticated coverage run",
+                            f"checker.{field_name}",
+                        )
+                    )
     except PlanningContractError as exc:
         issues.append(_issue_from_error(exc, "checker"))
 
@@ -1048,7 +1189,10 @@ def _validate_plan_gap(record: Mapping[str, Any]) -> list[PlanningIssue]:
 
 
 def validate_planning_artifact(
-    record: Mapping[str, Any], *, expected_record_type: str | None = None
+    record: Mapping[str, Any],
+    *,
+    expected_record_type: str | None = None,
+    expected_plan_gap_checker: Mapping[str, Any] | None = None,
 ) -> PlanningValidation:
     """Validate one strict planning artifact, including its stored digest."""
 
@@ -1103,7 +1247,11 @@ def validate_planning_artifact(
     elif record_type == COVERAGE_RECORD_TYPE:
         issues.extend(_validate_coverage_shape(record))
     elif record_type == PLAN_GAP_RECORD_TYPE:
-        issues.extend(_validate_plan_gap(record))
+        issues.extend(
+            _validate_plan_gap(
+                record, expected_checker=expected_plan_gap_checker
+            )
+        )
     return PlanningValidation(tuple(issues))
 
 
@@ -1475,6 +1623,7 @@ def validate_planning_bundle(
     required_requirement_refs: Iterable[str] = (),
     required_plan_item_refs: Iterable[str] = (),
     allowed_scope_refs: Iterable[str] | None = None,
+    expected_plan_gap_checker: Mapping[str, Any] | None = None,
 ) -> PlanningValidation:
     """Validate the complete pre-dispatch planning evidence bundle."""
 
@@ -1489,7 +1638,13 @@ def validate_planning_bundle(
     for record, record_type in zip(records, expected_types, strict=True):
         issues.extend(
             validate_planning_artifact(
-                record, expected_record_type=record_type
+                record,
+                expected_record_type=record_type,
+                expected_plan_gap_checker=(
+                    expected_plan_gap_checker
+                    if record_type == PLAN_GAP_RECORD_TYPE
+                    else None
+                ),
             ).issues
         )
     issues.extend(planning_staleness(records, current_identity).issues)

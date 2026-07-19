@@ -46,14 +46,56 @@
     },
     "checker": {
       "type": "object",
-      "required": ["role_id", "role_kind", "mode", "provider", "model", "effort"],
+      "required": [
+        "role_id",
+        "role_kind",
+        "mode",
+        "provider",
+        "model",
+        "effort",
+        "attempt_id",
+        "head_sha",
+        "planning_identity_digest",
+        "task_contract_digest",
+        "input_artifact_digests",
+        "config_sources"
+      ],
       "properties": {
-        "role_id": {"type": "string", "minLength": 1},
+        "role_id": {"const": "S001"},
         "role_kind": {"const": "specification_scout"},
         "mode": {"const": "coverage"},
-        "provider": {"const": "codex"},
-        "model": {"const": "gpt-5.6-sol"},
-        "effort": {"const": "xhigh"}
+        "provider": {"enum": ["codex", "claude"]},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "planning_identity_digest": {
+          "$ref": "planning-common.schema.json#/$defs/digest"
+        },
+        "task_contract_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "input_artifact_digests": {
+          "type": "object",
+          "required": ["impact_map", "task_graph", "coverage"],
+          "properties": {
+            "impact_map": {"$ref": "planning-common.schema.json#/$defs/digest"},
+            "task_graph": {"$ref": "planning-common.schema.json#/$defs/digest"},
+            "coverage": {"$ref": "planning-common.schema.json#/$defs/digest"}
+          },
+          "additionalProperties": false
+        },
+        "config_sources": {
+          "type": "object",
+          "required": ["provider", "model", "effort"],
+          "properties": {
+            "provider": {"type": "string", "minLength": 1},
+            "model": {"type": "string", "minLength": 1},
+            "effort": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },

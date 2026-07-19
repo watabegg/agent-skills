@@ -131,6 +131,75 @@ class ConfigProjectionRuntimeV053Tests(unittest.TestCase):
         )
         self.assertEqual(resolution.get("reviewer", "lane_count"), 6)
 
+    def test_omitted_gap_and_advisor_flags_do_not_override_config(self):
+        args = hloop.build_parser().parse_args(["init", "--goal", "role-defaults"])
+
+        self.assertIsNone(args.gap_agent_provider)
+        self.assertIsNone(args.gap_agent_model)
+        self.assertIsNone(args.gap_agent_effort)
+        self.assertIsNone(args.advisor_agent_provider)
+        self.assertIsNone(args.advisor_agent_model)
+        self.assertIsNone(args.advisor_agent_effort)
+        override = hloop.init_config_override(args)
+        self.assertNotIn("gap", override)
+        self.assertNotIn("advisor", override)
+
+    def test_runtime_role_resolution_preserves_source_and_explicit_precedence(self):
+        state = self.canonical_state()
+        state["resolved_config"]["gap"].update(
+            {"provider": "claude", "model": "opus", "effort": "max"}
+        )
+        state["config_resolution_provenance"] = [
+            {
+                "key": f"gap.{field}",
+                "value": value,
+                "source": "scope:tree:/repo",
+                "provenance": [
+                    {
+                        "source": "built-in-default",
+                        "input_key": f"gap.{field}",
+                        "value": hloop.BUILT_IN_CONFIG_DEFAULTS["gap"][field],
+                    },
+                    {
+                        "source": "scope:tree:/repo",
+                        "input_key": f"gap.{field}",
+                        "value": value,
+                    },
+                ],
+            }
+            for field, value in {
+                "provider": "claude",
+                "model": "opus",
+                "effort": "max",
+            }.items()
+        ]
+
+        configured = hloop.role_agent_config(state, "gap")
+        explicit = hloop.role_agent_config(
+            state,
+            "gap",
+            start_override={"agent_model": "sonnet"},
+        )
+
+        self.assertEqual(
+            (configured["provider"], configured["model"], configured["effort"]),
+            ("claude", "opus", "max"),
+        )
+        self.assertEqual(
+            configured["sources"],
+            {
+                "provider": "scope:tree:/repo",
+                "model": "scope:tree:/repo",
+                "effort": "scope:tree:/repo",
+            },
+        )
+        self.assertEqual(explicit["model"], "sonnet")
+        self.assertEqual(explicit["sources"]["model"], "start-override")
+        self.assertEqual(
+            [item["source"] for item in explicit["provenance"]["model"]],
+            ["built-in-default", "scope:tree:/repo", "start-override"],
+        )
+
     def test_explicit_native_init_protocol_remains_an_override(self):
         args = hloop.build_parser().parse_args(
             ["init", "--goal", "fresh-native", "--review-protocol", "native"]

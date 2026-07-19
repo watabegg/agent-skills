@@ -337,6 +337,11 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             mock.patch.object(
                 hloop, "assert_release_scope_snapshot", return_value=locked_scope
             ),
+            mock.patch.object(
+                hloop,
+                "plan_gap_scout_binding_issues",
+                return_value=([], dict(plan_gap["checker"])),
+            ),
         ):
             accepted = hloop.planning_dispatch_validation(Path("."), state)
             locked_scope.release_scope_refs = ()
@@ -347,6 +352,119 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             "authoritative-scope-required",
             {issue.code for issue in rejected.issues},
         )
+
+    def test_coverage_scout_binding_is_exact_and_stale_evidence_fails(self) -> None:
+        fixtures = importlib.import_module(
+            "skills.herdr-dev-loop.tests.test_planning_v053"
+        )
+        current, _impact, _graph, _coverage, plan_gap = fixtures.planning_bundle()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            artifact = hloop.planning_artifact_file(
+                repo, hloop.hloop_planning.PLAN_GAP_RECORD_TYPE
+            )
+            hloop.write_text(
+                artifact,
+                json.dumps(plan_gap, ensure_ascii=False, indent=2) + "\n",
+            )
+            checker = plan_gap["checker"]
+            run = {
+                "status": "completed",
+                "verdict": "clean",
+                "head_sha": checker["head_sha"],
+                "planning_identity": current.to_dict(),
+                "planning_identity_digest": checker["planning_identity_digest"],
+                "attempt_id": checker["attempt_id"],
+                "task_contract_digest": checker["task_contract_digest"],
+                "input_artifact_digests": checker["input_artifact_digests"],
+                "agent_config": {
+                    "provider": checker["provider"],
+                    "model": checker["model"],
+                    "effort": checker["effort"],
+                    "sources": checker["config_sources"],
+                },
+                "completion_event_id": "completion-event-001",
+                "artifact_digest": hloop._sha256_labelled(artifact.read_bytes()),
+                "artifact_contract_digest": plan_gap["artifact_digest"],
+            }
+            state = {"plan_gap_scout_run": run}
+            with mock.patch.object(
+                hloop,
+                "current_integration_target",
+                return_value=checker["head_sha"],
+            ):
+                issues, expected = hloop.plan_gap_scout_binding_issues(
+                    repo, state, current, plan_gap
+                )
+                self.assertEqual(issues, [])
+                self.assertEqual(expected, checker)
+
+                run["attempt_id"] = "S001-C999"
+                stale, _expected = hloop.plan_gap_scout_binding_issues(
+                    repo, state, current, plan_gap
+                )
+            self.assertNotEqual(
+                hloop.plan_gap_scout_checker(state, run), checker
+            )
+            self.assertEqual(stale, [])
+            validation = hloop.hloop_planning.validate_planning_artifact(
+                plan_gap,
+                expected_plan_gap_checker=hloop.plan_gap_scout_checker(state, run),
+            )
+            self.assertIn(
+                "checker-identity-mismatch",
+                {issue.code for issue in validation.issues},
+            )
+
+    def test_coverage_scout_completion_requires_exact_fresh_broker_event(self) -> None:
+        state = {"run_id": "run-coverage"}
+        run = {
+            "attempt_id": "S001-C001",
+            "head_sha": "a" * 40,
+            "prior_completion_event_id": "",
+        }
+        artifact = ".ai/herdr-dev-loop/loops/test/planning/PLAN-GAP.json"
+        artifact_digest = "sha256:" + "b" * 64
+        event = {
+            "event_id": "event-001",
+            "run_id": state["run_id"],
+            "role_id": "S001",
+            "attempt_id": run["attempt_id"],
+            "type": "completion",
+            "head_sha": run["head_sha"],
+            "artifact": artifact,
+            "artifact_digest": artifact_digest,
+        }
+        store = mock.MagicMock()
+        store.latest_role_event.return_value = event
+        with mock.patch.object(hloop, "_open_broker_store", return_value=store):
+            accepted = hloop.authenticated_plan_gap_completion(
+                Path("."),
+                state,
+                run,
+                artifact_ref=artifact,
+                artifact_digest=artifact_digest,
+            )
+            self.assertEqual(accepted, event)
+
+            with self.assertRaisesRegex(hloop.HLoopError, "identity mismatch"):
+                hloop.authenticated_plan_gap_completion(
+                    Path("."),
+                    state,
+                    run,
+                    artifact_ref=artifact,
+                    artifact_digest="sha256:" + "c" * 64,
+                )
+
+            replayed = {**run, "prior_completion_event_id": event["event_id"]}
+            with self.assertRaisesRegex(hloop.HLoopError, "replayed"):
+                hloop.authenticated_plan_gap_completion(
+                    Path("."),
+                    state,
+                    replayed,
+                    artifact_ref=artifact,
+                    artifact_digest=artifact_digest,
+                )
 
     def test_queued_revision_two_task_is_blocked_before_start(self) -> None:
         legacy = self.task_record("a" * 40)

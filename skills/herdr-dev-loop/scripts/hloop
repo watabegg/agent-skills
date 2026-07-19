@@ -2727,6 +2727,8 @@ def apply_resolved_config_to_state(
     state: dict[str, Any],
     resolved: dict[str, Any],
     candidate: hloop_config.ConfigCandidate | None,
+    *,
+    provenance: Sequence[Mapping[str, Any]] | None = None,
 ) -> None:
     """Replace the explicit loop snapshot and its runtime-facing leaves."""
 
@@ -2735,6 +2737,12 @@ def apply_resolved_config_to_state(
         "path": str(candidate.path) if candidate else "",
     }
     state["resolved_config"] = resolved
+    if provenance is not None:
+        state["config_resolution_provenance"] = [
+            json.loads(json.dumps(item)) for item in provenance
+        ]
+    else:
+        state.setdefault("config_resolution_provenance", [])
     state["max_workers"] = resolved["max_workers"]
     state["session_cleanup"] = resolved["session_cleanup"]
     state["specification_scout"] = str(
@@ -2856,7 +2864,12 @@ def cmd_config_apply(args: argparse.Namespace) -> int:
     if str(state.get("phase") or "") in RUN_TERMINAL_PHASES:
         raise HLoopError(f"cannot apply config to a terminal run: {state.get('phase')}")
     if changes or source_changed or review_policy_changed:
-        apply_resolved_config_to_state(state, resolved, candidate)
+        apply_resolved_config_to_state(
+            state,
+            resolved,
+            candidate,
+            provenance=resolution.explain_provenance(),
+        )
         assert_manager_identity(state)
         if review_policy_changed:
             # Review plans, convergence manifests, and manual-final
@@ -6217,6 +6230,91 @@ def planning_projection_issues(
     return issues
 
 
+def plan_gap_scout_binding_issues(
+    repo: Path,
+    state: Mapping[str, Any],
+    current: hloop_planning.PlanningIdentity,
+    plan_gap: Mapping[str, Any],
+) -> tuple[list[hloop_planning.PlanningIssue], dict[str, Any] | None]:
+    issues: list[hloop_planning.PlanningIssue] = []
+    run = state.get("plan_gap_scout_run")
+    if not isinstance(run, Mapping):
+        return (
+            [
+                hloop_planning.PlanningIssue(
+                    "plan-gap-scout-missing",
+                    "dispatch requires a harvested authenticated coverage Scout run",
+                    "plan_gap_scout_run",
+                )
+            ],
+            None,
+        )
+    if str(run.get("status") or "") != "completed" or str(
+        run.get("verdict") or ""
+    ) != "clean":
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "plan-gap-scout-incomplete",
+                "coverage Scout must be harvested with a clean verdict",
+                "plan_gap_scout_run.status",
+            )
+        )
+    identity = current.to_dict()
+    if run.get("planning_identity") != identity or str(
+        run.get("planning_identity_digest") or ""
+    ) != planning_identity_digest(identity):
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "plan-gap-scout-stale",
+                "coverage Scout planning identity is stale",
+                "plan_gap_scout_run.planning_identity",
+            )
+        )
+    target = current_integration_target(repo, dict(state))
+    if str(run.get("head_sha") or "") != target:
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "plan-gap-scout-stale",
+                "coverage Scout target SHA is stale",
+                "plan_gap_scout_run.head_sha",
+            )
+        )
+    event_id = str(run.get("completion_event_id") or "")
+    if not event_id:
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "plan-gap-scout-unauthenticated",
+                "coverage Scout lacks an authenticated completion event",
+                "plan_gap_scout_run.completion_event_id",
+            )
+        )
+    artifact_path = planning_artifact_file(
+        repo, hloop_planning.PLAN_GAP_RECORD_TYPE
+    )
+    artifact_digest = (
+        _sha256_labelled(artifact_path.read_bytes()) if artifact_path.is_file() else ""
+    )
+    if not artifact_digest or artifact_digest != str(run.get("artifact_digest") or ""):
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "plan-gap-scout-artifact-drift",
+                "coverage Scout harvested artifact bytes have drifted",
+                "plan_gap_scout_run.artifact_digest",
+            )
+        )
+    if str(plan_gap.get("artifact_digest") or "") != str(
+        run.get("artifact_contract_digest") or ""
+    ):
+        issues.append(
+            hloop_planning.PlanningIssue(
+                "plan-gap-scout-artifact-drift",
+                "coverage Scout canonical artifact digest has drifted",
+                "artifact_digest",
+            )
+        )
+    return issues, plan_gap_scout_checker(state, run)
+
+
 def planning_dispatch_validation(
     repo: Path, state: dict[str, Any], *, honor_recorded_status: bool = True
 ) -> hloop_planning.PlanningValidation:
@@ -6235,6 +6333,10 @@ def planning_dispatch_validation(
     try:
         current = current_planning_identity(repo, state)
         impact, task_graph, coverage, plan_gap = load_planning_bundle(repo)
+        scout_issues, expected_checker = plan_gap_scout_binding_issues(
+            repo, state, current, plan_gap
+        )
+        issues.extend(scout_issues)
         scope = assert_release_scope_snapshot(repo, state)
         allowed_scope_refs = tuple(scope.release_scope_refs)
         if honor_recorded_status and isinstance(projection, dict):
@@ -6287,6 +6389,7 @@ def planning_dispatch_validation(
             required_requirement_refs=scope.requirement_refs,
             required_plan_item_refs=scope.plan_item_refs,
             allowed_scope_refs=allowed_scope_refs,
+            expected_plan_gap_checker=expected_checker,
         )
         issues.extend(validation.issues)
         issues.extend(planning_projection_issues(state, task_graph))
@@ -6542,6 +6645,11 @@ def role_ids_running(state: dict[str, Any]) -> list[str]:
                         )
     scout = state.get("specification_scout_run")
     if isinstance(scout, dict) and str(scout.get("status") or "") in {"running", "starting"}:
+        running.append("S001")
+    coverage_scout = state.get("plan_gap_scout_run")
+    if isinstance(coverage_scout, dict) and str(
+        coverage_scout.get("status") or ""
+    ) in {"running", "starting"}:
         running.append("S001")
     return sorted(dict.fromkeys(running))
 
@@ -8365,43 +8473,119 @@ def role_state_prefix(role: str) -> str:
     return role if role in hloop_config.CONFIG_ROLE_NAMES else "worker"
 
 
+def _role_identity_override(
+    role: str,
+    values: Mapping[str, Any] | None,
+    *,
+    component: str | None = None,
+) -> dict[str, Any]:
+    """Return one canonical runtime config layer from explicit identity keys.
+
+    ``argparse`` omissions remain ``None`` and therefore do not become a
+    highest-precedence assignment.  The accepted spellings cover task
+    contract fields, participant records, and explicit start flags without
+    treating unrelated metadata as config.
+    """
+
+    if not isinstance(values, Mapping):
+        return {}
+    prefix = role_state_prefix(role)
+    identity: dict[str, Any] = {}
+    for key in ("provider", "model", "effort"):
+        candidates = (
+            f"agent_{key}",
+            key,
+            f"{prefix}_agent_{key}",
+            f"{prefix}_{key}",
+        )
+        for candidate in candidates:
+            value = values.get(candidate)
+            if value is not None and str(value).strip():
+                identity[key] = value
+                break
+    if not identity:
+        return {}
+    return {prefix: {component: identity}} if component else {prefix: identity}
+
+
+def _role_base_provenance(
+    state: Mapping[str, Any], role: str, component: str | None
+) -> dict[str, list[dict[str, Any]]]:
+    prefix = role_state_prefix(role)
+    base = f"{prefix}.{component}" if component else prefix
+    selected: dict[str, list[dict[str, Any]]] = {}
+    rows = state.get("config_resolution_provenance")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return selected
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        key = str(row.get("key") or "")
+        if key not in {f"{base}.provider", f"{base}.model", f"{base}.effort"}:
+            continue
+        history = row.get("provenance")
+        if isinstance(history, Sequence) and not isinstance(history, (str, bytes)):
+            selected[key] = [
+                json.loads(json.dumps(item))
+                for item in history
+                if isinstance(item, Mapping)
+            ]
+    return selected
+
+
 def role_agent_config(
     state: dict[str, Any],
     role: str,
     *,
     overrides: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    overrides = overrides or {}
+    task_override: Mapping[str, Any] | None = None,
+    start_override: Mapping[str, Any] | None = None,
+    participant_override: Mapping[str, Any] | None = None,
+    component: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one role launch through the canonical layered config path.
+
+    ``overrides`` is retained as a task-layer compatibility spelling.  New
+    runtime call sites distinguish task, explicit start, and participant
+    inputs so provenance and omission semantics remain observable.
+    """
+
+    if overrides is not None and task_override is None:
+        task_override = overrides
     prefix = role_state_prefix(role)
     resolved = state.get("resolved_config")
-    configured = (
-        resolved.get(prefix)
+    snapshot = (
+        json.loads(json.dumps(resolved))
         if isinstance(resolved, Mapping)
-        and isinstance(resolved.get(prefix), Mapping)
-        else {}
+        else json.loads(json.dumps(BUILT_IN_CONFIG_DEFAULTS))
     )
-    provider = normalize_agent_provider(
-        overrides.get("agent_provider")
-        or overrides.get("provider")
-        or overrides.get(f"{prefix}_agent_provider")
-        or overrides.get(f"{prefix}_provider")
-        or configured.get("provider")
-        or state.get(f"{prefix}_agent_provider")
-        or state.get(f"{prefix}_provider")
-        or DEFAULT_AGENT_PROVIDER
+    task_layer = _role_identity_override(prefix, task_override, component=component)
+    start_layer = _role_identity_override(prefix, start_override, component=component)
+    participant_layer = _role_identity_override(
+        prefix, participant_override, component=component
     )
-    model = normalize_agent_model(
-        overrides.get("agent_model")
-        or overrides.get("model")
-        or overrides.get(f"{prefix}_agent_model")
-        or overrides.get(f"{prefix}_model")
-        or configured.get("model")
-        or state.get(f"{prefix}_agent_model")
-        or state.get(f"{prefix}_model")
-        or DEFAULT_AGENT_MODEL
-    )
+    try:
+        resolution = hloop_config.resolve_config(
+            BUILT_IN_CONFIG_DEFAULTS,
+            target_dir=Path.cwd(),
+            loop_snapshot=snapshot,
+            task_override=task_layer,
+            start_override=start_layer,
+            participant_override=participant_layer,
+        )
+    except hloop_config.ConfigError as exc:
+        raise HLoopError(f"cannot resolve {prefix} launch config: {exc}") from exc
+    configured = resolution.as_dict().get(prefix) or {}
+    if component:
+        component_config = configured.get(component)
+        if not isinstance(component_config, Mapping):
+            raise HLoopError(f"resolved config {prefix}.{component} must be an object")
+        configured = component_config
+    provider = normalize_agent_provider(configured.get("provider"))
+    model = normalize_agent_model(configured.get("model"))
     fallback = str(
-        overrides.get("fallback_provider")
+        (start_override or {}).get("fallback_provider")
+        or (task_override or {}).get("fallback_provider")
         or state.get(f"{prefix}_fallback_provider")
         or DEFAULT_AGENT_PROVIDER
     ).strip().lower()
@@ -8410,18 +8594,53 @@ def role_agent_config(
             f"unsupported fallback provider `{fallback}`; expected one of: {', '.join(sorted(AGENT_PROVIDERS))}"
         )
     effort = normalize_agent_effort(
-        overrides.get("agent_effort")
-        or overrides.get(f"{prefix}_agent_effort")
-        or configured.get("effort")
-        or state.get(f"{prefix}_agent_effort")
+        configured.get("effort") or state.get(f"{prefix}_agent_effort")
     )
     permission_mode = str(
-        overrides.get("claude_permission_mode")
-        or overrides.get(f"{prefix}_claude_permission_mode")
+        (start_override or {}).get("claude_permission_mode")
+        or (start_override or {}).get(f"{prefix}_claude_permission_mode")
+        or (task_override or {}).get("claude_permission_mode")
+        or (task_override or {}).get(f"{prefix}_claude_permission_mode")
         or state.get(f"{prefix}_claude_permission_mode")
         or DEFAULT_CLAUDE_PERMISSION_MODE
     ).strip()
-    return {"provider": provider, "model": model, "effort": effort, "claude_permission_mode": permission_mode, "fallback_provider": fallback}
+    base_provenance = _role_base_provenance(state, prefix, component)
+    resolution_rows = {
+        row["key"]: row for row in resolution.explain_provenance()
+    }
+    identity_base = f"{prefix}.{component}" if component else prefix
+    provenance: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for key in ("provider", "model", "effort"):
+        path = f"{identity_base}.{key}"
+        row = resolution_rows.get(path, {})
+        history = list(base_provenance.get(path, []))
+        for assignment in row.get("provenance", []):
+            if assignment.get("source") in {
+                "task-override",
+                "start-override",
+                "participant-override",
+            }:
+                history.append(assignment)
+        if not history and row:
+            history = list(row.get("provenance", []))
+        provenance[key] = history
+        sources[key] = str(
+            (history[-1].get("source") if history else None)
+            or row.get("source")
+            or "loop-snapshot"
+        )
+    return {
+        "provider": provider,
+        "model": model,
+        "effort": effort,
+        "claude_permission_mode": permission_mode,
+        "fallback_provider": fallback,
+        "role": prefix,
+        "component": component or "",
+        "sources": sources,
+        "provenance": provenance,
+    }
 
 
 def require_agent_provider_available(provider: str) -> None:
@@ -10486,6 +10705,18 @@ def canonical_review_protocol(
     return selection
 
 
+def sealed_runtime_plan(record: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {key: value for key, value in record.items() if key != "plan_digest"}
+    return {**payload, "plan_digest": f"sha256:{_canonical_digest(payload)}"}
+
+
+def validate_runtime_plan_digest(record: Mapping[str, Any], *, label: str) -> None:
+    supplied = str(record.get("plan_digest") or "")
+    expected = sealed_runtime_plan(record)["plan_digest"]
+    if not supplied or supplied != expected:
+        raise HLoopError(f"{label} plan_digest does not match canonical plan identity")
+
+
 def review_max_fix_rounds(state: dict[str, Any], convergence: Mapping[str, Any] | None = None) -> int:
     policy = review_policy_record(state)
     record = convergence if isinstance(convergence, Mapping) else state.get("review_convergence")
@@ -10701,6 +10932,41 @@ def validate_epoch_runtime_protocol_capabilities(
             ) from exc
 
 
+def validate_epoch_process_identity_plan(
+    plan: hloop_review_epoch.ReviewEpochPlan,
+) -> None:
+    """Require canonical requested identity for every runtime audit process.
+
+    A plan records configuration as a request only.  Successful collection is
+    separately gated by per-process observed and provider-attested evidence in
+    ``EpochExecutionOutcome``; launch configuration is never promoted into
+    either evidence source.
+    """
+
+    invalid: list[str] = []
+    for execution in plan.required_executions:
+        for process in execution.processes:
+            identity = process.agent_identity
+            requested = identity.get("requested") if isinstance(identity, Mapping) else None
+            expected = {
+                "provider": process.provider,
+                "model": process.model,
+                "effort": process.effort,
+            }
+            if (
+                not process.attestation_required
+                or requested != expected
+                or str(identity.get("status") or "") != "requested-only"
+                or bool(identity.get("verified"))
+            ):
+                invalid.append(f"{execution.execution_id}/{process.process_id}")
+    if invalid:
+        raise HLoopError(
+            "review epoch process plans must preserve requested-only identity "
+            "and require independent attestation: " + ", ".join(sorted(invalid))
+        )
+
+
 def cmd_review_epoch_create(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
@@ -10715,6 +10981,7 @@ def cmd_review_epoch_create(args: argparse.Namespace) -> int:
         collection = hloop_review_epoch.ReviewEpochCollection.create(plan)
     except hloop_review_epoch.ReviewEpochError as exc:
         raise HLoopError(f"invalid review epoch plan: {exc}") from exc
+    validate_epoch_process_identity_plan(plan)
     store = review_epoch_store(state)
     if plan.epoch_id in store["records"]:
         existing = require_review_epoch_collection(state, plan.epoch_id, 1)
@@ -10735,11 +11002,15 @@ def cmd_review_epoch_create(args: argparse.Namespace) -> int:
         execution.execution_id
         for execution in plan.required_executions
         if execution.source_kind == "reviewer"
-        and execution.protocol != protocol_selection.protocol
+        and (
+            execution.execution_kind != protocol_selection.execution_kind
+            or execution.protocol_key != protocol_selection.key
+            or execution.protocol != protocol_selection.protocol
+        )
     )
     if mismatched_protocols:
         raise HLoopError(
-            f"review epoch Reviewer protocol must come from {protocol_selection.key}: "
+            f"review epoch Reviewer protocol identity must come from {protocol_selection.key}: "
             + ", ".join(mismatched_protocols)
         )
     last_validation = state.get("last_validation")
@@ -10796,6 +11067,7 @@ def cmd_review_epoch_successor(args: argparse.Namespace) -> int:
         )
     except hloop_review_epoch.ReviewEpochError as exc:
         raise HLoopError(f"invalid successor review epoch: {exc}") from exc
+    validate_epoch_process_identity_plan(plan)
     store = review_epoch_store(state)
     epoch_record = store["records"].get(plan.epoch_id)
     revisions = epoch_record.get("revisions") if isinstance(epoch_record, Mapping) else None
@@ -10822,7 +11094,11 @@ def cmd_review_epoch_successor(args: argparse.Namespace) -> int:
         execution.execution_id
         for execution in plan.required_executions
         if execution.source_kind == "reviewer"
-        and execution.protocol != protocol_selection.protocol
+        and (
+            execution.execution_kind != protocol_selection.execution_kind
+            or execution.protocol_key != protocol_selection.key
+            or execution.protocol != protocol_selection.protocol
+        )
     )
     if mismatched_protocols:
         raise HLoopError(
@@ -11084,6 +11360,7 @@ def epoch_execution_start_binding(
             f"create a review epoch before starting {source_kind} execution {role_id}"
         )
     collection = require_review_epoch_collection(state, epoch_id)
+    validate_epoch_process_identity_plan(collection.plan)
     try:
         execution = collection.plan.execution(role_id)
     except hloop_review_epoch.ReviewEpochError as exc:
@@ -11108,6 +11385,15 @@ def epoch_execution_start_binding(
             f"{source_kind} execution protocol {execution.protocol!r} does not "
             f"match configured protocol {expected_protocol!r}"
         )
+    if source_kind == "reviewer":
+        selection = canonical_review_protocol(state, "ordinary")
+        if (
+            execution.execution_kind != selection.execution_kind
+            or execution.protocol_key != selection.key
+        ):
+            raise HLoopError(
+                "reviewer execution kind/key does not match the canonical protocol selection"
+            )
     validate_epoch_runtime_protocol_capabilities(
         state, collection.plan, execution_ids=(execution.execution_id,)
     )
@@ -11138,6 +11424,7 @@ def epoch_execution_start_binding(
 def validate_reviewer_epoch_capacity_binding(
     binding: Mapping[str, Any] | None,
     review_plan: hloop_review.ReviewGroupPlan,
+    agent_config: Mapping[str, Any] | None = None,
 ) -> None:
     """Bind the existing Reviewer topology to the aggregate epoch budget."""
 
@@ -11188,6 +11475,20 @@ def validate_reviewer_epoch_capacity_binding(
             "review epoch process identities do not match the immutable Reviewer "
             "agent labels, providers, and models"
         )
+    if agent_config is not None:
+        coordinators = tuple(
+            process
+            for process in execution.processes
+            if process.process_kind == "coordinator"
+        )
+        if len(coordinators) != 1 or any(
+            getattr(coordinators[0], field) != agent_config[field]
+            for field in ("provider", "model", "effort")
+        ):
+            raise HLoopError(
+                "review epoch Coordinator provider/model/effort does not match "
+                "the resolved Reviewer Coordinator config"
+            )
     expected_artifact_ref = (
         f"reviews/{execution_id}.md"
         if review_plan.mode == "single"
@@ -11233,9 +11534,10 @@ def gap_epoch_execution(
         if (
             coordinator.provider != agent_config["provider"]
             or coordinator.model != agent_config["model"]
+            or coordinator.effort != agent_config["effort"]
         ):
             raise HLoopError(
-                "review epoch Gap Coordinator provider/model does not match the "
+                "review epoch Gap Coordinator provider/model/effort does not match the "
                 "configured Gap Agent"
             )
     return execution
@@ -11792,6 +12094,7 @@ def _review_plan_for_target(
     providers: Sequence[str] | None = None,
     probe_count: int | None = None,
     probes_per_provider: int | None = None,
+    agent_config: Mapping[str, Any] | None = None,
 ) -> hloop_review.ReviewGroupPlan:
     topology = resolved_reviewer_topology(
         state,
@@ -11804,7 +12107,9 @@ def _review_plan_for_target(
         return build_reviewer_group_plan(
             topology["mode"],
             target,
-            role_agent_config(state, "reviewer"),
+            dict(agent_config) if agent_config is not None else role_agent_config(
+                state, "reviewer"
+            ),
             topology=topology,
         )
     except (HLoopError, hloop_review.ReviewModelError) as exc:
@@ -12200,6 +12505,14 @@ def _final_certification_plan(
         raise HLoopError(
             "unsupported manual-final protocol: " + (manual_final_protocol or "missing")
         )
+    final_coordinator = role_agent_config(state, "final_coordinator")
+    reviewer_coordinator = role_agent_config(
+        state, "reviewer", component="coordinator"
+    )
+    reviewer_lane = role_agent_config(state, "reviewer", component="lane")
+    reviewer_verifier = role_agent_config(
+        state, "reviewer", component="verifier"
+    )
     group = _review_plan_for_target(
         state,
         target,
@@ -12207,6 +12520,7 @@ def _final_certification_plan(
         providers=providers,
         probe_count=probe_count,
         probes_per_provider=probes_per_provider,
+        agent_config=reviewer_lane,
     )
     scope_revision, snapshot_revision, source_digest, source_refs = _scope_certification_identity(repo, state)
     policy = hloop_certification.VerificationPolicy(
@@ -12224,6 +12538,87 @@ def _final_certification_plan(
         )
         for lane in group.expected_lanes
     )
+    def process_config(
+        configured: Mapping[str, Any],
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        topology_key: str = "",
+    ) -> dict[str, Any]:
+        """Materialize complete component config with explicit topology overrides."""
+
+        effective = {
+            key: str(configured[key]) for key in ("provider", "model", "effort")
+        }
+        sources = json.loads(json.dumps(configured.get("sources") or {}))
+        provenance = json.loads(json.dumps(configured.get("provenance") or {}))
+        for key in ("provider", "model", "effort"):
+            sources.setdefault(key, "loop-snapshot")
+            provenance.setdefault(key, [])
+        for key, value in (("provider", provider), ("model", model)):
+            if value is None or value == effective[key]:
+                continue
+            effective[key] = value
+            assignment = {
+                "source": "review-topology-override",
+                "input_key": f"review_plan.{topology_key}.{key}",
+                "value": value,
+            }
+            provenance[key].append(assignment)
+            sources[key] = assignment["source"]
+        return {
+            **effective,
+            "config_sources": sources,
+            "config_provenance": provenance,
+        }
+
+    final_process_config = process_config(final_coordinator)
+    processes: list[hloop_certification.FinalReviewProcessPlan] = [
+        hloop_certification.FinalReviewProcessPlan(
+            process_id="manual-final-coordinator",
+            process_kind="coordinator",
+            agent_label="manual-final-coordinator",
+            **final_process_config,
+        )
+    ]
+    for provider_plan in group.provider_plans:
+        if provider_plan.role == "coordinator":
+            coordinator_process_config = process_config(reviewer_coordinator)
+            processes.append(
+                hloop_certification.FinalReviewProcessPlan(
+                    process_id=f"provider-{provider_plan.provider}-coordinator",
+                    process_kind="coordinator",
+                    agent_label=provider_plan.coordinator_label,
+                    **coordinator_process_config,
+                )
+            )
+        for lane in provider_plan.lanes:
+            lane_process_config = process_config(
+                reviewer_lane,
+                provider=lane.provider,
+                model=provider_plan.model,
+                topology_key=f"providers.{provider_plan.provider}.lanes.{lane.lane_id}",
+            )
+            processes.append(
+                hloop_certification.FinalReviewProcessPlan(
+                    process_id=f"lane-{lane.provider}-{lane.lane_id}",
+                    process_kind="discovery",
+                    agent_label=lane.agent_label,
+                    **lane_process_config,
+                )
+            )
+        for index, agent_label in enumerate(
+            provider_plan.verifier_agents, start=1
+        ):
+            verifier_process_config = process_config(reviewer_verifier)
+            processes.append(
+                hloop_certification.FinalReviewProcessPlan(
+                    process_id=f"verifier-{provider_plan.provider}-{index}",
+                    process_kind="verifier",
+                    agent_label=agent_label,
+                    **verifier_process_config,
+                )
+            )
     plan = hloop_certification.CertificationPlan(
         certification_id=certification_id,
         base_ref=str(state.get("base_branch") or ""),
@@ -12235,9 +12630,19 @@ def _final_certification_plan(
         source_snapshot_revision=snapshot_revision,
         source_digest=source_digest,
         protocol=manual_final_protocol,
+        execution_kind=protocol_selection.execution_kind,
+        protocol_key=protocol_selection.key,
         lane_plan=lanes,
         verification_policy=policy,
         execution=execution,
+        process_plan=tuple(processes),
+        final_coordinator_config={
+            "provider": final_coordinator["provider"],
+            "model": final_coordinator["model"],
+            "effort": final_coordinator["effort"],
+            "sources": final_coordinator["sources"],
+            "provenance": final_coordinator["provenance"],
+        },
     )
     return plan, group
 
@@ -12703,6 +13108,7 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
         probes_per_provider=getattr(args, "probes_per_provider", None),
     )
     protocol_selection = canonical_review_protocol(state, "pre-final")
+    final_coordinator = role_agent_config(state, "final_coordinator")
     audit_projection = build_audit_identity(
         state,
         target_sha=target,
@@ -12710,11 +13116,19 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
     )
     plan_path = loop_path(repo) / "reviews" / "convergence" / "PLAN.json"
     manifest_path = loop_path(repo) / "reviews" / "convergence" / "MANIFEST.json"
-    plan_record = {
+    plan_record = sealed_runtime_plan({
         "protocol": protocol_selection.protocol,
         "execution_kind": protocol_selection.execution_kind,
         "protocol_key": protocol_selection.key,
         "protocol_source": protocol_selection.source or "resolved-config",
+        "final_coordinator_config": {
+            "provider": final_coordinator["provider"],
+            "model": final_coordinator["model"],
+            "effort": final_coordinator["effort"],
+            "sources": final_coordinator["sources"],
+            "provenance": final_coordinator["provenance"],
+            "agent_identity": agent_identity_record(final_coordinator),
+        },
         "audit_identity": audit_projection,
         "base_ref": str(state.get("base_branch") or ""),
         "base_sha": snapshot["base_sha"],
@@ -12725,7 +13139,7 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
         "review_plan": group.to_record(),
         "readiness": snapshot["checks"],
         "prepared_at": now_iso(),
-    }
+    })
     if not args.dry_run:
         # Once a round has been recorded, preserve its manifest when prepare
         # is retried.  Replacing an actionable manifest with the empty
@@ -12776,7 +13190,11 @@ def cmd_review_convergence_prepare(args: argparse.Namespace) -> int:
                     "protocol": protocol_selection.protocol,
                     "source": protocol_selection.source or "resolved-config",
                 },
+                "final_coordinator_config": plan_record[
+                    "final_coordinator_config"
+                ],
                 "audit_identity": audit_projection,
+                "plan_digest": plan_record["plan_digest"],
                 "artifact_refs": [str(plan_path.relative_to(repo)), str(manifest_path.relative_to(repo))],
                 "prepared_at": now_iso(),
                 "last_status": "prepared",
@@ -12838,6 +13256,40 @@ def cmd_review_convergence_record(args: argparse.Namespace) -> int:
         prepared_plan = json.loads(read_text(plan_path))
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise HLoopError(f"invalid prepared convergence plan {plan_path}: {exc}") from exc
+    if not isinstance(prepared_plan, Mapping):
+        raise HLoopError("prepared convergence plan must be an object")
+    validate_runtime_plan_digest(prepared_plan, label="prepared convergence")
+    protocol_selection = canonical_review_protocol(state, "pre-final")
+    expected_protocol_identity = {
+        "execution_kind": protocol_selection.execution_kind,
+        "protocol_key": protocol_selection.key,
+        "protocol": protocol_selection.protocol,
+    }
+    if any(
+        prepared_plan.get(key) != value
+        for key, value in expected_protocol_identity.items()
+    ):
+        raise HLoopError(
+            "prepared convergence protocol identity has drifted from canonical config"
+        )
+    current_final_coordinator = role_agent_config(state, "final_coordinator")
+    expected_final_coordinator = {
+        "provider": current_final_coordinator["provider"],
+        "model": current_final_coordinator["model"],
+        "effort": current_final_coordinator["effort"],
+        "sources": current_final_coordinator["sources"],
+        "provenance": current_final_coordinator["provenance"],
+        "agent_identity": agent_identity_record(current_final_coordinator),
+    }
+    if prepared_plan.get("final_coordinator_config") != expected_final_coordinator:
+        raise HLoopError(
+            "prepared convergence Final Coordinator config has drifted from "
+            "canonical config and provenance"
+        )
+    if str(convergence.get("plan_digest") or "") != str(
+        prepared_plan.get("plan_digest") or ""
+    ):
+        raise HLoopError("prepared convergence plan differs from STATE identity")
     prepared_round = prepared_plan.get("fix_round") if isinstance(prepared_plan, dict) else None
     if isinstance(prepared_round, bool) or not isinstance(prepared_round, int) or prepared_round < 0:
         raise HLoopError("prepared convergence plan fix_round must be a non-negative integer")
@@ -13234,6 +13686,8 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
             frontmatter(
                 {
                     "protocol": plan.protocol,
+                    "execution_kind": plan.execution_kind,
+                    "protocol_key": plan.protocol_key,
                     "certification_id": plan.certification_id,
                     "prepared_plan_digest": plan.digest,
                     "base_sha": plan.base_sha,
@@ -13251,6 +13705,7 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                     "lane_names": [],
                     "lane_outcomes": [],
                     "coordinator_session_id": "",
+                    "process_identity_count": 0,
                     "diff_inventory": [],
                     "verification_records": [],
                     "verification_shortfall": "",
@@ -13304,6 +13759,7 @@ def cmd_final_review_prepare(args: argparse.Namespace) -> int:
                     "protocol": protocol_selection.protocol,
                     "source": protocol_selection.source or "resolved-config",
                 },
+                "final_coordinator_config": dict(plan.final_coordinator_config),
                 "audit_identity": audit_projection,
             }
         )
@@ -13363,6 +13819,27 @@ def cmd_final_review_record(args: argparse.Namespace) -> int:
     ):
         raise HLoopError(
             "manual final review certification or target no longer matches prepared state"
+        )
+    protocol_selection = canonical_review_protocol(state, "manual-final")
+    if (
+        plan.execution_kind != protocol_selection.execution_kind
+        or plan.protocol_key != protocol_selection.key
+        or plan.protocol != protocol_selection.protocol
+    ):
+        raise HLoopError(
+            "manual final review protocol identity has drifted from canonical config"
+        )
+    final_coordinator = role_agent_config(state, "final_coordinator")
+    current_final_coordinator = {
+        "provider": final_coordinator["provider"],
+        "model": final_coordinator["model"],
+        "effort": final_coordinator["effort"],
+        "sources": final_coordinator["sources"],
+        "provenance": final_coordinator["provenance"],
+    }
+    if dict(plan.final_coordinator_config) != current_final_coordinator:
+        raise HLoopError(
+            "manual final review Final Coordinator config or provenance has drifted"
         )
     current = current_integration_target(repo, state)
     scope = release_scope_from_state(state)
@@ -14343,6 +14820,7 @@ def render_worker_prompt(
     branch: str,
     state: dict[str, Any],
     *,
+    agent_config: Mapping[str, Any] | None = None,
     report_credential_file: str = "",
     task_contract_digest: str = "",
 ) -> str:
@@ -14356,7 +14834,9 @@ def render_worker_prompt(
     )
     branch_strategy = state_value(state, "branch_strategy", DEFAULT_BRANCH_STRATEGY)
     base_ref = str(task_meta.get("base_ref") or "the integration branch")
-    agent_config = role_agent_config(state, "worker", overrides=task_meta)
+    agent_config = dict(agent_config) if agent_config is not None else role_agent_config(
+        state, "worker", task_override=task_meta
+    )
     completion_mode = str(task_meta.get("completion_mode") or "")
     protocol = worker_protocol_text(
         worker_protocol,
@@ -16195,6 +16675,7 @@ None.
         state,
         config_resolution.as_dict(),
         config_candidate,
+        provenance=config_resolution.explain_provenance(),
     )
     assert_manager_identity(state)
     if state_path(repo).exists() and not args.force:
@@ -18202,7 +18683,300 @@ def decision_role_fallback(
     return 0
 
 
+def planning_identity_digest(identity: Mapping[str, Any]) -> str:
+    return hloop_planning.canonical_digest(dict(identity))
+
+
+def plan_gap_scout_checker(
+    state: Mapping[str, Any], run: Mapping[str, Any]
+) -> dict[str, Any]:
+    config = run.get("agent_config")
+    if not isinstance(config, Mapping):
+        config = {
+            "provider": run.get("agent_provider"),
+            "model": run.get("agent_model"),
+            "effort": run.get("agent_effort"),
+            "sources": run.get("agent_config_sources") or {},
+        }
+    inputs = run.get("input_artifact_digests")
+    if not isinstance(inputs, Mapping):
+        inputs = {}
+    sources = config.get("sources")
+    if not isinstance(sources, Mapping):
+        sources = {}
+    return {
+        "role_id": "S001",
+        "role_kind": "specification_scout",
+        "mode": "coverage",
+        "provider": str(config.get("provider") or ""),
+        "model": str(config.get("model") or ""),
+        "effort": str(config.get("effort") or ""),
+        "attempt_id": str(run.get("attempt_id") or ""),
+        "head_sha": str(run.get("head_sha") or ""),
+        "planning_identity_digest": str(
+            run.get("planning_identity_digest") or ""
+        ),
+        "task_contract_digest": str(run.get("task_contract_digest") or ""),
+        "input_artifact_digests": {
+            key: str(inputs.get(key) or "")
+            for key in ("impact_map", "task_graph", "coverage")
+        },
+        "config_sources": {
+            key: str(sources.get(key) or "loop-snapshot")
+            for key in ("provider", "model", "effort")
+        },
+    }
+
+
+def render_plan_gap_scout_prompt(
+    state: Mapping[str, Any],
+    *,
+    head_sha: str,
+    planning_identity: Mapping[str, Any],
+    input_artifact_digests: Mapping[str, str],
+    agent_config: Mapping[str, Any],
+    attempt_id: str,
+    report_credential_file: str = "",
+    task_contract_digest: str = "",
+) -> str:
+    artifact = (LOOP_DIR / "planning" / "PLAN-GAP.json").as_posix()
+    run = {
+        "attempt_id": attempt_id,
+        "head_sha": head_sha,
+        "planning_identity_digest": planning_identity_digest(planning_identity),
+        "task_contract_digest": task_contract_digest,
+        "input_artifact_digests": dict(input_artifact_digests),
+        "agent_config": dict(agent_config),
+    }
+    checker = plan_gap_scout_checker(state, run)
+    return f"""You are the coverage-mode Specification Scout for herdr-dev-loop {SKILL_VERSION}.
+
+Independently audit the current Repository Impact Map, Task Risk Graph, and
+Coverage Ledger against MISSION.md, PLAN.md, accepted requirements, locked
+release scope, current task contracts, callers, consumers, failure paths,
+tests, fixtures, and final evidence. Do not edit product code or any planning
+artifact other than `{artifact}`.
+
+- target SHA: `{head_sha}`
+- planning identity: `{json.dumps(dict(planning_identity), ensure_ascii=False, sort_keys=True)}`
+- input artifact digests: `{json.dumps(dict(input_artifact_digests), ensure_ascii=False, sort_keys=True)}`
+- resolved plan_gap config: `{json.dumps({key: agent_config.get(key) for key in ('provider', 'model', 'effort')}, ensure_ascii=False, sort_keys=True)}`
+- config sources: `{json.dumps(agent_config.get('sources') or {}, ensure_ascii=False, sort_keys=True)}`
+
+{report_contract_text("S001", attempt_id, dict(state), report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+
+Write one strict `planning-plan-gap.schema.json` artifact at `{artifact}`.
+Copy the exact planning identity and dependency digests supplied above. Set
+`checker` to this exact authenticated identity:
+`{json.dumps(checker, ensure_ascii=False, sort_keys=True)}`
+
+Use verdict `clean` only when no coverage gap remains; otherwise use
+`gaps_found` and record every finding. Recompute `artifact_digest` with the
+native planning canonical digest contract. After writing the artifact, send a
+completion report with artifact `{artifact}`, head SHA `{head_sha}`, and the
+labelled SHA-256 digest of the exact artifact bytes. A report without the exact
+artifact identity cannot be harvested.
+"""
+
+
+def _plan_gap_input_artifacts(repo: Path) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        load_json_object(
+            planning_artifact_file(repo, record_type), label=record_type
+        )
+        for record_type in (
+            hloop_planning.IMPACT_RECORD_TYPE,
+            hloop_planning.TASK_GRAPH_RECORD_TYPE,
+            hloop_planning.COVERAGE_RECORD_TYPE,
+        )
+    )
+
+
+def cmd_plan_gap_scout_start(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    decision_run = state.get("specification_scout_run")
+    if isinstance(decision_run, Mapping) and str(decision_run.get("status") or "") in {
+        "running",
+        "starting",
+    }:
+        raise HLoopError("decision-mode Specification Scout is already running")
+    run = state.setdefault("plan_gap_scout_run", {})
+    if str(run.get("status") or "") in {"running", "starting"}:
+        raise HLoopError("coverage-mode Specification Scout is already running")
+    dispatch_start_preflight(
+        repo, state, role_id="S001", role_kind="specification-scout"
+    )
+    head_sha = git(repo, ["rev-parse", str(state["integration_branch"])])
+    identity = current_planning_identity(repo, state).to_dict()
+    impact, task_graph, coverage = _plan_gap_input_artifacts(repo)
+    input_digests = {
+        "impact_map": str(impact.get("artifact_digest") or ""),
+        "task_graph": str(task_graph.get("artifact_digest") or ""),
+        "coverage": str(coverage.get("artifact_digest") or ""),
+    }
+    for name, record in zip(
+        ("impact_map", "task_graph", "coverage"),
+        (impact, task_graph, coverage),
+        strict=True,
+    ):
+        validation = hloop_planning.validate_planning_artifact(record)
+        if not validation.ok:
+            detail = "; ".join(issue.message for issue in validation.issues)
+            raise HLoopError(f"cannot start coverage Scout with invalid {name}: {detail}")
+    worktree_arg = getattr(args, "worktree", None)
+    worktree = (
+        Path(worktree_arg).resolve()
+        if worktree_arg
+        else default_decision_role_worktree(repo, state, "S001", "plan-gap-scout")
+    )
+    prompt_rel = LOOP_DIR / "prompts" / "S001.plan-gap-scout.md"
+    artifact_rel = LOOP_DIR / "planning" / "PLAN-GAP.json"
+    attempt_no = normalize_int(run.get("attempt_no"), 0) + 1
+    attempt_id = f"S001-C{attempt_no:03d}"
+    agent_config = role_agent_config(
+        state,
+        "plan_gap",
+        start_override={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
+        },
+    )
+    prompt_without_identity = render_plan_gap_scout_prompt(
+        state,
+        head_sha=head_sha,
+        planning_identity=identity,
+        input_artifact_digests=input_digests,
+        agent_config=agent_config,
+        attempt_id=attempt_id,
+    )
+    task_contract_digest = prompt_contract_digest(prompt_without_identity)
+    runner = getattr(args, "runner", None) or "tui"
+    command_text, invocation = role_agent_command(
+        repo,
+        agent_config,
+        runner=runner,
+        prompt_rel=prompt_rel,
+        cwd=worktree,
+        role_id="S001",
+        attempt_id=attempt_id,
+        output_rel=artifact_rel if runner == "exec" else None,
+    )
+    command = f"cd {shlex.quote(str(worktree))} && {command_text}"
+    if getattr(args, "dry_run", False):
+        print(f"DRY RUN worktree: git worktree add --detach {worktree} {head_sha}")
+        print(f"DRY RUN prompt: {worktree / prompt_rel}")
+        print(f"DRY RUN {getattr(args, 'launcher', 'pane')}/{runner} command: {command}")
+        return 0
+    if os.environ.get("HERDR_ENV") != "1" or not command_exists("herdr"):
+        raise HLoopError("coverage-mode Specification Scout requires Herdr")
+    worktree_preexisting = worktree.exists()
+    pane_id = ""
+    try:
+        if not worktree_preexisting:
+            git(repo, ["worktree", "add", "--detach", str(worktree), head_sha])
+        prepare_role_worktree(repo, worktree, state, role="advisor", agent_id="S001")
+        ensure_advisor_visible_in_worktree(worktree)
+        ensure_worktree_parent_dirs(worktree, prompt_rel, artifact_rel)
+        credential, ack_floor = register_role_report_identity_and_ack_floor(
+            repo,
+            state,
+            role_id="S001",
+            attempt_id=attempt_id,
+            task_contract_digest=task_contract_digest,
+        )
+        prompt = render_plan_gap_scout_prompt(
+            state,
+            head_sha=head_sha,
+            planning_identity=identity,
+            input_artifact_digests=input_digests,
+            agent_config=agent_config,
+            attempt_id=attempt_id,
+            report_credential_file=str(credential),
+            task_contract_digest=task_contract_digest,
+        )
+        write_text(worktree / prompt_rel, prompt)
+        baseline = role_scope_paths(worktree)
+        if getattr(args, "launcher", "pane") == "agent":
+            pane_id = start_agent_launcher(
+                name=f"hloop-{state['goal_id']}-plan-gap-scout",
+                direction=getattr(args, "direction", "right"),
+                cwd=worktree,
+                command=command,
+            )
+        else:
+            pane_id = start_pane_launcher(
+                manager_pane=getattr(args, "manager_pane", None) or current_pane_id(),
+                direction=getattr(args, "direction", "right"),
+                cwd=worktree,
+                command=command,
+            )
+    except (
+        HLoopError,
+        hloop_broker.BrokerStorageError,
+        OSError,
+        subprocess.CalledProcessError,
+    ):
+        try:
+            rollback_failed_role_start(
+                repo, worktree, created_worktree=not worktree_preexisting
+            )
+        finally:
+            revoke_active_role_report_identity(repo, state, "S001")
+        raise
+    run.clear()
+    run.update(
+        {
+            "role_id": "S001",
+            "mode": "coverage",
+            "status": "running",
+            "gate_status": "running",
+            "head_sha": head_sha,
+            "planning_identity": identity,
+            "planning_identity_digest": planning_identity_digest(identity),
+            "input_artifact_digests": input_digests,
+            "pane_id": pane_id,
+            "worktree": str(worktree),
+            "prompt": str(worktree / prompt_rel),
+            "artifact_path": str(planning_artifact_file(repo, hloop_planning.PLAN_GAP_RECORD_TYPE)),
+            "worktree_artifact_path": str(worktree / artifact_rel),
+            "baseline_dirty_files": baseline,
+            "agent_provider": agent_config["provider"],
+            "agent_model": agent_config["model"],
+            "agent_effort": agent_config["effort"],
+            "agent_identity": agent_identity_record(agent_config),
+            "agent_config": {
+                key: agent_config[key] for key in ("provider", "model", "effort", "sources", "provenance")
+            },
+            "agent_config_sources": agent_config["sources"],
+            "agent_config_provenance": agent_config["provenance"],
+            "attempt_no": attempt_no,
+            "attempt_id": attempt_id,
+            "task_contract_digest": task_contract_digest,
+            "skill_version": SKILL_VERSION,
+            "runner": runner,
+            "provider_invocation": invocation.as_record(),
+            "started_at": now_iso(),
+        }
+    )
+    arm_initial_semantic_ack_barrier(
+        run,
+        attempt_id=attempt_id,
+        contract_digest=task_contract_digest,
+        required_reack_after_sequence=ack_floor,
+    )
+    invalidate_planning_evidence(state, reason="coverage-scout-started")
+    state["phase"] = "planning_coverage_scout"
+    save_state(repo, state)
+    journal(repo, f"Started coverage-mode Specification Scout in pane `{pane_id}` at `{head_sha}`.")
+    print(f"started coverage-mode Specification Scout in pane {pane_id}")
+    return 0
+
+
 def cmd_specification_scout_start(args: argparse.Namespace) -> int:
+    if str(getattr(args, "mode", None) or "decision") == "coverage":
+        return cmd_plan_gap_scout_start(args)
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     required, reasons = specification_scout_required(state)
@@ -18255,9 +19029,10 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "advisor",
-        overrides={
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
     )
     command_text, invocation = role_agent_command(
@@ -18348,6 +19123,8 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
             "agent_identity": agent_identity_record(agent_config),
+            "agent_config_sources": agent_config["sources"],
+            "agent_config_provenance": agent_config["provenance"],
             "attempt_no": attempt_no,
             "attempt_id": attempt_id,
             "skill_version": SKILL_VERSION,
@@ -18409,7 +19186,173 @@ def decision_role_artifact_identity_error(
     return ""
 
 
+def authenticated_plan_gap_completion(
+    repo: Path,
+    state: Mapping[str, Any],
+    run: Mapping[str, Any],
+    *,
+    artifact_ref: str,
+    artifact_digest: str,
+) -> Mapping[str, Any]:
+    store = _open_broker_store(repo)
+    try:
+        with store.transaction() as transaction:
+            event = store.latest_role_event(
+                transaction,
+                run_id=str(state.get("run_id") or "local"),
+                role_id="S001",
+                attempt_id=str(run.get("attempt_id") or ""),
+                report_type="completion",
+            )
+    except hloop_broker.BrokerStorageError as exc:
+        raise HLoopError(f"cannot read coverage Scout completion report: {exc}") from exc
+    if not isinstance(event, Mapping):
+        raise HLoopError(
+            "coverage Scout has no authenticated completion report for this attempt"
+        )
+    expected = {
+        "run_id": str(state.get("run_id") or "local"),
+        "role_id": "S001",
+        "attempt_id": str(run.get("attempt_id") or ""),
+        "type": "completion",
+        "head_sha": str(run.get("head_sha") or ""),
+        "artifact": artifact_ref,
+        "artifact_digest": artifact_digest,
+    }
+    mismatches = [
+        key for key, value in expected.items() if str(event.get(key) or "") != value
+    ]
+    if mismatches:
+        raise HLoopError(
+            "coverage Scout completion report identity mismatch: "
+            + ", ".join(mismatches)
+        )
+    event_id = str(event.get("event_id") or "")
+    if not event_id or event_id == str(run.get("prior_completion_event_id") or ""):
+        raise HLoopError("coverage Scout completion report is missing or replayed")
+    return event
+
+
+def cmd_plan_gap_scout_harvest(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
+    run = state.get("plan_gap_scout_run") or {}
+    if str(run.get("status") or "") != "running":
+        raise HLoopError("coverage-mode Specification Scout is not running")
+    block_reason = semantic_ack_barrier_blocking(run)
+    if block_reason:
+        raise HLoopError(f"cannot harvest coverage Scout: {block_reason}")
+    current_head = git(repo, ["rev-parse", str(state["integration_branch"])])
+    if current_head != str(run.get("head_sha") or ""):
+        raise HLoopError("coverage Scout target SHA is stale")
+    current_identity = current_planning_identity(repo, state).to_dict()
+    if (
+        current_identity != run.get("planning_identity")
+        or planning_identity_digest(current_identity)
+        != str(run.get("planning_identity_digest") or "")
+    ):
+        raise HLoopError("coverage Scout planning identity is stale")
+    impact, task_graph, coverage = _plan_gap_input_artifacts(repo)
+    current_inputs = {
+        "impact_map": str(impact.get("artifact_digest") or ""),
+        "task_graph": str(task_graph.get("artifact_digest") or ""),
+        "coverage": str(coverage.get("artifact_digest") or ""),
+    }
+    if current_inputs != run.get("input_artifact_digests"):
+        raise HLoopError("coverage Scout input artifact digests are stale")
+    worktree = Path(str(run.get("worktree") or "")).resolve()
+    artifact_rel = LOOP_DIR / "planning" / "PLAN-GAP.json"
+    prompt_rel = LOOP_DIR / "prompts" / "S001.plan-gap-scout.md"
+    source = worktree / artifact_rel
+    plan_gap = load_json_object(source, label="coverage Scout PLAN-GAP")
+    expected_checker = plan_gap_scout_checker(state, run)
+    validation = hloop_planning.validate_planning_artifact(
+        plan_gap,
+        expected_record_type=hloop_planning.PLAN_GAP_RECORD_TYPE,
+        expected_plan_gap_checker=expected_checker,
+    )
+    if not validation.ok:
+        detail = "; ".join(
+            f"{issue.code}: {issue.message}" for issue in validation.issues
+        )
+        raise HLoopError(f"coverage Scout PLAN-GAP is invalid: {detail}")
+    if hloop_planning.PlanningIdentity.from_record(plan_gap).to_dict() != current_identity:
+        raise HLoopError("coverage Scout PLAN-GAP planning identity mismatch")
+    expected_refs = {
+        "impact_map_digest": current_inputs["impact_map"],
+        "task_graph_digest": current_inputs["task_graph"],
+        "coverage_digest": current_inputs["coverage"],
+    }
+    if any(plan_gap.get(key) != value for key, value in expected_refs.items()):
+        raise HLoopError("coverage Scout PLAN-GAP dependency digest mismatch")
+    violations = validate_decision_role_scope(
+        worktree,
+        run,
+        allowed={artifact_rel.as_posix(), prompt_rel.as_posix()},
+    )
+    if violations:
+        raise HLoopError(
+            "coverage Scout changed files outside PLAN-GAP: " + ", ".join(violations)
+        )
+    artifact_digest = _sha256_labelled(source.read_bytes())
+    artifact_ref = artifact_rel.as_posix()
+    completion = authenticated_plan_gap_completion(
+        repo,
+        state,
+        run,
+        artifact_ref=artifact_ref,
+        artifact_digest=artifact_digest,
+    )
+    destination = planning_artifact_file(
+        repo, hloop_planning.PLAN_GAP_RECORD_TYPE
+    )
+    write_text(destination, read_text(source))
+    verdict = str(plan_gap.get("verdict") or "")
+    run.update(
+        {
+            "status": "completed" if verdict == "clean" else "reported",
+            "gate_status": "completed" if verdict == "clean" else "reported",
+            "verdict": verdict,
+            "artifact_path": str(destination),
+            "artifact_digest": artifact_digest,
+            "artifact_contract_digest": str(plan_gap.get("artifact_digest") or ""),
+            "completion_event_id": str(completion.get("event_id") or ""),
+            "worktree_artifact_path_harvested": str(source),
+            "harvested_at": now_iso(),
+            "completed_at": now_iso() if verdict == "clean" else "",
+        }
+    )
+    cleanup_completed_agent_pane(
+        repo,
+        run,
+        label="coverage-mode Specification Scout",
+        session_cleanup=session_cleanup_mode(args, state),
+    )
+    cleanup_decision_role_worktree(
+        repo, "S001", run, prompt_suffix="plan-gap-scout", best_effort=True
+    )
+    revoke_active_role_report_identity(repo, state, "S001")
+    invalidate_planning_evidence(
+        state,
+        reason=(
+            "coverage-scout-harvested"
+            if verdict == "clean"
+            else "coverage-scout-reported-gaps"
+        ),
+    )
+    state["phase"] = "planning" if verdict == "clean" else "triage"
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Harvested coverage-mode Specification Scout with verdict `{verdict}`.",
+    )
+    print(f"harvested coverage-mode Specification Scout: {destination}")
+    return 0
+
+
 def cmd_specification_scout_harvest(args: argparse.Namespace) -> int:
+    if str(getattr(args, "mode", None) or "decision") == "coverage":
+        return cmd_plan_gap_scout_harvest(args)
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_integration_branch=True, mark_blocked=False)
     run = state.get("specification_scout_run") or {}
@@ -18543,9 +19486,10 @@ def start_decision_liaison(
     agent_config = role_agent_config(
         state,
         "advisor",
-        overrides={
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
     )
     command_text, invocation = role_agent_command(
@@ -18634,6 +19578,8 @@ def start_decision_liaison(
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
             "agent_identity": agent_identity_record(agent_config),
+            "agent_config_sources": agent_config["sources"],
+            "agent_config_provenance": agent_config["provenance"],
             "attempt_no": attempt_no,
             "attempt_id": attempt_id,
             "skill_version": SKILL_VERSION,
@@ -20450,39 +21396,17 @@ def apply_patch_review_record(
 
 
 def patch_reviewer_agent_config(
-    state: Mapping[str, Any], args: argparse.Namespace
-) -> dict[str, str]:
-    defaults = hloop_config.V053_BUILT_IN_CONFIG_DEFAULTS["patch_reviewer"]
-    resolved = state.get("resolved_config")
-    configured = (
-        resolved.get("patch_reviewer")
-        if isinstance(resolved, Mapping)
-        and isinstance(resolved.get("patch_reviewer"), Mapping)
-        else {}
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    return role_agent_config(
+        state,
+        "patch_reviewer",
+        start_override={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
+        },
     )
-    provider = normalize_agent_provider(
-        getattr(args, "agent_provider", None)
-        or configured.get("provider")
-        or defaults["provider"]
-    )
-    return {
-        "provider": provider,
-        "model": normalize_agent_model(
-            getattr(args, "agent_model", None)
-            or configured.get("model")
-            or defaults["model"]
-        ),
-        "effort": normalize_agent_effort(
-            getattr(args, "agent_effort", None)
-            or configured.get("effort")
-            or defaults["effort"]
-        ),
-        "claude_permission_mode": str(
-            state.get("reviewer_claude_permission_mode")
-            or DEFAULT_CLAUDE_PERMISSION_MODE
-        ),
-        "fallback_provider": "",
-    }
 
 
 def render_patch_reviewer_prompt(
@@ -20732,6 +21656,8 @@ def cmd_patch_review_start(args: argparse.Namespace) -> int:
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
         "agent_identity": agent_identity_record(agent_config),
+        "agent_config_sources": agent_config["sources"],
+        "agent_config_provenance": agent_config["provenance"],
         "runner": runner,
         "provider_invocation": preview_invocation.as_record(),
         "started_at": now_iso(),
@@ -23528,10 +24454,6 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     dispatch_start_preflight(
         repo, state, role_id=task_id, role_kind="worker", task_meta=task_meta
     )
-    if getattr(args, "agent_provider", None):
-        task_meta["agent_provider"] = args.agent_provider
-    if getattr(args, "agent_model", None):
-        task_meta["agent_model"] = args.agent_model
     branch = task_state.get("branch") or task_meta["branch"]
     task_state.setdefault("root_branch", branch)
     integration = state["integration_branch"]
@@ -23547,10 +24469,11 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "worker",
-        overrides={
-            **task_meta,
+        task_override=task_meta,
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
     )
     agent_command, preview_invocation = role_agent_command(
@@ -23583,10 +24506,6 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     dispatch_start_preflight(
         repo, state, role_id=task_id, role_kind="worker", task_meta=task_meta
     )
-    if getattr(args, "agent_provider", None):
-        task_meta["agent_provider"] = args.agent_provider
-    if getattr(args, "agent_model", None):
-        task_meta["agent_model"] = args.agent_model
     branch = task_state.get("branch") or task_meta["branch"]
     task_state.setdefault("root_branch", branch)
     integration = state["integration_branch"]
@@ -23600,10 +24519,11 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "worker",
-        overrides={
-            **task_meta,
+        task_override=task_meta,
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
     )
     agent_command, provider_invocation = role_agent_command(
@@ -23648,6 +24568,7 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             worktree,
             branch,
             state,
+            agent_config=agent_config,
             report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
         )
@@ -23707,6 +24628,8 @@ def cmd_worker_start(args: argparse.Namespace) -> int:
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
             "agent_identity": agent_identity_record(agent_config),
+            "agent_config_sources": agent_config["sources"],
+            "agent_config_provenance": agent_config["provenance"],
             "claude_permission_mode": agent_config["claude_permission_mode"],
             "attempt_id": attempt_id,
             "worker_base_sha": worker_base_sha,
@@ -26934,13 +27857,15 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "reviewer",
-        overrides={
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
+        component="coordinator",
     )
     review_plan = build_reviewer_group_plan(mode, head_sha, agent_config, topology=topology)
-    validate_reviewer_epoch_capacity_binding(epoch_binding, review_plan)
+    validate_reviewer_epoch_capacity_binding(epoch_binding, review_plan, agent_config)
     # Numeric-only preview: this runs even for --dry-run, before any provider
     # is required to be installed. The real per-provider capability probe
     # only runs on the actual launch path below, after `--dry-run` returns.
@@ -27013,13 +27938,15 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "reviewer",
-        overrides={
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
+        component="coordinator",
     )
     review_plan = build_reviewer_group_plan(mode, head_sha, agent_config, topology=topology)
-    validate_reviewer_epoch_capacity_binding(epoch_binding, review_plan)
+    validate_reviewer_epoch_capacity_binding(epoch_binding, review_plan, agent_config)
     capacity_check = hloop_providers.check_review_capacity(
         hloop_review.required_provider_capacity(review_plan),
         limits=state.get("review_capacity_limits"),
@@ -27142,6 +28069,8 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
         "agent_identity": agent_identity_record(agent_config),
+        "agent_config_sources": agent_config["sources"],
+        "agent_config_provenance": agent_config["provenance"],
         "claude_permission_mode": agent_config["claude_permission_mode"],
         "attempt_id": attempt_id,
         "fallback_provider": agent_config["fallback_provider"],
@@ -27543,10 +28472,12 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "gap",
-        overrides={
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
+        component="coordinator",
     )
     attempt_id = f"{gap_id}-A001"
     epoch_binding = None
@@ -27610,10 +28541,12 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "gap",
-        overrides={
+        start_override={
             "agent_provider": getattr(args, "agent_provider", None),
             "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
+        component="coordinator",
     )
     epoch_execution = gap_epoch_execution(epoch_binding, agent_config)
     prompt_without_identity = render_gap_prompt(
@@ -27721,6 +28654,8 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
         "agent_model": agent_config["model"],
         "agent_effort": agent_config["effort"],
         "agent_identity": agent_identity_record(agent_config),
+        "agent_config_sources": agent_config["sources"],
+        "agent_config_provenance": agent_config["provenance"],
         "claude_permission_mode": agent_config["claude_permission_mode"],
         "attempt_id": attempt_id,
         "fallback_provider": agent_config["fallback_provider"],
@@ -28152,9 +29087,11 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
     agent_config = role_agent_config(
         state,
         "advisor",
-        overrides={
-            "agent_provider": getattr(args, "agent_provider", None) or participant.get("provider"),
-            "agent_model": getattr(args, "agent_model", None) or participant.get("model"),
+        participant_override=participant,
+        start_override={
+            "agent_provider": getattr(args, "agent_provider", None),
+            "agent_model": getattr(args, "agent_model", None),
+            "agent_effort": getattr(args, "agent_effort", None),
         },
     )
     participant["provider"] = agent_config["provider"]
@@ -28282,6 +29219,8 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             "agent_model": agent_config["model"],
             "agent_effort": agent_config["effort"],
             "agent_identity": agent_identity_record(agent_config),
+            "agent_config_sources": agent_config["sources"],
+            "agent_config_provenance": agent_config["provenance"],
             "claude_permission_mode": agent_config["claude_permission_mode"],
             "attempt_id": attempt_id,
             "fallback_provider": agent_config["fallback_provider"],
@@ -34003,13 +34942,13 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--reviewer-agent-model")
     init.add_argument("--reviewer-agent-effort")
     init.add_argument("--reviewer-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
-    init.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
-    init.add_argument("--gap-agent-model", default=DEFAULT_AGENT_MODEL)
-    init.add_argument("--gap-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--gap-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    init.add_argument("--gap-agent-model")
+    init.add_argument("--gap-agent-effort")
     init.add_argument("--gap-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
-    init.add_argument("--advisor-agent-provider", choices=sorted(AGENT_PROVIDERS), default=DEFAULT_AGENT_PROVIDER)
-    init.add_argument("--advisor-agent-model", default=DEFAULT_AGENT_MODEL)
-    init.add_argument("--advisor-agent-effort", default=DEFAULT_AGENT_EFFORT)
+    init.add_argument("--advisor-agent-provider", choices=sorted(AGENT_PROVIDERS))
+    init.add_argument("--advisor-agent-model")
+    init.add_argument("--advisor-agent-effort")
     init.add_argument("--advisor-claude-permission-mode", default=DEFAULT_CLAUDE_PERMISSION_MODE)
     init.add_argument("--advisor-enabled", action="store_true")
     init.add_argument("--advisor-mode", choices=sorted(ADVISOR_MODES), default=DEFAULT_ADVISOR_MODE)
@@ -34882,7 +35821,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="specification_scout_command", required=True
     )
     scout_start = specification_scout_sub.add_parser("start")
+    scout_start.add_argument(
+        "--mode", choices=["decision", "coverage"], default="decision"
+    )
     scout_start.add_argument("--force", action="store_true")
+    scout_start.add_argument("--dry-run", action="store_true")
     scout_start.add_argument("--worktree")
     scout_start.add_argument("--manager-pane")
     scout_start.add_argument("--direction", choices=["right", "down"], default="right")
@@ -34890,8 +35833,12 @@ def build_parser() -> argparse.ArgumentParser:
     scout_start.add_argument("--runner", choices=["tui", "exec"], default="tui")
     scout_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     scout_start.add_argument("--agent-model")
+    scout_start.add_argument("--agent-effort")
     scout_start.set_defaults(func=cmd_specification_scout_start)
     scout_harvest = specification_scout_sub.add_parser("harvest")
+    scout_harvest.add_argument(
+        "--mode", choices=["decision", "coverage"], default="decision"
+    )
     scout_harvest.add_argument("--session-cleanup", choices=sorted(SESSION_CLEANUP_MODES))
     scout_harvest.set_defaults(func=cmd_specification_scout_harvest)
     scout_close = specification_scout_sub.add_parser("close")
@@ -34989,6 +35936,7 @@ def build_parser() -> argparse.ArgumentParser:
     liaison_start.add_argument("--launcher", choices=["pane", "agent"], default="pane")
     liaison_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     liaison_start.add_argument("--agent-model")
+    liaison_start.add_argument("--agent-effort")
     liaison_start.set_defaults(func=cmd_decision_liaison_start)
     liaison_harvest = decision_liaison_sub.add_parser("harvest")
     liaison_harvest.add_argument("--id", required=True)
@@ -35006,6 +35954,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker_start.add_argument("--runner", choices=["tui", "exec"])
     worker_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     worker_start.add_argument("--agent-model")
+    worker_start.add_argument("--agent-effort")
     worker_start.add_argument("--dry-run", action="store_true")
     worker_start.set_defaults(func=cmd_worker_start)
     worker_submit = worker_sub.add_parser(
@@ -35418,6 +36367,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_start.add_argument("--runner", choices=["exec", "tui"])
     reviewer_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     reviewer_start.add_argument("--agent-model")
+    reviewer_start.add_argument("--agent-effort")
     reviewer_start.add_argument(
         "--mode",
         choices=sorted(hloop_review.REVIEW_MODES),
@@ -35511,6 +36461,7 @@ def build_parser() -> argparse.ArgumentParser:
     gap_start.add_argument("--runner", choices=["exec", "tui"])
     gap_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     gap_start.add_argument("--agent-model")
+    gap_start.add_argument("--agent-effort")
     gap_start.add_argument("--dry-run", action="store_true")
     gap_start.set_defaults(func=cmd_gap_start)
     gap_harvest = gap_sub.add_parser("harvest")
@@ -35601,6 +36552,7 @@ def build_parser() -> argparse.ArgumentParser:
     advisor_start.add_argument("--runner", choices=["exec", "tui"])
     advisor_start.add_argument("--agent-provider", choices=sorted(AGENT_PROVIDERS))
     advisor_start.add_argument("--agent-model")
+    advisor_start.add_argument("--agent-effort")
     advisor_start.add_argument("--dry-run", action="store_true")
     advisor_start.set_defaults(func=cmd_advisor_start)
     advisor_harvest = advisor_sub.add_parser("harvest", help="harvest one Advisor participant artifact")

@@ -26,6 +26,7 @@ PUBLIC_SCHEMA = SKILL_ROOT / "schemas" / "review-epoch.schema.json"
 sys.path.insert(0, str(SCRIPTS))
 
 from hloop_lib.review import plan_review_group  # noqa: E402
+from hloop_lib.config import project_agent_identity  # noqa: E402
 from hloop_lib.review_epoch import (  # noqa: E402
     AuditProcessPlan,
     CapacityLease,
@@ -59,6 +60,8 @@ def reviewer_execution(
         execution_id=execution_id,
         attempt_id=attempt,
         source_kind="reviewer",
+        execution_kind="ordinary",
+        protocol_key="reviewer.protocol",
         protocol=protocol,
         independence_key=f"reviewer:{execution_id}",
         artifact_ref=f"reviews/{execution_id}/MANIFEST.json",
@@ -70,6 +73,7 @@ def reviewer_execution(
                 provider="codex",
                 model="gpt-5.6-sol",
                 effort="xhigh",
+                attestation_required=True,
             ),
             AuditProcessPlan(
                 process_id=f"{prefix}-lane-correctness",
@@ -80,6 +84,7 @@ def reviewer_execution(
                 effort="xhigh",
                 parent_process_id=coordinator,
                 lane_id="product-correctness",
+                attestation_required=True,
             ),
             AuditProcessPlan(
                 process_id=f"{prefix}-verifier",
@@ -89,6 +94,7 @@ def reviewer_execution(
                 model="gpt-5.6-sol",
                 effort="xhigh",
                 parent_process_id=coordinator,
+                attestation_required=True,
             ),
         ),
     )
@@ -112,6 +118,7 @@ def gap_execution(execution_id: str = "G001") -> EpochExecutionPlan:
                 provider="codex",
                 model="gpt-5.6-sol",
                 effort="xhigh",
+                attestation_required=True,
             ),
             AuditProcessPlan(
                 process_id=f"{prefix}-lane-coverage",
@@ -122,6 +129,7 @@ def gap_execution(execution_id: str = "G001") -> EpochExecutionPlan:
                 effort="xhigh",
                 parent_process_id=coordinator,
                 lane_id="requirement-coverage",
+                attestation_required=True,
             ),
             AuditProcessPlan(
                 process_id=f"{prefix}-challenge",
@@ -132,6 +140,7 @@ def gap_execution(execution_id: str = "G001") -> EpochExecutionPlan:
                 effort="xhigh",
                 parent_process_id=coordinator,
                 lane_id="coverage-challenge",
+                attestation_required=True,
             ),
         ),
     )
@@ -184,6 +193,29 @@ def completed_epoch_collection() -> ReviewEpochCollection:
                 artifact_digest=digest(f"artifact-{execution.execution_id}"),
                 artifact_complete=True,
                 completed_process_ids=process_ids,
+                process_identities=tuple(
+                    {
+                        "process_id": process.process_id,
+                        "agent_identity": project_agent_identity(
+                            {
+                                "provider": process.provider,
+                                "model": process.model,
+                                "effort": process.effort,
+                            },
+                            observed={
+                                "provider": process.provider,
+                                "model": process.model,
+                                "effort": process.effort,
+                            },
+                            attested={
+                                "provider": process.provider,
+                                "model": process.model,
+                                "effort": process.effort,
+                            },
+                        ).as_dict(),
+                    }
+                    for process in execution.processes
+                ),
                 status="succeeded",
                 terminal_at="2026-07-17T08:01:00Z",
             )
@@ -254,6 +286,13 @@ class ReviewEpochIdentityTests(unittest.TestCase):
             replace(
                 plan,
                 required_executions=(
+                    replace(reviewer, execution_kind="", protocol_key=""),
+                    plan.execution("G001"),
+                ),
+            ),
+            replace(
+                plan,
+                required_executions=(
                     replace(
                         reviewer,
                         processes=(
@@ -272,7 +311,11 @@ class ReviewEpochIdentityTests(unittest.TestCase):
                         reviewer,
                         processes=(
                             reviewer.processes[0],
-                            replace(lane, model="gpt-5.6-terra"),
+                            replace(
+                                lane,
+                                model="gpt-5.6-terra",
+                                agent_identity={},
+                            ),
                             reviewer.processes[2],
                         ),
                     ),
@@ -286,7 +329,7 @@ class ReviewEpochIdentityTests(unittest.TestCase):
                         reviewer,
                         processes=(
                             reviewer.processes[0],
-                            replace(lane, effort="max"),
+                            replace(lane, effort="max", agent_identity={}),
                             reviewer.processes[2],
                         ),
                     ),
@@ -319,7 +362,9 @@ class ReviewEpochIdentityTests(unittest.TestCase):
     def test_tampered_execution_topology_and_plan_digests_fail_closed(self):
         record = epoch_plan().to_record()
         record["required_executions"][0]["processes"][1]["model"] = "tampered"
-        with self.assertRaisesRegex(ReviewEpochError, "execution_digest"):
+        with self.assertRaisesRegex(
+            ReviewEpochError, "agent_identity|execution_digest"
+        ):
             ReviewEpochPlan.from_record(record)
 
         record = epoch_plan().to_record()
@@ -763,6 +808,96 @@ class ReviewEpochCollectionTests(unittest.TestCase):
             {item.independence_key for item in restored.execution_outcomes},
             {"reviewer:R001", "gap:G001"},
         )
+
+    def test_successful_execution_requires_exact_attested_process_identity(self):
+        plan = epoch_plan()
+        execution = plan.execution("R001")
+        process_ids = tuple(item.process_id for item in execution.processes)
+        collection = ReviewEpochCollection.create(plan)
+        capacity = collection.capacity.reserve(
+            plan,
+            lease_id="lease-R001",
+            execution_id="R001",
+            process_ids=process_ids,
+            expires_at="2026-07-17T08:00:00Z",
+        ).mark_terminal(
+            "lease-R001",
+            reason="process tree exited",
+            process_exit_confirmed=True,
+        )
+        collection = collection.with_capacity(capacity)
+        with self.assertRaisesRegex(ReviewEpochError, "missing required process attestation"):
+            EpochExecutionOutcome.for_plan(
+                plan,
+                "R001",
+                artifact_digest=digest("artifact-R001"),
+                artifact_complete=True,
+                completed_process_ids=process_ids,
+                status="succeeded",
+                terminal_at="2026-07-17T08:01:00Z",
+            )
+
+        identities = tuple(
+            {
+                "process_id": process.process_id,
+                "agent_identity": project_agent_identity(
+                    {
+                        "provider": process.provider,
+                        "model": process.model,
+                        "effort": process.effort,
+                    },
+                    observed={
+                        "provider": process.provider,
+                        "model": process.model,
+                        "effort": process.effort,
+                    },
+                    attested={
+                        "provider": process.provider,
+                        "model": process.model,
+                        "effort": process.effort,
+                    },
+                ).as_dict(),
+            }
+            for process in execution.processes
+        )
+        base = EpochExecutionOutcome.for_plan(
+            plan,
+            "R001",
+            artifact_digest=digest("artifact-R001"),
+            artifact_complete=True,
+            completed_process_ids=process_ids,
+            process_identities=identities,
+            status="succeeded",
+            terminal_at="2026-07-17T08:01:00Z",
+        )
+        requested_mismatch = deepcopy(identities)
+        requested_mismatch[0]["agent_identity"] = project_agent_identity(
+            {
+                **requested_mismatch[0]["agent_identity"]["requested"],
+                "model": "other-model",
+            },
+            observed={
+                **requested_mismatch[0]["agent_identity"]["requested"],
+                "model": "other-model",
+            },
+            attested={
+                **requested_mismatch[0]["agent_identity"]["requested"],
+                "model": "other-model",
+            },
+        ).as_dict()
+        with self.assertRaisesRegex(ReviewEpochError, "requested values differ"):
+            collection.record_outcome(replace(base, process_identities=requested_mismatch))
+
+        unattested = deepcopy(identities)
+        unattested[0]["agent_identity"] = project_agent_identity(
+            unattested[0]["agent_identity"]["requested"],
+            observed={
+                **unattested[0]["agent_identity"]["requested"],
+                "model": "other-model",
+            },
+        ).as_dict()
+        with self.assertRaisesRegex(ReviewEpochError, "unavailable or mismatched"):
+            collection.record_outcome(replace(base, process_identities=unattested))
 
     def test_failed_or_artifact_incomplete_execution_never_reaches_triage(self):
         plan = epoch_plan()

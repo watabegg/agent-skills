@@ -9,7 +9,7 @@ process-exit confirmation or a forced-abort acknowledgement.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -17,6 +17,7 @@ import json
 import re
 from typing import Any, Mapping, Sequence
 
+from . import config as hloop_config
 from .review import SUPPORTED_PROVIDERS
 
 
@@ -52,6 +53,8 @@ _AUDIT_PROCESS_RECORD_FIELDS = (
     "provider",
     "model",
     "effort",
+    "agent_identity",
+    "attestation_required",
     "parent_process_id",
     "lane_id",
 )
@@ -59,6 +62,8 @@ _EPOCH_EXECUTION_RECORD_FIELDS = (
     "execution_id",
     "attempt_id",
     "source_kind",
+    "execution_kind",
+    "protocol_key",
     "protocol",
     "independence_key",
     "artifact_ref",
@@ -140,9 +145,18 @@ _EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS = (
     "artifact_digest",
     "artifact_complete",
     "completed_process_ids",
+    "process_identities",
     "status",
     "terminal_at",
 )
+_PROCESS_IDENTITY_EVIDENCE_FIELDS = ("process_id", "agent_identity")
+
+_SOURCE_PROTOCOL_IDENTITIES = {
+    "reviewer": ("ordinary", "reviewer.protocol"),
+    "convergence": ("pre-final", "review.pre_final_protocol"),
+    "pre_final": ("pre-final", "review.pre_final_protocol"),
+    "manual_final": ("manual-final", "review.manual_final_protocol"),
+}
 _REVIEW_EPOCH_COLLECTION_RECORD_FIELDS = (
     "record_type",
     "plan",
@@ -282,6 +296,40 @@ def _timestamp(value: Any, field_name: str) -> str:
     return _parse_timestamp(value, field_name).isoformat().replace("+00:00", "Z")
 
 
+def _canonical_agent_identity(
+    value: Mapping[str, Any] | None,
+    *,
+    requested: Mapping[str, Any],
+    field_name: str,
+) -> dict[str, Any]:
+    if not value:
+        return hloop_config.project_agent_identity(requested).as_dict()
+    record = _record(value, field_name)
+    required = {
+        "requested",
+        "observed",
+        "attested",
+        "status",
+        "verified",
+        "issues",
+    }
+    if set(record) != required:
+        raise ReviewEpochError(f"{field_name} fields are not canonical")
+    try:
+        projected = hloop_config.project_agent_identity(
+            requested,
+            observed=_record(record["observed"], f"{field_name}.observed"),
+            attested=_record(record["attested"], f"{field_name}.attested"),
+        ).as_dict()
+    except hloop_config.ConfigValidationError as exc:
+        raise ReviewEpochError(f"{field_name} is invalid: {exc}") from exc
+    if dict(record) != projected:
+        raise ReviewEpochError(
+            f"{field_name} does not match its requested/observed/attested evidence"
+        )
+    return projected
+
+
 @dataclass(frozen=True, slots=True)
 class AuditProcessPlan:
     """One planned process that consumes one aggregate audit-budget slot."""
@@ -294,6 +342,8 @@ class AuditProcessPlan:
     effort: str
     parent_process_id: str = ""
     lane_id: str = ""
+    agent_identity: Mapping[str, Any] = field(default_factory=dict)
+    attestation_required: bool = False
 
     def __post_init__(self) -> None:
         for field_name in ("process_id", "agent_label", "model", "effort"):
@@ -308,6 +358,23 @@ class AuditProcessPlan:
             )
         if self.provider not in SUPPORTED_PROVIDERS:
             raise ReviewEpochError(f"unsupported audit provider: {self.provider!r}")
+        if not isinstance(self.attestation_required, bool):
+            raise ReviewEpochError("attestation_required must be boolean")
+        if self.agent_identity or self.attestation_required:
+            requested = {
+                "provider": self.provider,
+                "model": self.model,
+                "effort": self.effort,
+            }
+            object.__setattr__(
+                self,
+                "agent_identity",
+                _canonical_agent_identity(
+                    self.agent_identity,
+                    requested=requested,
+                    field_name="audit process agent_identity",
+                ),
+            )
         object.__setattr__(
             self,
             "parent_process_id",
@@ -333,7 +400,7 @@ class AuditProcessPlan:
                 )
 
     def to_record(self) -> dict[str, str]:
-        return {
+        record = {
             "process_id": self.process_id,
             "process_kind": self.process_kind,
             "agent_label": self.agent_label,
@@ -343,15 +410,31 @@ class AuditProcessPlan:
             "parent_process_id": self.parent_process_id,
             "lane_id": self.lane_id,
         }
+        if self.agent_identity or self.attestation_required:
+            record["agent_identity"] = dict(self.agent_identity)
+            record["attestation_required"] = self.attestation_required
+        return record
 
     @classmethod
     def from_record(cls, value: Any) -> "AuditProcessPlan":
         if isinstance(value, cls):
             return value
         record = _record(value, "audit process plan")
-        _exact_record_fields(
-            record, "audit process plan", _AUDIT_PROCESS_RECORD_FIELDS
+        legacy_fields = tuple(
+            field_name
+            for field_name in _AUDIT_PROCESS_RECORD_FIELDS
+            if field_name not in {"agent_identity", "attestation_required"}
         )
+        if set(record) == set(legacy_fields):
+            record = {
+                **record,
+                "agent_identity": {},
+                "attestation_required": False,
+            }
+        else:
+            _exact_record_fields(
+                record, "audit process plan", _AUDIT_PROCESS_RECORD_FIELDS
+            )
         return cls(
             process_id=record["process_id"],
             process_kind=record["process_kind"],
@@ -359,6 +442,8 @@ class AuditProcessPlan:
             provider=record["provider"],
             model=record["model"],
             effort=record["effort"],
+            agent_identity=record["agent_identity"],
+            attestation_required=record["attestation_required"],
             parent_process_id=record["parent_process_id"],
             lane_id=record["lane_id"],
         )
@@ -375,6 +460,8 @@ class EpochExecutionPlan:
     independence_key: str
     artifact_ref: str
     processes: tuple[AuditProcessPlan, ...]
+    execution_kind: str = ""
+    protocol_key: str = ""
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -393,6 +480,27 @@ class EpochExecutionPlan:
             raise ReviewEpochError(
                 f"unsupported epoch source_kind: {self.source_kind!r}"
             )
+        canonical_identity = _SOURCE_PROTOCOL_IDENTITIES.get(self.source_kind)
+        execution_kind = self.execution_kind
+        protocol_key = self.protocol_key
+        if bool(execution_kind) != bool(protocol_key):
+            raise ReviewEpochError(
+                "epoch execution requires both execution_kind and protocol_key"
+            )
+        if execution_kind and canonical_identity is None:
+            raise ReviewEpochError(
+                f"epoch execution source_kind {self.source_kind!r} has no review protocol identity"
+            )
+        if execution_kind and canonical_identity is not None and (
+            execution_kind != canonical_identity[0]
+            or protocol_key != canonical_identity[1]
+        ):
+            raise ReviewEpochError(
+                "epoch execution protocol identity does not match source_kind: "
+                f"expected {canonical_identity[0]}/{canonical_identity[1]}"
+            )
+        object.__setattr__(self, "execution_kind", execution_kind)
+        object.__setattr__(self, "protocol_key", protocol_key)
 
         processes = tuple(AuditProcessPlan.from_record(item) for item in self.processes)
         if not processes:
@@ -430,7 +538,7 @@ class EpochExecutionPlan:
         )
 
     def identity_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "execution_id": self.execution_id,
             "attempt_id": self.attempt_id,
             "source_kind": self.source_kind,
@@ -439,6 +547,10 @@ class EpochExecutionPlan:
             "artifact_ref": self.artifact_ref,
             "processes": [process.to_record() for process in self.processes],
         }
+        if self.execution_kind:
+            record["execution_kind"] = self.execution_kind
+            record["protocol_key"] = self.protocol_key
+        return record
 
     @property
     def execution_digest(self) -> str:
@@ -452,13 +564,27 @@ class EpochExecutionPlan:
         if isinstance(value, cls):
             return value
         record = _record(value, "epoch execution plan")
-        _exact_record_fields(
-            record, "epoch execution plan", _EPOCH_EXECUTION_RECORD_FIELDS
+        legacy_fields = tuple(
+            field_name
+            for field_name in _EPOCH_EXECUTION_RECORD_FIELDS
+            if field_name not in {"execution_kind", "protocol_key"}
         )
+        if set(record) == set(legacy_fields):
+            record = {
+                **record,
+                "execution_kind": "",
+                "protocol_key": "",
+            }
+        else:
+            _exact_record_fields(
+                record, "epoch execution plan", _EPOCH_EXECUTION_RECORD_FIELDS
+            )
         execution = cls(
             execution_id=record["execution_id"],
             attempt_id=record["attempt_id"],
             source_kind=record["source_kind"],
+            execution_kind=record["execution_kind"],
+            protocol_key=record["protocol_key"],
             protocol=record["protocol"],
             independence_key=record["independence_key"],
             artifact_ref=record["artifact_ref"],
@@ -1533,6 +1659,57 @@ class EpochCapacityLedger:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessIdentityEvidence:
+    """Observed and provider-attested identity for one planned audit process."""
+
+    process_id: str
+    agent_identity: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "process_id", _required_text(self.process_id, "process_id")
+        )
+        record = _record(self.agent_identity, "process agent_identity")
+        requested = _record(record.get("requested"), "process agent_identity.requested")
+        object.__setattr__(
+            self,
+            "agent_identity",
+            _canonical_agent_identity(
+                record,
+                requested=requested,
+                field_name="process agent_identity",
+            ),
+        )
+
+    @property
+    def verified(self) -> bool:
+        return bool(self.agent_identity.get("verified")) and str(
+            self.agent_identity.get("status") or ""
+        ) == "attested"
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "process_id": self.process_id,
+            "agent_identity": dict(self.agent_identity),
+        }
+
+    @classmethod
+    def from_record(cls, value: Any) -> "ProcessIdentityEvidence":
+        if isinstance(value, cls):
+            return value
+        record = _record(value, "process identity evidence")
+        _exact_record_fields(
+            record,
+            "process identity evidence",
+            _PROCESS_IDENTITY_EVIDENCE_FIELDS,
+        )
+        return cls(
+            process_id=record["process_id"],
+            agent_identity=record["agent_identity"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EpochExecutionOutcome:
     """One terminal execution result bound to an immutable epoch plan.
 
@@ -1556,6 +1733,7 @@ class EpochExecutionOutcome:
     completed_process_ids: tuple[str, ...]
     status: str
     terminal_at: str
+    process_identities: tuple[ProcessIdentityEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         identity = EpochArtifactIdentity(
@@ -1590,6 +1768,20 @@ class EpochExecutionOutcome:
             )
         )
         object.__setattr__(self, "completed_process_ids", completed)
+        identities = tuple(
+            sorted(
+                (
+                    ProcessIdentityEvidence.from_record(item)
+                    for item in self.process_identities
+                ),
+                key=lambda item: item.process_id,
+            )
+        )
+        if len({item.process_id for item in identities}) != len(identities):
+            raise ReviewEpochError(
+                "process_identities must contain unique process_id values"
+            )
+        object.__setattr__(self, "process_identities", identities)
         if self.status not in EXECUTION_OUTCOME_STATUSES:
             raise ReviewEpochError(
                 f"unsupported execution outcome status: {self.status!r}"
@@ -1619,6 +1811,7 @@ class EpochExecutionOutcome:
         completed_process_ids: Sequence[str],
         status: str,
         terminal_at: str,
+        process_identities: Sequence[ProcessIdentityEvidence | Mapping[str, Any]] = (),
     ) -> "EpochExecutionOutcome":
         epoch = ReviewEpochPlan.from_record(plan)
         identity = epoch.artifact_identity(execution_id)
@@ -1629,6 +1822,7 @@ class EpochExecutionOutcome:
             completed_process_ids=tuple(completed_process_ids),
             status=status,
             terminal_at=terminal_at,
+            process_identities=tuple(process_identities),
         )
         outcome.validate_for_plan(epoch)
         return outcome
@@ -1663,6 +1857,37 @@ class EpochExecutionOutcome:
                 "execution outcome contains unplanned process results: "
                 + ", ".join(unknown)
             )
+        evidence = {item.process_id: item for item in self.process_identities}
+        unknown_evidence = sorted(set(evidence) - set(expected_process_ids))
+        if unknown_evidence:
+            raise ReviewEpochError(
+                "execution outcome contains unplanned process identity evidence: "
+                + ", ".join(unknown_evidence)
+            )
+        for process in execution.processes:
+            item = evidence.get(process.process_id)
+            if item is None:
+                if self.successful and process.attestation_required:
+                    raise ReviewEpochError(
+                        "succeeded execution outcome is missing required process "
+                        f"attestation: {process.process_id}"
+                    )
+                continue
+            planned_requested = (
+                process.agent_identity.get("requested")
+                if isinstance(process.agent_identity, Mapping)
+                else None
+            )
+            if planned_requested and item.agent_identity.get("requested") != planned_requested:
+                raise ReviewEpochError(
+                    "process identity requested values differ from immutable plan: "
+                    f"{process.process_id}"
+                )
+            if self.successful and process.attestation_required and not item.verified:
+                raise ReviewEpochError(
+                    "required process identity is unavailable or mismatched: "
+                    f"{process.process_id}"
+                )
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -1680,6 +1905,9 @@ class EpochExecutionOutcome:
             "artifact_digest": self.artifact_digest,
             "artifact_complete": self.artifact_complete,
             "completed_process_ids": list(self.completed_process_ids),
+            "process_identities": [
+                item.to_record() for item in self.process_identities
+            ],
             "status": self.status,
             "terminal_at": self.terminal_at,
         }
@@ -1689,11 +1917,19 @@ class EpochExecutionOutcome:
         if isinstance(value, cls):
             return value
         record = _record(value, "epoch execution outcome")
-        _exact_record_fields(
-            record,
-            "epoch execution outcome",
-            _EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS,
+        legacy_fields = tuple(
+            field_name
+            for field_name in _EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS
+            if field_name != "process_identities"
         )
+        if set(record) == set(legacy_fields):
+            record = {**record, "process_identities": []}
+        else:
+            _exact_record_fields(
+                record,
+                "epoch execution outcome",
+                _EPOCH_EXECUTION_OUTCOME_RECORD_FIELDS,
+            )
         if record["record_type"] != "review_epoch_execution_outcome":
             raise ReviewEpochError("execution outcome record_type is invalid")
         return cls(
@@ -2020,6 +2256,7 @@ def create_successor_collection(
                 artifact_digest=inherited.artifact_digest,
                 artifact_complete=True,
                 completed_process_ids=source.completed_process_ids,
+                process_identities=source.process_identities,
                 status="succeeded",
                 terminal_at=source.terminal_at,
             )

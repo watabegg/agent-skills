@@ -43,6 +43,7 @@ from hloop_lib.remediation import (  # noqa: E402
     reconcile_materialization,
     register_candidate,
 )
+from hloop_lib.config import project_agent_identity  # noqa: E402
 from hloop_lib.review_epoch import (  # noqa: E402
     EpochExecutionOutcome,
     ReviewEpochCollection,
@@ -81,6 +82,38 @@ class ScenarioFailure(RuntimeError):
 
 class InjectedCrash(RuntimeError):
     """Deterministic crash injected immediately after one durable rename."""
+
+
+FIXTURE_OBSERVED_PROCESS_IDENTITY = {
+    "provider": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "xhigh",
+}
+FIXTURE_ATTESTED_PROCESS_IDENTITY = {
+    "provider": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "xhigh",
+}
+
+
+def _fixture_process_identities(execution: Any) -> tuple[dict[str, Any], ...]:
+    """Build canonical evidence from separate synthetic runtime observations."""
+
+    return tuple(
+        {
+            "process_id": process.process_id,
+            "agent_identity": project_agent_identity(
+                {
+                    "provider": process.provider,
+                    "model": process.model,
+                    "effort": process.effort,
+                },
+                observed=dict(FIXTURE_OBSERVED_PROCESS_IDENTITY),
+                attested=dict(FIXTURE_ATTESTED_PROCESS_IDENTITY),
+            ).as_dict(),
+        }
+        for process in execution.processes
+    )
 
 
 def require(condition: bool, message: str) -> None:
@@ -152,6 +185,11 @@ def _record_epoch_outcome(
             ),
             artifact_complete=artifact_complete,
             completed_process_ids=process_ids,
+            process_identities=(
+                _fixture_process_identities(execution)
+                if status == "succeeded"
+                else ()
+            ),
             status=status,
             terminal_at="2026-07-17T08:01:00Z",
         )
