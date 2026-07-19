@@ -147,6 +147,7 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             "semantic_ack_barrier": {
                 "kind": "initial",
                 "message_id": "initial:T001-A001",
+                "digest": digest,
                 "status": "approved",
                 "ack_event_id": "ack-event-001",
                 "ack_sequence": 1,
@@ -154,6 +155,14 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                     "status": "approved",
                     "ack_event_id": "ack-event-001",
                     "ack_sequence": 1,
+                },
+                "approval_application": {
+                    "status": "applied",
+                    "ack_event_id": "ack-event-001",
+                    "application_event_id": "application-event-001",
+                    "application_event_digest": "a" * 64,
+                    "application_attempt_id": "T001-A001",
+                    "application_task_contract_digest": digest,
                 },
             },
             "completion_mode": completion_mode,
@@ -683,7 +692,14 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
                 barrier.update(
                     status="approved",
                     ack_event_id="ack-coverage",
-                    approval_application={},
+                    approval_application={
+                        "status": "applied",
+                        "ack_event_id": "ack-coverage",
+                        "application_event_id": "application-coverage",
+                        "application_event_digest": "b" * 64,
+                        "application_attempt_id": agent["attempt_id"],
+                        "application_task_contract_digest": barrier["digest"],
+                    },
                 )
                 barrier["semantic_decision"].update(
                     status="approved", ack_event_id="ack-coverage"

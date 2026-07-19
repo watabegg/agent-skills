@@ -2683,11 +2683,15 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                     state,
                     report_credential_file=str(credential_file),
                     task_contract_digest=digest,
+                    manager_repo=str(repo),
                 )
                 self.assertIn(f"agent ack exchange {role_id}", contract)
                 self.assertIn(f"--attempt-id {attempt_id}", contract)
                 self.assertIn("--report-credential-file", contract)
-                self.assertIn("authenticated application event", contract)
+                self.assertIn(
+                    f"--manager-repo {repo.resolve()}", contract
+                )
+                self.assertIn("broker-accepted application event", contract)
                 self.assertNotIn(token, contract)
                 self.assertIn("stop before material work", contract)
 
@@ -2889,7 +2893,10 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 )
             reloaded_task_state = hloop.load_state(repo)["tasks"]["T001"]
             self.assertEqual(reloaded_task_state["semantic_ack_barrier"]["status"], "approved")
-            self.assertEqual(hloop.semantic_ack_barrier_blocking(reloaded_task_state), "")
+            self.assertIn(
+                "approval application",
+                hloop.semantic_ack_barrier_blocking(reloaded_task_state),
+            )
 
     def test_running_task_update_rebinds_digest_and_requires_matching_reack(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3052,6 +3059,21 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             approved = hloop.load_state(repo)["tasks"]["T001"]["semantic_ack_barrier"]
             self.assertEqual(approved["status"], "approved")
 
+            manager_state = hloop.load_state(repo)
+            task_state = manager_state["tasks"]["T001"]
+            barrier = task_state["semantic_ack_barrier"]
+            barrier["approval_application"].update(
+                {
+                    "status": "applied",
+                    "ack_event_id": barrier["semantic_decision"]["ack_event_id"],
+                    "application_event_id": "application-1",
+                    "application_event_digest": "a" * 64,
+                    "application_attempt_id": task_state["active_attempt_id"],
+                    "application_task_contract_digest": barrier["digest"],
+                }
+            )
+            hloop.save_state(repo, manager_state)
+
             with mock.patch.object(hloop, "porcelain_paths", return_value=[]), mock.patch.object(hloop, "porcelain_paths_no_renames", return_value=[]):
                 with self.assertRaisesRegex(hloop.HLoopError, "validation did not pass"):
                     hloop.cmd_worker_finalize(
@@ -3156,7 +3178,9 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             reason="corrected",
             latest_ack={"event_id": "ack-2", "sequence": 2},
         )
-        self.assertEqual(hloop.semantic_ack_barrier_blocking(state), "")
+        self.assertIn(
+            "approval application", hloop.semantic_ack_barrier_blocking(state)
+        )
 
         hloop.arm_initial_semantic_ack_barrier(
             state, attempt_id="T001-A002", contract_digest="b" * 64
@@ -3172,7 +3196,9 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             reason="fresh ACK after timeout",
             latest_ack={"event_id": "ack-3", "sequence": 3},
         )
-        self.assertEqual(hloop.semantic_ack_barrier_blocking(state), "")
+        self.assertIn(
+            "approval application", hloop.semantic_ack_barrier_blocking(state)
+        )
 
         hloop.arm_initial_semantic_ack_barrier(
             state,
@@ -3193,7 +3219,9 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             reason="post-registration ACK",
             latest_ack={"event_id": "ack-new", "sequence": 8},
         )
-        self.assertEqual(hloop.semantic_ack_barrier_blocking(state), "")
+        self.assertIn(
+            "approval application", hloop.semantic_ack_barrier_blocking(state)
+        )
 
 
 class ReviewGroupRuntimeTests(unittest.TestCase):
@@ -3886,7 +3914,23 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
                 "attempt_id": "L-D001-A001",
                 "skill_version": hloop.SKILL_VERSION,
                 "head_sha": head_sha,
-                "semantic_ack_barrier": {"status": "approved"},
+                "semantic_ack_barrier": {
+                    "message_id": "initial:L-D001-A001",
+                    "digest": "a" * 64,
+                    "status": "approved",
+                    "semantic_decision": {
+                        "status": "approved",
+                        "ack_event_id": "ack-1",
+                    },
+                    "approval_application": {
+                        "status": "applied",
+                        "ack_event_id": "ack-1",
+                        "application_event_id": "application-1",
+                        "application_event_digest": "b" * 64,
+                        "application_attempt_id": "L-D001-A001",
+                        "application_task_contract_digest": "a" * 64,
+                    },
+                },
             }
             state["decision_liaisons"]["D001"] = liaison
             args = SimpleNamespace(

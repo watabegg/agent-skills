@@ -17,8 +17,10 @@ For `persistence: local-only`, committed snapshot checks are replaced by copying
 The initial TUI prompt remains the one transport boundary whose successful
 execution is detected by the semantic ACK timeout. After the role starts, its
 blocking `agent ack exchange` appends the ACK, waits without holding the loop
-lock, verifies the exact Manager decision and availability, appends application
-evidence, and resumes in the same provider process turn. `agent ack resolve`
+lock, verifies the exact Manager decision and availability, appends a
+broker-accepted application event, and waits for the Manager consumer to apply
+that exact event binding before resuming in the same provider process turn.
+Spool-only evidence remains blocked. `agent ack resolve`
 does not send pane input by default. The state machine keeps semantic decision,
 approval availability, role application, and optional pane notification as
 independent projections; reject, timeout, supersede, or identity drift keeps
