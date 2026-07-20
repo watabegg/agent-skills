@@ -1123,7 +1123,18 @@ def scenario_scout_liaison_reports(ctx: dict[str, Any]) -> dict[str, Any]:
             hloop.preflight_loop = original_preflight
             hloop.send_agent_tui_message = original_send
         state = json.loads(path.read_text(encoding="utf-8"))
-        state["decision_liaisons"]["D001"].pop("pane_id", None)
+        liaison = state["decision_liaisons"]["D001"]
+        rebound_digest = str(liaison.get("active_report_contract_digest") or "")
+        barrier = liaison.get("semantic_ack_barrier") or {}
+        require(
+            str(barrier.get("report_identity_status") or "") == "bound"
+            and rebound_digest == str(barrier.get("digest") or "")
+            and rebound_digest == str(barrier.get("rendered_exchange_digest") or ""),
+            "Liaison contract-changing message did not complete identity rebinding",
+        )
+        attempt_id, _, credential = identities["L-D001"]
+        identities["L-D001"] = (attempt_id, rebound_digest, credential)
+        liaison.pop("pane_id", None)
         hloop.save_state(repo, state)
         run(
             hloop_command(
