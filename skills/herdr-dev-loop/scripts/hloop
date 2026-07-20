@@ -7213,8 +7213,8 @@ def manager_message_envelope(
     ack = f"HERDR_LOOP_MESSAGE_ACK:{run_id}:{agent_id}:{attempt_id}:{message_id}"
     contract_notice = (
         "This message changes the task contract. Material work (a `done` finalize "
-        "or merge) is blocked until the Manager resolves the semantic ACK barrier "
-        "with `hloop agent ack resolve`.\n\n"
+        "or merge) remains blocked after the Manager resolves the semantic ACK "
+        "barrier, until its exact broker-sequenced application is Manager-applied.\n\n"
         if contract_changing
         else ""
     )
@@ -7539,6 +7539,7 @@ def resolve_semantic_ack_barrier(
     decision: str,
     reason: str,
     latest_ack: dict[str, Any] | None,
+    require_current_ack_digest: bool = False,
 ) -> dict[str, Any]:
     if decision not in SEMANTIC_ACK_DECISIONS:
         raise HLoopError(f"unsupported semantic ACK decision: {decision}")
@@ -7561,15 +7562,6 @@ def resolve_semantic_ack_barrier(
         raise HLoopError(
             "a corrected semantic ACK report is required after the previous reject/timeout"
         )
-    if (
-        decision == "approve"
-        and str(barrier.get("kind") or "") == "task-contract"
-        and str((latest_ack or {}).get("task_contract_digest") or "")
-        != str(barrier.get("digest") or "")
-    ):
-        raise HLoopError(
-            "the corrected semantic ACK does not match the active task contract digest"
-        )
     completion_mode = str((latest_ack or {}).get("completion_mode") or "")
     completion_probe = (latest_ack or {}).get("completion_mode_probe")
     active_attempt = str(
@@ -7578,6 +7570,43 @@ def resolve_semantic_ack_barrier(
     initial_message = str(barrier.get("message_id") or "")
     if not active_attempt and initial_message.startswith("initial:T"):
         active_attempt = initial_message.removeprefix("initial:")
+    if decision == "approve":
+        barrier_digest = str(barrier.get("digest") or "")
+        latest_ack_digest = str(
+            (latest_ack or {}).get("task_contract_digest") or ""
+        )
+        rebind_fields = (
+            "report_identity_status",
+            "report_identity_attempt_id",
+            "rendered_exchange_digest",
+        )
+        has_rebind_identity = any(field in barrier for field in rebind_fields)
+        # Broker-backed Manager resolution always supplies an authenticated ACK
+        # digest.  Keep direct legacy fixture callers compatible only when they
+        # supply no digest at all; a supplied digest must never target a different
+        # active barrier.
+        if (
+            (require_current_ack_digest or has_rebind_identity)
+            and latest_ack_digest != barrier_digest
+        ) or (latest_ack_digest and latest_ack_digest != barrier_digest):
+            raise HLoopError(
+                "the latest authenticated semantic ACK digest does not match the active barrier"
+            )
+        if has_rebind_identity:
+            active_role_digest = str(
+                agent_state.get("active_report_contract_digest") or ""
+            )
+            if (
+                str(barrier.get("report_identity_status") or "") != "bound"
+                or str(barrier.get("report_identity_attempt_id") or "")
+                != active_attempt
+                or active_role_digest != barrier_digest
+                or str(barrier.get("rendered_exchange_digest") or "")
+                != barrier_digest
+            ):
+                raise HLoopError(
+                    "semantic ACK rebind identity is not fully bound to the active role"
+                )
     is_worker_ack = bool(
         active_attempt.startswith("T")
         and task_contract_revision(agent_state)
@@ -31757,6 +31786,7 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
         decision=args.decision,
         reason=args.reason,
         latest_ack=latest_ack,
+        require_current_ack_digest=True,
     )
     save_state(repo, state)
     journal(
@@ -31776,8 +31806,10 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
             save_state(repo, state)
         if barrier["status"] == "approved":
             notice = (
-                f"Semantic ACK {barrier.get('ack_event_id')} is approved. "
-                "Resume the contracted material work."
+                f"Semantic ACK {barrier.get('ack_event_id')} is approved, but its "
+                "approval application is pending. Remain stopped: request "
+                "application with `hloop agent ack status --apply` and resume only "
+                "after the exact broker-sequenced application is Manager-applied."
             )
         else:
             notice = (
@@ -36812,7 +36844,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_message.add_argument(
         "--contract-changing",
         action="store_true",
-        help="arm a semantic ACK barrier that blocks material work until resolved",
+        help="arm a semantic ACK barrier; material work remains blocked until its application is Manager-applied",
     )
     agent_message.set_defaults(func=cmd_agent_message)
     agent_report = agent_sub.add_parser("report", help="submit a semantic agent report to the broker")
@@ -36884,13 +36916,17 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument("--handoff")
     agent_report.set_defaults(func=cmd_agent_report)
     agent_ack = agent_sub.add_parser(
-        "ack", help="resolve a role's initial or contract-changing semantic ACK barrier"
+        "ack", help="manage a role's semantic ACK barrier; material work requires Manager-applied application"
     )
     agent_ack_sub = agent_ack.add_subparsers(dest="agent_ack_command", required=True)
     agent_ack_resolve = agent_ack_sub.add_parser(
-        "resolve", help="approve, reject, or time out the pending semantic ACK barrier"
+        "resolve",
+        help="record a decision; material work remains stopped until the application is Manager-applied",
+        description="Record a semantic ACK decision; material work remains stopped until the exact application is Manager-applied.",
     )
-    agent_ack_resolve.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    agent_ack_resolve.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
     agent_ack_resolve.add_argument(
         "--decision", choices=["approve", "reject", "timeout"], required=True
     )
@@ -36898,14 +36934,17 @@ def build_parser() -> argparse.ArgumentParser:
     agent_ack_resolve.add_argument(
         "--notify-pane",
         action="store_true",
-        help="optionally send an advisory pane notice after durable resolution",
+        help="optionally send an advisory stop notice; it never authorizes work before Manager-applied",
     )
     agent_ack_resolve.set_defaults(func=cmd_agent_ack_resolve)
     agent_ack_status = agent_ack_sub.add_parser(
         "status",
-        help="read or explicitly apply the persisted semantic ACK approval",
+        help="read or request application of semantic ACK approval; material work requires Manager-applied",
+        description="Read or request semantic ACK approval application; material work remains stopped until the exact application is Manager-applied.",
     )
-    agent_ack_status.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    agent_ack_status.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
     agent_ack_status.add_argument("--attempt-id")
     ack_status_transition = agent_ack_status.add_mutually_exclusive_group()
     ack_status_transition.add_argument("--acknowledge", action="store_true")
@@ -36914,7 +36953,8 @@ def build_parser() -> argparse.ArgumentParser:
     agent_ack_status.set_defaults(func=cmd_agent_ack_status)
     agent_ack_exchange = agent_ack_sub.add_parser(
         "exchange",
-        help="submit an ACK and block for its exact durable Manager decision",
+        help="submit an ACK and block through its exact broker-sequenced Manager-applied application",
+        description="Submit an ACK and wait through its exact broker-sequenced Manager-applied application before material work.",
     )
     agent_ack_exchange.add_argument(
         "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
@@ -37582,7 +37622,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker_message.add_argument(
         "--contract-changing",
         action="store_true",
-        help="arm a semantic ACK barrier that blocks a `done` finalize until resolved",
+        help="arm a semantic ACK barrier; material work and `done` finalize remain blocked until Manager-applied",
     )
     worker_message.set_defaults(func=cmd_worker_message)
 
@@ -37603,9 +37643,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     message_drain.set_defaults(func=cmd_message_drain)
     message_resolve = message_sub.add_parser(
-        "resolve", help="durably resolve one delivered or unknown Manager message"
+        "resolve",
+        help="durably resolve one delivered or unknown Manager message; semantic ACK work still requires Manager-applied",
+        description="Resolve Manager-message delivery state. A semantic ACK decision or message resolution never authorizes material work before the exact approval application is Manager-applied.",
     )
-    message_resolve.add_argument("agent_id", help="T..., R..., G..., or A.../P...")
+    message_resolve.add_argument(
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+    )
     message_resolve.add_argument("message_id")
     message_resolve.add_argument(
         "--status",
@@ -37953,7 +37997,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_message.add_argument(
         "--contract-changing",
         action="store_true",
-        help="arm a semantic ACK barrier that blocks a merge-ready result until resolved",
+        help="arm a semantic ACK barrier; merge-ready work remains blocked until Manager-applied",
     )
     reviewer_message.set_defaults(func=cmd_reviewer_message)
 
@@ -38032,7 +38076,7 @@ def build_parser() -> argparse.ArgumentParser:
     gap_message.add_argument(
         "--contract-changing",
         action="store_true",
-        help="arm a semantic ACK barrier that blocks material work until resolved",
+        help="arm a semantic ACK barrier; material work remains blocked until Manager-applied",
     )
     gap_message.set_defaults(func=cmd_gap_message)
 
@@ -38113,7 +38157,7 @@ def build_parser() -> argparse.ArgumentParser:
     advisor_message.add_argument(
         "--contract-changing",
         action="store_true",
-        help="arm a semantic ACK barrier that blocks material work until resolved",
+        help="arm a semantic ACK barrier; material work remains blocked until Manager-applied",
     )
     advisor_message.set_defaults(func=cmd_advisor_message)
 
