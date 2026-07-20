@@ -2783,6 +2783,159 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 )
             )
 
+    def test_delayed_initial_tui_submit_without_authenticated_ack_times_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.init_repo(root)
+            worktree = root / "worker-tui"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            herdr_log = root / "fake-herdr.log"
+            codex_log = root / "fake-codex.log"
+
+            fake_herdr = fake_bin / "herdr"
+            fake_herdr.write_text(
+                "#!/bin/sh\n"
+                "case \"$1 $2\" in\n"
+                "  'pane split') printf '{\"pane_id\":\"fake-worker-pane\"}\\n' ;;\n"
+                "  'pane run')\n"
+                "    printf 'typed\\nnewline\\n' >> \"$FAKE_HERDR_LOG\"\n"
+                "    sleep 0.05\n"
+                "    printf 'enter\\n' >> \"$FAKE_HERDR_LOG\"\n"
+                "    shift 3\n"
+                "    /bin/sh -c \"$1\"\n"
+                "    ;;\n"
+                "  'pane close') exit 0 ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_codex = fake_bin / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = '--help' ]; then\n"
+                "  printf '%s\\n' '--sandbox --model -c --output-last-message'\n"
+                "  exit 0\n"
+                "fi\n"
+                "printf '%s\\n' \"$@\" > \"$FAKE_CODEX_LOG\"\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_herdr, fake_codex):
+                executable.chmod(
+                    executable.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+                )
+
+            loop = hloop.loop_path(repo)
+            loop.mkdir(parents=True, exist_ok=True)
+            for name in ("MISSION.md", "PLAN.md", "PROFILE.md", "DECISIONS.md"):
+                (loop / name).write_text(f"# {name}\n", encoding="utf-8")
+            task_path = hloop.task_file(repo, "T010")
+            task_path.parent.mkdir(parents=True, exist_ok=True)
+            task_path.write_text(
+                "---\n"
+                "id: T010\n"
+                "kind: implementation\n"
+                "status: queued\n"
+                "branch: worker-tui\n"
+                "base_ref: main\n"
+                "base_sha: HEAD\n"
+                "write_allow:\n"
+                "  - tracked.txt\n"
+                "write_deny: []\n"
+                "acceptance:\n"
+                "  - initial ACK is required\n"
+                "validation_minimum: python3 -m unittest\n"
+                "worker_protocol: native\n"
+                "worker_qa_profile: repo-default\n"
+                "contract_schema_revision: 3\n"
+                "---\n"
+                "\n# Fake TUI initial ACK timeout\n",
+                encoding="utf-8",
+            )
+            state = hloop.load_state(repo)
+            state.update(
+                {
+                    "goal_id": "fake-tui",
+                    "persistence": "local-only",
+                    "branch_strategy": "integration",
+                    "tasks": {
+                        "T010": {
+                            "status": "queued",
+                            "branch": "worker-tui",
+                            "base_ref": "main",
+                        }
+                    },
+                }
+            )
+            hloop.save_state(repo, state)
+            args = SimpleNamespace(
+                repo=str(repo),
+                task_id="T010",
+                worktree=str(worktree),
+                runner="tui",
+                launcher="pane",
+                manager_pane="fake-manager-pane",
+                direction="right",
+                dry_run=False,
+                agent_provider=None,
+                agent_model=None,
+                agent_effort=None,
+            )
+            env = {
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                "HERDR_ENV": "1",
+                "FAKE_HERDR_LOG": str(herdr_log),
+                "FAKE_CODEX_LOG": str(codex_log),
+            }
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                hloop, "dispatch_start_preflight"
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(hloop.cmd_worker_start(args), 0)
+
+            self.assertEqual(
+                herdr_log.read_text(encoding="utf-8").splitlines(),
+                ["typed", "newline", "enter"],
+            )
+            launched_prompt = codex_log.read_text(encoding="utf-8")
+            self.assertIn("agent ack exchange T010", launched_prompt)
+            self.assertIn("stop before material work", launched_prompt)
+            started = hloop.load_state(repo)
+            worker = started["tasks"]["T010"]
+            self.assertEqual(worker["pane_id"], "fake-worker-pane")
+            self.assertEqual(worker["semantic_ack_barrier"]["status"], "awaiting_ack")
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                self.assertIsNone(
+                    store.latest_role_event(
+                        transaction,
+                        run_id="run-001",
+                        role_id="T010",
+                        attempt_id="T010-A001",
+                        report_type="ack",
+                    )
+                )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    hloop.cmd_agent_ack_resolve(
+                        SimpleNamespace(
+                            repo=str(repo),
+                            agent_id="T010",
+                            decision="timeout",
+                            reason="initial authenticated ACK did not arrive",
+                            notify_pane=False,
+                        )
+                    ),
+                    0,
+                )
+            timed_out = hloop.load_state(repo)["tasks"]["T010"]
+            self.assertEqual(timed_out["semantic_ack_barrier"]["status"], "timed_out")
+            self.assertEqual(
+                timed_out["semantic_ack_barrier"]["semantic_decision"]["status"],
+                "timed_out",
+            )
+            self.assertTrue(hloop.semantic_ack_barrier_blocking(timed_out))
+
     def test_visible_message_transport_failure_is_unknown_and_never_auto_drained(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = self.init_repo(Path(directory))
