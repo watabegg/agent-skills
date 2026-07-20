@@ -5341,7 +5341,7 @@ def replace_frontmatter(path: Path, updates: dict[str, Any]) -> None:
     write_text(path, frontmatter(meta) + "\n" + rest)
 
 
-def replace_frontmatter_record(path: Path, meta: Mapping[str, Any]) -> None:
+def render_frontmatter_record(path: Path, meta: Mapping[str, Any]) -> str:
     text = read_text(path)
     if not text.startswith("---\n"):
         raise HLoopError(f"missing frontmatter: {path}")
@@ -5351,7 +5351,11 @@ def replace_frontmatter_record(path: Path, meta: Mapping[str, Any]) -> None:
     rest = text[end + 4 :]
     if rest.startswith("\n"):
         rest = rest[1:]
-    write_text(path, frontmatter(dict(meta)) + "\n" + rest)
+    return frontmatter(dict(meta)) + "\n" + rest
+
+
+def replace_frontmatter_record(path: Path, meta: Mapping[str, Any]) -> None:
+    write_text(path, render_frontmatter_record(path, meta))
 
 
 def yaml_scalar(value: Any, *, key: str | None = None) -> str:
@@ -7100,8 +7104,12 @@ def resend_pending_manager_messages(
     input_settle_ms: int,
     submit_verify_ms: int,
     submit_attempts: int,
-) -> tuple[int, int]:
-    """Resend one role's `undelivered` Manager messages; return (drained, remaining).
+) -> tuple[int, int, int, list[Path]]:
+    """Process one role's pending messages.
+
+    Return ``(resent, superseded, remaining, cleanup_after_save)``. Legacy
+    unsafe ACK notices are removed from state before their pending files are
+    deleted, so a failed state save leaves a safely retryable suppression.
 
     Entries tagged anything other than `undelivered` (defensively defaulted to
     `undelivered` for pre-0.5.0 state) are left untouched: `unknown` messages
@@ -7112,9 +7120,11 @@ def resend_pending_manager_messages(
     pane_id = str(agent_state.get("pane_id") or "")
     pending = agent_state.get("pending_manager_messages") or []
     if not pane_id or not pending:
-        return 0, 0
+        return 0, 0, 0, []
     remaining: list[dict[str, Any]] = []
-    drained = 0
+    resent = 0
+    superseded = 0
+    cleanup_after_save: list[Path] = []
     marker = "## Message\n\n"
     for entry in pending:
         if str(entry.get("status") or "undelivered") != "undelivered":
@@ -7131,6 +7141,33 @@ def resend_pending_manager_messages(
         message = content[offset + len(marker) :] if offset != -1 else content
         message_id = str(entry.get("message_id") or "")
         original = manager_message_by_id(agent_state, message_id) if message_id else None
+        source = str(entry.get("source") or (original or {}).get("source") or "")
+        if (
+            source == "semantic-ack-resolution"
+            and "Resume the contracted material work." in message
+        ):
+            # Pre-0.5.3 approval notices could authorize work before the
+            # Manager-owned application event was applied. Pane notification is
+            # advisory, so dropping that stale retry is safer than replaying it.
+            if original is not None:
+                transition_manager_message(
+                    agent_state, original, delivery_status="superseded"
+                )
+            barrier = agent_state.get("semantic_ack_barrier")
+            notification = (
+                barrier.get("pane_notification")
+                if isinstance(barrier, Mapping)
+                else None
+            )
+            if (
+                isinstance(notification, dict)
+                and str(notification.get("message_id") or "") == message_id
+            ):
+                notification["status"] = "superseded"
+                notification["updated_at"] = now_iso()
+            cleanup_after_save.append(full_path)
+            superseded += 1
+            continue
         try:
             send_agent_tui_message(
                 str(agent_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
@@ -7183,9 +7220,9 @@ def resend_pending_manager_messages(
             full_path.unlink()
         except OSError:
             pass
-        drained += 1
+        resent += 1
     agent_state["pending_manager_messages"] = remaining
-    return drained, len(remaining)
+    return resent, superseded, len(remaining), cleanup_after_save
 
 
 def manager_message_from_args(args: argparse.Namespace) -> tuple[str, str]:
@@ -7558,6 +7595,13 @@ def resolve_semantic_ack_barrier(
     required_after = int(barrier.get("required_reack_after_sequence") or 0)
     if decision in {"approve", "reject"} and latest_ack is None:
         raise HLoopError("no authenticated semantic ACK report is available")
+    if (
+        decision == "approve"
+        and str(barrier.get("status") or "") == "identity_rebind_failed"
+    ):
+        raise HLoopError(
+            "semantic ACK rebind identity failed; a successful rebind is required"
+        )
     if decision == "approve" and latest_sequence <= required_after:
         raise HLoopError(
             "a corrected semantic ACK report is required after the previous reject/timeout"
@@ -7575,12 +7619,12 @@ def resolve_semantic_ack_barrier(
         latest_ack_digest = str(
             (latest_ack or {}).get("task_contract_digest") or ""
         )
-        rebind_fields = (
-            "report_identity_status",
-            "report_identity_attempt_id",
-            "rendered_exchange_digest",
+        has_rebind_identity = (
+            "rendered_exchange_digest" in barrier
+            or any(
+                str(field).startswith("report_identity_") for field in barrier
+            )
         )
-        has_rebind_identity = any(field in barrier for field in rebind_fields)
         # Broker-backed Manager resolution always supplies an authenticated ACK
         # digest.  Keep direct legacy fixture callers compatible only when they
         # supply no digest at all; a supplied digest must never target a different
@@ -21168,7 +21212,35 @@ def cmd_task_update(args: argparse.Namespace) -> int:
     ):
         next_meta.pop("migration_blocker", None)
         validate_revision_three_task(next_meta, task_id=task_id)
-    replace_frontmatter_record(path, next_meta)
+    updated_task_text = render_frontmatter_record(path, next_meta)
+    task_contract_digest = hashlib.sha256(
+        updated_task_text.encode("utf-8")
+    ).hexdigest()
+    running_task = task_state.get("status") == "running"
+    attempt_id = ""
+    if running_task:
+        attempt_id = str(
+            task_state.get("active_attempt_id") or task_state.get("attempt_id") or ""
+        )
+        if not attempt_id:
+            raise HLoopError(f"running task has no active attempt identity: {task_id}")
+        arm_semantic_ack_barrier(
+            task_state,
+            message_id=f"task-contract:{task_contract_digest}",
+            digest=task_contract_digest,
+            kind="task-contract",
+        )
+        barrier = task_state["semantic_ack_barrier"]
+        barrier["report_identity_status"] = "rebinding"
+        barrier["report_identity_attempt_id"] = attempt_id
+        invalidate_planning_evidence(
+            state, reason=f"task contract update prepared: {task_id}"
+        )
+        # Make the new digest blocking before its artifact bytes become visible.
+        # If this durable save fails the old artifact remains; if the later write
+        # fails, the prepared barrier remains fail-closed and can be retried.
+        save_state(repo, state)
+    write_text(path, updated_task_text)
     for key in (
         "write_allow",
         "write_deny",
@@ -21194,7 +21266,6 @@ def cmd_task_update(args: argparse.Namespace) -> int:
         task_state["agent_provider"] = normalize_agent_provider(updates["worker_agent_provider"])
     if "worker_agent_model" in updates:
         task_state["agent_model"] = normalize_agent_model(updates["worker_agent_model"])
-    task_contract_digest = hashlib.sha256(path.read_bytes()).hexdigest()
     task_state["task_contract_digest"] = task_contract_digest
     task_state["contract_updated_at"] = now_iso()
     task_state.pop("candidate", None)
@@ -21208,10 +21279,18 @@ def cmd_task_update(args: argparse.Namespace) -> int:
     task_state.pop("active_patch_review_id", None)
     if task_state.get("candidate_lifecycle_status") in PATCH_REVIEW_TASK_STATUSES:
         task_state["candidate_lifecycle_status"] = "running"
-    if task_state.get("status") == "running":
-        attempt_id = str(task_state.get("active_attempt_id") or task_state.get("attempt_id") or "")
-        if not attempt_id:
-            raise HLoopError(f"running task has no active attempt identity: {task_id}")
+    if "write_allow" in updates:
+        batch_id = str(task_state.get("batch_id") or state.get("current_batch_id") or "")
+        persist_write_scope_conflict_graph(state, batch_id=batch_id)
+        if batch_id and batch_id in state_batches(state):
+            write_batch_artifact(repo, state, batch_id)
+    invalidate_planning_evidence(state, reason=f"task contract updated: {task_id}")
+    if running_task:
+        barrier = task_state["semantic_ack_barrier"]
+        # Persist the updated contract and every derived planning projection
+        # before attempting the broker transaction. Rebind failure therefore
+        # cannot leave a stale conflict graph or dispatch-ready plan behind.
+        save_state(repo, state)
         try:
             ack_floor = rebind_role_report_contract_digest(
                 repo,
@@ -21221,35 +21300,25 @@ def cmd_task_update(args: argparse.Namespace) -> int:
                 task_contract_digest=task_contract_digest,
             )
         except (HLoopError, hloop_broker.BrokerStorageError, OSError) as exc:
-            arm_semantic_ack_barrier(
-                task_state,
-                message_id=f"task-contract:{task_contract_digest}",
-                digest=task_contract_digest,
-                kind="task-contract",
-            )
-            task_state["semantic_ack_barrier"]["status"] = "identity_rebind_failed"
-            task_state["semantic_ack_barrier"]["error"] = str(exc)
+            barrier["status"] = "identity_rebind_failed"
+            barrier["report_identity_status"] = "failed"
+            barrier["report_identity_error"] = str(exc)
             save_state(repo, state)
             raise HLoopError(
                 f"task contract changed but report identity rebinding failed for {task_id}; "
                 "finalize, harvest, and merge remain blocked"
             ) from exc
         task_state["active_report_contract_digest"] = task_contract_digest
-        arm_semantic_ack_barrier(
-            task_state,
-            message_id=f"task-contract:{task_contract_digest}",
-            digest=task_contract_digest,
-            kind="task-contract",
-            required_reack_after_sequence=ack_floor,
-        )
-    if "write_allow" in updates:
-        batch_id = str(task_state.get("batch_id") or state.get("current_batch_id") or "")
-        persist_write_scope_conflict_graph(state, batch_id=batch_id)
-        if batch_id and batch_id in state_batches(state):
-            write_batch_artifact(repo, state, batch_id)
-    invalidate_planning_evidence(state, reason=f"task contract updated: {task_id}")
+        barrier["required_reack_after_sequence"] = ack_floor
+        barrier["status"] = "awaiting_ack"
+        # A successful task-update rebind retains the established task-contract
+        # flow. The contract-changing message path adds the stricter rendered
+        # exchange identity when that message is sent.
+        barrier.pop("report_identity_status", None)
+        barrier.pop("report_identity_attempt_id", None)
+        barrier.pop("report_identity_error", None)
     save_state(repo, state)
-    if task_state.get("status") == "running":
+    if running_task:
         refresh_running_worker_contract_snapshot(
             repo,
             state,
@@ -21259,7 +21328,7 @@ def cmd_task_update(args: argparse.Namespace) -> int:
         )
     journal(repo, f"Updated task contract `{task_id}`: {', '.join(sorted(updates))}.")
     print(f"updated {task_id}: {', '.join(sorted(updates))}")
-    if task_state.get("status") == "running":
+    if running_task:
         print(
             "Worker contract digest changed to "
             f"{task_contract_digest}; a corrected semantic ACK and Manager approval are required "
@@ -25730,12 +25799,14 @@ def cmd_message_drain(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_herdr=True)
     agent_states = long_running_role_states(state)
-    total_drained = 0
+    total_resent = 0
+    total_superseded = 0
     total_remaining = 0
+    cleanup_after_save: list[Path] = []
     for agent_state in agent_states:
         if agent_state.get("status") != "running" and agent_state.get("gate_status") != "running":
             continue
-        drained, remaining = resend_pending_manager_messages(
+        resent, superseded, remaining, cleanup_paths = resend_pending_manager_messages(
             repo,
             agent_state,
             timeout_ms=args.timeout_ms,
@@ -25743,14 +25814,28 @@ def cmd_message_drain(args: argparse.Namespace) -> int:
             submit_verify_ms=args.submit_verify_ms,
             submit_attempts=args.submit_attempts,
         )
-        total_drained += drained
+        total_resent += resent
+        total_superseded += superseded
         total_remaining += remaining
+        cleanup_after_save.extend(cleanup_paths)
     save_state(repo, state)
+    for path in cleanup_after_save:
+        try:
+            path.unlink()
+        except OSError:
+            pass
     journal(
         repo,
-        f"Drained pending Manager messages: {total_drained} resent, {total_remaining} still pending.",
+        "Processed pending Manager messages: "
+        f"{total_resent} resent, {total_superseded} superseded, "
+        f"{total_remaining} still pending.",
     )
-    print(f"drained {total_drained} pending message(s); {total_remaining} still pending")
+    total_processed = total_resent + total_superseded
+    print(
+        f"drained {total_processed} pending message(s); "
+        f"{total_remaining} still pending "
+        f"(resent={total_resent}, superseded={total_superseded})"
+    )
     return 0
 
 
@@ -31609,7 +31694,7 @@ def cmd_harvest(args: argparse.Namespace) -> int:
         return cmd_decision_liaison_harvest(args)
     raise HLoopError(
         f"cannot infer harvest target from id: {agent_id}; "
-        "use T..., R..., G..., A..., S001, or L-D..."
+        "use T..., R..., G..., A..., S001, or L-DNNN"
     )
 
 
@@ -31794,7 +31879,24 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
         f"Resolved semantic ACK barrier for {role} `{args.agent_id}` "
         f"(message `{barrier.get('message_id')}`) as `{barrier['status']}`: {args.reason}",
     )
-    print(f"{args.agent_id}: semantic ACK barrier {barrier['status']}")
+    decision_record = barrier.get("semantic_decision")
+    application_record = barrier.get("approval_application")
+    decision_status = (
+        str(decision_record.get("status") or "")
+        if isinstance(decision_record, Mapping)
+        else str(barrier.get("status") or "")
+    )
+    application_status = (
+        str(application_record.get("status") or "")
+        if isinstance(application_record, Mapping)
+        else "missing"
+    )
+    material_work_authorized = not bool(semantic_ack_barrier_blocking(agent))
+    print(
+        f"{args.agent_id}: decision={decision_status} "
+        f"application={application_status} "
+        f"material_work_authorized={str(material_work_authorized).lower()}"
+    )
     pane_id = str(agent.get("pane_id") or "")
     notify_pane = bool(getattr(args, "notify_pane", False))
     if notify_pane and pane_id:
@@ -31805,10 +31907,17 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
             notification["updated_at"] = notification["requested_at"]
             save_state(repo, state)
         if barrier["status"] == "approved":
+            application_command = (
+                f"{shlex.quote(sys.executable)} "
+                f"{shlex.quote(str(Path(__file__).resolve()))} "
+                f"{loop_namespace_flag()} agent ack status "
+                f"{shlex.quote(args.agent_id)} --attempt-id "
+                f"{shlex.quote(attempt_id)} --apply"
+            )
             notice = (
                 f"Semantic ACK {barrier.get('ack_event_id')} is approved, but its "
                 "approval application is pending. Remain stopped: request "
-                "application with `hloop agent ack status --apply` and resume only "
+                f"application with `{application_command}` and resume only "
                 "after the exact broker-sequenced application is Manager-applied."
             )
         else:
@@ -36804,7 +36913,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     agent_abort = agent_sub.add_parser("abort", help="abort a role even when no artifact exists")
     agent_abort.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_abort.add_argument("--reason", required=True)
     agent_abort.add_argument("--keep-worktree", action="store_true")
@@ -36812,7 +36921,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_abort.set_defaults(func=cmd_agent_abort)
     agent_requeue = agent_sub.add_parser("requeue", help="clean a failed attempt and make it startable again")
     agent_requeue.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_requeue.add_argument("--reason", required=True)
     agent_requeue.add_argument("--force-cleanup", action="store_true")
@@ -36821,7 +36930,7 @@ def build_parser() -> argparse.ArgumentParser:
         "message", help="send a durable Manager message to any running role"
     )
     agent_message.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_message.add_argument("message", nargs="?")
     agent_message.add_argument("--file")
@@ -36851,7 +36960,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_report.add_argument(
         "--role-id",
         required=True,
-        help="T..., R..., G..., A.../P..., S001, or L-D...",
+        help="T..., R..., G..., A.../P..., S001, or L-DNNN",
     )
     agent_report.add_argument("--attempt-id")
     agent_report.add_argument("--run-id")
@@ -36925,7 +37034,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Record a semantic ACK decision; material work remains stopped until the exact application is Manager-applied.",
     )
     agent_ack_resolve.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_ack_resolve.add_argument(
         "--decision", choices=["approve", "reject", "timeout"], required=True
@@ -36943,7 +37052,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Read or request semantic ACK approval application; material work remains stopped until the exact application is Manager-applied.",
     )
     agent_ack_status.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_ack_status.add_argument("--attempt-id")
     ack_status_transition = agent_ack_status.add_mutually_exclusive_group()
@@ -36957,7 +37066,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Submit an ACK and wait through its exact broker-sequenced Manager-applied application before material work.",
     )
     agent_ack_exchange.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_ack_exchange.add_argument("--attempt-id", required=True)
     agent_ack_exchange.add_argument("--run-id")
@@ -37648,7 +37757,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Resolve Manager-message delivery state. A semantic ACK decision or message resolution never authorizes material work before the exact approval application is Manager-applied.",
     )
     message_resolve.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-D..."
+        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     message_resolve.add_argument("message_id")
     message_resolve.add_argument(
@@ -37728,7 +37837,7 @@ def build_parser() -> argparse.ArgumentParser:
         "harvest", help="harvest a role artifact by id prefix"
     )
     harvest.add_argument(
-        "agent_id", help="T..., R..., G..., A..., A.../P..., S001, or L-D... id"
+        "agent_id", help="T..., R..., G..., A..., A.../P..., S001, or L-DNNN id"
     )
     harvest.add_argument("--participant-id", default="P1", help="Advisor participant id when harvesting A... without /P...")
     harvest.add_argument("--keep-pane", action="store_true")
