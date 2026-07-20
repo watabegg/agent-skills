@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -795,6 +796,7 @@ class SemanticAckTests(unittest.TestCase):
             "sequence": 1,
             "task_contract_digest": "a" * 64,
         }
+        output = io.StringIO()
         with (
             mock.patch.object(hloop, "repo_root", return_value=Path("/manager")),
             mock.patch.object(hloop, "load_state", return_value=state),
@@ -802,6 +804,7 @@ class SemanticAckTests(unittest.TestCase):
             mock.patch.object(hloop, "save_state"),
             mock.patch.object(hloop, "journal"),
             mock.patch.object(hloop, "send_manager_message_and_record") as pane_send,
+            contextlib.redirect_stdout(output),
         ):
             self.assertEqual(
                 hloop.cmd_agent_ack_resolve(
@@ -821,6 +824,10 @@ class SemanticAckTests(unittest.TestCase):
         self.assertEqual(barrier["approval_availability"]["status"], "available")
         self.assertEqual(barrier["approval_application"]["status"], "pending")
         self.assertEqual(barrier["pane_notification"]["status"], "not-requested")
+        self.assertIn(
+            "decision=approved application=pending material_work_authorized=false",
+            output.getvalue(),
+        )
 
     def test_approval_requires_current_digest_and_fully_bound_rebind_identity(self):
         digest = "a" * 64
@@ -883,6 +890,83 @@ class SemanticAckTests(unittest.TestCase):
                     )
                 self.assertEqual(agent, before)
 
+        for name, field, value in (
+            (
+                "bound-at-only",
+                "report_identity_bound_at",
+                "2026-07-20T00:00:00+00:00",
+            ),
+            ("error-only", "report_identity_error", "broker rebind failed"),
+        ):
+            with self.subTest(ancillary_rebind_identity=name):
+                agent = rebind_agent()
+                barrier = agent["semantic_ack_barrier"]
+                for primary_field in (
+                    "report_identity_status",
+                    "report_identity_attempt_id",
+                    "rendered_exchange_digest",
+                ):
+                    barrier.pop(primary_field)
+                barrier[field] = value
+                before = json.loads(json.dumps(agent, ensure_ascii=False))
+                with self.assertRaisesRegex(hloop.HLoopError, "rebind identity"):
+                    hloop.resolve_semantic_ack_barrier(
+                        agent,
+                        decision="approve",
+                        reason="ancillary-only rebind identity must remain blocked",
+                        latest_ack={
+                            "event_id": "ack-current",
+                            "sequence": 3,
+                            "task_contract_digest": digest,
+                        },
+                        require_current_ack_digest=True,
+                    )
+                self.assertEqual(agent, before)
+
+        failed_status_only = rebind_agent()
+        failed_barrier = failed_status_only["semantic_ack_barrier"]
+        for rebind_field in tuple(failed_barrier):
+            if rebind_field == "rendered_exchange_digest" or rebind_field.startswith(
+                "report_identity_"
+            ):
+                failed_barrier.pop(rebind_field)
+        failed_barrier["status"] = "identity_rebind_failed"
+        before = json.loads(json.dumps(failed_status_only, ensure_ascii=False))
+        with self.assertRaisesRegex(hloop.HLoopError, "rebind identity"):
+            hloop.resolve_semantic_ack_barrier(
+                failed_status_only,
+                decision="approve",
+                reason="failed rebind status must remain blocked",
+                latest_ack={
+                    "event_id": "ack-current",
+                    "sequence": 4,
+                    "task_contract_digest": digest,
+                },
+                require_current_ack_digest=True,
+            )
+        self.assertEqual(failed_status_only, before)
+
+        failed_with_bound_metadata = rebind_agent()
+        failed_with_bound_metadata["semantic_ack_barrier"][
+            "status"
+        ] = "identity_rebind_failed"
+        before = json.loads(
+            json.dumps(failed_with_bound_metadata, ensure_ascii=False)
+        )
+        with self.assertRaisesRegex(hloop.HLoopError, "rebind identity failed"):
+            hloop.resolve_semantic_ack_barrier(
+                failed_with_bound_metadata,
+                decision="approve",
+                reason="a failed scalar cannot be masked by bound metadata",
+                latest_ack={
+                    "event_id": "ack-current",
+                    "sequence": 5,
+                    "task_contract_digest": digest,
+                },
+                require_current_ack_digest=True,
+            )
+        self.assertEqual(failed_with_bound_metadata, before)
+
         approved = hloop.resolve_semantic_ack_barrier(
             rebind_agent(),
             decision="approve",
@@ -938,6 +1022,15 @@ class SemanticAckTests(unittest.TestCase):
         self.assertIn("Remain stopped", notice)
         self.assertIn("Manager-applied", notice)
         self.assertNotIn("Resume the contracted material work", notice)
+        command = notice.split("`", 2)[1]
+        argv = shlex.split(command)
+        self.assertEqual(Path(argv[0]).resolve(), Path(sys.executable).resolve())
+        self.assertEqual(Path(argv[1]).resolve(), SCRIPT.resolve())
+        parsed = hloop.build_parser().parse_args(argv[2:])
+        self.assertEqual(parsed.namespace, hloop.LOOP_NAMESPACE)
+        self.assertEqual(parsed.agent_id, "T001")
+        self.assertEqual(parsed.attempt_id, "T001-A001")
+        self.assertTrue(parsed.apply)
         self.assertEqual(
             agent["semantic_ack_barrier"]["approval_application"]["status"],
             "pending",
@@ -963,7 +1056,7 @@ class SemanticAckTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 text = help_text(*argv)
                 self.assertIn("S001", text)
-                self.assertIn("L-D", text)
+                self.assertIn("L-DNNN", text)
         for argv in (
             ("agent", "ack", "resolve"),
             ("agent", "ack", "status"),
