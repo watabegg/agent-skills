@@ -793,6 +793,7 @@ class SemanticAckTests(unittest.TestCase):
         store.latest_role_event.return_value = {
             "event_id": "11111111-1111-4111-8111-111111111111",
             "sequence": 1,
+            "task_contract_digest": "a" * 64,
         }
         with (
             mock.patch.object(hloop, "repo_root", return_value=Path("/manager")),
@@ -820,6 +821,158 @@ class SemanticAckTests(unittest.TestCase):
         self.assertEqual(barrier["approval_availability"]["status"], "available")
         self.assertEqual(barrier["approval_application"]["status"], "pending")
         self.assertEqual(barrier["pane_notification"]["status"], "not-requested")
+
+    def test_approval_requires_current_digest_and_fully_bound_rebind_identity(self):
+        digest = "a" * 64
+
+        def rebind_agent() -> dict:
+            agent = {
+                "active_attempt_id": "T001-A001",
+                "active_report_contract_digest": digest,
+            }
+            hloop.arm_semantic_ack_barrier(
+                agent,
+                message_id="task-contract:" + digest,
+                digest=digest,
+                kind="task-contract",
+            )
+            agent["semantic_ack_barrier"].update(
+                report_identity_status="bound",
+                report_identity_attempt_id="T001-A001",
+                rendered_exchange_digest=digest,
+            )
+            return agent
+
+        stale = rebind_agent()
+        before = json.loads(json.dumps(stale, ensure_ascii=False))
+        with self.assertRaisesRegex(hloop.HLoopError, "latest authenticated semantic ACK digest"):
+            hloop.resolve_semantic_ack_barrier(
+                stale,
+                decision="approve",
+                reason="old digest must not approve a rebinding barrier",
+                latest_ack={
+                    "event_id": "ack-old",
+                    "sequence": 1,
+                    "task_contract_digest": "b" * 64,
+                },
+                require_current_ack_digest=True,
+            )
+        self.assertEqual(stale, before)
+
+        for name, mutate in (
+            ("status", lambda agent: agent["semantic_ack_barrier"].update(report_identity_status="rebinding")),
+            ("attempt", lambda agent: agent["semantic_ack_barrier"].update(report_identity_attempt_id="T001-A002")),
+            ("active-digest", lambda agent: agent.update(active_report_contract_digest="b" * 64)),
+            ("rendered-digest", lambda agent: agent["semantic_ack_barrier"].update(rendered_exchange_digest="b" * 64)),
+        ):
+            with self.subTest(rebind_identity=name):
+                agent = rebind_agent()
+                mutate(agent)
+                before = json.loads(json.dumps(agent, ensure_ascii=False))
+                with self.assertRaisesRegex(hloop.HLoopError, "rebind identity"):
+                    hloop.resolve_semantic_ack_barrier(
+                        agent,
+                        decision="approve",
+                        reason="incomplete rebind identity must remain blocked",
+                        latest_ack={
+                            "event_id": "ack-current",
+                            "sequence": 2,
+                            "task_contract_digest": digest,
+                        },
+                        require_current_ack_digest=True,
+                    )
+                self.assertEqual(agent, before)
+
+        approved = hloop.resolve_semantic_ack_barrier(
+            rebind_agent(),
+            decision="approve",
+            reason="fully bound current ACK is safe to approve",
+            latest_ack={
+                "event_id": "ack-current",
+                "sequence": 3,
+                "task_contract_digest": digest,
+            },
+            require_current_ack_digest=True,
+        )
+        self.assertEqual(approved["semantic_decision"]["status"], "approved")
+        self.assertEqual(approved["approval_application"]["status"], "pending")
+
+    def test_approval_pane_notice_keeps_role_stopped_until_manager_applies(self):
+        digest = "a" * 64
+        agent = {"active_attempt_id": "T001-A001", "pane_id": "busy-pane"}
+        hloop.arm_initial_semantic_ack_barrier(
+            agent,
+            attempt_id="T001-A001",
+            contract_digest=digest,
+        )
+        state = {"run_id": "run-1", "tasks": {"T001": agent}}
+        store = mock.MagicMock()
+        store.transaction.return_value.__enter__.return_value = mock.MagicMock()
+        store.latest_role_event.return_value = {
+            "event_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 1,
+            "task_contract_digest": digest,
+        }
+        with (
+            mock.patch.object(hloop, "repo_root", return_value=Path("/manager")),
+            mock.patch.object(hloop, "load_state", return_value=state),
+            mock.patch.object(hloop, "_open_broker_store", return_value=store),
+            mock.patch.object(hloop, "save_state"),
+            mock.patch.object(hloop, "journal"),
+            mock.patch.object(hloop, "send_manager_message_and_record", return_value=0) as pane_send,
+        ):
+            self.assertEqual(
+                hloop.cmd_agent_ack_resolve(
+                    argparse.Namespace(
+                        repo="/manager",
+                        agent_id="T001",
+                        decision="approve",
+                        reason="current ACK approved",
+                        notify_pane=True,
+                    )
+                ),
+                0,
+            )
+
+        notice = pane_send.call_args.kwargs["message"]
+        self.assertIn("Remain stopped", notice)
+        self.assertIn("Manager-applied", notice)
+        self.assertNotIn("Resume the contracted material work", notice)
+        self.assertEqual(
+            agent["semantic_ack_barrier"]["approval_application"]["status"],
+            "pending",
+        )
+
+    def test_semantic_ack_and_manager_message_help_describe_role_ids_and_boundary(self):
+        parser = hloop.build_parser()
+
+        def help_text(*argv: str) -> str:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                parser.parse_args([*argv, "--help"])
+            self.assertEqual(raised.exception.code, 0)
+            return output.getvalue()
+
+        for argv in (
+            ("agent", "ack", "resolve"),
+            ("agent", "ack", "status"),
+            ("agent", "ack", "exchange"),
+            ("agent", "message"),
+            ("message", "resolve"),
+        ):
+            with self.subTest(argv=argv):
+                text = help_text(*argv)
+                self.assertIn("S001", text)
+                self.assertIn("L-D", text)
+        for argv in (
+            ("agent", "ack", "resolve"),
+            ("agent", "ack", "status"),
+            ("agent", "ack", "exchange"),
+            ("agent", "message"),
+            ("message", "resolve"),
+        ):
+            with self.subTest(boundary=argv):
+                self.assertIn("Manager-applied", help_text(*argv))
 
     def test_blocking_exchange_subprocess_resumes_without_pane_and_is_idempotent(self):
         previous_namespace = hloop.LOOP_NAMESPACE

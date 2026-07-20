@@ -65,9 +65,10 @@ The Manager resolves the newest authenticated ACK with `hloop agent ack resolve
 records `semantic_decision`, `approval_availability`, `approval_application`,
 and `pane_notification` as separate projections. The default sends no pane
 message. `--notify-pane` is an explicit advisory/debug option whose delivery
-status cannot change decision, availability, or application state. Lifecycle
-commands remain blocked after decision approval until the exact Manager-owned
-application binding is `applied`. The same
+status cannot change decision, availability, or application state; while an
+application is pending, its text must keep the role stopped and must not
+authorize material work. Lifecycle commands remain blocked after decision
+approval until the exact Manager-owned application binding is `applied`. The same
 barrier applies when a later Manager message changes goal, scope, acceptance,
 or public behavior. This is an integration gate: finalize, harvest, and merge
 still verify approved work, but the barrier is not an OS sandbox.
