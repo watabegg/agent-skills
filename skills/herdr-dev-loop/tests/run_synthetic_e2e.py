@@ -1672,7 +1672,9 @@ def _new_synthetic_fixture(
     merge_tasks: bool = True,
 ) -> dict[str, Any]:
     root: Path = ctx["root"]
-    env: dict[str, str] = ctx["env"]
+    env = dict(ctx["env"])
+    env["HLOOP_CONFIG_HOME"] = str(root / f"config-home-{label}")
+    env["XDG_CONFIG_HOME"] = str(root / f"xdg-{label}")
     repo = make_repo(root, f"{label}-repo")
     namespace = f"synthetic-{label}"
     _run = lambda *args, expected=0: run(
