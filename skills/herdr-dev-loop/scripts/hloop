@@ -27176,7 +27176,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             loop_path(repo) / "USER_ACTION_REQUIRED.md",
             f"\n## Merge conflict for {task_id}\n\nResolve or abort the merge for `{branch}`.\n",
         )
-        raise
+        raise exc
     if mode == "cherry-pick":
         observed = observed_merge_transaction(repo, transaction, allow_completed=True)
         validate_cherry_pick_evidence(
@@ -33771,7 +33771,7 @@ def apply_semantic_ack_application_event(
             return record_obsolete_semantic_ack_application(
                 state, normalized, observed, reason=obsolete_reason
             )
-        raise exc
+        raise
     attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
     if not attempt_id or normalized.get("attempt_id") != attempt_id:
         obsolete_reason = semantic_ack_obsolete_application_reason(
