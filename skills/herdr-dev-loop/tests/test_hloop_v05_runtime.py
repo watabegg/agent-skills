@@ -2442,6 +2442,111 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertEqual(task_state["pending_manager_messages"], [])
             self.assertFalse((repo / pending_rel).exists())
 
+    def test_message_drain_supersedes_legacy_ack_notice_that_authorizes_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            state = hloop.load_state(repo)
+            task_state = {
+                "status": "running",
+                "pane_id": "pane-1",
+                "agent_provider": "codex",
+                "active_attempt_id": "T001-A001",
+                "pending_manager_messages": [],
+            }
+            hloop.arm_initial_semantic_ack_barrier(
+                task_state,
+                attempt_id="T001-A001",
+                contract_digest="a" * 64,
+            )
+            barrier = task_state["semantic_ack_barrier"]
+            barrier["status"] = "approved"
+            barrier["semantic_decision"] = {
+                "status": "approved",
+                "ack_event_id": "ack-legacy",
+            }
+            legacy_notice = (
+                "Manager message id: 11111111-1111-4111-8111-111111111111\n"
+                "Before acting, print exactly: legacy-ack\n\n"
+                "Semantic ACK ack-legacy is approved. "
+                "Resume the contracted material work.\n"
+            )
+            pending_rel = hloop.write_pending_manager_message(
+                repo,
+                role="Worker",
+                agent_id="T001",
+                pane_id="pane-1",
+                source="semantic-ack-resolution",
+                message=legacy_notice,
+                error="simulated send failure",
+            )
+            recorded = hloop.record_manager_message(
+                task_state,
+                "semantic-ack-resolution",
+                legacy_notice,
+                delivery_status="undelivered",
+                pending_path=pending_rel.as_posix(),
+            )
+            barrier["pane_notification"] = {
+                "status": "undelivered",
+                "message_id": recorded["message_id"],
+                "updated_at": hloop.now_iso(),
+            }
+            task_state["pending_manager_messages"].append(
+                {
+                    "at": hloop.now_iso(),
+                    "source": "semantic-ack-resolution",
+                    "pending_path": pending_rel.as_posix(),
+                    "error": "simulated send failure",
+                    "status": "undelivered",
+                    "message_id": recorded["message_id"],
+                }
+            )
+            state["tasks"] = {"T001": task_state}
+            hloop.save_state(repo, state)
+
+            real_save_state = hloop.save_state
+            save_observations = []
+
+            def save_before_cleanup(target_repo, target_state):
+                save_observations.append(
+                    {
+                        "pending_file_exists": (repo / pending_rel).exists(),
+                        "pending_count": len(
+                            target_state["tasks"]["T001"][
+                                "pending_manager_messages"
+                            ]
+                        ),
+                    }
+                )
+                real_save_state(target_repo, target_state)
+
+            with mock.patch.object(
+                hloop, "send_agent_tui_message"
+            ) as send, mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "save_state", side_effect=save_before_cleanup
+            ), contextlib.redirect_stdout(io.StringIO()):
+                hloop.cmd_message_drain(
+                    SimpleNamespace(
+                        repo=str(repo),
+                        timeout_ms=1,
+                        input_settle_ms=0,
+                        submit_verify_ms=1,
+                        submit_attempts=1,
+                    )
+                )
+
+            send.assert_not_called()
+            self.assertEqual(task_state["pending_manager_messages"], [])
+            self.assertEqual(recorded["delivery_status"], "superseded")
+            self.assertEqual(barrier["pane_notification"]["status"], "superseded")
+            self.assertEqual(
+                save_observations,
+                [{"pending_file_exists": True, "pending_count": 0}],
+            )
+            self.assertFalse((repo / pending_rel).exists())
+
     def test_message_drain_only_retries_undelivered_and_never_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3255,6 +3360,172 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                             no_commit=True,
                         )
                     )
+
+    def test_task_update_rebind_failure_remains_blocked_after_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.init_repo(Path(directory))
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            task_meta = {
+                "id": "T001",
+                "run_id": "run-001",
+                "kind": "fix",
+                "status": "running",
+                "branch": "main",
+                "base_ref": "main",
+                "base_sha": head,
+                "write_allow": ["tracked.txt"],
+                "write_deny": [],
+                "acceptance": ["original contract"],
+            }
+            hloop.write_text(
+                hloop.task_file(repo, "T001"),
+                hloop.frontmatter(task_meta) + "\n\n# Task T001\n",
+            )
+            original_digest = hashlib.sha256(
+                hloop.task_file(repo, "T001").read_bytes()
+            ).hexdigest()
+            state = hloop.load_state(repo)
+            state["persistence"] = "local-only"
+            task_state = {
+                **task_meta,
+                "worktree": str(repo),
+                "attempt_id": "T001-A001",
+                "active_attempt_id": "T001-A001",
+                "active_report_contract_digest": original_digest,
+                "worker_base_sha": head,
+                "task_contract_digest": original_digest,
+            }
+            hloop.arm_initial_semantic_ack_barrier(
+                task_state,
+                attempt_id="T001-A001",
+                contract_digest=original_digest,
+            )
+            old_barrier = task_state["semantic_ack_barrier"]
+            old_barrier["status"] = "approved"
+            old_barrier["semantic_decision"] = {
+                "status": "approved",
+                "ack_event_id": "ack-old",
+            }
+            old_barrier["approval_application"] = {
+                "status": "applied",
+                "ack_event_id": "ack-old",
+                "application_event_id": "application-old",
+                "application_event_digest": "a" * 64,
+                "application_attempt_id": "T001-A001",
+                "application_task_contract_digest": original_digest,
+            }
+            self.assertEqual(hloop.semantic_ack_barrier_blocking(task_state), "")
+            state["tasks"] = {
+                "T001": task_state,
+                "T002": {
+                    "status": "queued",
+                    "write_allow": ["shared.txt"],
+                },
+            }
+            state["planning"] = {"status": "ready"}
+            hloop.save_state(repo, state)
+            update_args = SimpleNamespace(
+                repo=str(repo),
+                task_id="T001",
+                add_write_allow=["shared.txt"],
+                remove_write_allow=None,
+                add_write_deny=None,
+                remove_write_deny=None,
+                add_acceptance=["updated contract"],
+                set_acceptance=None,
+                priority=None,
+                validation_minimum=None,
+                worker_protocol=None,
+                worker_qa_profile=None,
+                worker_agent_provider=None,
+                worker_agent_model=None,
+            )
+
+            real_write_text = hloop.write_text
+
+            def fail_updated_task(target, text, *, durable=False):
+                if Path(target) == hloop.task_file(repo, "T001"):
+                    raise OSError("synthetic task artifact failure")
+                real_write_text(target, text, durable=durable)
+
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=state
+            ), mock.patch.object(
+                hloop, "write_text", side_effect=fail_updated_task
+            ), self.assertRaisesRegex(OSError, "task artifact failure"):
+                hloop.cmd_task_update(update_args)
+
+            prepared_state = hloop.load_state(repo)
+            prepared = prepared_state["tasks"]["T001"]
+            self.assertEqual(
+                hloop.read_frontmatter(hloop.task_file(repo, "T001"))[
+                    "acceptance"
+                ],
+                ["original contract"],
+            )
+            self.assertEqual(prepared["task_contract_digest"], original_digest)
+            self.assertEqual(
+                prepared["semantic_ack_barrier"]["report_identity_status"],
+                "rebinding",
+            )
+            self.assertEqual(prepared_state["planning"]["status"], "stale")
+            self.assertTrue(hloop.semantic_ack_barrier_blocking(prepared))
+
+            with mock.patch.object(
+                hloop, "preflight_loop", return_value=prepared_state
+            ), mock.patch.object(
+                hloop,
+                "rebind_role_report_contract_digest",
+                side_effect=hloop.HLoopError("synthetic broker failure"),
+            ), self.assertRaisesRegex(hloop.HLoopError, "rebinding failed"):
+                hloop.cmd_task_update(update_args)
+
+            failed_state = hloop.load_state(repo)
+            failed = failed_state["tasks"]["T001"]
+            updated_digest = hashlib.sha256(
+                hloop.task_file(repo, "T001").read_bytes()
+            ).hexdigest()
+            barrier = failed["semantic_ack_barrier"]
+            self.assertEqual(barrier["status"], "identity_rebind_failed")
+            self.assertEqual(barrier["digest"], updated_digest)
+            self.assertEqual(barrier["report_identity_status"], "failed")
+            self.assertEqual(
+                barrier["report_identity_attempt_id"], "T001-A001"
+            )
+            self.assertIn("synthetic broker failure", barrier["report_identity_error"])
+            self.assertEqual(failed_state["planning"]["status"], "stale")
+            graph = failed_state["write_scope_conflict_graph"]
+            self.assertIn("shared.txt", graph["nodes"]["T001"]["write_allow"])
+            self.assertEqual(graph["conflicts"]["T001"], ["T002"])
+
+            hloop.resolve_semantic_ack_barrier(
+                failed,
+                decision="timeout",
+                reason="rebind recovery timed out",
+                latest_ack=None,
+            )
+            self.assertEqual(barrier["status"], "timed_out")
+            self.assertEqual(barrier["report_identity_status"], "failed")
+            before = json.loads(json.dumps(failed, ensure_ascii=False))
+            with self.assertRaisesRegex(hloop.HLoopError, "rebind identity"):
+                hloop.resolve_semantic_ack_barrier(
+                    failed,
+                    decision="approve",
+                    reason="timeout must not erase failed rebind provenance",
+                    latest_ack={
+                        "event_id": "ack-current",
+                        "sequence": 1,
+                        "task_contract_digest": updated_digest,
+                    },
+                    require_current_ack_digest=True,
+                )
+            self.assertEqual(failed, before)
 
     def test_contract_changing_message_rearms_an_already_resolved_barrier(self):
         agent_state = {}
