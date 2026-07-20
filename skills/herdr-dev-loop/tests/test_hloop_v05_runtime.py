@@ -3003,7 +3003,11 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                 "result_status": "in_progress",
                 "attempt_id": "T001-A001",
             }
-            hloop.arm_semantic_ack_barrier(task_state, message_id="msg-1", digest="deadbeef")
+            hloop.arm_semantic_ack_barrier(
+                task_state,
+                message_id="msg-1",
+                digest=hashlib.sha256(b"T001").hexdigest(),
+            )
             state["tasks"] = {"T001": task_state}
             hloop.save_state(repo, state)
             hloop.write_text(
@@ -4812,11 +4816,27 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
             floor = hloop.latest_semantic_ack_sequence(
                 repo, reloaded, role_id="L-D001", agent_state=liaison
             )
+            updated_digest = hashlib.sha256(b"updated liaison contract").hexdigest()
             hloop.arm_semantic_ack_barrier(
                 liaison,
                 message_id="contract-change",
-                digest="updated",
+                digest=updated_digest,
                 required_reack_after_sequence=floor,
+            )
+            liaison["active_report_contract_digest"] = updated_digest
+            store = hloop._open_broker_store(repo)
+            with store.transaction() as transaction:
+                store.rebind_active_role_contract(
+                    transaction,
+                    run_id="run-spec",
+                    role_id="L-D001",
+                    attempt_id=liaison_attempt,
+                    task_contract_digest=updated_digest,
+                )
+            identities["L-D001"] = (
+                liaison_attempt,
+                updated_digest,
+                liaison_credential,
             )
             hloop.save_state(repo, reloaded)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -4843,7 +4863,7 @@ class SpecificationDecisionRoleTests(unittest.TestCase):
                     liaison_credential,
                     role_id="L-D001",
                     attempt_id=liaison_attempt,
-                    digest=liaison_digest,
+                    digest=updated_digest,
                 )
             )
             with contextlib.redirect_stdout(io.StringIO()):
