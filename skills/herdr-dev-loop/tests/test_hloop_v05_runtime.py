@@ -2944,6 +2944,41 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
             self.assertIn("mode 0600", str(raised.exception))
             self.assertNotIn(secret, str(raised.exception))
 
+    def test_explicit_ready_status_ignores_stale_working_transcript_markers(self):
+        stale_transcript = "\n".join(
+            (
+                "• Working (27s • esc to interrupt)",
+                "• Finished the previous turn.",
+                "› Explain this codebase",
+            )
+        )
+        for provider, agent in (("codex", "codex"), ("claude", "claude")):
+            for status in ("idle", "done"):
+                with self.subTest(provider=provider, status=status):
+                    self.assertIsNone(
+                        hloop.agent_tui_blocker(
+                            provider,
+                            {"agent": agent, "agent_status": status},
+                            stale_transcript,
+                        )
+                    )
+
+    def test_working_status_and_text_fallback_still_block_tui_delivery(self):
+        self.assertEqual(
+            hloop.codex_tui_blocker(
+                {"agent": "codex", "agent_status": "working"},
+                "› idle-looking prompt",
+            ),
+            "Codex is still working",
+        )
+        self.assertEqual(
+            hloop.codex_tui_blocker(
+                {"agent": "codex", "agent_status": "starting"},
+                "• Working (1s • esc to interrupt)",
+            ),
+            "Codex is still working",
+        )
+
     def test_codex_transcript_change_without_output_is_not_delivery_evidence(self):
         _, message = hloop.manager_message_envelope(
             {"run_id": "run-1"},
