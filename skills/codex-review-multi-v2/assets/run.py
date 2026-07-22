@@ -190,14 +190,26 @@ def _has_symlink_component(path):
 
 
 def _publish_trusted_artifact(source, run_dir, name):
-    """Atomically publish a trusted file without touching an existing path."""
+    """Publish an independent inode without following an existing path."""
 
     destination = os.path.join(run_dir, name)
     if not _is_regular_nonsymlink(source):
         return False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
     try:
-        os.link(source, destination, follow_symlinks=False)
+        output_fd = os.open(destination, flags, 0o600)
+        created = True
+        with os.fdopen(output_fd, "wb") as output, open(source, "rb") as trusted_input:
+            shutil.copyfileobj(trusted_input, output)
     except OSError:
+        if created:
+            try:
+                os.unlink(destination)
+            except OSError:
+                pass
         return False
     return True
 
@@ -207,6 +219,24 @@ def _is_regular_nonsymlink(path):
         return stat.S_ISREG(os.lstat(path).st_mode)
     except OSError:
         return False
+
+
+def _read_regular_nofollow(path):
+    """Read a regular file through the same no-follow descriptor that was checked."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _git(args, cwd=None):
@@ -458,20 +488,33 @@ def capture_review_target(review_mode, base_ref):
     base_sha = base_out.strip()
 
     rc, status = _git_bytes(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ]
     )
     if rc != 0:
         return None
     if _has_unpinned_submodule_state(status):
         return None
     rc, committed_diff_bytes = _git_bytes(
-        ["diff", "--binary", "%s...HEAD" % (base_ref or "HEAD")]
+        [
+            "diff",
+            "--ignore-submodules=none",
+            "--binary",
+            "%s...HEAD" % (base_ref or "HEAD"),
+        ]
         if review_mode == "branch"
-        else ["diff", "--binary", "HEAD"]
+        else ["diff", "--ignore-submodules=none", "--binary", "HEAD"]
     )
     if rc != 0:
         return None
-    rc, worktree_diff_bytes = _git_bytes(["diff", "--binary", "HEAD"])
+    rc, worktree_diff_bytes = _git_bytes(
+        ["diff", "--ignore-submodules=none", "--binary", "HEAD"]
+    )
     if rc != 0:
         return None
     rc, untracked_raw = _git_bytes(
@@ -537,7 +580,11 @@ def resolve_profile_path(*, allow_agents=True):
         if os.path.isfile(repo_profile):
             return repo_profile, "repo override: %s" % repo_profile, "repo"
         agents_md = os.path.join(repo_root, "AGENTS.md")
-        if allow_agents and os.path.isfile(agents_md):
+        if (
+            allow_agents
+            and os.path.isfile(agents_md)
+            and not _has_symlink_component(agents_md)
+        ):
             try:
                 with open(agents_md, "r", encoding="utf-8", errors="replace") as fh:
                     for line in fh:
@@ -832,16 +879,18 @@ def build_profile_slice(profile_path, resolved, today=None):
 # 正本の解決と読込
 # ---------------------------------------------------------------------------
 
-def load_canonical():
+def load_canonical(trusted=None):
     """SKILL.md / schema を実行時に読み込む(正本実行時読込)。"""
-    missing = [p for p in (SKILL_MD, SCHEMA_PATH, VALIDATOR_PATH, RENDERER_PATH)
-               if not os.path.isfile(p)]
+    paths = (trusted or {}).get("paths") or {}
+    skill_path = paths.get("skill", SKILL_MD)
+    schema_path = paths.get("schema", SCHEMA_PATH)
+    missing = [p for p in (skill_path, schema_path) if not os.path.isfile(p)]
     if missing:
         _err("正本ファイルが見つかりません: %s" % ", ".join(missing))
         return None
-    with open(SKILL_MD, "r", encoding="utf-8") as fh:
+    with open(skill_path, "r", encoding="utf-8") as fh:
         skill_text = fh.read()
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as fh:
+    with open(schema_path, "r", encoding="utf-8") as fh:
         schema_text = fh.read()
     return {"skill": skill_text, "schema": schema_text}
 
@@ -851,6 +900,7 @@ def load_canonical():
 # ---------------------------------------------------------------------------
 
 TRUSTED_FILES = {
+    "skill": ("SKILL.md", SKILL_MD),
     "validator": ("validate_review.py", VALIDATOR_PATH),
     "renderer": ("render_review.py", RENDERER_PATH),
     "schema": ("review.schema.json", SCHEMA_PATH),
@@ -1044,14 +1094,27 @@ def _optional_lines(run_dir, name, limit=20):
 
 
 def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
-             quiet=False, today=None, slice_info=None):
+             quiet=False, today=None, slice_info=None, model_dir=None):
     """review.json の外部検証と最終レビュー・KPI artifact の機械生成。戻り値は exit code。
 
     today: 鮮度判定の基準日(YYYY-MM-DD 文字列。selftest の決定論用。None なら実行日)。
     slice_info: {"slice_sha256", "status", "stale_fields", "origin", "notes",
                  "extra_non_demotable"}(attestation と renderer へ伝搬)。
     """
-    review_path = os.path.join(run_dir, "review.json")
+    model_dir = model_dir or run_dir
+    reserved_outputs = (
+        "validation.log",
+        "review.md",
+        "profile_gaps.json",
+        "action_derivation.json",
+        "attestation.json",
+    )
+    if any(os.path.lexists(os.path.join(run_dir, name)) for name in reserved_outputs):
+        if not quiet:
+            _err("ATTESTATION_FAILED: reserved output path already exists")
+        return EXIT_VIOLATION
+
+    review_path = os.path.join(model_dir, "review.json")
     if not _is_regular_nonsymlink(review_path):
         if not quiet:
             _err("")
@@ -1076,8 +1139,7 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
         return EXIT_VIOLATION
 
     try:
-        with open(review_path, "rb") as fh:
-            review_bytes = fh.read()
+        review_bytes = _read_regular_nofollow(review_path)
         review_value = json.loads(review_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
         return EXIT_PARSE
@@ -1173,16 +1235,6 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
             _err("ATTESTATION_FAILED: trusted review snapshot changed")
         return EXIT_VIOLATION
 
-    for source, name in (
-        (review_md, "review.md"),
-        (profile_gaps, "profile_gaps.json"),
-        (action_derivation, "action_derivation.json"),
-    ):
-        if not _publish_trusted_artifact(source, run_dir, name):
-            if not quiet:
-                _err("ATTESTATION_FAILED: model-managed %s already exists" % name)
-            return EXIT_VIOLATION
-
     # attestation.json の外部生成(モデルは書けない)。resolved profile の来歴を含める。
     rc, head_out = _git(["rev-parse", "HEAD"])
     si = slice_info or {}
@@ -1203,7 +1255,7 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
         "validator_sha256": trusted["sha256"]["validator"],
         "renderer_sha256": trusted["sha256"]["renderer"],
         "schema_sha256": trusted["sha256"]["schema"],
-        "skill_md_sha256": _sha256(SKILL_MD),
+        "skill_md_sha256": trusted["sha256"]["skill"],
         "resolved_profile": {
             "sha256": trusted["sha256"].get("profile"),
             "source": si.get("origin"),
@@ -1219,11 +1271,23 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
     with open(trusted_attestation_path, "w", encoding="utf-8") as fh:
         json.dump(attestation, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-    if not _publish_trusted_artifact(
-        trusted_attestation_path, run_dir, "attestation.json"
+    published = []
+    for source, name in (
+        (review_md, "review.md"),
+        (profile_gaps, "profile_gaps.json"),
+        (action_derivation, "action_derivation.json"),
+        (trusted_attestation_path, "attestation.json"),
     ):
+        if _publish_trusted_artifact(source, run_dir, name):
+            published.append(name)
+            continue
+        for published_name in published:
+            try:
+                os.unlink(os.path.join(run_dir, published_name))
+            except OSError:
+                pass
         if not quiet:
-            _err("ATTESTATION_FAILED: model-managed attestation.json already exists")
+            _err("ATTESTATION_FAILED: cannot publish trusted artifact %s" % name)
         return EXIT_VIOLATION
     attestation_path = os.path.join(run_dir, "attestation.json")
 
@@ -1417,6 +1481,17 @@ def _selftest_base_resolution(expect):
                 resolved4["source_kind"] == "shared-default",
                 str(resolved4),
             )
+            os.unlink(os.path.join(repo, ".codex"))
+            external_agents = os.path.join(td, "external-AGENTS.md")
+            with open(external_agents, "w", encoding="utf-8") as fh:
+                fh.write("product_profile: profiles/approved.yaml\n")
+            os.symlink(external_agents, os.path.join(repo, "AGENTS.md"))
+            _path, _origin, source_kind = resolve_profile_path()
+            expect(
+                "base 版解決: symlink AGENTS.md は shared-defaultへfail-closed",
+                source_kind == "shared-default",
+                source_kind,
+            )
         finally:
             os.chdir(prev_cwd)
 
@@ -1524,6 +1599,31 @@ def selftest():
             code == EXIT_VIOLATION and victim_text == "preserve-me\n",
         )
 
+        # 後段予約名の衝突でも公式artifactを部分公開しない
+        run_dir = os.path.join(td, "artifact_transaction")
+        os.makedirs(run_dir)
+        trusted = prepare_trusted(run_dir, FIXTURE_PROFILE)
+        shutil.copyfile(
+            os.path.join(FIXTURES_DIR, "review_good.json"),
+            os.path.join(run_dir, "review.json"),
+        )
+        with open(os.path.join(run_dir, "attestation.json"), "w", encoding="utf-8") as fh:
+            fh.write("model-owned\n")
+        code = finalize(run_dir, trusted, "review", False, context,
+                        quiet=True, today=FIXTURE_TODAY, slice_info=slice_info)
+        expect(
+            "reserved artifact collision → official bundle is not partially published",
+            code == EXIT_VIOLATION
+            and not any(
+                os.path.exists(os.path.join(run_dir, name))
+                for name in (
+                    "review.md",
+                    "profile_gaps.json",
+                    "action_derivation.json",
+                )
+            ),
+        )
+
         # stale profile では良例(context_effect 降格を含む)も契約違反になる(fail-closed)
         run_dir = os.path.join(td, "stale_profile")
         os.makedirs(run_dir)
@@ -1582,41 +1682,52 @@ def main(argv):
         _err("review target identity を固定できません")
         return EXIT_ENV
 
-    canonical = load_canonical()
-    if canonical is None:
-        return EXIT_ENV
-
-    # run dir(セッションログ・成果物の永続保存先)
+    # run dirは親だけが書く正式artifact領域、model dirはsandbox用の子領域。
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(RUNS_ROOT, "%s-%d" % (stamp, os.getpid()))
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(RUNS_ROOT, mode=0o700, exist_ok=True)
+    os.chmod(RUNS_ROOT, 0o700)
+    os.makedirs(run_dir, mode=0o700, exist_ok=False)
+    model_dir = os.path.join(run_dir, "model")
+    os.makedirs(model_dir, mode=0o700, exist_ok=False)
 
-    # profile 解決(diff が profile を変更していれば base 版)→ 構造化スライス生成
+    # profile pathを解決し、canonical/profileを同じtrusted snapshotへ固定する。
     resolved = resolve_profile(opts, scope, run_dir)
     marker = ">>> " if resolved["source_kind"] in ("repo", "repo-base", "agents-md") else ""
     print("%sProduct profile: %s" % (marker, resolved["origin"]), file=sys.stderr)
     for note in resolved["notes"]:
         print(">>> %s" % note, file=sys.stderr)
-    slice_obj, slice_canonical, slice_sha256 = build_profile_slice(resolved["path"], resolved)
-    with open(os.path.join(run_dir, "profile_slice.json"), "w", encoding="utf-8") as fh:
-        fh.write(slice_canonical)
-        fh.write("\n")
-    extra_non_demotable = [c for c in slice_obj["non_demotable"] if c not in ORG_NON_DEMOTABLE]
-    slice_info = {
-        "slice_sha256": slice_sha256,
-        "status": slice_obj["profile"]["status"],
-        "stale_fields": slice_obj["stale_fields"],
-        "origin": resolved["origin"],
-        "source_kind": resolved["source_kind"],
-        "notes": slice_obj["notes"],
-        "extra_non_demotable": extra_non_demotable,
-    }
-
     trusted = prepare_trusted(run_dir, resolved["path"])
     if trusted is None:
         return EXIT_VIOLATION
 
     try:
+        canonical = load_canonical(trusted)
+        if canonical is None:
+            return EXIT_ENV
+        trusted_profile = trusted["paths"].get("profile")
+        slice_obj, slice_canonical, slice_sha256 = build_profile_slice(
+            trusted_profile, resolved
+        )
+        profile_slice_path = os.path.join(run_dir, "profile_slice.json")
+        with open(profile_slice_path, "w", encoding="utf-8") as fh:
+            fh.write(slice_canonical)
+            fh.write("\n")
+        os.chmod(profile_slice_path, 0o600)
+        extra_non_demotable = [
+            cls
+            for cls in slice_obj["non_demotable"]
+            if cls not in ORG_NON_DEMOTABLE
+        ]
+        slice_info = {
+            "slice_sha256": slice_sha256,
+            "status": slice_obj["profile"]["status"],
+            "stale_fields": slice_obj["stale_fields"],
+            "origin": resolved["origin"],
+            "source_kind": resolved["source_kind"],
+            "notes": slice_obj["notes"],
+            "extra_non_demotable": extra_non_demotable,
+        }
         prompt = build_prompt(
             opts,
             scope,
@@ -1624,14 +1735,17 @@ def main(argv):
             slice_canonical,
             slice_sha256,
             resolved["origin"],
-            run_dir,
+            model_dir,
             target_identity,
         )
-        with open(os.path.join(run_dir, "prompt.txt"), "w", encoding="utf-8") as fh:
+        prompt_path = os.path.join(run_dir, "prompt.txt")
+        with open(prompt_path, "w", encoding="utf-8") as fh:
             fh.write(prompt)
+        os.chmod(prompt_path, 0o600)
 
         log_path = os.path.join(run_dir, "session.log")
-        codex_status = launch_codex(prompt, opts, log_path, run_dir)
+        codex_status = launch_codex(prompt, opts, log_path, model_dir)
+        os.chmod(log_path, 0o600)
 
         session_id = extract_session_id(log_path)
         if session_id:
@@ -1640,7 +1754,9 @@ def main(argv):
             print("Resume: env CODEX_HOME=\"%s\" codex exec resume --skip-git-repo-check %s"
                   % (opts["codex_home"], session_id), file=sys.stderr)
 
-        review_exists = os.path.isfile(os.path.join(run_dir, "review.json"))
+        review_exists = _is_regular_nonsymlink(
+            os.path.join(model_dir, "review.json")
+        )
         if codex_status != 0 and not review_exists:
             _err("codex が exit %d で失敗し、review.json も生成されていません(UNATTESTED)" % codex_status)
             _err("セッションログ: %s" % log_path)
@@ -1665,6 +1781,7 @@ def main(argv):
             allow_a11y,
             context,
             slice_info=slice_info,
+            model_dir=model_dir,
         )
     finally:
         shutil.rmtree(trusted["dir"], ignore_errors=True)
