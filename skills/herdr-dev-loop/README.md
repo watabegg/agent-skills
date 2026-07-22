@@ -482,6 +482,10 @@ hloop reviewer message R001 --file review-followup.md
 hloop gap message G001 --file gap-followup.md
 ```
 
+message command が nonzero で終了した場合、同じ command を再実行したり本文を直接再送したりしません。`undelivered` は本文が入力されていないことを確定できた状態で、`hloop message drain` の対象になるのはこの状態だけですが、再送先は実行中 role に限ります。終了済み role の `undelivered` は `hloop message list` が表示する repository-pinned の `message resolve ... --status superseded` で明示的に閉じ、本文を再送しません。drain 中に `unknown` へ遷移した場合は nonzero で停止します。`unknown` は本文がすでに入力された可能性がある状態です。診断出力を失った場合や Manager 再起動後は `hloop message list --status unknown` で再発見し、durable evidence が許可するときだけ表示された `hloop message submit <agent-id> <message-id>` で Enter-only 復旧を行います。それ以外は pinned pane を確認し、観測できた outcome に合わせて `hloop message resolve` で `acknowledged`、`applied --result ...`、`superseded` のいずれかを明示します。outcome を確定できない場合は `unknown` のまま残します。orphan/malformed pending marker と malformed container も blocking / inspection-only です。`undelivered`、`unknown`、malformed のいずれかが残る間は `finish` できません。
+
+Manager follow-up に direct `herdr pane run` は使いません。これは helper 自体を診断するときだけの低水準操作です。
+
 revision-3 Workerは承認済みcompletion modeを確認し、まずnonterminal candidateを提出します。commit modeではproduct変更を先にcommitしてcandidate sealを作り、handoff modeではstage/commitせず同じworktree treeを提出します。validationと5分類のQA evidenceはcandidate identityへ固定します。
 
 ```bash

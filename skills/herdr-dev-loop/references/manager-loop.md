@@ -183,17 +183,42 @@ hloop reviewer message R001 --file .ai/herdr-dev-loop/loops/<namespace>/inbox/ma
 hloop advisor message A001 --participant-id P1 --file .ai/herdr-dev-loop/loops/<namespace>/inbox/manager/A001-P1-followup.md
 ```
 
-Do not use this TUI follow-up path to resume a semantic ACK. ACK resolution and
-application use the broker/state exchange above. Do not send other follow-ups
-directly with `herdr pane run` unless debugging the pane itself. `hloop ...
-message` refuses to send when the target pane is not Codex, is showing the
-trust prompt, or is still working. It then uses `send-text`, waits for the input
-to appear, pauses before Enter, and verifies that Codex started working or
-answered before reporting success. If delivery fails after Manager wrote a
-follow-up, `hloop` records the undelivered message under
-`.ai/herdr-dev-loop/loops/<namespace>/inbox/pending/` and marks it in the target
-state; retry that pending file when the pane is ready instead of reconstructing
-the instruction from memory.
+Do not use pane delivery to resume a semantic ACK. Pane delivery is advisory;
+semantic ACK authority and authorization to continue material work remain with
+the broker/state exchange and Manager-applied state above. Do not send
+follow-ups directly with `herdr pane run` unless debugging the helper itself.
+
+`hloop ... message` requires a ready role-agent TUI and rejects trust prompts or
+busy sessions. For Codex, it sends the structured start marker, body, and end
+marker in order, with the body sent exactly once, revalidates the same idle
+session at each boundary, uses `Ctrl+E` to expose the staged tail, and sends at
+most two delayed Enter attempts. Claude messages, and legacy marker-less
+messages, remain supported through the single-send path.
+
+Treat a failed send according to its recorded delivery state:
+
+- `undelivered` means no body was typed. It is stored under
+  `.ai/herdr-dev-loop/loops/<namespace>/inbox/pending/` and is the only state
+  eligible for `hloop message drain`. Drain resends only while the addressed
+  role remains running. For a terminal role, use the exact `message resolve
+  ... --status superseded` action from `message list`; never replay the body.
+  A resend that becomes `unknown` makes drain exit nonzero.
+- `unknown` means the body may already be typed. Never resend or auto-drain it.
+  Rediscover unresolved records and their pinned recovery commands with `hloop
+  message list --status unknown`; the filter also keeps malformed unresolved
+  records and malformed/orphan pending markers visible as blocking,
+  inspection-only entries. Inspect the pane first. If transport evidence
+  confirms the exact end marker is safely staged, use the listed `hloop message
+  submit <agent-id> <message-id>` command for Enter-only recovery; it
+  revalidates the pinned pane session and exact staged input without sending the
+  body again.
+
+If the end marker is not safely staged, or the staged input cannot be
+distinguished from transcript history, do not use `message submit`. Inspect the
+pane, establish the actual delivery or application result, then record it
+explicitly with `hloop message resolve <agent-id> <message-id> --status
+acknowledged` (or `--status applied` / `--status superseded`). Leave the state
+`unknown` when the outcome cannot be established.
 
 ## Harvest Rules
 

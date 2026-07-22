@@ -4123,12 +4123,23 @@ effort = "medium"
                 0,
             )
         for expected, (_, message) in zip(("T001", "R001", "G001", "A001/P1"), sent):
-            self.assertIn(f":{expected}:", message)
+            identity = hloop.manager_message_transport_identity(message)
+            self.assertIsNotNone(identity)
+            self.assertEqual(identity["role_id"], expected)
+            self.assertIn(f" role={expected} attempt=", message)
 
         with mock.patch.object(hloop, "check_herdr_env"), mock.patch.object(
-            hloop, "wait_agent_tui_ready", return_value=({}, "")
+            hloop,
+            "wait_agent_tui_ready",
+            return_value=({"agent": "codex", "agent_status": "idle", "session_id": "session-1"}, ""),
         ), mock.patch.object(hloop, "run_cmd"), mock.patch.object(
             hloop, "wait_manager_message_visible", return_value="typed"
+        ), mock.patch.object(
+            hloop,
+            "pane_info",
+            return_value={"agent": "codex", "agent_status": "idle", "session_id": "session-1"},
+        ), mock.patch.object(
+            hloop, "pane_text", return_value="input> already enveloped"
         ), mock.patch.object(hloop, "manager_message_submitted", return_value=True):
             hloop.send_agent_tui_message("codex", "p1", "already enveloped", 1, 0, 1, 1)
 

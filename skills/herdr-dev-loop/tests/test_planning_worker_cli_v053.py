@@ -248,6 +248,117 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             unrun_check=[],
         )
 
+    def install_applied_message_ack(
+        self,
+        repo: Path,
+        state: dict,
+        task_state: dict,
+    ) -> str:
+        digest = hloop.hashlib.sha256(b"replacement Manager message").hexdigest()
+        ack_event_id = "11111111-1111-4111-8111-111111111111"
+        task_state["active_report_contract_digest"] = digest
+        task_state["semantic_ack_barrier"] = {
+            "kind": "message",
+            "attempt_id": "T001-A001",
+            "message_id": "22222222-2222-4222-8222-222222222222",
+            "digest": digest,
+            "status": "approved",
+            "ack_event_id": ack_event_id,
+            "ack_sequence": 2,
+            "required_reack_after_sequence": 1,
+            "report_identity_status": "bound",
+            "report_identity_attempt_id": "T001-A001",
+            "rendered_exchange_digest": digest,
+            "semantic_decision": {
+                "status": "approved",
+                "ack_event_id": ack_event_id,
+                "ack_sequence": 2,
+            },
+            "approval_application": {
+                "status": "applied",
+                "ack_event_id": ack_event_id,
+                "application_event_id": "33333333-3333-4333-8333-333333333333",
+                "application_event_digest": "b" * 64,
+                "application_attempt_id": "T001-A001",
+                "application_task_contract_digest": digest,
+            },
+            "approval_availability": {
+                "status": "available",
+                "message_id": "22222222-2222-4222-8222-222222222222",
+                "task_contract_digest": digest,
+                "ack_event_id": ack_event_id,
+            },
+        }
+        hloop.write_text(
+            repo / hloop.LOOP_DIR / "STATE.json",
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        )
+        return ack_event_id
+
+    def submit_and_seal_current_candidate(
+        self,
+        repo: Path,
+        state: dict,
+        *,
+        mode: str,
+    ):
+        old_cwd = Path.cwd()
+        try:
+            hloop.os.chdir(repo)
+            hloop.cmd_worker_submit(self.submit_args(mode))
+        finally:
+            hloop.os.chdir(old_cwd)
+        candidate, _payload = hloop.load_candidate_artifact(
+            repo, "T001", "T001-A001", 1
+        )
+        with (
+            mock.patch.object(hloop, "preflight_loop", return_value=state),
+            mock.patch.object(hloop, "require_worker_pane_quiesced_preserved"),
+        ):
+            hloop.cmd_worker_candidate_seal(
+                argparse.Namespace(
+                    repo=str(repo), task_id="T001", candidate_revision=1
+                )
+            )
+        return candidate
+
+    def harvest_and_dry_run_merge(
+        self,
+        repo: Path,
+        state: dict,
+        task_state: dict,
+    ) -> None:
+        with (
+            mock.patch.object(hloop, "preflight_loop", return_value=state),
+            mock.patch.object(hloop, "cleanup_completed_agent_pane"),
+            mock.patch.object(hloop, "revoke_active_role_report_identity"),
+        ):
+            hloop.cmd_worker_harvest(
+                argparse.Namespace(
+                    repo=str(repo),
+                    task_id="T001",
+                    keep_pane=True,
+                    session_cleanup=None,
+                )
+            )
+        self.assertEqual(task_state["status"], "result_reported")
+        self.assertTrue(task_state["merge_ready"])
+        with mock.patch.object(hloop, "preflight_loop", return_value=state):
+            self.assertEqual(
+                hloop.cmd_merge(
+                    argparse.Namespace(
+                        repo=str(repo),
+                        task_id="T001",
+                        abort=False,
+                        continue_merge=False,
+                        retry=False,
+                        mode="squash",
+                        dry_run=True,
+                    )
+                ),
+                0,
+            )
+
     def patch_finding(self, label: str):
         return hloop.hloop_worker_candidate.PatchReviewFinding.from_evidence(
             scope="unresolved",
@@ -1146,6 +1257,140 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             self.assertEqual(self.git(repo, "rev-parse", "HEAD^{tree}"), candidate.candidate_tree_sha)
             self.assertEqual(task_state["active_attempt_id"], "T001-A001")
             self.assertTrue(committed)
+
+    def test_message_replacement_ack_completes_commit_candidate_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base_sha = self.make_repo(Path(directory))
+            state, task_state = self.write_fixture(
+                repo, base_sha, gates=(), completion_mode="commit"
+            )
+            replacement_ack = self.install_applied_message_ack(
+                repo, state, task_state
+            )
+            (repo / "src" / "task.py").write_text("VALUE = 8\n", encoding="utf-8")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                candidate = self.submit_and_seal_current_candidate(
+                    repo, state, mode="commit"
+                )
+            self.assertEqual(candidate.semantic_ack_event_id, replacement_ack)
+            self.assertEqual(
+                task_state["implementation_candidate"]["semantic_ack_event_id"],
+                replacement_ack,
+            )
+            self.assertEqual(task_state["candidate_lifecycle_status"], "candidate_sealed")
+            self.assertEqual(task_state["completion_mode_ack_event_id"], "ack-event-001")
+
+            old_cwd = Path.cwd()
+            output = io.StringIO()
+            try:
+                hloop.os.chdir(repo)
+                with contextlib.redirect_stdout(output):
+                    hloop.cmd_worker_finalize(self.finalize_args())
+            finally:
+                hloop.os.chdir(old_cwd)
+            self.assertIn(
+                "HERDR_LOOP_ROLE_DONE:run-v053:T001:T001-A001:done",
+                output.getvalue(),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.harvest_and_dry_run_merge(repo, state, task_state)
+
+    def test_message_replacement_ack_completes_handoff_candidate_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base_sha = self.make_repo(Path(directory))
+            state, task_state = self.write_fixture(
+                repo, base_sha, gates=(), completion_mode="handoff"
+            )
+            replacement_ack = self.install_applied_message_ack(
+                repo, state, task_state
+            )
+            (repo / "src" / "task.py").write_text("VALUE = 9\n", encoding="utf-8")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                candidate = self.submit_and_seal_current_candidate(
+                    repo, state, mode="handoff"
+                )
+            self.assertEqual(candidate.semantic_ack_event_id, replacement_ack)
+            self.assertEqual(
+                task_state["implementation_candidate"]["semantic_ack_event_id"],
+                replacement_ack,
+            )
+            self.assertEqual(task_state["candidate_lifecycle_status"], "candidate_sealed")
+            self.assertEqual(task_state["completion_mode_ack_event_id"], "ack-event-001")
+
+            finalize = self.finalize_args()
+            finalize.handoff = True
+            old_cwd = Path.cwd()
+            handoff_output = io.StringIO()
+            try:
+                hloop.os.chdir(repo)
+                with contextlib.redirect_stdout(handoff_output):
+                    hloop.cmd_worker_finalize(finalize)
+            finally:
+                hloop.os.chdir(old_cwd)
+            self.assertNotIn("HERDR_LOOP_ROLE_DONE", handoff_output.getvalue())
+
+            seal_output = io.StringIO()
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(hloop, "require_worker_pane_quiesced_and_closed"),
+                contextlib.redirect_stdout(seal_output),
+            ):
+                hloop.cmd_worker_seal(
+                    argparse.Namespace(
+                        repo=str(repo),
+                        task_id="T001",
+                        attempt_id="T001-A001",
+                        validation_command=["true"],
+                        validation_summary="Manager seal validation passed",
+                    )
+                )
+            self.assertIn(
+                "HERDR_LOOP_ROLE_DONE:run-v053:T001:T001-A001:done",
+                seal_output.getvalue(),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.harvest_and_dry_run_merge(repo, state, task_state)
+
+    def test_message_replacement_ack_tampering_after_submit_blocks_candidate_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base_sha = self.make_repo(Path(directory))
+            state, task_state = self.write_fixture(
+                repo, base_sha, gates=(), completion_mode="commit"
+            )
+            self.install_applied_message_ack(repo, state, task_state)
+            (repo / "src" / "task.py").write_text("VALUE = 10\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                hloop.os.chdir(repo)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    hloop.cmd_worker_submit(self.submit_args("commit"))
+            finally:
+                hloop.os.chdir(old_cwd)
+
+            task_state["semantic_ack_barrier"]["attempt_id"] = "T001-A000"
+            state_path = repo / hloop.LOOP_DIR / "STATE.json"
+            hloop.write_text(
+                state_path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+            state_before = state_path.read_bytes()
+            head_before = self.git(repo, "rev-parse", "HEAD")
+            with (
+                mock.patch.object(hloop, "preflight_loop", return_value=state),
+                mock.patch.object(hloop, "require_worker_pane_quiesced_preserved"),
+                self.assertRaisesRegex(hloop.HLoopError, "report identity is not fully bound"),
+            ):
+                hloop.cmd_worker_candidate_seal(
+                    argparse.Namespace(
+                        repo=str(repo), task_id="T001", candidate_revision=1
+                    )
+                )
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(self.git(repo, "rev-parse", "HEAD"), head_before)
+            self.assertNotIn("candidate_seal", task_state)
+            self.assertNotIn("implementation_candidate", task_state)
 
     def test_patch_fix_resubmission_stays_in_attempt_and_stops_at_round_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

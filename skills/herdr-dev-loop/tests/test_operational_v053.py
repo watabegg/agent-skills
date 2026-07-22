@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -302,15 +303,16 @@ class CompletionModeTests(unittest.TestCase):
         self.assertIn("Generate and commit the result", commit)
         self.assertNotIn("worker finalize T001 --handoff", commit)
 
-    def test_worker_and_patch_reviewer_ack_commands_pin_manager_repo(self):
+    def test_all_role_ack_commands_pin_manager_repo(self):
         manager_repo = "/manager/repository"
         digest = "a" * 64
-        state = {"run_id": "run-1"}
+        state = {"run_id": "run-1", "advisor_max_rounds": 2}
         worker = hloop.render_worker_prompt(
             "T001",
             {
                 "id": "T001",
                 "attempt_id": "T001-A001",
+                "contract_schema_revision": 3,
                 "base_ref": "main",
                 "worker_protocol": "native",
                 "worker_qa_profile": "repo-default",
@@ -356,11 +358,169 @@ class CompletionModeTests(unittest.TestCase):
             report_credential_file="/credentials/PR-T001-R001.json",
             manager_repo=manager_repo,
         )
-        for prompt in (worker, patch_reviewer):
-            self.assertIn(
-                "--manager-repo /manager/repository",
-                prompt,
+        reviewer = hloop.render_reviewer_prompt(
+            "R001",
+            "main",
+            "integration",
+            state,
+            report_credential_file="/credentials/R001.json",
+            task_contract_digest=digest,
+            attempt_id="R001-A001",
+            manager_repo=manager_repo,
+        )
+        gap = hloop.render_gap_prompt(
+            "G001",
+            "main",
+            "integration",
+            [],
+            state,
+            report_credential_file="/credentials/G001.json",
+            task_contract_digest=digest,
+            attempt_id="G001-A001",
+            manager_repo=manager_repo,
+        )
+        advisor = hloop.render_advisor_prompt(
+            "A001",
+            {"participant_id": "P1", "provider": "codex", "model": "auto"},
+            {"topic": "bounded advice", "mode": "single", "source_refs": []},
+            state,
+            Path(".ai/herdr-dev-loop/loops/default/advice/A001-P1.md"),
+            report_credential_file="/credentials/A001-P1.json",
+            task_contract_digest=digest,
+            attempt_id="A001-P1-A001",
+            manager_repo=manager_repo,
+        )
+        scout = hloop.render_specification_scout_prompt(
+            state,
+            head_sha="b" * 40,
+            reasons=["test"],
+            report_credential_file="/credentials/S001.json",
+            task_contract_digest=digest,
+            attempt_id="S001-A001",
+            manager_repo=manager_repo,
+        )
+        coverage_scout = hloop.render_plan_gap_scout_prompt(
+            state,
+            head_sha="b" * 40,
+            planning_identity={"head_sha": "b" * 40},
+            input_artifact_digests={
+                "impact_map": "sha256:" + "1" * 64,
+                "task_graph": "sha256:" + "2" * 64,
+                "coverage": "sha256:" + "3" * 64,
+            },
+            agent_config={
+                "provider": "codex",
+                "model": "auto",
+                "effort": "auto",
+                "sources": {},
+            },
+            attempt_id="S001-C001",
+            report_credential_file="/credentials/S001-C001.json",
+            task_contract_digest=digest,
+            manager_repo=manager_repo,
+        )
+        liaison = hloop.render_decision_liaison_prompt(
+            hloop.DecisionRecord(
+                decision_id="D001",
+                decision_class=hloop.DECISION_BLOCKING_USER,
+                status=hloop.DECISION_PENDING,
+                question="公開 API の互換性を維持しますか",
+                options=(
+                    {"id": "opt_1", "label": "維持する", "tradeoffs": ["安全"]},
+                    {"id": "opt_2", "label": "変更する", "tradeoffs": ["移行が必要"]},
+                ),
+                recommendation={"option_id": "opt_1", "rationale": "互換性を保つため"},
+                affected_task_ids=("T001",),
+            ),
+            state,
+            head_sha="b" * 40,
+            report_credential_file="/credentials/L-D001.json",
+            task_contract_digest=digest,
+            attempt_id="L-D001-A001",
+            manager_repo=manager_repo,
+        )
+        prompts = {
+            "worker": worker,
+            "patch-reviewer": patch_reviewer,
+            "reviewer": reviewer,
+            "gap": gap,
+            "advisor": advisor,
+            "decision-scout": scout,
+            "coverage-scout": coverage_scout,
+            "liaison": liaison,
+        }
+        for role, prompt in prompts.items():
+            with self.subTest(role=role):
+                self.assertIn(
+                    "--manager-repo /manager/repository",
+                    prompt,
+                )
+
+        self.assertIn(
+            f"python3 {SCRIPT.resolve()} --namespace {hloop.LOOP_NAMESPACE} "
+            "agent ack status T001 --attempt-id T001-A001 "
+            "--run-id run-1 --manager-repo /manager/repository --apply",
+            worker,
+        )
+        parsed = hloop.build_parser().parse_args(
+            [
+                "agent",
+                "ack",
+                "status",
+                "T001",
+                "--attempt-id",
+                "T001-A001",
+                "--manager-repo",
+                manager_repo,
+            ]
+        )
+        self.assertEqual(parsed.manager_repo, manager_repo)
+
+        with self.assertRaisesRegex(hloop.HLoopError, "canonical Manager repo"):
+            hloop.report_contract_text(
+                "R002",
+                "R002-A001",
+                state,
+                report_credential_file="/credentials/R002.json",
+                task_contract_digest=digest,
             )
+
+    def test_worker_ack_status_command_pins_custom_namespace_without_env(self):
+        previous_namespace = hloop.LOOP_NAMESPACE
+        hloop.configure_loop_namespace("custom-worker-namespace")
+        try:
+            environment = dict(os.environ)
+            environment.pop("HLOOP_NAMESPACE", None)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                prompt = hloop.render_worker_prompt(
+                    "T001",
+                    {
+                        "id": "T001",
+                        "attempt_id": "T001-A001",
+                        "contract_schema_revision": 3,
+                        "base_ref": "main",
+                        "worker_protocol": "native",
+                        "worker_qa_profile": "repo-default",
+                    },
+                    Path("/worker/T001"),
+                    "ai/T001",
+                    {"run_id": "run-1"},
+                    manager_repo="/manager/repository",
+                )
+            commands = re.findall(r"`([^`]*agent ack status T001[^`]*)`", prompt)
+            self.assertTrue(commands)
+            argv = shlex.split(commands[0])
+            self.assertEqual(argv[0], "python3")
+            self.assertEqual(Path(argv[1]).resolve(), SCRIPT.resolve())
+            parsed = hloop.build_parser().parse_args(argv[2:])
+            self.assertEqual(parsed.namespace, "custom-worker-namespace")
+            self.assertEqual(parsed.agent_id, "T001")
+            self.assertEqual(parsed.attempt_id, "T001-A001")
+            self.assertEqual(parsed.run_id, "run-1")
+            self.assertEqual(parsed.manager_repo, "/manager/repository")
+            self.assertTrue(parsed.apply)
+        finally:
+            hloop.configure_loop_namespace(previous_namespace)
 
     def test_explicit_ack_retry_reuses_retained_probe_before_fresh_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1030,6 +1190,8 @@ class SemanticAckTests(unittest.TestCase):
         self.assertEqual(parsed.namespace, hloop.LOOP_NAMESPACE)
         self.assertEqual(parsed.agent_id, "T001")
         self.assertEqual(parsed.attempt_id, "T001-A001")
+        self.assertEqual(parsed.run_id, "run-1")
+        self.assertEqual(parsed.manager_repo, "/manager")
         self.assertTrue(parsed.apply)
         self.assertEqual(
             agent["semantic_ack_barrier"]["approval_application"]["status"],
@@ -1051,6 +1213,7 @@ class SemanticAckTests(unittest.TestCase):
             ("agent", "ack", "status"),
             ("agent", "ack", "exchange"),
             ("agent", "message"),
+            ("message", "submit"),
             ("message", "resolve"),
         ):
             with self.subTest(argv=argv):
@@ -1345,6 +1508,119 @@ class SemanticAckTests(unittest.TestCase):
         structured["completion_mode_attempt_id"] = "T001-A000"
         with self.assertRaisesRegex(hloop.HLoopError, "attempt binding"):
             hloop.approved_semantic_ack_event_id("T001", structured)
+
+    def test_revision_three_candidate_gate_accepts_only_fully_bound_message_ack(self):
+        digest = "a" * 64
+        message_id = "11111111-1111-4111-8111-111111111111"
+        probe = {
+            "version": 1,
+            "mode": "commit",
+            "status": "writable",
+            "checked_at": "2026-07-20T00:00:00+00:00",
+            "git_metadata_paths": ["/repo/.git"],
+            "checks": [
+                {
+                    "resource": "git-metadata",
+                    "path": "/repo/.git",
+                    "status": "writable",
+                    "detail": "ok",
+                }
+            ],
+        }
+
+        def message_state() -> dict:
+            return {
+                "contract_schema_revision": 3,
+                "active_attempt_id": "T001-A001",
+                "active_report_contract_digest": digest,
+                "semantic_ack_barrier": {
+                    "kind": "message",
+                    "attempt_id": "T001-A001",
+                    "message_id": message_id,
+                    "digest": digest,
+                    "status": "approved",
+                    "ack_event_id": "ack-message",
+                    "ack_sequence": 8,
+                    "required_reack_after_sequence": 7,
+                    "report_identity_status": "bound",
+                    "report_identity_attempt_id": "T001-A001",
+                    "rendered_exchange_digest": digest,
+                    "semantic_decision": {
+                        "status": "approved",
+                        "ack_event_id": "ack-message",
+                        "ack_sequence": 8,
+                    },
+                    "approval_application": {
+                        "status": "applied",
+                        "ack_event_id": "ack-message",
+                        "application_event_id": "application-message",
+                        "application_event_digest": "f" * 64,
+                        "application_attempt_id": "T001-A001",
+                        "application_task_contract_digest": digest,
+                    },
+                },
+                "completion_mode": "commit",
+                "completion_mode_attempt_id": "T001-A001",
+                "completion_mode_ack_event_id": "ack-initial",
+                "completion_mode_probe": probe,
+            }
+
+        self.assertEqual(
+            hloop.approved_semantic_ack_event_id("T001", message_state()),
+            "ack-message",
+        )
+
+        mutations = {
+            "barrier attempt": lambda state: state["semantic_ack_barrier"].update(
+                attempt_id="T001-A002"
+            ),
+            "message identity": lambda state: state["semantic_ack_barrier"].update(
+                message_id="not-a-uuid"
+            ),
+            "report identity status": lambda state: state["semantic_ack_barrier"].update(
+                report_identity_status="rebinding"
+            ),
+            "report identity attempt": lambda state: state["semantic_ack_barrier"].update(
+                report_identity_attempt_id="T001-A002"
+            ),
+            "active report digest": lambda state: state.update(
+                active_report_contract_digest="b" * 64
+            ),
+            "rendered exchange digest": lambda state: state["semantic_ack_barrier"].update(
+                rendered_exchange_digest="b" * 64
+            ),
+            "ACK sequence floor": lambda state: state["semantic_ack_barrier"].update(
+                ack_sequence=7,
+                semantic_decision={
+                    "status": "approved",
+                    "ack_event_id": "ack-message",
+                    "ack_sequence": 7,
+                },
+            ),
+            "boolean decision sequence": lambda state: state[
+                "semantic_ack_barrier"
+            ].update(
+                ack_sequence=1,
+                required_reack_after_sequence=0,
+                semantic_decision={
+                    "status": "approved",
+                    "ack_event_id": "ack-message",
+                    "ack_sequence": True,
+                },
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(binding=name):
+                state = message_state()
+                mutate(state)
+                with self.assertRaises(hloop.HLoopError):
+                    hloop.approved_semantic_ack_event_id("T001", state)
+
+        unknown = message_state()
+        unknown["semantic_ack_barrier"]["kind"] = "future-kind"
+        with self.assertRaisesRegex(hloop.HLoopError, "unsupported structured barrier kind"):
+            hloop.approved_semantic_ack_event_id("T001", unknown)
+
     def test_role_ack_status_emits_event_and_only_manager_consumer_applies(self):
         manager_next = hloop.build_parser().parse_args(["manager", "next"])
         self.assertTrue(hloop.command_requires_loop_lock(manager_next))
@@ -1429,6 +1705,108 @@ class SemanticAckTests(unittest.TestCase):
                     manager_state, application_event
                 )
             )
+
+    def test_ack_status_explicit_manager_repo_reads_canonical_state_from_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager_repo = root / "manager"
+            role_repo = root / "worker"
+            unrelated_repo = root / "unrelated"
+            manager_repo.mkdir()
+            subprocess.run(
+                ["git", "init", "--initial-branch=main"],
+                cwd=manager_repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=manager_repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=manager_repo,
+                check=True,
+            )
+            (manager_repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=manager_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=manager_repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(role_repo), "HEAD"],
+                cwd=manager_repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            digest = "a" * 64
+            canonical = {
+                "run_id": "run-current",
+                "tasks": {
+                    "T001": {
+                        "attempt_id": "T001-A001",
+                        "active_attempt_id": "T001-A001",
+                        "completion_mode": "commit",
+                        "semantic_ack_barrier": {
+                            "message_id": "initial:T001-A001",
+                            "digest": digest,
+                            "status": "approved",
+                            "semantic_decision": {
+                                "status": "approved",
+                                "ack_event_id": "ack-current",
+                            },
+                            "approval_application": {"status": "pending"},
+                        },
+                    }
+                },
+            }
+            hloop.save_state(manager_repo, canonical)
+            hloop.save_state(role_repo, {"run_id": "run-stale", "tasks": {}})
+            args = argparse.Namespace(
+                repo=str(role_repo),
+                manager_repo=str(manager_repo),
+                run_id="run-current",
+                agent_id="T001",
+                attempt_id="T001-A001",
+                acknowledge=False,
+                apply=False,
+                json=False,
+                _return_payload=True,
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("HLOOP_MANAGER_REPO", None)
+                os.environ.pop("HLOOP_ROLE_ID", None)
+                os.environ.pop("HLOOP_ROLE_ATTEMPT_ID", None)
+                payload = hloop.cmd_agent_ack_status(args)
+            self.assertEqual(payload["message_id"], "initial:T001-A001")
+            self.assertEqual(
+                payload["semantic_decision"]["ack_event_id"], "ack-current"
+            )
+
+            stale_run = argparse.Namespace(**{**vars(args), "run_id": "run-stale"})
+            with self.assertRaisesRegex(hloop.HLoopError, "run mismatch"):
+                hloop.cmd_agent_ack_status(stale_run)
+
+            unrelated_repo.mkdir()
+            subprocess.run(
+                ["git", "init", "--initial-branch=main"],
+                cwd=unrelated_repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            wrong_repo = argparse.Namespace(
+                **{**vars(args), "manager_repo": str(unrelated_repo)}
+            )
+            with self.assertRaisesRegex(hloop.HLoopError, "do not share Git metadata"):
+                hloop.cmd_agent_ack_status(wrong_repo)
 
     def test_manager_rejects_stale_ack_application_event(self):
         ack_event_id = "11111111-1111-4111-8111-111111111111"

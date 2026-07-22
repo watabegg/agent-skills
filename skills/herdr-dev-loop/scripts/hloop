@@ -215,7 +215,7 @@ ADVISOR_VERDICTS = {
     "no-action",
     "blocked",
 }
-DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 1_000
+DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS = 2_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS = 5_000
 DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS = 2
 DEFAULT_PUMP_SLEEP_MS = 2_000
@@ -440,6 +440,15 @@ class ManagerMessageDeliveryUnknown(HLoopError):
     not be visually confirmed.  This is distinct from a confirmed failure: the
     caller must not treat it as ``undelivered`` and silently auto-retry it."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        transport: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.transport = dict(transport or {})
+
 
 SKILL_VERSION = read_skill_version()
 
@@ -447,6 +456,7 @@ SKILL_VERSION = read_skill_version()
 MESSAGE_DELIVERY_STATUSES = frozenset(
     {"delivered", "acknowledged", "applied", "undelivered", "unknown", "superseded"}
 )
+MESSAGE_DELIVERY_FILTER_STATUSES = MESSAGE_DELIVERY_STATUSES | {"malformed"}
 REPORT_WAKE_TYPES = hloop_supervisor.WAKE_REPORT_TYPES
 
 
@@ -3240,7 +3250,7 @@ def command_requires_loop_lock(args: argparse.Namespace) -> bool:
             return False
         return True
     if command == "message":
-        return True
+        return getattr(args, "message_command", "") != "list"
     if command == "inbox":
         return getattr(args, "inbox_command", "") == "ack"
     if command == "manager":
@@ -6910,7 +6920,175 @@ def agent_tui_blocker(provider: str, pane: dict[str, Any] | None, text: str) -> 
     return None
 
 
+MANAGER_MESSAGE_TRANSPORT_FINGERPRINT_LENGTH = 20
+MANAGER_MESSAGE_START_PATTERN = re.compile(
+    r"^HERDR_LOOP_MESSAGE_START:([0-9a-f]{20})$",
+    re.MULTILINE,
+)
+MANAGER_MESSAGE_END_PATTERN = re.compile(
+    r"^HERDR_LOOP_MESSAGE_END:([0-9a-f]{20}):([0-9a-f]{20})$",
+    re.MULTILINE,
+)
+LEGACY_MANAGER_MESSAGE_START_PATTERN = re.compile(
+    r"^HERDR_LOOP_MESSAGE_START:([^:\r\n]+):([^:\r\n]+):([^:\r\n]+):([0-9a-f-]{36})$",
+    re.MULTILINE,
+)
+LEGACY_MANAGER_MESSAGE_END_PATTERN = re.compile(
+    r"^HERDR_LOOP_MESSAGE_END:([^:\r\n]+):([^:\r\n]+):([^:\r\n]+):([0-9a-f-]{36}):([0-9a-f]{64})$",
+    re.MULTILINE,
+)
+MANAGER_MESSAGE_CONTEXT_PATTERN = re.compile(
+    r"^Manager message context: run=([^\s]+) role=([^\s]+) attempt=([^\s]+)$",
+    re.MULTILINE,
+)
+MANAGER_MESSAGE_ID_PATTERN = re.compile(
+    r"^Manager message id: ([0-9a-f-]{36})$",
+    re.MULTILINE,
+)
+
+
+def manager_message_transport_fingerprint(
+    run_id: str, role_id: str, attempt_id: str, message_id: str
+) -> str:
+    identity = "\0".join((run_id, role_id, attempt_id, message_id))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[
+        :MANAGER_MESSAGE_TRANSPORT_FINGERPRINT_LENGTH
+    ]
+
+
+def manager_message_payload_fingerprint(
+    transport_fingerprint: str, payload_digest: str
+) -> str:
+    identity = f"{transport_fingerprint}\0{payload_digest}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[
+        :MANAGER_MESSAGE_TRANSPORT_FINGERPRINT_LENGTH
+    ]
+
+
+def manager_message_transport_identity(message: str) -> dict[str, str] | None:
+    stripped_message = message.rstrip("\r\n")
+    lines = stripped_message.splitlines()
+    if len(lines) < 5:
+        return None
+    start = MANAGER_MESSAGE_START_PATTERN.fullmatch(lines[0])
+    message_id_match = MANAGER_MESSAGE_ID_PATTERN.fullmatch(lines[1])
+    context = MANAGER_MESSAGE_CONTEXT_PATTERN.fullmatch(lines[2])
+    end = MANAGER_MESSAGE_END_PATTERN.fullmatch(lines[-1])
+    if all(item is not None for item in (start, message_id_match, context, end)):
+        assert start is not None
+        assert message_id_match is not None
+        assert context is not None
+        assert end is not None
+        run_id, role_id, attempt_id = context.groups()
+        message_id = message_id_match.group(1)
+        transport_fingerprint = manager_message_transport_fingerprint(
+            run_id, role_id, attempt_id, message_id
+        )
+        if start.group(1) != transport_fingerprint or end.group(1) != transport_fingerprint:
+            return None
+        end_index = stripped_message.rfind(end.group(0))
+        if end_index < 0:
+            return None
+        payload = message[:end_index]
+        payload_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        payload_fingerprint = manager_message_payload_fingerprint(
+            transport_fingerprint, payload_digest
+        )
+        if end.group(2) != payload_fingerprint:
+            return None
+        ack_marker = f"HERDR_LOOP_MESSAGE_ACK:{transport_fingerprint}"
+        if lines[3] != f"Before acting, print exactly: {ack_marker}":
+            return None
+        return {
+            "run_id": run_id,
+            "role_id": role_id,
+            "attempt_id": attempt_id,
+            "message_id": message_id,
+            "transport_fingerprint": transport_fingerprint,
+            "payload_fingerprint": payload_fingerprint,
+            "start_marker": start.group(0),
+            "end_marker": end.group(0),
+            "payload_digest": payload_digest,
+            "ack_marker": ack_marker,
+        }
+
+    legacy_start = LEGACY_MANAGER_MESSAGE_START_PATTERN.fullmatch(lines[0])
+    legacy_end = LEGACY_MANAGER_MESSAGE_END_PATTERN.fullmatch(lines[-1])
+    if legacy_start is None or legacy_end is None:
+        return None
+    if legacy_start.groups() != legacy_end.groups()[:4]:
+        return None
+    end_index = stripped_message.rfind(legacy_end.group(0))
+    if end_index < 0:
+        return None
+    payload = message[:end_index]
+    payload_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if payload_digest != legacy_end.group(5):
+        return None
+    run_id, role_id, attempt_id, message_id = legacy_start.groups()
+    return {
+        "run_id": run_id,
+        "role_id": role_id,
+        "attempt_id": attempt_id,
+        "message_id": message_id,
+        "transport_fingerprint": "",
+        "payload_fingerprint": "",
+        "start_marker": legacy_start.group(0),
+        "end_marker": legacy_end.group(0),
+        "payload_digest": payload_digest,
+        "ack_marker": "HERDR_LOOP_MESSAGE_ACK:" + ":".join(legacy_start.groups()),
+    }
+
+
+def strip_manager_message_end_marker(message: str) -> str:
+    identity = manager_message_transport_identity(message)
+    if identity is None:
+        return message
+    end_index = message.rfind(identity["end_marker"])
+    if end_index < 0:
+        return message
+    return message[:end_index]
+
+
+def finalize_manager_message_envelope(message: str) -> str:
+    message = strip_manager_message_end_marker(message)
+    first_line = message.splitlines()[0] if message.splitlines() else ""
+    start = MANAGER_MESSAGE_START_PATTERN.fullmatch(first_line)
+    payload = message.rstrip() + "\n"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if start is not None:
+        transport_fingerprint = start.group(1)
+        payload_fingerprint = manager_message_payload_fingerprint(
+            transport_fingerprint, digest
+        )
+        end_marker = (
+            f"HERDR_LOOP_MESSAGE_END:{transport_fingerprint}:"
+            f"{payload_fingerprint}"
+        )
+    else:
+        legacy_start = LEGACY_MANAGER_MESSAGE_START_PATTERN.fullmatch(first_line)
+        if legacy_start is None:
+            raise HLoopError("Manager message start marker is missing or ambiguous")
+        end_marker = (
+            "HERDR_LOOP_MESSAGE_END:"
+            + ":".join(legacy_start.groups())
+            + f":{digest}"
+        )
+    return payload + end_marker + "\n"
+
+
+def manager_message_pane_line_budget(message: str) -> int:
+    logical_lines = len(message.splitlines()) or 1
+    wrapped_lines = (len(message.encode("utf-8")) + 79) // 80
+    return min(5_000, max(160, logical_lines * 3 + 40, wrapped_lines + 80))
+
+
 def message_anchors(message: str) -> list[str]:
+    transport = manager_message_transport_identity(message)
+    if transport is not None:
+        return [transport["start_marker"], transport["end_marker"]]
+    if "HERDR_LOOP_MESSAGE_START:" in message or "HERDR_LOOP_MESSAGE_END:" in message:
+        return []
     anchors: list[str] = []
     for line in message.splitlines():
         stripped = line.strip()
@@ -6937,6 +7115,38 @@ def codex_output_after_message(message: str, text: str) -> bool:
         return False
     after = text[index + len(anchors[-1]) :]
     return "\n• " in after
+
+
+def exact_message_ack_after_message(message: str, text: str) -> bool:
+    transport = manager_message_transport_identity(message)
+    if transport is None:
+        return False
+    end_index = text.rfind(transport["end_marker"])
+    if end_index < 0:
+        return False
+    after = text[end_index + len(transport["end_marker"]) :]
+    return bool(
+        re.search(
+            rf"(?m)^[^\S\r\n]*{re.escape(transport['ack_marker'])}[^\S\r\n]*$",
+            after,
+        )
+    )
+
+
+def working_marker_after_message(message: str, text: str) -> bool:
+    transport = manager_message_transport_identity(message)
+    if transport is not None:
+        marker = transport["end_marker"]
+    else:
+        anchors = message_anchors(message)
+        if not anchors:
+            return False
+        marker = anchors[-1]
+    end_index = text.rfind(marker)
+    if end_index < 0:
+        return False
+    after = text[end_index + len(marker) :]
+    return "esc to interrupt" in after or "• Working" in after
 
 
 def agent_output_after_message(provider: str, message: str, text: str) -> bool:
@@ -6976,12 +7186,57 @@ def wait_agent_tui_ready(provider: str, pane_id: str, timeout_ms: int) -> tuple[
 def wait_manager_message_visible(pane_id: str, message: str, timeout_ms: int) -> str:
     deadline = time.monotonic() + max(0, timeout_ms) / 1000
     while True:
-        text = pane_text(pane_id)
+        text = pane_text(pane_id, lines=manager_message_pane_line_budget(message))
         if message_visible_in_text(message, text):
             return text
         if time.monotonic() >= deadline:
             raise HLoopError("manager message was not visible in the Codex input after send-text")
         time.sleep(0.2)
+
+
+def wait_manager_message_marker_visible(
+    pane_id: str,
+    marker: str,
+    *,
+    lines: int,
+    timeout_ms: int,
+) -> str:
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    while True:
+        text = pane_text(pane_id, lines=lines)
+        if marker in text:
+            return text
+        if time.monotonic() >= deadline:
+            raise HLoopError(
+                f"Manager message marker was not visible after send-text: {marker}"
+            )
+        time.sleep(0.2)
+
+
+def manager_message_transport_segments(
+    message: str,
+) -> tuple[str, str, str] | None:
+    identity = manager_message_transport_identity(message)
+    if identity is None or not identity.get("transport_fingerprint"):
+        return None
+    start_marker = identity["start_marker"]
+    end_marker = identity["end_marker"]
+    start_index = message.find(start_marker)
+    end_index = message.rfind(end_marker)
+    start_end = start_index + len(start_marker)
+    if (
+        start_index != 0
+        or end_index < 0
+        or start_end >= len(message)
+        or message[start_end] != "\n"
+    ):
+        return None
+    start_chunk = message[: start_end + 1]
+    body_chunk = message[start_end + 1 : end_index]
+    end_chunk = message[end_index:]
+    if start_chunk + body_chunk + end_chunk != message or not body_chunk:
+        return None
+    return start_chunk, body_chunk, end_chunk
 
 
 def manager_message_submitted(
@@ -6992,31 +7247,190 @@ def manager_message_submitted(
     initial_session_id: str | None,
     timeout_ms: int,
 ) -> bool:
+    del typed_snapshot
     deadline = time.monotonic() + max(0, timeout_ms) / 1000
     while True:
-        pane = pane_info(pane_id)
-        text = pane_text(pane_id)
+        observation = same_agent_session_observation(
+            provider,
+            pane_id,
+            initial_session_id,
+            lines=manager_message_pane_line_budget(message),
+        )
+        if observation is None:
+            return False
+        pane, text = observation
+        if exact_message_ack_after_message(message, text):
+            return True
+        # Claude panes may transiently be reported as ``shell`` while the TUI
+        # starts or exits.  Generic shell activity is not evidence that the
+        # addressed Claude session accepted this exact message; only the bound
+        # ACK marker is authoritative until the provider is observed again.
+        if str(pane.get("agent") or "") == "shell":
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+            continue
         status = str((pane or {}).get("agent_status") or "unknown")
-        session_id = extract_agent_session_id(pane)
-        if status in {"working", "blocked"} or "esc to interrupt" in text or "• Working" in text:
+        if status == "working" or working_marker_after_message(message, text):
             return True
         if agent_output_after_message(provider, message, text):
-            return True
-        if (
-            normalize_agent_provider(provider) == "codex"
-            and text != typed_snapshot
-            and message_visible_in_text(message, text)
-        ):
-            # Codex can move the submitted input into the transcript before it
-            # exposes a Working marker or assistant bullet.  The changed pane
-            # snapshot plus the still-visible exact input is transport evidence;
-            # classifying it as undelivered would make a retry duplicate work.
-            return True
-        if session_id and session_id != initial_session_id and text != typed_snapshot:
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.25)
+
+
+def same_agent_session_observation(
+    provider: str,
+    pane_id: str,
+    expected_session_id: str | None,
+    *,
+    lines: int = 160,
+    require_idle: bool = False,
+) -> tuple[dict[str, Any], str] | None:
+    """Return one session-stable pane/text observation, or fail closed.
+
+    The pane is sampled both before and after reading text so a TUI restart
+    during the read cannot authorize a control key against the replacement
+    session.  Generic UI words inside the staged Manager payload are not pane
+    state and therefore are not inspected here.
+    """
+
+    if not expected_session_id:
+        return None
+    normalized_provider = normalize_agent_provider(provider)
+
+    def matching(
+        pane: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], str] | None:
+        if extract_agent_session_id(dict(pane or {})) != expected_session_id:
+            return None
+        observed = dict(pane or {})
+        observed_provider = str(observed.get("agent") or "")
+        if not observed_provider:
+            return None
+        if normalized_provider == "codex":
+            if observed_provider != "codex":
+                return None
+        elif observed_provider not in {normalized_provider, "shell"}:
+            return None
+        if require_idle and str(observed.get("agent_status") or "unknown") != "idle":
+            return None
+        return observed, observed_provider
+
+    before_match = matching(pane_info(pane_id))
+    if before_match is None:
+        return None
+    text = pane_text(pane_id, lines=lines)
+    after_match = matching(pane_info(pane_id))
+    if after_match is None or after_match[1] != before_match[1]:
+        return None
+    return after_match[0], text
+
+
+def same_idle_agent_session(
+    provider: str,
+    pane_id: str,
+    expected_session_id: str | None,
+    *,
+    lines: int = 160,
+) -> tuple[dict[str, Any], str] | None:
+    """Return one session-stable idle observation for a control-key gate."""
+
+    return same_agent_session_observation(
+        provider,
+        pane_id,
+        expected_session_id,
+        lines=lines,
+        require_idle=True,
+    )
+
+
+def manager_message_staged_for_retry(
+    provider: str,
+    pane_id: str,
+    message: str,
+    initial_session_id: str | None,
+) -> bool:
+    observation = same_idle_agent_session(
+        provider,
+        pane_id,
+        initial_session_id,
+        lines=manager_message_pane_line_budget(message),
+    )
+    if observation is None:
+        return False
+    _, text = observation
+    identity = manager_message_transport_identity(message)
+    if identity is None or not text.rstrip().endswith(identity["end_marker"]):
+        return False
+    return (
+        not exact_message_ack_after_message(message, text)
+        and not agent_output_after_message(provider, message, text)
+    )
+
+
+def manager_message_ready_for_submit(
+    provider: str,
+    pane_id: str,
+    message: str,
+    initial_session_id: str | None,
+) -> bool:
+    """Revalidate the exact staged input immediately before one Enter."""
+
+    if manager_message_transport_identity(message) is not None:
+        return manager_message_staged_for_retry(
+            provider,
+            pane_id,
+            message,
+            initial_session_id,
+        )
+    observation = same_idle_agent_session(
+        provider,
+        pane_id,
+        initial_session_id,
+        lines=manager_message_pane_line_budget(message),
+    )
+    if observation is None:
+        return False
+    _, text = observation
+    return message_visible_in_text(message, text) and not agent_output_after_message(
+        provider, message, text
+    )
+
+
+def manager_message_transport_evidence(
+    message: str,
+    *,
+    stage: str,
+    pane_session_id: str | None,
+    enter_attempts: int,
+    end_marker_staged: bool | None = None,
+) -> dict[str, Any]:
+    identity = manager_message_transport_identity(message) or {}
+    if end_marker_staged is None:
+        end_marker_staged = stage in {"typed-confirmed", "submit-confirmed"}
+    if not isinstance(end_marker_staged, bool):
+        raise HLoopError("Manager message end-marker staging evidence must be boolean")
+    return {
+        "transport_stage": stage,
+        "pane_session_id": str(pane_session_id or ""),
+        "enter_attempts": max(0, int(enter_attempts)),
+        "run_id": str(identity.get("run_id") or ""),
+        "role_id": str(identity.get("role_id") or ""),
+        "attempt_id": str(identity.get("attempt_id") or ""),
+        "message_id": str(identity.get("message_id") or ""),
+        "transport_fingerprint": str(
+            identity.get("transport_fingerprint") or ""
+        ),
+        "payload_fingerprint": str(
+            identity.get("payload_fingerprint") or ""
+        ),
+        "start_marker": str(identity.get("start_marker") or ""),
+        "end_marker": str(identity.get("end_marker") or ""),
+        "end_marker_staged": end_marker_staged,
+        "payload_digest": str(identity.get("payload_digest") or ""),
+    }
 
 
 def send_codex_tui_message(
@@ -7026,8 +7440,8 @@ def send_codex_tui_message(
     input_settle_ms: int,
     submit_verify_ms: int,
     submit_attempts: int,
-) -> None:
-    send_agent_tui_message(
+) -> dict[str, Any]:
+    return send_agent_tui_message(
         "codex",
         pane_id,
         message,
@@ -7046,34 +7460,249 @@ def send_agent_tui_message(
     input_settle_ms: int,
     submit_verify_ms: int,
     submit_attempts: int,
-) -> None:
+) -> dict[str, Any]:
     provider = normalize_agent_provider(provider)
     if not message.strip():
         raise HLoopError("manager message is empty")
     check_herdr_env()
     initial_pane, _ = wait_agent_tui_ready(provider, pane_id, timeout_ms)
     initial_session_id = extract_agent_session_id(initial_pane)
-    try:
-        run_cmd(["herdr", "pane", "send-text", pane_id, message], check=True, capture=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise HLoopError("manager message could not be typed into the agent pane") from exc
-    try:
-        typed_snapshot = wait_manager_message_visible(
-            pane_id,
-            message,
-            max(input_settle_ms, 1_000),
+    line_budget = manager_message_pane_line_budget(message)
+    segments = (
+        manager_message_transport_segments(message)
+        if provider == "codex"
+        else None
+    )
+    if not initial_session_id:
+        raise HLoopError(
+            "Manager message delivery requires a non-empty agent "
+            "pane session id before typing"
         )
+    identity = manager_message_transport_identity(message)
+    end_marker_staged = False
+    if segments is not None:
+        if identity is None:
+            raise HLoopError("Manager message transport identity changed before send")
+        if (
+            same_idle_agent_session(
+                provider,
+                pane_id,
+                initial_session_id,
+                lines=line_budget,
+            )
+            is None
+        ):
+            raise HLoopError(
+                "Manager message pane changed or became busy before any text was typed"
+            )
+    try:
+        if segments is None:
+            run_cmd(
+                ["herdr", "pane", "send-text", pane_id, message],
+                check=True,
+                capture=True,
+            )
+            end_marker_staged = identity is not None
+        else:
+            start_chunk, body_chunk, end_chunk = segments
+            assert identity is not None
+            run_cmd(
+                ["herdr", "pane", "send-text", pane_id, start_chunk],
+                check=True,
+                capture=True,
+            )
+            wait_manager_message_marker_visible(
+                pane_id,
+                identity["start_marker"],
+                lines=line_budget,
+                timeout_ms=max(input_settle_ms, 1_000),
+            )
+            start_observation = same_idle_agent_session(
+                provider,
+                pane_id,
+                initial_session_id,
+                lines=line_budget,
+            )
+            if (
+                start_observation is None
+                or identity["start_marker"] not in start_observation[1]
+            ):
+                raise ManagerMessageDeliveryUnknown(
+                    "Manager message pane changed, became busy, or no longer showed "
+                    "the exact start marker before the body was typed",
+                    transport=manager_message_transport_evidence(
+                        message,
+                        stage="send-text-started",
+                        pane_session_id=initial_session_id,
+                        enter_attempts=0,
+                        end_marker_staged=end_marker_staged,
+                    ),
+                )
+            run_cmd(
+                ["herdr", "pane", "send-text", pane_id, body_chunk],
+                check=True,
+                capture=True,
+            )
+            body_observation = same_idle_agent_session(
+                provider,
+                pane_id,
+                initial_session_id,
+                lines=line_budget,
+            )
+            if (
+                body_observation is None
+                or identity["start_marker"] not in body_observation[1]
+            ):
+                raise ManagerMessageDeliveryUnknown(
+                    "Manager message pane changed, became busy, or no longer showed "
+                    "the exact start marker after the body was typed; the end marker "
+                    "was not sent",
+                    transport=manager_message_transport_evidence(
+                        message,
+                        stage="send-text-started",
+                        pane_session_id=initial_session_id,
+                        enter_attempts=0,
+                        end_marker_staged=end_marker_staged,
+                    ),
+                )
+            run_cmd(
+                ["herdr", "pane", "send-text", pane_id, end_chunk],
+                check=True,
+                capture=True,
+            )
+            end_marker_staged = True
+            ctrl_e_observation = same_idle_agent_session(
+                provider,
+                pane_id,
+                initial_session_id,
+                lines=line_budget,
+            )
+            if ctrl_e_observation is None or not any(
+                marker in ctrl_e_observation[1]
+                for marker in (identity["start_marker"], identity["end_marker"])
+            ):
+                raise ManagerMessageDeliveryUnknown(
+                    "Manager message pane changed or no longer showed the staged "
+                    "message before Ctrl+E; no control key was sent",
+                    transport=manager_message_transport_evidence(
+                        message,
+                        stage="send-text-started",
+                        pane_session_id=initial_session_id,
+                        enter_attempts=0,
+                        end_marker_staged=end_marker_staged,
+                    ),
+                )
+            # Codex can keep a long multiline input viewport pinned near its
+            # beginning even though later pasted text is present.  Moving the
+            # cursor to the logical end refreshes that viewport without
+            # changing or submitting the staged message, so the compact end
+            # marker can be verified before any Enter is sent.
+            try:
+                run_cmd(
+                    ["herdr", "pane", "send-keys", pane_id, "Ctrl+E"],
+                    check=True,
+                    capture=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise ManagerMessageDeliveryUnknown(
+                    "structured Manager message Ctrl+E refresh failed after the "
+                    "body was typed; delivery is unknown and no Enter was sent",
+                    transport=manager_message_transport_evidence(
+                        message,
+                        stage="send-text-started",
+                        pane_session_id=initial_session_id,
+                        enter_attempts=0,
+                        end_marker_staged=end_marker_staged,
+                    ),
+                ) from exc
+            wait_manager_message_marker_visible(
+                pane_id,
+                identity["end_marker"],
+                lines=line_budget,
+                timeout_ms=max(input_settle_ms, 1_000),
+            )
+            typed_observation = same_idle_agent_session(
+                provider,
+                pane_id,
+                initial_session_id,
+                lines=line_budget,
+            )
+            if (
+                typed_observation is None
+                or not typed_observation[1].rstrip().endswith(identity["end_marker"])
+            ):
+                raise ManagerMessageDeliveryUnknown(
+                    "Manager message pane changed or the exact staged input was lost "
+                    "before submission",
+                    transport=manager_message_transport_evidence(
+                        message,
+                        stage="send-text-started",
+                        pane_session_id=initial_session_id,
+                        enter_attempts=0,
+                        end_marker_staged=end_marker_staged,
+                    ),
+                )
+            typed_snapshot = typed_observation[1]
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ManagerMessageDeliveryUnknown(
+            "a Manager message send-text operation was attempted but could not be "
+            "confirmed; delivery is unknown and must not be auto-retried",
+            transport=manager_message_transport_evidence(
+                message,
+                stage="send-text-started",
+                pane_session_id=initial_session_id,
+                enter_attempts=0,
+                end_marker_staged=end_marker_staged if segments is not None else False,
+            ),
+        ) from exc
+    except ManagerMessageDeliveryUnknown:
+        raise
     except HLoopError as exc:
         raise ManagerMessageDeliveryUnknown(
-            "send-text succeeded but input visibility could not be confirmed; "
-            "delivery is unknown and must not be auto-retried"
+            "send-text succeeded but sequential marker visibility could not be "
+            "confirmed; delivery is unknown and must not be auto-retried",
+            transport=manager_message_transport_evidence(
+                message,
+                stage="send-text-started",
+                pane_session_id=initial_session_id,
+                enter_attempts=0,
+                end_marker_staged=end_marker_staged,
+            ),
         ) from exc
-    if input_settle_ms > 0:
-        time.sleep(input_settle_ms / 1000)
-    attempts = max(1, submit_attempts)
+    if segments is None:
+        try:
+            typed_snapshot = wait_manager_message_visible(
+                pane_id,
+                message,
+                max(input_settle_ms, 1_000),
+            )
+        except HLoopError as exc:
+            raise ManagerMessageDeliveryUnknown(
+                "send-text succeeded but input visibility could not be confirmed; "
+                "delivery is unknown and must not be auto-retried",
+                transport=manager_message_transport_evidence(
+                    message,
+                    stage="send-text-started",
+                    pane_session_id=initial_session_id,
+                    enter_attempts=0,
+                    end_marker_staged=end_marker_staged,
+                ),
+            ) from exc
+    attempts = min(2, max(1, submit_attempts))
+    enter_attempts = 0
     try:
         for attempt in range(attempts):
+            if input_settle_ms > 0:
+                time.sleep(input_settle_ms / 1000)
+            if not manager_message_ready_for_submit(
+                provider,
+                pane_id,
+                message,
+                initial_session_id,
+            ):
+                break
             run_cmd(["herdr", "pane", "send-keys", pane_id, "Enter"], check=True, capture=True)
+            enter_attempts += 1
             if manager_message_submitted(
                 provider,
                 pane_id,
@@ -7082,17 +7711,40 @@ def send_agent_tui_message(
                 initial_session_id,
                 submit_verify_ms,
             ):
-                return
-            if attempt + 1 < attempts and input_settle_ms > 0:
-                time.sleep(input_settle_ms / 1000)
+                return manager_message_transport_evidence(
+                    message,
+                    stage="submit-confirmed",
+                    pane_session_id=initial_session_id,
+                    enter_attempts=enter_attempts,
+                    end_marker_staged=end_marker_staged,
+                )
     except (HLoopError, OSError, subprocess.CalledProcessError) as exc:
         raise ManagerMessageDeliveryUnknown(
             "manager message was visibly typed before submission verification failed; "
-            "delivery is unknown and must not be auto-retried"
+            "delivery is unknown and must not be auto-retried",
+            transport=manager_message_transport_evidence(
+                message,
+                stage="typed-confirmed",
+                pane_session_id=initial_session_id,
+                enter_attempts=enter_attempts,
+                end_marker_staged=end_marker_staged,
+            ),
         ) from exc
+    delivery_error = (
+        "manager message input changed before Enter; no Enter was sent"
+        if enter_attempts == 0
+        else f"manager message was typed and Enter was sent {enter_attempts} time(s), "
+        "but submission could not be visually confirmed"
+    )
     raise ManagerMessageDeliveryUnknown(
-        f"manager message was typed and Enter was sent {attempts} time(s), but submission "
-        "could not be visually confirmed"
+        delivery_error,
+        transport=manager_message_transport_evidence(
+            message,
+            stage="typed-confirmed",
+            pane_session_id=initial_session_id,
+            enter_attempts=enter_attempts,
+            end_marker_staged=end_marker_staged,
+        ),
     )
 
 
@@ -7104,10 +7756,10 @@ def resend_pending_manager_messages(
     input_settle_ms: int,
     submit_verify_ms: int,
     submit_attempts: int,
-) -> tuple[int, int, int, list[Path]]:
+) -> tuple[int, int, int, int, list[Path]]:
     """Process one role's pending messages.
 
-    Return ``(resent, superseded, remaining, cleanup_after_save)``. Legacy
+    Return ``(resent, superseded, remaining, unknown, cleanup_after_save)``. Legacy
     unsafe ACK notices are removed from state before their pending files are
     deleted, so a failed state save leaves a safely retryable suppression.
 
@@ -7118,20 +7770,29 @@ def resend_pending_manager_messages(
     """
 
     pane_id = str(agent_state.get("pane_id") or "")
-    pending = agent_state.get("pending_manager_messages") or []
+    validate_manager_message_mutation_collections(agent_state)
+    raw_pending = agent_state.get("pending_manager_messages")
+    if raw_pending is not None and not isinstance(raw_pending, list):
+        raise HLoopError("pending_manager_messages must be a list before draining")
+    pending = raw_pending or []
     if not pane_id or not pending:
-        return 0, 0, 0, []
+        return 0, 0, 0, 0, []
     remaining: list[dict[str, Any]] = []
     resent = 0
     superseded = 0
+    unknown = 0
     cleanup_after_save: list[Path] = []
     marker = "## Message\n\n"
     for entry in pending:
+        if not isinstance(entry, dict):
+            raise HLoopError(
+                "pending_manager_messages entries must be objects before draining"
+            )
         if str(entry.get("status") or "undelivered") != "undelivered":
             remaining.append(entry)
             continue
-        pending_path = entry.get("pending_path")
-        full_path = repo / pending_path if pending_path else None
+        pending_path = str(entry.get("pending_path") or "")
+        full_path = safe_repo_path(repo, pending_path) if pending_path else None
         if full_path is None or not full_path.exists():
             entry["error"] = "pending Manager message file is missing"
             remaining.append(entry)
@@ -7141,6 +7802,19 @@ def resend_pending_manager_messages(
         message = content[offset + len(marker) :] if offset != -1 else content
         message_id = str(entry.get("message_id") or "")
         original = manager_message_by_id(agent_state, message_id) if message_id else None
+        unknown_ids = {
+            str(marker.get("message_id") or "")
+            for marker in agent_state.get("unknown_manager_messages") or []
+            if isinstance(marker, Mapping)
+        }
+        if original is not None and (
+            str(original.get("delivery_status") or "") != "undelivered"
+            or message_id in unknown_ids
+        ):
+            raise HLoopError(
+                "pending Manager-message evidence conflicts with its durable "
+                f"delivery state: {message_id or '<missing-id>'}"
+            )
         source = str(entry.get("source") or (original or {}).get("source") or "")
         if (
             source == "semantic-ack-resolution"
@@ -7169,7 +7843,7 @@ def resend_pending_manager_messages(
             superseded += 1
             continue
         try:
-            send_agent_tui_message(
+            transport = send_agent_tui_message(
                 str(agent_state.get("agent_provider") or DEFAULT_AGENT_PROVIDER),
                 pane_id,
                 message,
@@ -7180,6 +7854,7 @@ def resend_pending_manager_messages(
             )
         except ManagerMessageDeliveryUnknown as exc:
             if original is not None:
+                apply_manager_message_transport(original, exc.transport)
                 transition_manager_message(
                     agent_state,
                     original,
@@ -7193,6 +7868,7 @@ def resend_pending_manager_messages(
                     message,
                     delivery_status="unknown",
                     delivery_error=str(exc),
+                    transport=exc.transport,
                 )
             agent_state.setdefault("unknown_manager_messages", []).append(
                 {
@@ -7206,23 +7882,28 @@ def resend_pending_manager_messages(
                 full_path.unlink()
             except OSError:
                 pass
+            unknown += 1
             continue
         except HLoopError:
             remaining.append(entry)
             continue
         if original is not None:
+            if isinstance(transport, Mapping):
+                apply_manager_message_transport(original, transport)
             transition_manager_message(
                 agent_state, original, delivery_status="delivered"
             )
         else:
-            record_manager_message(agent_state, "drain", message)
+            record_manager_message(
+                agent_state, "drain", message, transport=transport
+            )
         try:
             full_path.unlink()
         except OSError:
             pass
         resent += 1
     agent_state["pending_manager_messages"] = remaining
-    return resent, superseded, len(remaining), cleanup_after_save
+    return resent, superseded, len(remaining), unknown, cleanup_after_save
 
 
 def manager_message_from_args(args: argparse.Namespace) -> tuple[str, str]:
@@ -7247,7 +7928,11 @@ def manager_message_envelope(
     message_id = str(uuid.uuid4())
     run_id = str(state.get("run_id") or "")
     attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
-    ack = f"HERDR_LOOP_MESSAGE_ACK:{run_id}:{agent_id}:{attempt_id}:{message_id}"
+    transport_fingerprint = manager_message_transport_fingerprint(
+        run_id, agent_id, attempt_id, message_id
+    )
+    ack = f"HERDR_LOOP_MESSAGE_ACK:{transport_fingerprint}"
+    start = f"HERDR_LOOP_MESSAGE_START:{transport_fingerprint}"
     contract_notice = (
         "This message changes the task contract. Material work (a `done` finalize "
         "or merge) remains blocked after the Manager resolves the semantic ACK "
@@ -7256,10 +7941,13 @@ def manager_message_envelope(
         else ""
     )
     body = (
+        f"{start}\n"
         f"Manager message id: {message_id}\n"
+        f"Manager message context: run={run_id} role={agent_id} "
+        f"attempt={attempt_id}\n"
         f"Before acting, print exactly: {ack}\n\n{contract_notice}{message.rstrip()}\n"
     )
-    return message_id, body
+    return message_id, finalize_manager_message_envelope(body)
 
 
 def message_digest(message: str) -> str:
@@ -7274,6 +7962,7 @@ def record_manager_message(
     delivery_status: str = "delivered",
     delivery_error: str | None = None,
     pending_path: str | None = None,
+    transport: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if delivery_status not in MESSAGE_DELIVERY_STATUSES:
         raise HLoopError(f"unsupported message delivery status: {delivery_status}")
@@ -7288,6 +7977,22 @@ def record_manager_message(
         "delivery_status": delivery_status,
         "result": None,
     }
+    default_stage = (
+        "submit-confirmed"
+        if delivery_status in {"delivered", "acknowledged", "applied"}
+        else "unknown"
+    )
+    apply_manager_message_transport(
+        entry,
+        manager_message_transport_evidence(
+            message,
+            stage=default_stage,
+            pane_session_id=None,
+            enter_attempts=0,
+        ),
+    )
+    if isinstance(transport, Mapping):
+        apply_manager_message_transport(entry, transport)
     match = re.search(r"Manager message id: ([0-9a-f-]{36})", message)
     if match:
         entry["message_id"] = match.group(1)
@@ -7299,13 +8004,828 @@ def record_manager_message(
     return entry
 
 
+def apply_manager_message_transport(
+    entry: dict[str, Any], transport: Mapping[str, Any]
+) -> None:
+    stage = str(
+        transport.get("transport_stage")
+        or entry.get("transport_stage")
+        or "unknown"
+    )
+    if stage not in {
+        "send-text-started",
+        "typed-confirmed",
+        "submit-confirmed",
+        "unknown",
+    }:
+        raise HLoopError(f"unsupported Manager message transport stage: {stage}")
+    raw_attempts = transport.get(
+        "enter_attempts", entry.get("enter_attempts", 0)
+    )
+    if isinstance(raw_attempts, bool) or not isinstance(raw_attempts, int):
+        raise HLoopError("Manager message Enter attempts must be a non-negative integer")
+    if raw_attempts < 0:
+        raise HLoopError("Manager message Enter attempts must be a non-negative integer")
+    raw_end_marker_staged = transport.get(
+        "end_marker_staged", entry.get("end_marker_staged", False)
+    )
+    if not isinstance(raw_end_marker_staged, bool):
+        raise HLoopError("Manager message end-marker staging evidence must be boolean")
+    entry.update(
+        {
+            "transport_stage": stage,
+            "pane_session_id": str(
+                transport.get("pane_session_id")
+                if "pane_session_id" in transport
+                else entry.get("pane_session_id") or ""
+            ),
+            "enter_attempts": raw_attempts,
+            "run_id": str(
+                transport.get("run_id")
+                if "run_id" in transport
+                else entry.get("run_id") or ""
+            ),
+            "role_id": str(
+                transport.get("role_id")
+                if "role_id" in transport
+                else entry.get("role_id") or ""
+            ),
+            "attempt_id": str(
+                transport.get("attempt_id")
+                if "attempt_id" in transport
+                else entry.get("attempt_id") or ""
+            ),
+            "transport_fingerprint": str(
+                transport.get("transport_fingerprint")
+                if "transport_fingerprint" in transport
+                else entry.get("transport_fingerprint") or ""
+            ),
+            "payload_fingerprint": str(
+                transport.get("payload_fingerprint")
+                if "payload_fingerprint" in transport
+                else entry.get("payload_fingerprint") or ""
+            ),
+            "start_marker": str(
+                transport.get("start_marker")
+                if "start_marker" in transport
+                else entry.get("start_marker") or ""
+            ),
+            "end_marker": str(
+                transport.get("end_marker")
+                if "end_marker" in transport
+                else entry.get("end_marker") or ""
+            ),
+            "end_marker_staged": raw_end_marker_staged,
+            "payload_digest": str(
+                transport.get("payload_digest")
+                if "payload_digest" in transport
+                else entry.get("payload_digest") or ""
+            ),
+        }
+    )
+
+
 def manager_message_by_id(
     target_state: dict[str, Any], message_id: str
 ) -> dict[str, Any] | None:
-    for entry in reversed(target_state.get("manager_messages") or []):
-        if entry.get("message_id") == message_id:
+    raw_messages = target_state.get("manager_messages")
+    if raw_messages is None:
+        return None
+    if not isinstance(raw_messages, list):
+        raise HLoopError("Manager message records must be a list")
+    for entry in reversed(raw_messages):
+        if isinstance(entry, Mapping) and entry.get("message_id") == message_id:
             return entry
     return None
+
+
+def validate_manager_message_mutation_collections(
+    target_state: Mapping[str, Any],
+) -> None:
+    """Fail before a control key or status mutation if durable lists are corrupt."""
+
+    for key in (
+        "manager_messages",
+        "pending_manager_messages",
+        "unknown_manager_messages",
+        "manager_message_events",
+    ):
+        if key in target_state and not isinstance(target_state.get(key), list):
+            raise HLoopError(f"{key} must be a list before Manager-message recovery")
+
+
+def remove_unknown_manager_message_marker(
+    target_state: dict[str, Any], message_id: str
+) -> None:
+    """Remove one matching marker while preserving malformed legacy evidence."""
+
+    raw_markers = target_state.get("unknown_manager_messages")
+    if raw_markers is None:
+        target_state["unknown_manager_messages"] = []
+        return
+    if not isinstance(raw_markers, list):
+        raise HLoopError(
+            "unknown_manager_messages must be a list before Manager-message recovery"
+        )
+    target_state["unknown_manager_messages"] = [
+        item
+        for item in raw_markers
+        if not (
+            isinstance(item, Mapping)
+            and str(item.get("message_id") or "") == message_id
+        )
+    ]
+
+
+def detach_pending_manager_message_markers(
+    repo: Path, target_state: dict[str, Any], message_id: str
+) -> list[Path]:
+    """Remove exact pending markers from state and return files to clean later."""
+
+    raw_pending = target_state.get("pending_manager_messages")
+    if raw_pending is None:
+        target_state["pending_manager_messages"] = []
+        return []
+    if not isinstance(raw_pending, list):
+        raise HLoopError(
+            "pending_manager_messages must be a list before Manager-message recovery"
+        )
+    retained: list[Any] = []
+    pending_paths: list[Path] = []
+    for item in raw_pending:
+        if not (
+            isinstance(item, Mapping)
+            and str(item.get("message_id") or "") == message_id
+        ):
+            retained.append(item)
+            continue
+        pending_path = str(item.get("pending_path") or "")
+        if pending_path:
+            pending_paths.append(safe_repo_path(repo, pending_path))
+    target_state["pending_manager_messages"] = retained
+    return pending_paths
+
+
+def manager_message_record_identity(entry: Mapping[str, Any]) -> dict[str, str] | None:
+    start_marker = str(entry.get("start_marker") or "")
+    end_marker = str(entry.get("end_marker") or "")
+    start = MANAGER_MESSAGE_START_PATTERN.fullmatch(start_marker)
+    end = MANAGER_MESSAGE_END_PATTERN.fullmatch(end_marker)
+    if start is not None and end is not None and start.group(1) == end.group(1):
+        run_id = str(entry.get("run_id") or "")
+        role_id = str(entry.get("role_id") or "")
+        attempt_id = str(entry.get("attempt_id") or "")
+        message_id = str(entry.get("message_id") or "")
+        payload_digest = str(entry.get("payload_digest") or "")
+        transport_fingerprint = manager_message_transport_fingerprint(
+            run_id, role_id, attempt_id, message_id
+        )
+        payload_fingerprint = manager_message_payload_fingerprint(
+            transport_fingerprint, payload_digest
+        )
+        if (
+            not all((run_id, role_id, attempt_id, message_id, payload_digest))
+            or start.group(1) != transport_fingerprint
+            or end.group(2) != payload_fingerprint
+            or str(entry.get("transport_fingerprint") or "")
+            != transport_fingerprint
+            or str(entry.get("payload_fingerprint") or "")
+            != payload_fingerprint
+        ):
+            return None
+        return {
+            "run_id": run_id,
+            "role_id": role_id,
+            "attempt_id": attempt_id,
+            "message_id": message_id,
+            "transport_fingerprint": transport_fingerprint,
+            "payload_fingerprint": payload_fingerprint,
+            "start_marker": start_marker,
+            "end_marker": end_marker,
+            "payload_digest": payload_digest,
+            "ack_marker": f"HERDR_LOOP_MESSAGE_ACK:{transport_fingerprint}",
+        }
+
+    legacy_start = LEGACY_MANAGER_MESSAGE_START_PATTERN.fullmatch(start_marker)
+    legacy_end = LEGACY_MANAGER_MESSAGE_END_PATTERN.fullmatch(end_marker)
+    if (
+        legacy_start is None
+        or legacy_end is None
+        or legacy_start.groups() != legacy_end.groups()[:4]
+        or str(entry.get("message_id") or "") != legacy_start.group(4)
+        or str(entry.get("payload_digest") or "") != legacy_end.group(5)
+    ):
+        return None
+    return {
+        "run_id": legacy_start.group(1),
+        "role_id": legacy_start.group(2),
+        "attempt_id": legacy_start.group(3),
+        "message_id": legacy_start.group(4),
+        "transport_fingerprint": "",
+        "payload_fingerprint": "",
+        "start_marker": start_marker,
+        "end_marker": end_marker,
+        "payload_digest": legacy_end.group(5),
+        "ack_marker": "HERDR_LOOP_MESSAGE_ACK:"
+        + ":".join(legacy_start.groups()),
+    }
+
+
+def manager_message_transport_evidence_error(entry: Mapping[str, Any]) -> str:
+    """Return a fail-closed reason for malformed durable transport evidence."""
+
+    stage = str(entry.get("transport_stage") or "unknown")
+    if stage not in {
+        "send-text-started",
+        "typed-confirmed",
+        "submit-confirmed",
+        "unknown",
+    }:
+        return f"unsupported transport stage: {stage}"
+    attempts = entry.get("enter_attempts", 0)
+    if (
+        isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 0
+    ):
+        return "Enter attempts are not a non-negative integer"
+    end_marker_staged = entry.get("end_marker_staged", False)
+    if not isinstance(end_marker_staged, bool):
+        return "end-marker staging evidence is not boolean"
+    return ""
+
+
+def manager_message_transport_record_allows_submit(
+    entry: Mapping[str, Any],
+) -> bool:
+    """Return whether durable transport evidence permits Enter-only recovery.
+
+    This is deliberately limited to evidence recorded before live pane
+    observation.  ``message submit`` still performs the stronger current-run,
+    role, attempt, pane-session, staged-input, and idle checks immediately
+    before sending one Enter.
+    """
+
+    return bool(
+        str(entry.get("message_id") or "")
+        and manager_message_record_identity(entry) is not None
+        and not manager_message_transport_evidence_error(entry)
+        and str(entry.get("transport_stage") or "")
+        in {"send-text-started", "typed-confirmed"}
+        and str(entry.get("pane_session_id") or "")
+        and entry.get("end_marker_staged") is True
+    )
+
+
+def manager_message_selector_transport_role_ids(agent_id: str) -> set[str]:
+    """Return durable role ids accepted for one exact CLI role selector."""
+
+    accepted = {agent_id}
+    if agent_id in {"S001/decision", "S001/coverage"}:
+        # Both Scout modes historically shared S001.  Qualified selectors are
+        # needed once both historical role states coexist in STATE.json.
+        accepted.add("S001")
+    return accepted
+
+
+def manager_message_resolution_identity_error(
+    state: Mapping[str, Any],
+    agent_id: str,
+    agent_state: Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> str:
+    """Return why an explicit durable resolution is unsafe, if anything."""
+
+    identity = manager_message_record_identity(entry)
+    if identity is None:
+        return "transport identity is incomplete or invalid"
+    evidence_error = manager_message_transport_evidence_error(entry)
+    if evidence_error:
+        return "transport evidence is malformed: " + evidence_error
+    current_run_id = str(state.get("run_id") or "")
+    current_attempt_id = str(
+        agent_state.get("attempt_id")
+        or agent_state.get("active_attempt_id")
+        or ""
+    )
+    if not current_run_id or identity["run_id"] != current_run_id:
+        return "transport identity does not match the current run"
+    if identity["role_id"] not in manager_message_selector_transport_role_ids(
+        agent_id
+    ):
+        return "transport identity does not match the role state"
+    if not current_attempt_id or identity["attempt_id"] != current_attempt_id:
+        return "transport identity does not match the current attempt"
+    if identity["message_id"] != str(entry.get("message_id") or ""):
+        return "transport identity does not match the message id"
+    return ""
+
+
+def manager_message_submit_recovery_assessment(
+    state: Mapping[str, Any],
+    agent_id: str,
+    agent_state: Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Assess whether an inventory row may safely recommend ``message submit``.
+
+    No live pane read happens here.  A positive result means only that the
+    durable record is coherent enough to offer the fail-closed command; the
+    command itself must re-observe the pinned pane session and exact staged
+    end marker before sending Enter.
+    """
+
+    if str(entry.get("delivery_status") or "") != "unknown":
+        return False, "delivery status is not exactly unknown"
+    if not manager_message_transport_record_allows_submit(entry):
+        identity = manager_message_record_identity(entry)
+        if identity is None:
+            return False, "transport identity is incomplete or invalid"
+        evidence_error = manager_message_transport_evidence_error(entry)
+        if evidence_error:
+            return False, "transport evidence is malformed: " + evidence_error
+        if str(entry.get("transport_stage") or "") not in {
+            "send-text-started",
+            "typed-confirmed",
+        }:
+            return False, "transport stage does not prove a typed or possibly typed message"
+        if not str(entry.get("pane_session_id") or ""):
+            return False, "pinned pane session is missing"
+        if entry.get("end_marker_staged") is not True:
+            return False, "staged end-marker evidence is not exactly true"
+        return False, "message identity is missing"
+    resolution_error = manager_message_resolution_identity_error(
+        state, agent_id, agent_state, entry
+    )
+    if resolution_error:
+        return False, resolution_error
+    if not str(agent_state.get("pane_id") or ""):
+        return False, "role state has no pane for Enter-only recovery"
+    return True, "durable identity and staged transport evidence permit fail-closed pane inspection"
+
+
+def collect_manager_message_inventory(
+    state: Mapping[str, Any],
+    *,
+    status: str | None = None,
+    repo: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Collect read-only Manager-message rows from every supported role state."""
+
+    recovery_prefix = "hloop"
+    if repo is not None:
+        recovery_prefix = (
+            f"python3 {shlex.quote(str(Path(__file__).resolve()))} "
+            f"--repo {shlex.quote(str(repo.resolve()))} {loop_namespace_flag()}"
+        )
+    rows: list[dict[str, Any]] = []
+    for role, agent_id, agent_state in iter_all_roles(dict(state)):
+        role_running = bool(
+            agent_state.get("status") == "running"
+            or agent_state.get("gate_status") == "running"
+        )
+        raw_unknown = agent_state.get("unknown_manager_messages")
+        unknown_markers = raw_unknown if isinstance(raw_unknown, list) else []
+        if raw_unknown is not None and not isinstance(raw_unknown, list):
+            if status is None or status in {"unknown", "malformed"}:
+                rows.append(
+                    {
+                        "role": str(role),
+                        "role_id": str(agent_id),
+                        "message_id": "",
+                        "record_index": None,
+                        "record_status": "malformed-unknown-container",
+                        "delivery_status": "malformed",
+                        "recorded_delivery_status": "",
+                        "unknown_tracked": True,
+                        "transport_stage": "",
+                        "end_marker_staged": None,
+                        "pane_id": str(agent_state.get("pane_id") or ""),
+                        "pane_session_id": "",
+                        "attempt_id": "",
+                        "transport_role_id": "",
+                        "identity_valid": False,
+                        "source": "",
+                        "recorded_at": "",
+                        "delivery_error": "unknown_manager_messages is not a list",
+                        "recovery": "inspect state",
+                        "recovery_command": "",
+                        "recovery_guidance": (
+                            "Restore a valid unknown-message marker list from durable "
+                            "evidence; do not submit, resolve, drain, or resend any body."
+                        ),
+                        "recovery_requires_inspection": True,
+                        "recovery_reason": "unknown-message marker container is malformed",
+                    }
+                )
+        unknown_ids = {
+            str(item.get("message_id") or "")
+            for item in unknown_markers
+            if isinstance(item, Mapping) and str(item.get("message_id") or "")
+        }
+        raw_messages = agent_state.get("manager_messages")
+        messages = raw_messages if isinstance(raw_messages, list) else []
+        if raw_messages is not None and not isinstance(raw_messages, list):
+            if status is None or status in {"unknown", "malformed"}:
+                rows.append(
+                    {
+                        "role": str(role),
+                        "role_id": str(agent_id),
+                        "message_id": "",
+                        "record_index": None,
+                        "record_status": "malformed-container",
+                        "delivery_status": "malformed",
+                        "recorded_delivery_status": "",
+                        "unknown_tracked": bool(unknown_markers),
+                        "transport_stage": "",
+                        "end_marker_staged": None,
+                        "pane_id": str(agent_state.get("pane_id") or ""),
+                        "pane_session_id": "",
+                        "attempt_id": "",
+                        "transport_role_id": "",
+                        "identity_valid": False,
+                        "source": "",
+                        "recorded_at": "",
+                        "delivery_error": "manager_messages is not a list",
+                        "recovery": "inspect state",
+                        "recovery_command": "",
+                        "recovery_guidance": (
+                            "Restore a valid Manager-message list from durable evidence; "
+                            "do not submit, resolve, drain, or resend any body."
+                        ),
+                        "recovery_requires_inspection": True,
+                        "recovery_reason": "Manager-message container is malformed",
+                    }
+                )
+        seen_unknown_ids: set[str] = set()
+        for record_index, raw_entry in enumerate(messages):
+            entry = raw_entry if isinstance(raw_entry, Mapping) else {}
+            message_id = str(entry.get("message_id") or "")
+            unknown_tracked = bool(message_id and message_id in unknown_ids)
+            if unknown_tracked:
+                seen_unknown_ids.add(message_id)
+            raw_delivery_status = str(entry.get("delivery_status") or "")
+            transport_evidence_error = (
+                manager_message_transport_evidence_error(entry)
+                if isinstance(raw_entry, Mapping)
+                else "Manager-message record is not an object"
+            )
+            delivery_status = (
+                "malformed"
+                if transport_evidence_error
+                else "unknown"
+                if unknown_tracked
+                else raw_delivery_status
+                if raw_delivery_status in MESSAGE_DELIVERY_STATUSES
+                else "malformed"
+            )
+            if status is not None and not (
+                delivery_status == status
+                or (status == "unknown" and delivery_status == "malformed")
+            ):
+                continue
+            identity = manager_message_record_identity(entry)
+            recovery = ""
+            recovery_command = ""
+            recovery_guidance = ""
+            recovery_reason = ""
+            recovery_requires_inspection = False
+            if delivery_status == "unknown":
+                can_submit, recovery_reason = (
+                    manager_message_submit_recovery_assessment(
+                        state, str(agent_id), agent_state, entry
+                    )
+                )
+                if can_submit:
+                    recovery = "message submit"
+                    recovery_command = (
+                        f"{recovery_prefix} message submit {shlex.quote(str(agent_id))} "
+                        f"{shlex.quote(message_id)}"
+                    )
+                else:
+                    recovery_requires_inspection = True
+                    if identity is not None and message_id:
+                        recovery = "message resolve"
+                        resolution_prefix = (
+                            f"{recovery_prefix} message resolve "
+                            f"{shlex.quote(str(agent_id))} {shlex.quote(message_id)}"
+                        )
+                        recovery_guidance = (
+                            "After inspection, explicitly choose the observed outcome: "
+                            f"`{resolution_prefix} --status <acknowledged|superseded>` "
+                            f"or `{resolution_prefix} --status applied "
+                            "--result <observed-result>`. Leave it unknown when the "
+                            "outcome cannot be established."
+                        )
+                    else:
+                        recovery = "inspect state"
+                        recovery_guidance = (
+                            "Restore the exact durable message identity before any "
+                            "submit or resolution; do not resend the body."
+                        )
+            elif delivery_status == "undelivered":
+                if role_running:
+                    recovery = "message drain"
+                    recovery_command = f"{recovery_prefix} message drain"
+                    recovery_reason = (
+                        "delivery is durably confirmed as undelivered to a running role"
+                    )
+                else:
+                    resolution_error = manager_message_resolution_identity_error(
+                        state, str(agent_id), agent_state, entry
+                    )
+                    if not resolution_error and message_id:
+                        recovery = "message resolve"
+                        recovery_command = (
+                            f"{recovery_prefix} message resolve "
+                            f"{shlex.quote(str(agent_id))} {shlex.quote(message_id)} "
+                            "--status superseded"
+                        )
+                        recovery_reason = (
+                            "the addressed role is terminal, so the undelivered "
+                            "message must not be replayed"
+                        )
+                    else:
+                        recovery = "inspect state"
+                        recovery_requires_inspection = True
+                        recovery_reason = (
+                            resolution_error
+                            or "terminal undelivered message identity is incomplete"
+                        )
+                        recovery_guidance = (
+                            "Restore the exact current run, role, attempt, and message "
+                            "identity before explicitly superseding it; do not drain or "
+                            "resend the body to a terminal role."
+                        )
+            elif delivery_status == "malformed":
+                recovery = "inspect state"
+                recovery_requires_inspection = True
+                recovery_reason = (
+                    "delivery state or Manager-message record is malformed"
+                )
+                recovery_guidance = (
+                    "Inspect durable state and the pinned pane; do not submit, "
+                    "resolve, drain, or resend the body until exact identity and "
+                    "outcome are restored."
+                )
+            rows.append(
+                {
+                    "role": str(role),
+                    "role_id": str(agent_id),
+                    "role_running": role_running,
+                    "message_id": message_id,
+                    "record_index": record_index,
+                    "record_status": (
+                        "valid" if isinstance(raw_entry, Mapping) else "malformed"
+                    ),
+                    "delivery_status": delivery_status,
+                    "recorded_delivery_status": raw_delivery_status,
+                    "unknown_tracked": unknown_tracked,
+                    "transport_stage": str(entry.get("transport_stage") or ""),
+                    "end_marker_staged": (
+                        entry.get("end_marker_staged")
+                        if isinstance(entry.get("end_marker_staged"), bool)
+                        else None
+                    ),
+                    "pane_id": str(agent_state.get("pane_id") or ""),
+                    "pane_session_id": str(entry.get("pane_session_id") or ""),
+                    "attempt_id": str(entry.get("attempt_id") or ""),
+                    "transport_role_id": str((identity or {}).get("role_id") or ""),
+                    "identity_valid": identity is not None,
+                    "source": str(entry.get("source") or ""),
+                    "recorded_at": str(entry.get("sent_at") or entry.get("at") or ""),
+                    "delivery_error": str(entry.get("delivery_error") or ""),
+                    "transport_evidence_error": transport_evidence_error,
+                    "recovery": recovery,
+                    "recovery_command": recovery_command,
+                    "recovery_guidance": recovery_guidance,
+                    "recovery_requires_inspection": recovery_requires_inspection,
+                    "recovery_reason": recovery_reason,
+                }
+            )
+        raw_pending = agent_state.get("pending_manager_messages")
+        if raw_pending is not None and not isinstance(raw_pending, list):
+            if status is None or status in {"unknown", "malformed"}:
+                rows.append(
+                    {
+                        "role": str(role),
+                        "role_id": str(agent_id),
+                        "role_running": role_running,
+                        "message_id": "",
+                        "record_index": None,
+                        "record_status": "malformed-pending-container",
+                        "delivery_status": "malformed",
+                        "recorded_delivery_status": "",
+                        "unknown_tracked": False,
+                        "transport_stage": "",
+                        "end_marker_staged": None,
+                        "pane_id": str(agent_state.get("pane_id") or ""),
+                        "pane_session_id": "",
+                        "attempt_id": "",
+                        "transport_role_id": "",
+                        "identity_valid": False,
+                        "source": "pending-container",
+                        "recorded_at": "",
+                        "delivery_error": "pending_manager_messages is not a list",
+                        "recovery": "inspect state",
+                        "recovery_command": "",
+                        "recovery_guidance": (
+                            "Restore the pending-message marker list from durable "
+                            "evidence; do not drain, resolve, or resend any body."
+                        ),
+                        "recovery_requires_inspection": True,
+                        "recovery_reason": (
+                            "pending Manager-message container is malformed"
+                        ),
+                    }
+                )
+        elif isinstance(raw_pending, list):
+            message_records_by_id: dict[str, list[Mapping[str, Any]]] = {}
+            for raw_message in messages:
+                if not isinstance(raw_message, Mapping):
+                    continue
+                record_message_id = str(raw_message.get("message_id") or "")
+                if record_message_id:
+                    message_records_by_id.setdefault(record_message_id, []).append(
+                        raw_message
+                    )
+            for pending_index, raw_pending_entry in enumerate(raw_pending):
+                pending_entry = (
+                    raw_pending_entry
+                    if isinstance(raw_pending_entry, Mapping)
+                    else {}
+                )
+                pending_message_id = str(pending_entry.get("message_id") or "")
+                matching = message_records_by_id.get(pending_message_id, [])
+                pending_status = str(
+                    pending_entry.get("status") or "undelivered"
+                )
+                pending_path = str(pending_entry.get("pending_path") or "")
+                marker_error = ""
+                if not isinstance(raw_pending_entry, Mapping):
+                    marker_error = "pending Manager-message marker is not an object"
+                elif not pending_message_id:
+                    marker_error = "pending Manager-message marker has no message id"
+                elif pending_status != "undelivered":
+                    marker_error = (
+                        "pending Manager-message marker status is not undelivered"
+                    )
+                elif len(matching) != 1:
+                    marker_error = (
+                        "pending Manager-message marker does not match exactly one "
+                        "durable message record"
+                    )
+                elif str(matching[0].get("delivery_status") or "") != "undelivered":
+                    marker_error = (
+                        "pending Manager-message marker points to a non-undelivered "
+                        "message record"
+                    )
+                elif pending_path and str(matching[0].get("pending_path") or "") != pending_path:
+                    marker_error = (
+                        "pending Manager-message path does not match its durable record"
+                    )
+                if not marker_error:
+                    continue
+                if status is not None and status not in {"unknown", "malformed"}:
+                    continue
+                rows.append(
+                    {
+                        "role": str(role),
+                        "role_id": str(agent_id),
+                        "role_running": role_running,
+                        "message_id": pending_message_id,
+                        "record_index": None,
+                        "pending_marker_index": pending_index,
+                        "record_status": "malformed-pending-marker",
+                        "delivery_status": "malformed",
+                        "recorded_delivery_status": pending_status,
+                        "unknown_tracked": False,
+                        "transport_stage": "",
+                        "end_marker_staged": None,
+                        "pane_id": str(agent_state.get("pane_id") or ""),
+                        "pane_session_id": "",
+                        "attempt_id": "",
+                        "transport_role_id": "",
+                        "identity_valid": False,
+                        "source": "pending-marker",
+                        "recorded_at": str(pending_entry.get("at") or ""),
+                        "delivery_error": marker_error,
+                        "recovery": "inspect state",
+                        "recovery_command": "",
+                        "recovery_guidance": (
+                            "Reconcile this marker with exactly one undelivered durable "
+                            "message record before any drain or resolution."
+                        ),
+                        "recovery_requires_inspection": True,
+                        "recovery_reason": marker_error,
+                    }
+                )
+        for marker_index, marker in enumerate(unknown_markers):
+            marker_entry = marker if isinstance(marker, Mapping) else {}
+            message_id = str(marker_entry.get("message_id") or "")
+            if message_id and message_id in seen_unknown_ids:
+                continue
+            if status is not None and status != "unknown":
+                continue
+            rows.append(
+                {
+                    "role": str(role),
+                    "role_id": str(agent_id),
+                    "role_running": role_running,
+                    "message_id": message_id,
+                    "record_index": None,
+                    "unknown_marker_index": marker_index,
+                    "record_status": "missing",
+                    "delivery_status": "unknown",
+                    "recorded_delivery_status": "",
+                    "unknown_tracked": True,
+                    "transport_stage": "",
+                    "end_marker_staged": None,
+                    "pane_id": str(agent_state.get("pane_id") or ""),
+                    "pane_session_id": "",
+                    "attempt_id": "",
+                    "transport_role_id": "",
+                    "identity_valid": False,
+                    "source": str(marker_entry.get("source") or ""),
+                    "recorded_at": str(marker_entry.get("at") or ""),
+                    "delivery_error": str(marker_entry.get("error") or ""),
+                    "recovery": "inspect state",
+                    "recovery_command": "",
+                    "recovery_guidance": (
+                        "Restore the exact message identity from durable evidence, "
+                        "then explicitly record only the observed outcome; do not "
+                        "resend the body."
+                    ),
+                    "recovery_requires_inspection": True,
+                    "recovery_reason": (
+                        "unknown marker has no matching Manager-message record; "
+                        "inspect durable state before resolving"
+                    ),
+                }
+            )
+    return sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("role_id") or ""),
+            str(item.get("recorded_at") or ""),
+            int(item.get("record_index") or 0),
+        ),
+    )
+
+
+def manager_message_record_line_budget(entry: Mapping[str, Any]) -> int:
+    raw_lines = entry.get("lines")
+    raw_bytes = entry.get("bytes")
+    logical_lines = (
+        max(1, raw_lines)
+        if isinstance(raw_lines, int) and not isinstance(raw_lines, bool)
+        else 1
+    )
+    byte_count = (
+        max(0, raw_bytes)
+        if isinstance(raw_bytes, int) and not isinstance(raw_bytes, bool)
+        else 0
+    )
+    wrapped_lines = (byte_count + 79) // 80
+    return min(5_000, max(160, logical_lines * 3 + 40, wrapped_lines + 80))
+
+
+def recorded_manager_message_observation(
+    provider: str,
+    entry: Mapping[str, Any],
+    pane: Mapping[str, Any] | None,
+    text: str,
+) -> str:
+    identity = manager_message_record_identity(entry)
+    if identity is None:
+        return "invalid-identity"
+    transport_stage = str(entry.get("transport_stage") or "")
+    end_index = text.rfind(identity["end_marker"])
+    after = (
+        text[end_index + len(identity["end_marker"]) :]
+        if end_index >= 0
+        else ""
+    )
+    if re.search(
+        rf"(?m)^[^\S\r\n]*{re.escape(identity['ack_marker'])}[^\S\r\n]*$",
+        after,
+    ):
+        return "submitted-ack"
+    if end_index < 0:
+        return "marker-missing"
+    if (
+        str((pane or {}).get("agent_status") or "unknown") == "idle"
+        and text.rstrip().endswith(identity["end_marker"])
+        and (
+            transport_stage == "typed-confirmed"
+            or identity["start_marker"] in text
+        )
+    ):
+        return "staged-idle"
+    # Recovery cannot safely correlate global pane activity or arbitrary text
+    # after an old marker with this exact message. Only the exact ACK above is
+    # authoritative; otherwise retain the durable unknown state.
+    return "ambiguous"
 
 
 def transition_manager_message(
@@ -7320,13 +8840,20 @@ def transition_manager_message(
 
     if delivery_status not in MESSAGE_DELIVERY_STATUSES:
         raise HLoopError(f"unsupported message delivery status: {delivery_status}")
+    validate_manager_message_mutation_collections(target_state)
     previous = str(entry.get("delivery_status") or "delivered")
     allowed = {
         "delivered": {"acknowledged", "applied", "unknown", "superseded"},
         "acknowledged": {"applied", "unknown", "superseded"},
         "applied": set(),
         "undelivered": {"delivered", "unknown", "superseded"},
-        "unknown": {"acknowledged", "applied", "undelivered", "superseded"},
+        "unknown": {
+            "delivered",
+            "acknowledged",
+            "applied",
+            "undelivered",
+            "superseded",
+        },
         "superseded": set(),
     }
     if delivery_status == previous:
@@ -7363,6 +8890,9 @@ def transition_manager_message(
 
 
 SEMANTIC_ACK_DECISIONS = frozenset({"approve", "reject", "timeout"})
+REVISION_THREE_STRUCTURED_ACK_KINDS = frozenset(
+    {"initial", "task-contract", "message"}
+)
 
 
 def archive_semantic_ack_barrier(agent_state: dict[str, Any]) -> dict[str, Any] | None:
@@ -7848,6 +9378,7 @@ def record_unknown_manager_message(
     source: str,
     message: str,
     error: Exception,
+    transport: Mapping[str, Any] | None = None,
 ) -> int:
     """Record a message whose delivery could not be confirmed.
 
@@ -7863,6 +9394,7 @@ def record_unknown_manager_message(
         message,
         delivery_status="unknown",
         delivery_error=detail,
+        transport=transport,
     )
     agent_state["last_manager_message_error"] = detail
     agent_state.setdefault("unknown_manager_messages", []).append(
@@ -7878,9 +9410,37 @@ def record_unknown_manager_message(
         repo,
         f"Manager message delivery to {role} `{agent_id}` is unknown (not auto-resent): {detail}",
     )
+    message_id = str(recorded.get("message_id") or "")
+    recovery_prefix = (
+        f"python3 {shlex.quote(str(Path(__file__).resolve()))} "
+        f"--repo {shlex.quote(str(repo.resolve()))} {loop_namespace_flag()}"
+    )
+    if manager_message_transport_record_allows_submit(recorded):
+        recovery = (
+            "do not resend the body; inspect the pane, then retry Enter only with "
+            f"`{recovery_prefix} message submit {shlex.quote(agent_id)} "
+            f"{shlex.quote(message_id)}`"
+        )
+    elif message_id:
+        resolution_prefix = (
+            f"{recovery_prefix} message resolve {shlex.quote(agent_id)} "
+            f"{shlex.quote(message_id)}"
+        )
+        recovery = (
+            "do not resend the body; inspect the pane and establish the outcome, "
+            "then explicitly choose the observed resolution with "
+            f"`{resolution_prefix} --status <acknowledged|superseded>` or "
+            f"`{resolution_prefix} --status applied --result <observed-result>`; "
+            "leave it unknown when the outcome cannot be established"
+        )
+    else:
+        recovery = (
+            "do not resend the body; inspect the pane and use message resolve only "
+            "after establishing the outcome"
+        )
     print(
         f"manager message delivery to {agent_id} is unknown: {detail}; "
-        "confirm pane state or resend explicitly; it will not be auto-drained",
+        f"{recovery}; it will not be auto-drained",
         file=sys.stderr,
     )
     return 3
@@ -7894,9 +9454,12 @@ def supersede_pending_manager_messages(repo: Path, agent_state: dict[str, Any]) 
     attempt.
     """
 
-    messages = agent_state.get("manager_messages") or []
+    raw_messages = agent_state.get("manager_messages")
+    if raw_messages is not None and not isinstance(raw_messages, list):
+        raise HLoopError("manager_messages must be a list before superseding")
+    messages = raw_messages or []
     for entry in messages:
-        if entry.get("delivery_status") in {
+        if isinstance(entry, dict) and entry.get("delivery_status") in {
             "delivered",
             "acknowledged",
             "undelivered",
@@ -7905,7 +9468,12 @@ def supersede_pending_manager_messages(repo: Path, agent_state: dict[str, Any]) 
             transition_manager_message(
                 agent_state, entry, delivery_status="superseded"
             )
-    for entry in agent_state.get("pending_manager_messages") or []:
+    raw_pending = agent_state.get("pending_manager_messages")
+    if raw_pending is not None and not isinstance(raw_pending, list):
+        raise HLoopError("pending_manager_messages must be a list before superseding")
+    for entry in raw_pending or []:
+        if not isinstance(entry, Mapping):
+            continue
         pending_path = entry.get("pending_path")
         if not pending_path:
             continue
@@ -8231,20 +9799,29 @@ def active_attempt_id(task_id: str, task_state: Mapping[str, Any]) -> str:
 def approved_semantic_ack_event_id(
     task_id: str, task_state: Mapping[str, Any]
 ) -> str:
-    block_reason = semantic_ack_barrier_blocking(dict(task_state))
-    if block_reason:
-        raise HLoopError(f"candidate gate blocked for {task_id}: {block_reason}")
     barrier = task_state.get("semantic_ack_barrier")
-    if task_contract_revision(task_state) == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION:
+    revision_three = (
+        task_contract_revision(task_state)
+        == hloop_task_contract.V053_CONTRACT_SCHEMA_REVISION
+    )
+    if revision_three:
         if not isinstance(barrier, Mapping):
             raise HLoopError(
                 f"candidate gate blocked for {task_id}: structured semantic ACK barrier is missing"
             )
         kind = str(barrier.get("kind") or "")
-        if kind not in {"initial", "task-contract"}:
+        if not kind:
             raise HLoopError(
                 f"candidate gate blocked for {task_id}: legacy unstructured ACK is forbidden"
             )
+        if kind not in REVISION_THREE_STRUCTURED_ACK_KINDS:
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: unsupported structured barrier kind `{kind}`"
+            )
+    block_reason = semantic_ack_barrier_blocking(dict(task_state))
+    if block_reason:
+        raise HLoopError(f"candidate gate blocked for {task_id}: {block_reason}")
+    if revision_three:
         decision = barrier.get("semantic_decision")
         if not isinstance(decision, Mapping) or str(decision.get("status") or "") != "approved":
             raise HLoopError(
@@ -8275,11 +9852,60 @@ def approved_semantic_ack_event_id(
             or isinstance(barrier_sequence, bool)
             or not isinstance(barrier_sequence, int)
             or barrier_sequence < 1
+            or isinstance(decision_sequence, bool)
+            or not isinstance(decision_sequence, int)
+            or decision_sequence < 1
             or decision_sequence != barrier_sequence
         ):
             raise HLoopError(
                 f"candidate gate blocked for {task_id}: semantic ACK decision binding is inconsistent"
             )
+        required_after = barrier.get("required_reack_after_sequence", 0)
+        if (
+            isinstance(required_after, bool)
+            or not isinstance(required_after, int)
+            or required_after < 0
+            or barrier_sequence <= required_after
+        ):
+            raise HLoopError(
+                f"candidate gate blocked for {task_id}: semantic ACK sequence does not clear the required re-ACK floor"
+            )
+        if kind == "message":
+            message_id = str(barrier.get("message_id") or "")
+            try:
+                canonical_message_id = str(uuid.UUID(message_id))
+            except (ValueError, AttributeError):
+                canonical_message_id = ""
+            if canonical_message_id != message_id:
+                raise HLoopError(
+                    f"candidate gate blocked for {task_id}: Manager message identity is invalid"
+                )
+            message_binding = {
+                "barrier_attempt_id": str(barrier.get("attempt_id") or ""),
+                "report_identity_status": str(
+                    barrier.get("report_identity_status") or ""
+                ),
+                "report_identity_attempt_id": str(
+                    barrier.get("report_identity_attempt_id") or ""
+                ),
+                "active_report_contract_digest": str(
+                    task_state.get("active_report_contract_digest") or ""
+                ),
+                "rendered_exchange_digest": str(
+                    barrier.get("rendered_exchange_digest") or ""
+                ),
+            }
+            expected_message_binding = {
+                "barrier_attempt_id": active_attempt,
+                "report_identity_status": "bound",
+                "report_identity_attempt_id": active_attempt,
+                "active_report_contract_digest": str(barrier.get("digest") or ""),
+                "rendered_exchange_digest": str(barrier.get("digest") or ""),
+            }
+            if message_binding != expected_message_binding:
+                raise HLoopError(
+                    f"candidate gate blocked for {task_id}: Manager message report identity is not fully bound"
+                )
         mode = str(task_state.get("completion_mode") or "")
         mode_attempt = str(task_state.get("completion_mode_attempt_id") or "")
         mode_event = str(task_state.get("completion_mode_ack_event_id") or "")
@@ -10829,6 +12455,46 @@ def collect_loop_inventory(
                     include_output=include_output,
                 )
             )
+    manager_messages = collect_manager_message_inventory(state, repo=repo)
+    for message in manager_messages:
+        delivery_status = str(message.get("delivery_status") or "")
+        if delivery_status not in {"undelivered", "unknown", "malformed"}:
+            continue
+        message_id = str(message.get("message_id") or "")
+        target = f"{message.get('role_id')}/{message_id or '<missing-id>'}"
+        recovery_command = str(message.get("recovery_command") or "")
+        if message.get("recovery") == "message submit" and recovery_command:
+            action = recovery_command
+        elif recovery_command:
+            action = recovery_command
+        elif str(message.get("recovery_guidance") or ""):
+            action = str(message.get("recovery_guidance") or "")
+        else:
+            action = (
+                "Inspect this malformed unresolved record in STATE.json and the pane; "
+                "restore its exact message identity and observed outcome without "
+                "resending the body."
+            )
+        issues.append(
+            make_issue(
+                "P1",
+                (
+                    "manager-message-delivery-undelivered"
+                    if delivery_status == "undelivered"
+                    else "manager-message-delivery-unknown"
+                ),
+                f"manager-message:{target}",
+                (
+                    f"Manager message delivery is unresolved for {target}: "
+                    f"status={delivery_status} "
+                    f"transport={message.get('transport_stage') or 'missing'} "
+                    f"end_marker_staged={message.get('end_marker_staged')} "
+                    f"pane_session={message.get('pane_session_id') or 'missing'}; "
+                    "the body must not be resent."
+                ),
+                action,
+            )
+        )
     for collection in (workers, reviewers, gaps, advisors):
         for item in collection:
             issues.extend(item.get("issues", []))
@@ -10925,6 +12591,18 @@ def collect_loop_inventory(
             "advisors": len(advisors),
             "advisors_running": len(running_advisors),
             "advisors_reported": sum(1 for item in advisors if item.get("gate_status") == "reported"),
+            "manager_messages": len(manager_messages),
+            "unknown_manager_messages": sum(
+                1
+                for item in manager_messages
+                if item.get("delivery_status") in {"unknown", "malformed"}
+            ),
+            "unresolved_manager_messages": sum(
+                1
+                for item in manager_messages
+                if item.get("delivery_status")
+                in {"undelivered", "unknown", "malformed"}
+            ),
             "issues": len(issues),
             "p0_p1_issues": sum(1 for item in issues if item.get("severity") in {"P0", "P1"}),
         },
@@ -10932,6 +12610,7 @@ def collect_loop_inventory(
         "reviewers": reviewers,
         "gaps": gaps,
         "advisors": advisors,
+        "manager_messages": manager_messages,
         "issues": issues,
         "next_actions": next_actions,
         "herdr": {
@@ -15106,6 +16785,7 @@ def render_advisor_prompt(
     report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
+    manager_repo: str = "",
 ) -> str:
     participant_id = str(participant.get("participant_id") or "P1")
     provider = str(participant.get("provider") or DEFAULT_AGENT_PROVIDER)
@@ -15152,7 +16832,7 @@ Source artifacts or code references:
 
 Peer advice artifacts for bounded cross-model dialogue:
 {peer_lines}
-{report_contract_text(f"{advice_id}/{participant_id}", attempt_id or f"{advice_id}-{participant_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+{report_contract_text(f"{advice_id}/{participant_id}", attempt_id or f"{advice_id}-{participant_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest, manager_repo=manager_repo)}
 
 Rules:
 - Do not edit code.
@@ -15191,11 +16871,20 @@ def report_contract_text(
 ) -> str:
     if not report_credential_file:
         return ""
+    if not manager_repo:
+        raise HLoopError(
+            "authenticated report contract requires the canonical Manager repo"
+        )
+    manager_repo_path = Path(manager_repo).expanduser()
+    if not manager_repo_path.is_absolute():
+        raise HLoopError(
+            "authenticated report contract requires an absolute canonical Manager repo"
+        )
     run_id = str(state.get("run_id") or "local")
     credential_ref = shlex.quote(str(report_credential_file))
     manager_repo_line = (
         "  --manager-repo "
-        + shlex.quote(str(Path(manager_repo).resolve()))
+        + shlex.quote(str(manager_repo_path.resolve()))
         + " \\\n"
         if manager_repo
         else ""
@@ -15420,6 +17109,17 @@ def render_worker_prompt(
         state, "worker", task_override=task_meta
     )
     completion_mode = str(task_meta.get("completion_mode") or "")
+    manager_repo_status_arg = (
+        " --manager-repo " + shlex.quote(str(Path(manager_repo).resolve()))
+        if manager_repo
+        else ""
+    )
+    ack_status_command = (
+        f"python3 {shlex.quote(str(Path(__file__).resolve()))} "
+        f"{loop_namespace_flag()} agent ack status {task_id} --attempt-id "
+        f"{str(task_meta.get('attempt_id') or '')} --run-id "
+        f"{shlex.quote(str(state.get('run_id') or 'local'))}{manager_repo_status_arg}"
+    )
     protocol = worker_protocol_text(
         worker_protocol,
         worker_qa_profile,
@@ -15432,7 +17132,7 @@ def render_worker_prompt(
 Completion-mode preflight:
 - Your first semantic ACK exchange automatically performs a real Git metadata create/fsync/unlink probe.
 - Manager approval binds `commit` or `handoff` to this attempt and the exchange returns it before material work.
-- Do not choose or change the mode at submit/finalize time. `hloop agent ack status {task_id} --attempt-id {str(task_meta.get('attempt_id') or '')} --apply` remains a compatibility recovery path.
+- Do not choose or change the mode at submit/finalize time. `{ack_status_command} --apply` remains a compatibility recovery path.
 - Submit the exact revision-3 implementation candidate with `hloop worker submit`; candidate and final seals must retain the approved completion mode.
 """
     if completion_mode == "handoff":
@@ -15446,7 +17146,7 @@ Completion-mode preflight:
 - Generate and commit the result with:
   `python3 {Path(__file__).resolve()} {loop_namespace_flag()} worker finalize {task_id} --status done --validation-command '<command>' --validation-result passed --validation-summary '<summary>'`"""
     else:
-        required_output = f"""- Learn the Manager-approved attempt mode with `hloop agent ack status {task_id} --attempt-id {str(task_meta.get('attempt_id') or '')}` before choosing a result path.
+        required_output = f"""- Learn the Manager-approved attempt mode with `{ack_status_command}` before choosing a result path.
 - In `commit` mode, commit product changes first and use `worker submit` plus `worker finalize` without `--handoff`.
 - In `handoff` mode, do not run `git add` or `git commit`; use `worker submit --completion-mode handoff` and `worker finalize --handoff` so the Manager can seal the result."""
     return f"""You are Worker {task_id}.
@@ -15616,6 +17316,7 @@ def render_reviewer_prompt(
     task_contract_digest: str = "",
     attempt_id: str = "",
     repo: Path | None = None,
+    manager_repo: str = "",
 ) -> str:
     review_protocol = canonical_review_protocol(state, "ordinary").protocol
     worker_qa_profile = state_worker_qa_profile(state)
@@ -15716,7 +17417,7 @@ Review profile:
 - Review mode: {mode}
 - Agent backend: {agent_display(agent_config)}
 - Validation reuse: {validation_guidance}
-{report_contract_text(review_id, attempt_id or f"{review_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+{report_contract_text(review_id, attempt_id or f"{review_id}-A001", state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest, manager_repo=manager_repo)}
 
 {protocol}
 
@@ -15751,6 +17452,7 @@ def render_gap_prompt(
     attempt_id: str = "",
     epoch_execution: hloop_review_epoch.EpochExecutionPlan | None = None,
     repo: Path | None = None,
+    manager_repo: str = "",
 ) -> str:
     agent_config = agent_config or role_agent_config(state or {}, "gap")
     if spec_sources:
@@ -15808,7 +17510,7 @@ Read:
 Spec sources:
 {source_lines}
 {epoch_contract}
-{report_contract_text(gap_id, attempt_id or f"{gap_id}-A001", state or {}, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+{report_contract_text(gap_id, attempt_id or f"{gap_id}-A001", state or {}, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest, manager_repo=manager_repo)}
 
 Rules:
 - Do not edit code.
@@ -16479,7 +18181,11 @@ validation_commands: ["npm test -- --grep foo,bar"]
         "worker prompt ignored task-level worker agent backend override",
     )
     check(
-        "hloop agent ack status T001" in worker_prompt
+        (
+            f"python3 {shlex.quote(str(Path(__file__).resolve()))} "
+            f"{loop_namespace_flag()} agent ack status T001"
+        )
+        in worker_prompt
         and "worker finalize --handoff" in worker_prompt
         and "worker finalize` without `--handoff" in worker_prompt,
         "worker prompt omitted completion-mode-specific finalization guidance",
@@ -16494,6 +18200,7 @@ validation_commands: ["npm test -- --grep foo,bar"]
         {"run_id": "run-selftest"},
         report_credential_file="/tmp/hloop-report-credential.json",
         task_contract_digest=hashlib.sha256(b"T001").hexdigest(),
+        manager_repo="/tmp/hloop-manager-repo",
     )
     check(
         "--invocation-id T001-A001:report/0001" in report_contract
@@ -18325,6 +20032,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"  {item.get('severity')} {item.get('subject')} "
             f"{item.get('code')}: {item.get('message')}"
         )
+        if item.get("action"):
+            print(f"    action: {item.get('action')}")
+    if inventory.get("next_actions"):
+        print("next_actions:")
+        for action in inventory["next_actions"]:
+            print(f"  - {action}")
     return 0
 
 
@@ -18401,7 +20114,8 @@ def print_inventory_dashboard(inventory: dict[str, Any]) -> None:
         f"queued={counts.get('workers_queued')} merge_ready={counts.get('workers_merge_ready')}; "
         f"reviewers={counts.get('reviewers')} running={counts.get('reviewers_running')} reported={counts.get('reviewers_reported')}; "
         f"gaps={counts.get('gaps')} running={counts.get('gaps_running')} reported={counts.get('gaps_reported')}; "
-        f"advisors={counts.get('advisors')} running={counts.get('advisors_running')} reported={counts.get('advisors_reported')}"
+        f"advisors={counts.get('advisors')} running={counts.get('advisors_running')} reported={counts.get('advisors_reported')}; "
+        f"manager_messages={counts.get('manager_messages')} unknown={counts.get('unknown_manager_messages')}"
     )
     print_agent_rows("Workers", inventory["workers"])
     print_agent_rows("Reviewers", inventory["reviewers"])
@@ -18973,6 +20687,7 @@ def render_specification_scout_prompt(
     report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "S001-A001",
+    manager_repo: str = "",
 ) -> str:
     reason_lines = "\n".join(f"- {reason}" for reason in reasons) or "- Manager requested it."
     artifact = (LOOP_DIR / "decisions" / "SCOUT.md").as_posix()
@@ -18985,7 +20700,7 @@ edit product code and do not decide user-visible specifications yourself.
 The automatic trigger reasons were:
 {reason_lines}
 
-{report_contract_text("S001", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+{report_contract_text("S001", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest, manager_repo=manager_repo)}
 
 Write only `{artifact}` with frontmatter containing `status: reported`,
 `role_id: S001`, `attempt_id: {attempt_id}`, `skill_version: {SKILL_VERSION}`,
@@ -19007,6 +20722,7 @@ def render_decision_liaison_prompt(
     report_credential_file: str = "",
     task_contract_digest: str = "",
     attempt_id: str = "",
+    manager_repo: str = "",
 ) -> str:
     question = decision_question_text(record, state)
     artifact = (LOOP_DIR / "decisions" / record.decision_id / "RESPONSE.md").as_posix()
@@ -19029,7 +20745,7 @@ semantic ACK の承認、あなた自身が提示した推奨案、無応答、s
 
 {question}
 
-{report_contract_text(f"L-{record.decision_id}", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+{report_contract_text(f"L-{record.decision_id}", attempt_id, state, report_credential_file=report_credential_file, task_contract_digest=task_contract_digest, manager_repo=manager_repo)}
 
 質問提示後の明示的な利用者入力を得た場合に限り `{artifact}` だけを書き、frontmatter に
 `decision_id: {record.decision_id}`、`responded_by: liaison`、
@@ -19377,6 +21093,7 @@ def render_plan_gap_scout_prompt(
     attempt_id: str,
     report_credential_file: str = "",
     task_contract_digest: str = "",
+    manager_repo: str = "",
 ) -> str:
     artifact = (LOOP_DIR / "planning" / "PLAN-GAP.json").as_posix()
     run = {
@@ -19402,7 +21119,7 @@ artifact other than `{artifact}`.
 - resolved plan_gap config: `{json.dumps({key: agent_config.get(key) for key in ('provider', 'model', 'effort')}, ensure_ascii=False, sort_keys=True)}`
 - config sources: `{json.dumps(agent_config.get('sources') or {}, ensure_ascii=False, sort_keys=True)}`
 
-{report_contract_text("S001", attempt_id, dict(state), report_credential_file=report_credential_file, task_contract_digest=task_contract_digest)}
+{report_contract_text("S001", attempt_id, dict(state), report_credential_file=report_credential_file, task_contract_digest=task_contract_digest, manager_repo=manager_repo)}
 
 Write one strict `planning-plan-gap.schema.json` artifact at `{artifact}`.
 Copy the exact planning identity and dependency digests supplied above. Set
@@ -19527,6 +21244,7 @@ def cmd_plan_gap_scout_start(args: argparse.Namespace) -> int:
             attempt_id=attempt_id,
             report_credential_file=str(credential),
             task_contract_digest=task_contract_digest,
+            manager_repo=str(repo.resolve()),
         )
         write_text(worktree / prompt_rel, prompt)
         baseline = role_scope_paths(worktree)
@@ -19700,6 +21418,7 @@ def cmd_specification_scout_start(args: argparse.Namespace) -> int:
             report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
+            manager_repo=str(repo.resolve()),
         )
         write_text(worktree / prompt_rel, prompt)
         baseline = role_scope_paths(worktree)
@@ -20156,6 +21875,7 @@ def start_decision_liaison(
             report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
+            manager_repo=str(repo.resolve()),
         )
         write_text(worktree / prompt_rel, prompt)
         baseline = role_scope_paths(worktree)
@@ -25613,7 +27333,10 @@ def rebind_contract_changing_manager_message(
         manager_repo=str(repo),
         invocation_id=f"{attempt_id}:reack/{message_id}",
     )
-    rendered_message = message.rstrip() + "\n" + exchange_text
+    rendered_message = (
+        strip_manager_message_end_marker(message).rstrip() + "\n" + exchange_text
+    )
+    rendered_message = finalize_manager_message_envelope(rendered_message)
     if f"--task-contract-digest {target_digest}" not in rendered_message:
         raise HLoopError(
             f"contract-changing message exchange command is not bound for {agent_id}"
@@ -25696,7 +27419,7 @@ def send_manager_message_and_record(
             message=message,
         )
     try:
-        send_agent_tui_message(
+        transport = send_agent_tui_message(
             str(agent_state.get("agent_provider") or agent_state.get("provider") or DEFAULT_AGENT_PROVIDER),
             pane_id,
             message,
@@ -25715,6 +27438,7 @@ def send_manager_message_and_record(
             source=source,
             message=message,
             error=exc,
+            transport=exc.transport,
         )
     except HLoopError as exc:
         return record_pending_manager_message(
@@ -25728,7 +27452,7 @@ def send_manager_message_and_record(
             message=message,
             error=exc,
         )
-    record_manager_message(agent_state, source, message)
+    record_manager_message(agent_state, source, message, transport=transport)
     save_state(repo, state)
     journal(repo, f"Sent Manager message to {role} `{agent_id}` in pane `{pane_id}` from {source}.")
     print(f"sent manager message to {agent_id} in pane {pane_id}")
@@ -25793,8 +27517,49 @@ def cmd_worker_message(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_message_list(args: argparse.Namespace) -> int:
+    """List durable Manager-message delivery records without mutating state."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = load_state(repo)
+    rows = collect_manager_message_inventory(
+        state,
+        status=getattr(args, "status", None),
+        repo=repo,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("no Manager messages")
+        return 0
+    for row in rows:
+        end_marker = row.get("end_marker_staged")
+        end_marker_text = (
+            str(end_marker).lower() if isinstance(end_marker, bool) else "unknown"
+        )
+        print(
+            f"{row.get('role_id')}/{row.get('message_id') or '<missing-id>'} "
+            f"[{row.get('role')}/{row.get('delivery_status')}] "
+            f"transport={row.get('transport_stage') or '-'} "
+            f"end_marker_staged={end_marker_text} "
+            f"pane={row.get('pane_id') or '-'} "
+            f"pane_session={row.get('pane_session_id') or '-'} "
+            f"recovery={row.get('recovery') or '-'}"
+        )
+        if row.get("recovery_reason"):
+            print(f"  reason: {row.get('recovery_reason')}")
+        if row.get("recovery_command"):
+            print(f"  action: {row.get('recovery_command')}")
+        if row.get("recovery_guidance"):
+            print(f"  guidance: {row.get('recovery_guidance')}")
+        elif row.get("recovery_requires_inspection"):
+            print("  action: inspect durable state and pane; do not resend the body")
+    return 0
+
+
 def cmd_message_drain(args: argparse.Namespace) -> int:
-    """Resend every running role's undelivered Manager messages."""
+    """Resend running-role messages and reject unsafe terminal-role replay."""
 
     repo = repo_root(Path(args.repo).resolve())
     state = preflight_loop(repo, require_herdr=True)
@@ -25802,21 +27567,28 @@ def cmd_message_drain(args: argparse.Namespace) -> int:
     total_resent = 0
     total_superseded = 0
     total_remaining = 0
+    total_unknown = 0
     cleanup_after_save: list[Path] = []
     for agent_state in agent_states:
-        if agent_state.get("status") != "running" and agent_state.get("gate_status") != "running":
+        if (
+            agent_state.get("status") != "running"
+            and agent_state.get("gate_status") != "running"
+        ):
             continue
-        resent, superseded, remaining, cleanup_paths = resend_pending_manager_messages(
-            repo,
-            agent_state,
-            timeout_ms=args.timeout_ms,
-            input_settle_ms=args.input_settle_ms,
-            submit_verify_ms=args.submit_verify_ms,
-            submit_attempts=args.submit_attempts,
+        resent, superseded, remaining, unknown, cleanup_paths = (
+            resend_pending_manager_messages(
+                repo,
+                agent_state,
+                timeout_ms=args.timeout_ms,
+                input_settle_ms=args.input_settle_ms,
+                submit_verify_ms=args.submit_verify_ms,
+                submit_attempts=args.submit_attempts,
+            )
         )
         total_resent += resent
         total_superseded += superseded
         total_remaining += remaining
+        total_unknown += unknown
         cleanup_after_save.extend(cleanup_paths)
     save_state(repo, state)
     for path in cleanup_after_save:
@@ -25828,15 +27600,250 @@ def cmd_message_drain(args: argparse.Namespace) -> int:
         repo,
         "Processed pending Manager messages: "
         f"{total_resent} resent, {total_superseded} superseded, "
-        f"{total_remaining} still pending.",
+        f"{total_unknown} became unknown, {total_remaining} still pending.",
     )
     total_processed = total_resent + total_superseded
     print(
         f"drained {total_processed} pending message(s); "
         f"{total_remaining} still pending "
-        f"(resent={total_resent}, superseded={total_superseded})"
+        f"(resent={total_resent}, superseded={total_superseded}, "
+        f"unknown={total_unknown})"
     )
-    return 0
+    terminal_undelivered = [
+        row
+        for row in collect_manager_message_inventory(state, repo=repo)
+        if row.get("delivery_status") == "undelivered"
+        and not row.get("role_running")
+    ]
+    if terminal_undelivered:
+        print(
+            "terminal roles still have undelivered Manager messages; "
+            "the bodies were not resent:",
+            file=sys.stderr,
+        )
+        for row in terminal_undelivered:
+            action = str(row.get("recovery_command") or "inspect durable state")
+            print(
+                f"- {row.get('role_id')}/{row.get('message_id') or '<missing-id>'}: "
+                f"{action}",
+                file=sys.stderr,
+            )
+    if total_unknown:
+        print(
+            "one or more drain attempts became delivery-unknown; inspect with "
+            f"`{Path(__file__).name} message list --status unknown` and do not "
+            "resend their bodies",
+            file=sys.stderr,
+        )
+    return 3 if total_unknown or terminal_undelivered else 0
+
+
+def cmd_message_submit(args: argparse.Namespace) -> int:
+    """Retry Enter for one exact typed Manager message without resending its body."""
+
+    repo = repo_root(Path(args.repo).resolve())
+    state = preflight_loop(repo, require_herdr=True)
+    role, agent_state = resolve_agent_state(state, args.agent_id)
+    entry = manager_message_by_id(agent_state, args.message_id)
+    if entry is None:
+        raise HLoopError(
+            f"unknown Manager message for {args.agent_id}: {args.message_id}"
+        )
+    delivery_status = str(entry.get("delivery_status") or "")
+    if delivery_status in {"delivered", "acknowledged", "applied"}:
+        print(
+            f"{args.agent_id}/{args.message_id}: already {delivery_status}; "
+            "no Enter sent"
+        )
+        return 0
+    if delivery_status != "unknown":
+        raise HLoopError(
+            "Enter-only recovery requires delivery_status=unknown; "
+            f"current={delivery_status or 'missing'}"
+        )
+    transport_stage = str(entry.get("transport_stage") or "")
+    if transport_stage not in {"send-text-started", "typed-confirmed"}:
+        raise HLoopError(
+            "Enter-only recovery requires a typed or possibly typed transport stage"
+        )
+    if not manager_message_transport_record_allows_submit(entry):
+        raise HLoopError(
+            "Enter-only recovery requires complete durable transport identity, "
+            "a pinned pane session, and end_marker_staged=true"
+        )
+    identity = manager_message_record_identity(entry)
+    assert identity is not None
+    validate_manager_message_mutation_collections(agent_state)
+    attempt_id = str(
+        agent_state.get("attempt_id") or agent_state.get("active_attempt_id") or ""
+    )
+    expected_identity = {
+        "run_id": str(state.get("run_id") or ""),
+        "attempt_id": attempt_id,
+        "message_id": str(args.message_id),
+    }
+    if any(identity[field] != value for field, value in expected_identity.items()):
+        raise HLoopError(
+            "Manager message transport identity does not match the current run, role, or attempt"
+        )
+    if identity["role_id"] not in manager_message_selector_transport_role_ids(
+        str(args.agent_id)
+    ):
+        raise HLoopError(
+            "Manager message transport identity does not match the current run, role, or attempt"
+        )
+    pane_id = str(agent_state.get("pane_id") or "")
+    if not pane_id:
+        raise HLoopError(f"{role} has no pane for Enter-only recovery")
+    saved_session_id = str(entry.get("pane_session_id") or "")
+    if not saved_session_id:
+        raise HLoopError("Manager message has no pinned pane session for recovery")
+    provider = str(
+        agent_state.get("agent_provider")
+        or agent_state.get("provider")
+        or DEFAULT_AGENT_PROVIDER
+    )
+    line_budget = manager_message_record_line_budget(entry)
+    stable_observation = same_agent_session_observation(
+        provider,
+        pane_id,
+        saved_session_id,
+        lines=line_budget,
+    )
+    if stable_observation is None:
+        raise HLoopError(
+            "Manager message pane session changed during observation; "
+            "refusing Enter-only recovery"
+        )
+    pane, text = stable_observation
+    observation = recorded_manager_message_observation(provider, entry, pane, text)
+
+    def persist_success(*, acknowledged: bool) -> int:
+        apply_manager_message_transport(
+            entry,
+            {
+                **entry,
+                "transport_stage": "submit-confirmed",
+            },
+        )
+        transition_manager_message(
+            agent_state,
+            entry,
+            delivery_status="acknowledged" if acknowledged else "delivered",
+        )
+        remove_unknown_manager_message_marker(agent_state, args.message_id)
+        save_state(repo, state)
+        journal(
+            repo,
+            f"Enter-only recovery confirmed Manager message `{args.message_id}` "
+            f"for {role} `{args.agent_id}` without resending the body.",
+        )
+        print(
+            f"{args.agent_id}/{args.message_id}: "
+            f"{'acknowledged' if acknowledged else 'delivered'}; no body resend"
+        )
+        return 0
+
+    if observation in {"submitted-ack", "submitted-output"}:
+        return persist_success(acknowledged=True)
+    if observation == "submitted-working":
+        return persist_success(acknowledged=False)
+    if observation != "staged-idle":
+        raise HLoopError(
+            "Manager message is not distinguishable as the current staged pane input; "
+            f"observation={observation}"
+        )
+    input_settle_ms = max(0, int(getattr(args, "input_settle_ms", 0) or 0))
+    if input_settle_ms:
+        time.sleep(input_settle_ms / 1000)
+    stable_observation = same_idle_agent_session(
+        provider,
+        pane_id,
+        saved_session_id,
+        lines=line_budget,
+    )
+    if stable_observation is None:
+        raise HLoopError(
+            "Manager message pane changed or became non-idle during settle; "
+            "refusing Enter-only recovery"
+        )
+    pane, text = stable_observation
+    observation = recorded_manager_message_observation(provider, entry, pane, text)
+    if observation in {"submitted-ack", "submitted-output"}:
+        return persist_success(acknowledged=True)
+    if observation == "submitted-working":
+        return persist_success(acknowledged=False)
+    if observation != "staged-idle":
+        raise HLoopError(
+            "Manager message changed during settle and is not the exact staged "
+            f"pane input; observation={observation}; no Enter sent"
+        )
+    try:
+        run_cmd(
+            ["herdr", "pane", "send-keys", pane_id, "Enter"],
+            check=True,
+            capture=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        entry["enter_attempts"] = int(entry.get("enter_attempts") or 0) + 1
+        entry["transport_stage"] = "typed-confirmed"
+        entry["delivery_error"] = (
+            "Enter-only recovery attempted one Enter but the transport command "
+            "failed; submission remains unknown"
+        )
+        save_state(repo, state)
+        journal(
+            repo,
+            f"Enter-only recovery remains unknown for Manager message "
+            f"`{args.message_id}` to {role} `{args.agent_id}` after the Enter "
+            "transport command failed; body was not resent.",
+        )
+        print(
+            f"{args.agent_id}/{args.message_id}: Enter transport failed and "
+            "submission remains unknown; inspect the pane before retrying Enter; "
+            "do not resend the body",
+            file=sys.stderr,
+        )
+        return 3
+    entry["enter_attempts"] = int(entry.get("enter_attempts") or 0) + 1
+    deadline = time.monotonic() + max(
+        0, int(getattr(args, "submit_verify_ms", 0) or 0)
+    ) / 1000
+    while True:
+        stable_observation = same_agent_session_observation(
+            provider,
+            pane_id,
+            saved_session_id,
+            lines=line_budget,
+        )
+        if stable_observation is None:
+            break
+        pane, text = stable_observation
+        observation = recorded_manager_message_observation(
+            provider, entry, pane, text
+        )
+        if observation in {"submitted-ack", "submitted-output"}:
+            return persist_success(acknowledged=True)
+        if observation == "submitted-working":
+            return persist_success(acknowledged=False)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    entry["transport_stage"] = "typed-confirmed"
+    entry["delivery_error"] = (
+        "Enter-only recovery sent one Enter but submission remains unconfirmed"
+    )
+    save_state(repo, state)
+    journal(
+        repo,
+        f"Enter-only recovery remains unknown for Manager message `{args.message_id}` "
+        f"to {role} `{args.agent_id}`; body was not resent.",
+    )
+    print(
+        f"{args.agent_id}/{args.message_id}: submission remains unknown; no body resend",
+        file=sys.stderr,
+    )
+    return 3
 
 
 def cmd_message_resolve(args: argparse.Namespace) -> int:
@@ -25850,6 +27857,14 @@ def cmd_message_resolve(args: argparse.Namespace) -> int:
         raise HLoopError(
             f"unknown Manager message for {args.agent_id}: {args.message_id}"
         )
+    validate_manager_message_mutation_collections(agent_state)
+    resolution_error = manager_message_resolution_identity_error(
+        state, str(args.agent_id), agent_state, entry
+    )
+    if resolution_error:
+        raise HLoopError(
+            "Manager message cannot be explicitly resolved: " + resolution_error
+        )
     transition_manager_message(
         agent_state,
         entry,
@@ -25858,12 +27873,16 @@ def cmd_message_resolve(args: argparse.Namespace) -> int:
         error=getattr(args, "error", None),
     )
     if args.status in {"acknowledged", "applied", "superseded"}:
-        agent_state["unknown_manager_messages"] = [
-            item
-            for item in agent_state.get("unknown_manager_messages") or []
-            if item.get("message_id") != args.message_id
-        ]
+        remove_unknown_manager_message_marker(agent_state, args.message_id)
+    pending_paths = detach_pending_manager_message_markers(
+        repo, agent_state, str(args.message_id)
+    )
     save_state(repo, state)
+    for pending_path in pending_paths:
+        try:
+            pending_path.unlink()
+        except OSError:
+            pass
     journal(
         repo,
         f"Resolved Manager message `{args.message_id}` for {role} `{args.agent_id}` "
@@ -28918,6 +30937,7 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
             repo=repo,
+            manager_repo=str(repo.resolve()),
         )
         write_text(prompt_path, prompt)
         baseline_dirty = role_scope_paths(worktree)
@@ -29506,6 +31526,7 @@ def cmd_gap_start(args: argparse.Namespace) -> int:
             attempt_id=attempt_id,
             epoch_execution=epoch_execution,
             repo=repo,
+            manager_repo=str(repo.resolve()),
         )
         write_text(prompt_path, prompt)
         baseline_dirty = role_scope_paths(worktree)
@@ -30080,6 +32101,7 @@ def cmd_advisor_start(args: argparse.Namespace) -> int:
             report_credential_file=str(report_credential_file),
             task_contract_digest=task_contract_digest,
             attempt_id=attempt_id,
+            manager_repo=str(repo.resolve()),
         )
         write_text(prompt_path, prompt)
         baseline_dirty = role_scope_paths(worktree)
@@ -30354,7 +32376,7 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
             message=message,
         )
     try:
-        send_agent_tui_message(
+        transport = send_agent_tui_message(
             str(participant.get("agent_provider") or participant.get("provider") or DEFAULT_AGENT_PROVIDER),
             pane_id,
             message,
@@ -30373,6 +32395,7 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
             source=source,
             message=message,
             error=exc,
+            transport=exc.transport,
         )
     except HLoopError as exc:
         return record_pending_manager_message(
@@ -30386,7 +32409,7 @@ def cmd_advisor_message(args: argparse.Namespace) -> int:
             message=message,
             error=exc,
         )
-    record_manager_message(participant, source, message)
+    record_manager_message(participant, source, message, transport=transport)
     participant["advisor_followup_count"] = followups_before + 1
     participant["dialogue_max_rounds"] = max_rounds
     if advisor_dialogue_mode(advice_state):
@@ -31709,6 +33732,17 @@ def split_advice_target(agent_id: str, participant_id: str | None = None) -> tup
 
 
 def resolve_agent_state(state: dict[str, Any], agent_id: str) -> tuple[str, dict[str, Any]]:
+    if agent_id in {"S001/decision", "S001/coverage"}:
+        mode = agent_id.split("/", 1)[1]
+        key = (
+            "specification_scout_run"
+            if mode == "decision"
+            else "plan_gap_scout_run"
+        )
+        agent = state.get(key)
+        if isinstance(agent, dict) and agent:
+            return ("scout" if mode == "decision" else "coverage-scout"), agent
+        raise HLoopError(f"unknown agent id: {agent_id}")
     if agent_id == "S001":
         active = active_specification_scout_run(state)
         if active is not None:
@@ -31912,7 +33946,9 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
                 f"{shlex.quote(str(Path(__file__).resolve()))} "
                 f"{loop_namespace_flag()} agent ack status "
                 f"{shlex.quote(args.agent_id)} --attempt-id "
-                f"{shlex.quote(attempt_id)} --apply"
+                f"{shlex.quote(attempt_id)} --run-id "
+                f"{shlex.quote(str(state.get('run_id') or 'local'))} "
+                f"--manager-repo {shlex.quote(str(repo.resolve()))} --apply"
             )
             notice = (
                 f"Semantic ACK {barrier.get('ack_event_id')} is approved, but its "
@@ -31952,7 +33988,14 @@ def cmd_agent_ack_resolve(args: argparse.Namespace) -> int:
             notification = refreshed_barrier.get("pane_notification")
             if isinstance(notification, dict):
                 messages = refreshed_agent.get("manager_messages") or []
-                latest_message = messages[-1] if messages else {}
+                latest_message = next(
+                    (
+                        item
+                        for item in reversed(messages)
+                        if isinstance(item, Mapping)
+                    ),
+                    {},
+                )
                 delivery_status = str(
                     latest_message.get("delivery_status") or "unknown"
                 )
@@ -31984,20 +34027,40 @@ def cmd_agent_ack_status(args: argparse.Namespace) -> int | dict[str, Any]:
     """Let a role learn and explicitly apply an approval without pane input."""
 
     role_repo = repo_root(Path(args.repo).resolve())
-    manager_repo = str(
-        getattr(args, "manager_repo", None)
-        or os.environ.get(MANAGER_REPO_ENV)
-        or ""
-    ).strip()
-    repo = repo_root(
-        Path(manager_repo).resolve()
-        if manager_repo
+    explicit_manager_repo = str(getattr(args, "manager_repo", None) or "").strip()
+    context_manager_repo = str(os.environ.get(MANAGER_REPO_ENV) or "").strip()
+    manager_repo_raw = explicit_manager_repo or context_manager_repo
+    repo = (
+        repo_root(Path(manager_repo_raw).expanduser().resolve())
+        if manager_repo_raw
         else role_repo
     )
+    if explicit_manager_repo and context_manager_repo:
+        context_repo = repo_root(Path(context_manager_repo).expanduser().resolve())
+        if context_repo != repo:
+            raise HLoopError("ACK status Manager repository context mismatch")
+    if manager_repo_raw and (
+        git_common_dir(role_repo).resolve() != git_common_dir(repo).resolve()
+    ):
+        raise HLoopError(
+            "ACK status role and Manager repositories do not share Git metadata"
+        )
     state = load_state(repo)
+    run_id = str(state.get("run_id") or "local")
+    requested_run_id = str(getattr(args, "run_id", None) or run_id)
+    if requested_run_id != run_id:
+        raise HLoopError(
+            f"ACK status run mismatch: expected={run_id} requested={requested_run_id}"
+        )
+    context_role_id = str(os.environ.get(ROLE_ID_ENV) or "")
+    context_attempt_id = str(os.environ.get(ROLE_ATTEMPT_ID_ENV) or "")
+    if context_role_id and context_role_id != str(args.agent_id or ""):
+        raise HLoopError("ACK status role context mismatch")
     role, agent = resolve_agent_state(state, args.agent_id)
     attempt_id = str(agent.get("attempt_id") or agent.get("active_attempt_id") or "")
     requested_attempt = str(getattr(args, "attempt_id", None) or "")
+    if context_attempt_id and context_attempt_id != (requested_attempt or attempt_id):
+        raise HLoopError("ACK status attempt context mismatch")
     if requested_attempt and requested_attempt != attempt_id:
         raise HLoopError(
             f"ACK status attempt mismatch: active={attempt_id} requested={requested_attempt}"
@@ -32391,6 +34454,7 @@ def cmd_agent_ack_exchange(args: argparse.Namespace) -> int:
             manager_repo=str(manager_repo),
             agent_id=requested_role_id,
             attempt_id=requested_attempt_id,
+            run_id=run_id,
             acknowledge=False,
             apply=True,
             json=False,
@@ -33648,6 +35712,10 @@ def manager_consumer_command_name(args: argparse.Namespace) -> str | None:
         manager_command = str(getattr(args, "manager_command", "") or "")
         if manager_command in {"next", "sleep"}:
             return f"manager {manager_command}"
+    if command == "message":
+        message_command = str(getattr(args, "message_command", "") or "")
+        if message_command == "submit":
+            return "message submit"
     if command == "validate":
         return "validate"
     return None
@@ -35929,6 +37997,30 @@ def _finish_accepted_risk_errors(
     return []
 
 
+def unresolved_manager_message_completion_errors(
+    state: Mapping[str, Any],
+) -> list[str]:
+    """Return terminal-gate errors for unresolved delivery state."""
+
+    blocked = [
+        row
+        for row in collect_manager_message_inventory(state)
+        if str(row.get("delivery_status") or "")
+        in {"undelivered", "unknown", "malformed"}
+    ]
+    if not blocked:
+        return []
+    targets = [
+        f"{row.get('role_id')}/{row.get('message_id') or '<missing-id>'}"
+        f"({row.get('delivery_status')})"
+        for row in blocked
+    ]
+    return [
+        "unresolved Manager message delivery blocks completion: "
+        + ", ".join(targets)
+    ]
+
+
 def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     target = git(repo, ["rev-parse", str(state["integration_branch"])])
@@ -35938,6 +38030,7 @@ def completion_errors(repo: Path, state: dict[str, Any]) -> list[str]:
         errors.append("not all tasks are merged")
     if running_agent_ids(state):
         errors.append("role agents are still running")
+    errors.extend(unresolved_manager_message_completion_errors(state))
     if unsafe_dirty_paths(repo):
         errors.append("Manager checkout has non-loop dirty files")
     if not release_validation_is_current(repo, state, target):
@@ -36948,6 +39041,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_message.add_argument(
         "--submit-attempts",
         type=int,
+        choices=(1, 2),
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
     )
     agent_message.add_argument(
@@ -37055,6 +39149,8 @@ def build_parser() -> argparse.ArgumentParser:
         "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
     )
     agent_ack_status.add_argument("--attempt-id")
+    agent_ack_status.add_argument("--run-id")
+    agent_ack_status.add_argument("--manager-repo")
     ack_status_transition = agent_ack_status.add_mutually_exclusive_group()
     ack_status_transition.add_argument("--acknowledge", action="store_true")
     ack_status_transition.add_argument("--apply", action="store_true")
@@ -37725,6 +39821,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker_message.add_argument(
         "--submit-attempts",
         type=int,
+        choices=(1, 2),
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
     )
@@ -37737,6 +39834,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     message = sub.add_parser("message", help="Manager message delivery operations")
     message_sub = message.add_subparsers(dest="message_command", required=True)
+    message_list = message_sub.add_parser(
+        "list",
+        help="list durable Manager-message records and safe recovery actions",
+    )
+    message_list.add_argument(
+        "--status",
+        choices=sorted(MESSAGE_DELIVERY_FILTER_STATUSES),
+        help="filter delivery state; unknown also includes malformed unresolved records",
+    )
+    message_list.add_argument("--json", action="store_true")
+    message_list.set_defaults(func=cmd_message_list)
     message_drain = message_sub.add_parser(
         "drain", help="resend undelivered Manager messages to every running role"
     )
@@ -37748,16 +39856,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--submit-verify-ms", type=int, default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS
     )
     message_drain.add_argument(
-        "--submit-attempts", type=int, default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS
+        "--submit-attempts",
+        type=int,
+        choices=(1, 2),
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
     )
     message_drain.set_defaults(func=cmd_message_drain)
+    message_submit = message_sub.add_parser(
+        "submit",
+        help="retry Enter for one exact typed Manager message without resending its body",
+    )
+    message_submit.add_argument(
+        "agent_id",
+        help="T..., PR-..., R..., G..., A.../P..., S001[/decision|/coverage], or L-DNNN",
+    )
+    message_submit.add_argument("message_id")
+    message_submit.add_argument(
+        "--input-settle-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_INPUT_SETTLE_MS,
+    )
+    message_submit.add_argument(
+        "--submit-verify-ms",
+        type=int,
+        default=DEFAULT_MANAGER_MESSAGE_SUBMIT_VERIFY_MS,
+    )
+    message_submit.set_defaults(func=cmd_message_submit)
     message_resolve = message_sub.add_parser(
         "resolve",
         help="durably resolve one delivered or unknown Manager message; semantic ACK work still requires Manager-applied",
         description="Resolve Manager-message delivery state. A semantic ACK decision or message resolution never authorizes material work before the exact approval application is Manager-applied.",
     )
     message_resolve.add_argument(
-        "agent_id", help="T..., R..., G..., A.../P..., S001, or L-DNNN"
+        "agent_id",
+        help="T..., PR-..., R..., G..., A.../P..., S001[/decision|/coverage], or L-DNNN",
     )
     message_resolve.add_argument("message_id")
     message_resolve.add_argument(
@@ -38100,6 +40232,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer_message.add_argument(
         "--submit-attempts",
         type=int,
+        choices=(1, 2),
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
     )
@@ -38179,6 +40312,7 @@ def build_parser() -> argparse.ArgumentParser:
     gap_message.add_argument(
         "--submit-attempts",
         type=int,
+        choices=(1, 2),
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
     )
@@ -38260,6 +40394,7 @@ def build_parser() -> argparse.ArgumentParser:
     advisor_message.add_argument(
         "--submit-attempts",
         type=int,
+        choices=(1, 2),
         default=DEFAULT_MANAGER_MESSAGE_SUBMIT_ATTEMPTS,
         help="Enter retry count when the message remains typed but unsubmitted",
     )
