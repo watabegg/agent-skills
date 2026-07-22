@@ -116,7 +116,7 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 
 - 目的:
   - Herdr 上で Manager / Worker / Gap Auditor / Reviewer / Advisor の Codex・Claude agent を、git worktree、integration branch、`.ai/herdr-dev-loop/loops/<namespace>` artifact によって安全に協調させる。
-  - Worker / Reviewer は既定でこの Skill 内蔵の HLoop protocol を使い、外部の `$codex-impl` / `$external-review` は必要時だけ選ぶ互換モードにする。
+  - 0.5.3のWorkerはnativeを使い、ordinary review、pre-final、manual-finalはpin済みの`$external-review`を既定にする。0.5.5ではnative manual-finalを追加し、外部companionを明示選択時だけの任意依存へ移す計画である。
   - Gap Auditor には元 repo の plan/spec と統合ブランチ実装の相違確認を担当させ、仕様判断が必要な場合は `DECISIONS.md` と `USER_ACTION_REQUIRED.md` に分離して止める。
   - `scripts/hloop` で init、task 作成、Worker/Gap Auditor/Reviewer 起動、harvest、merge、validation、pump、triage、report を実行する。
   - namespaced `PROFILE.md` で branch strategy、roleごとのprovider/model/effort、Worker protocol、Review lanes、QA profileを調整する。

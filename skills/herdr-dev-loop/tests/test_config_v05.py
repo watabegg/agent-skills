@@ -19,7 +19,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 
 # Any absolute path under a specific user's home directory (e.g.
 # /home/watabegg/...), regardless of username -- required-command blocks
-# must only ever discover installs via $HOME/$CODEX_HOME/$CLAUDE_SKILLS_HOME
+# must only ever discover installs via $HOME/$CODEX_HOME/$CLAUDE_CONFIG_DIR
 # or a project-relative path, so they work for every author's machine.
 _AUTHOR_HOME_PATH = re.compile(r"/home/[^/\s\"'()]+/")
 

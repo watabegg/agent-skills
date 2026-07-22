@@ -47,6 +47,28 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertIn("--effort high", command)
         self.assertIn("--model opus", command)
 
+    def test_role_command_pins_validated_provider_environment(self):
+        config = {
+            "provider": "codex",
+            "model": "auto",
+            "effort": "high",
+            "claude_permission_mode": "auto",
+        }
+        with mock.patch.object(
+            hloop, "git_common_dir", return_value=Path("/repo/.git")
+        ):
+            command, _invocation = hloop.role_agent_command(
+                Path("/repo"),
+                config,
+                runner="tui",
+                prompt_rel=Path("prompt.md"),
+                cwd=Path("/repo/review"),
+                role_id="R001",
+                attempt_id="R001-A001",
+                provider_environment={"CODEX_HOME": "/validated/codex"},
+            )
+        self.assertIn("CODEX_HOME=/validated/codex", command)
+
 
 class LifecycleContractTests(unittest.TestCase):
     def test_terminal_marker_is_bound_to_current_attempt(self):
