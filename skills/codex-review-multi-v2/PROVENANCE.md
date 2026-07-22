@@ -5,9 +5,9 @@ This repository forked `skills/codex-review-multi-v2` from `fullerene-inc/agent-
 The fork keeps the upstream review contract and adds local release hardening:
 
 - reject generated Python bytecode from immutable companion distributions;
-- bind attestation to a start-of-review Git and worktree fingerprint;
+- bind attestation to a start-of-review Git and worktree fingerprint, including branch-mode dirty bytes, and reject dirty submodules whose inner bytes are not pinned by the superproject;
 - run the model with only its artifact directory writable and keep trusted validation files outside that directory;
-- validate and render a parent-owned snapshot of `review.json`, then publish generated artifacts without following model-created paths;
+- validate and render a parent-owned regular-file snapshot of `review.json`, then atomically publish generated artifacts without following or replacing model-created paths;
 - reject shared-default, future-approved, repository-external, and symlinked product profiles as demotion evidence;
 - exclude unverified model-authored reviewer and summary sidecars from the attested report.
 

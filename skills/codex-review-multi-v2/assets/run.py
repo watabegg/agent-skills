@@ -190,19 +190,23 @@ def _has_symlink_component(path):
 
 
 def _publish_trusted_artifact(source, run_dir, name):
-    """Publish trusted bytes without following or replacing model-created paths."""
+    """Atomically publish a trusted file without touching an existing path."""
 
     destination = os.path.join(run_dir, name)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    if not _is_regular_nonsymlink(source):
+        return False
     try:
-        fd = os.open(destination, flags, 0o600)
-        with os.fdopen(fd, "wb") as output, open(source, "rb") as trusted_input:
-            shutil.copyfileobj(trusted_input, output)
-    except (FileExistsError, OSError):
+        os.link(source, destination, follow_symlinks=False)
+    except OSError:
         return False
     return True
+
+
+def _is_regular_nonsymlink(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def _git(args, cwd=None):
@@ -427,6 +431,16 @@ def compute_scope(opts):
     }
 
 
+def _has_unpinned_submodule_state(status_bytes):
+    """Reject submodule worktree bytes that the superproject cannot fingerprint."""
+
+    for entry in (item for item in status_bytes.split(b"\0") if item):
+        code = entry[:2]
+        if b"m" in code or (b"?" in code and code != b"??"):
+            return True
+    return False
+
+
 def capture_review_target(review_mode, base_ref):
     """Capture the exact Git/worktree bytes that one review is allowed to attest."""
 
@@ -447,6 +461,8 @@ def capture_review_target(review_mode, base_ref):
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
     )
     if rc != 0:
+        return None
+    if _has_unpinned_submodule_state(status):
         return None
     rc, committed_diff_bytes = _git_bytes(
         ["diff", "--binary", "%s...HEAD" % (base_ref or "HEAD")]
@@ -609,9 +625,20 @@ def resolve_profile(opts, scope, run_dir, repo_root=None):
 
     changed = False
     if mode == "branch":
-        _, names = _git(["diff", "--name-only", "%s...HEAD" % base_ref, "--", rel])
-        changed = bool(names.strip())
-        show_ref = base_ref
+        _, committed_names = _git(
+            ["diff", "--name-only", "%s...HEAD" % base_ref, "--", rel]
+        )
+        _, worktree_names = _git(
+            ["diff", "--name-only", "HEAD", "--", rel]
+        )
+        _, untracked = _git(
+            ["ls-files", "--others", "--exclude-standard", "--", rel]
+        )
+        committed_changed = bool(committed_names.strip())
+        changed = committed_changed or bool(worktree_names.strip()) or bool(
+            untracked.strip()
+        )
+        show_ref = base_ref if committed_changed else "HEAD"
     else:
         # uncommitted / codebase: worktree 上の profile 改変を信用せず HEAD 版で評価する
         _, names = _git(["diff", "--name-only", "HEAD", "--", rel])
@@ -1025,7 +1052,7 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
                  "extra_non_demotable"}(attestation と renderer へ伝搬)。
     """
     review_path = os.path.join(run_dir, "review.json")
-    if not os.path.isfile(review_path):
+    if not _is_regular_nonsymlink(review_path):
         if not quiet:
             _err("")
             _err("UNATTESTED: review.json が生成されていません(%s)" % review_path)
@@ -1350,6 +1377,23 @@ def _selftest_base_resolution(expect):
                    resolved2["source_kind"] == "repo"
                    and os.path.realpath(resolved2["path"]) == os.path.realpath(profile_abs),
                    str(resolved2))
+            with open(profile_abs, "r", encoding="utf-8") as fh:
+                branch_tampered = fh.read().replace(
+                    "status: approved", "status: draft"
+                )
+            with open(profile_abs, "w", encoding="utf-8") as fh:
+                fh.write(branch_tampered)
+            resolved_branch = resolve_profile(
+                {"review_mode": "branch"}, {"base_ref": "HEAD"}, run_dir
+            )
+            expect(
+                "base 版解決: branch modeのdirty profileもHEAD版で評価",
+                resolved_branch["source_kind"] == "repo-base"
+                and os.path.realpath(resolved_branch["path"])
+                != os.path.realpath(profile_abs),
+                str(resolved_branch),
+            )
+            _git(["checkout", "--", profile_rel], cwd=repo)
             os.unlink(profile_abs)
             os.symlink(FIXTURE_PROFILE, profile_abs)
             resolved3 = resolve_profile(opts, {"base_ref": "HEAD"}, run_dir)
@@ -1387,6 +1431,12 @@ def selftest():
 
     expect("review model policy", REVIEW_MODEL == "gpt-5.6-sol")
     expect("review reasoning policy", REVIEW_REASONING_EFFORT == "high")
+    expect(
+        "target identity: dirty submodule state is rejected",
+        _has_unpinned_submodule_state(b" m vendor/module\0")
+        and _has_unpinned_submodule_state(b" ? vendor/module\0")
+        and not _has_unpinned_submodule_state(b"?? new-file\0 M tracked\0"),
+    )
 
     _selftest_slice(expect)
     _selftest_base_resolution(expect)
