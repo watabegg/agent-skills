@@ -6888,10 +6888,14 @@ def codex_tui_blocker(pane: dict[str, Any] | None, text: str) -> str | None:
     if "Do you trust the contents of this directory?" in text or "Press enter to continue" in text:
         return "Codex trust prompt is pending"
     status = str(pane.get("agent_status") or "unknown")
-    if status == "working" or "esc to interrupt" in text or "• Working" in text:
+    if status == "working":
         return "Codex is still working"
     if status in {"blocked", "unknown"}:
         return f"Codex is not ready: agent_status={status}"
+    if status in {"idle", "done"}:
+        return None
+    if "esc to interrupt" in text or "• Working" in text:
+        return "Codex is still working"
     return None
 
 
@@ -6913,10 +6917,14 @@ def agent_tui_blocker(provider: str, pane: dict[str, Any] | None, text: str) -> 
         return f"{provider} trust prompt is pending"
     status = str(pane.get("agent_status") or "unknown")
     working_markers = ("esc to interrupt", "• Working", "Working…", "Working...")
-    if status == "working" or any(marker in text for marker in working_markers):
+    if status == "working":
         return f"{provider} is still working"
     if status in {"blocked", "unknown"}:
         return f"{provider} is not ready: agent_status={status}"
+    if status in {"idle", "done"}:
+        return None
+    if any(marker in text for marker in working_markers):
+        return f"{provider} is still working"
     return None
 
 
