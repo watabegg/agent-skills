@@ -566,9 +566,11 @@ def capture_review_target(review_mode, base_ref):
             mode = os.lstat(path).st_mode
             if stat.S_ISLNK(mode):
                 kind = b"symlink"
+                git_mode = b"120000"
                 contents = os.readlink(path).encode("utf-8", errors="surrogateescape")
             elif stat.S_ISREG(mode):
                 kind = b"regular"
+                git_mode = b"100755" if mode & 0o111 else b"100644"
                 with open(path, "rb") as fh:
                     contents = fh.read()
             else:
@@ -580,6 +582,8 @@ def capture_review_target(review_mode, base_ref):
             + raw_relative
             + b"\0"
             + kind
+            + b"\0"
+            + git_mode
             + b"\0"
             + str(len(contents)).encode("ascii")
             + b"\0"
@@ -1488,6 +1492,20 @@ def _selftest_base_resolution(expect):
                 regular_target is not None
                 and symlink_target is not None
                 and regular_target["fingerprint"] != symlink_target["fingerprint"],
+            )
+            os.unlink(untracked_path)
+            with open(untracked_path, "w", encoding="utf-8") as fh:
+                fh.write("same-bytes")
+            os.chmod(untracked_path, 0o644)
+            nonexecutable_target = capture_review_target("branch", "HEAD")
+            os.chmod(untracked_path, 0o755)
+            executable_target = capture_review_target("branch", "HEAD")
+            expect(
+                "target identity: untracked executable bit changes fingerprint",
+                nonexecutable_target is not None
+                and executable_target is not None
+                and nonexecutable_target["fingerprint"]
+                != executable_target["fingerprint"],
             )
             # 改変が無ければ worktree 版をそのまま使う
             rc, _ = _git(["checkout", "--", profile_rel], cwd=repo)
