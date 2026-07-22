@@ -1,9 +1,9 @@
 {
   "record_type": "external_review_protocol_adapter",
   "protocol": "codex-review-multi-v2",
-  "source": "https://github.com/fullerene-inc/agent-skills.git@49fd08742f7666efa1fd4775989317d2da73f077",
-  "version": "2.1.0",
-  "content_digest": "sha256:3efb10a8449c6f7602507b94b60008d8ecee77f1e8f8c03d1c91c69572e8f3e8",
+  "source": "https://github.com/watabegg/agent-skills.git#sha256-tree-v1=02af173b335dba110f10bf62b2601b13a160acabc4c3485f2e3536bfad0e7371",
+  "version": "2.1.1",
+  "content_digest": "sha256:02af173b335dba110f10bf62b2601b13a160acabc4c3485f2e3536bfad0e7371",
   "capabilities": [
     "externally-planned-v1"
   ]

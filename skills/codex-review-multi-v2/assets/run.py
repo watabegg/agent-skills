@@ -171,6 +171,40 @@ def _sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _has_symlink_component(path):
+    """Return True when any existing component of path is a symlink."""
+
+    current = os.path.sep
+    for component in os.path.abspath(path).split(os.path.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+    return False
+
+
+def _publish_trusted_artifact(source, run_dir, name):
+    """Publish trusted bytes without following or replacing model-created paths."""
+
+    destination = os.path.join(run_dir, name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(destination, flags, 0o600)
+        with os.fdopen(fd, "wb") as output, open(source, "rb") as trusted_input:
+            shutil.copyfileobj(trusted_input, output)
+    except (FileExistsError, OSError):
+        return False
+    return True
+
+
 def _git(args, cwd=None):
     """git コマンドを実行し (returncode, stdout文字列) を返す。"""
     try:
@@ -414,12 +448,14 @@ def capture_review_target(review_mode, base_ref):
     )
     if rc != 0:
         return None
-    diff_args = (
+    rc, committed_diff_bytes = _git_bytes(
         ["diff", "--binary", "%s...HEAD" % (base_ref or "HEAD")]
         if review_mode == "branch"
         else ["diff", "--binary", "HEAD"]
     )
-    rc, diff_bytes = _git_bytes(diff_args)
+    if rc != 0:
+        return None
+    rc, worktree_diff_bytes = _git_bytes(["diff", "--binary", "HEAD"])
     if rc != 0:
         return None
     rc, untracked_raw = _git_bytes(
@@ -435,7 +471,8 @@ def capture_review_target(review_mode, base_ref):
         (b"head", head_sha.encode("ascii")),
         (b"base", base_sha.encode("ascii")),
         (b"status", status),
-        (b"diff", diff_bytes),
+        (b"committed_diff", committed_diff_bytes),
+        (b"worktree_diff", worktree_diff_bytes),
     ):
         digest.update(label + b"\0" + str(len(value)).encode("ascii") + b"\0" + value)
     for raw_relative in sorted(item for item in untracked_raw.split(b"\0") if item):
@@ -469,13 +506,13 @@ def capture_review_target(review_mode, base_ref):
 # profile の解決(base 版採用による risk laundering 防止)と構造化スライス生成
 # ---------------------------------------------------------------------------
 
-def resolve_profile_path():
+def resolve_profile_path(*, allow_agents=True):
     """product profile のパス解決。repo override → AGENTS.md キー → 共有既定。"""
     rc, out = _git(["rev-parse", "--show-toplevel"])
     repo_root = out.strip() if rc == 0 else ""
     if repo_root:
         repo_profile = os.path.join(repo_root, ".codex", "product-profile.yaml")
-        if os.path.islink(repo_profile):
+        if _has_symlink_component(repo_profile):
             return (
                 DEFAULT_PROFILE,
                 "shared default (repo profile symlink rejected): %s" % DEFAULT_PROFILE,
@@ -484,19 +521,34 @@ def resolve_profile_path():
         if os.path.isfile(repo_profile):
             return repo_profile, "repo override: %s" % repo_profile, "repo"
         agents_md = os.path.join(repo_root, "AGENTS.md")
-        if os.path.isfile(agents_md):
+        if allow_agents and os.path.isfile(agents_md):
             try:
                 with open(agents_md, "r", encoding="utf-8", errors="replace") as fh:
                     for line in fh:
                         m = re.match(r"^product_profile:\s*(\S+)\s*$", line.strip())
                         if m:
                             cand = m.group(1)
-                            if not os.path.isabs(cand):
-                                cand = os.path.join(repo_root, cand)
-                            if os.path.islink(cand):
+                            if os.path.isabs(cand):
                                 return (
                                     DEFAULT_PROFILE,
-                                    "shared default (AGENTS.md profile symlink rejected): %s"
+                                    "shared default (absolute AGENTS.md profile rejected): %s"
+                                    % DEFAULT_PROFILE,
+                                    "shared-default",
+                                )
+                            cand = os.path.abspath(os.path.join(repo_root, cand))
+                            try:
+                                inside_repo = (
+                                    os.path.commonpath(
+                                        [os.path.realpath(repo_root), os.path.realpath(cand)]
+                                    )
+                                    == os.path.realpath(repo_root)
+                                )
+                            except ValueError:
+                                inside_repo = False
+                            if not inside_repo or _has_symlink_component(cand):
+                                return (
+                                    DEFAULT_PROFILE,
+                                    "shared default (unsafe AGENTS.md profile rejected): %s"
                                     % DEFAULT_PROFILE,
                                     "shared-default",
                                 )
@@ -514,15 +566,39 @@ def resolve_profile(opts, scope, run_dir, repo_root=None):
       path      = 検証・スライス生成に使う実ファイル(base 版なら run_dir 内コピー)
       full_path = reviewer へ提示する完全版パス(base 版なら「BASE:相対パス」表記)
     """
-    path, origin, source_kind = resolve_profile_path()
-    resolved = {"path": path, "full_path": path, "origin": origin,
-                "source_kind": source_kind, "notes": []}
-    if source_kind == "shared-default":
-        return resolved
-
     if repo_root is None:
         rc, out = _git(["rev-parse", "--show-toplevel"])
         repo_root = out.strip() if rc == 0 else ""
+    base_ref = (scope or {}).get("base_ref") or "HEAD"
+    allow_agents = True
+    if repo_root:
+        if opts["review_mode"] == "branch":
+            _, agents_changed = _git(
+                ["diff", "--name-only", "%s...HEAD" % base_ref, "--", "AGENTS.md"]
+            )
+            _, agents_worktree_changed = _git(
+                ["diff", "--name-only", "HEAD", "--", "AGENTS.md"]
+            )
+            agents_changed += agents_worktree_changed
+        else:
+            _, agents_changed = _git(
+                ["diff", "--name-only", "HEAD", "--", "AGENTS.md"]
+            )
+        _, agents_untracked = _git(
+            ["ls-files", "--others", "--exclude-standard", "--", "AGENTS.md"]
+        )
+        agents_changed += agents_untracked
+        allow_agents = not bool(agents_changed.strip())
+    path, origin, source_kind = resolve_profile_path(allow_agents=allow_agents)
+    resolved = {"path": path, "full_path": path, "origin": origin,
+                "source_kind": source_kind, "notes": []}
+    if not allow_agents:
+        resolved["notes"].append(
+            "レビュー対象が AGENTS.md を変更しているため、worktree の product_profile "
+            "指定は採用しない(fail-closed)"
+        )
+    if source_kind == "shared-default":
+        return resolved
     if not repo_root:
         return resolved
     # macOS の /var → /private/var 等の symlink 差を吸収してから相対化する
@@ -530,7 +606,6 @@ def resolve_profile(opts, scope, run_dir, repo_root=None):
     if rel.startswith(".."):
         return resolved  # repo 外の profile(AGENTS.md 指定の絶対パス等)は diff 改変対象外
     mode = opts["review_mode"]
-    base_ref = (scope or {}).get("base_ref") or "HEAD"
 
     changed = False
     if mode == "branch":
@@ -764,16 +839,22 @@ def prepare_trusted(run_dir, profile_path):
     items = dict(TRUSTED_FILES)
     if profile_path and os.path.isfile(profile_path):
         items["profile"] = ("product-profile.yaml", profile_path)
-    for key, (name, src) in items.items():
-        dst = os.path.join(trusted_dir, name)
-        shutil.copyfile(src, dst)
-        os.chmod(dst, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)  # 0444
-        digest = _sha256(dst)
-        if digest != _sha256(src):
-            _err("ATTESTATION_FAILED: %s のコピー検証に失敗しました" % src)
-            return None
-        trusted["paths"][key] = dst
-        trusted["sha256"][key] = digest
+    try:
+        for key, (name, src) in items.items():
+            dst = os.path.join(trusted_dir, name)
+            shutil.copyfile(src, dst)
+            os.chmod(dst, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)  # 0444
+            digest = _sha256(dst)
+            if digest != _sha256(src):
+                _err("ATTESTATION_FAILED: %s のコピー検証に失敗しました" % src)
+                shutil.rmtree(trusted_dir, ignore_errors=True)
+                return None
+            trusted["paths"][key] = dst
+            trusted["sha256"][key] = digest
+    except OSError as exc:
+        _err("ATTESTATION_FAILED: trusted コピーを作成できません: %s" % exc)
+        shutil.rmtree(trusted_dir, ignore_errors=True)
+        return None
     return trusted
 
 
@@ -851,9 +932,7 @@ def build_prompt(
         ),
         "- Do NOT write Action, P labels, verdicts, counts, or OK lines anywhere: the launcher derives them mechanically with validate_review.py and render_review.py after this session ends (fixed mapping in references/output-format.md).",
         "- Keep every candidate finding in review.json, including ones that product context would demote or omit; display trimming is the renderer's job, and record ALL profile gaps in the run-level profile_gaps array.",
-        "- Also write, as plain UTF-8 text files:",
-        "  - %s : one line per reviewer lane actually used (mark the sentinel lane as context-blind; for the Reviewed by section)" % os.path.join(run_dir, "reviewed_by.txt"),
-        "  - %s : the 総評 prose, 3-6 lines, without counts, P labels, or verdict words" % os.path.join(run_dir, "summary.txt"),
+        "- Do not create review.md, attestation.json, validation.log, or KPI artifacts; the trusted launcher creates those outside the model-writable directory and publishes them fail-closed.",
         "- The rendered output produced by the launcher is the official (attested) review result.",
         "",
         "JSON Schema (review.schema.json):",
@@ -1004,11 +1083,18 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
         validator_cmd.append("--allow-a11y")
     validator_cmd.append(validated_review_path)
     vproc = subprocess.run(validator_cmd, capture_output=True, text=True, check=False)
-    validation_log = os.path.join(run_dir, "validation.log")
-    with open(validation_log, "w", encoding="utf-8") as fh:
+    trusted_validation_log = os.path.join(trusted["dir"], "validation.log")
+    with open(trusted_validation_log, "w", encoding="utf-8") as fh:
         fh.write(vproc.stdout)
         if vproc.stderr:
             fh.write(vproc.stderr)
+    if not _publish_trusted_artifact(
+        trusted_validation_log, run_dir, "validation.log"
+    ):
+        if not quiet:
+            _err("ATTESTATION_FAILED: model-managed validation.log already exists")
+        return EXIT_VIOLATION
+    validation_log = os.path.join(run_dir, "validation.log")
     if not quiet and (vproc.stdout or vproc.stderr):
         sys.stderr.write(vproc.stdout)
         sys.stderr.write(vproc.stderr)
@@ -1025,19 +1111,17 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
 
     # 描画(Action・P・verdict・件数は renderer が固定写像で機械導出。attested なので
     # --unattested は付けない)。KPI artifact も同時に書き出す。
-    review_md = os.path.join(run_dir, "review.md")
+    review_md = os.path.join(trusted["dir"], "review.md")
+    profile_gaps = os.path.join(trusted["dir"], "profile_gaps.json")
+    action_derivation = os.path.join(trusted["dir"], "action_derivation.json")
     render_cmd = [sys.executable, trusted["paths"]["renderer"],
                   "--mode", validator_mode, "-o", review_md,
-                  "--gaps-out", os.path.join(run_dir, "profile_gaps.json"),
-                  "--derivation-out", os.path.join(run_dir, "action_derivation.json")]
+                  "--gaps-out", profile_gaps,
+                  "--derivation-out", action_derivation]
     if today:
         render_cmd += ["--today", today]
     for cls in (slice_info or {}).get("extra_non_demotable") or []:
         render_cmd += ["--non-demotable", cls]
-    for line in _optional_lines(run_dir, "reviewed_by.txt"):
-        render_cmd += ["--reviewed-by", line]
-    for line in _optional_lines(run_dir, "summary.txt"):
-        render_cmd += ["--summary", line]
     render_cmd.append(validated_review_path)
     rproc = subprocess.run(render_cmd, capture_output=True, text=True, check=False)
     if rproc.returncode != 0:
@@ -1061,6 +1145,16 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
         if not quiet:
             _err("ATTESTATION_FAILED: trusted review snapshot changed")
         return EXIT_VIOLATION
+
+    for source, name in (
+        (review_md, "review.md"),
+        (profile_gaps, "profile_gaps.json"),
+        (action_derivation, "action_derivation.json"),
+    ):
+        if not _publish_trusted_artifact(source, run_dir, name):
+            if not quiet:
+                _err("ATTESTATION_FAILED: model-managed %s already exists" % name)
+            return EXIT_VIOLATION
 
     # attestation.json の外部生成(モデルは書けない)。resolved profile の来歴を含める。
     rc, head_out = _git(["rev-parse", "HEAD"])
@@ -1094,10 +1188,17 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
         "validated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "exit_code": vproc.returncode,
     }
-    attestation_path = os.path.join(run_dir, "attestation.json")
-    with open(attestation_path, "w", encoding="utf-8") as fh:
+    trusted_attestation_path = os.path.join(trusted["dir"], "attestation.json")
+    with open(trusted_attestation_path, "w", encoding="utf-8") as fh:
         json.dump(attestation, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
+    if not _publish_trusted_artifact(
+        trusted_attestation_path, run_dir, "attestation.json"
+    ):
+        if not quiet:
+            _err("ATTESTATION_FAILED: model-managed attestation.json already exists")
+        return EXIT_VIOLATION
+    attestation_path = os.path.join(run_dir, "attestation.json")
 
     if not quiet:
         with open(review_md, "r", encoding="utf-8") as fh:
@@ -1106,7 +1207,7 @@ def finalize(run_dir, trusted, validator_mode, allow_a11y, context,
         print("-" * 64)
         print("ATTESTED: crv2 trusted launcher 経由の検証済みレビュー結果")
         print("  run dir:     %s" % run_dir)
-        print("  review:      %s" % review_md)
+        print("  review:      %s" % os.path.join(run_dir, "review.md"))
         print("  attestation: %s" % attestation_path)
     return EXIT_OK
 
@@ -1229,6 +1330,19 @@ def _selftest_base_resolution(expect):
                 and target_after is not None
                 and target_before["fingerprint"] != target_after["fingerprint"],
             )
+            with open(os.path.join(repo, "main.txt"), "w", encoding="utf-8") as fh:
+                fh.write("dirty-one\n")
+            branch_target_before = capture_review_target("branch", "HEAD")
+            with open(os.path.join(repo, "main.txt"), "w", encoding="utf-8") as fh:
+                fh.write("dirty-two\n")
+            branch_target_after = capture_review_target("branch", "HEAD")
+            expect(
+                "target identity: branch mode also hashes dirty tracked bytes",
+                branch_target_before is not None
+                and branch_target_after is not None
+                and branch_target_before["fingerprint"]
+                != branch_target_after["fingerprint"],
+            )
             # 改変が無ければ worktree 版をそのまま使う
             rc, _ = _git(["checkout", "--", profile_rel], cwd=repo)
             resolved2 = resolve_profile(opts, {"base_ref": "HEAD"}, run_dir)
@@ -1243,6 +1357,21 @@ def _selftest_base_resolution(expect):
                 "base 版解決: symlink profile は shared-default へ fail-closed",
                 resolved3["source_kind"] == "shared-default",
                 str(resolved3),
+            )
+            os.unlink(profile_abs)
+            os.rmdir(os.path.dirname(profile_abs))
+            external_profile_dir = os.path.join(td, "external-profile")
+            os.makedirs(external_profile_dir)
+            shutil.copyfile(
+                FIXTURE_PROFILE,
+                os.path.join(external_profile_dir, "product-profile.yaml"),
+            )
+            os.symlink(external_profile_dir, os.path.join(repo, ".codex"))
+            resolved4 = resolve_profile(opts, {"base_ref": "HEAD"}, run_dir)
+            expect(
+                "base 版解決: parent symlink profile は shared-default へ fail-closed",
+                resolved4["source_kind"] == "shared-default",
+                str(resolved4),
             )
         finally:
             os.chdir(prev_cwd)
@@ -1323,6 +1452,27 @@ def selftest():
         code = finalize(run_dir, trusted, "review", False, context,
                         quiet=True, today=FIXTURE_TODAY, slice_info=slice_info)
         expect("trusted 改変 → exit 2 (実際 %d)" % code, code == EXIT_VIOLATION)
+
+        # model-writable artifact symlinkをtrusted親プロセスが辿らない
+        run_dir = os.path.join(td, "artifact_symlink")
+        os.makedirs(run_dir)
+        trusted = prepare_trusted(run_dir, FIXTURE_PROFILE)
+        shutil.copyfile(
+            os.path.join(FIXTURES_DIR, "review_good.json"),
+            os.path.join(run_dir, "review.json"),
+        )
+        victim = os.path.join(td, "victim.txt")
+        with open(victim, "w", encoding="utf-8") as fh:
+            fh.write("preserve-me\n")
+        os.symlink(victim, os.path.join(run_dir, "validation.log"))
+        code = finalize(run_dir, trusted, "review", False, context,
+                        quiet=True, today=FIXTURE_TODAY, slice_info=slice_info)
+        with open(victim, encoding="utf-8") as fh:
+            victim_text = fh.read()
+        expect(
+            "artifact symlink → exit 2 without victim overwrite",
+            code == EXIT_VIOLATION and victim_text == "preserve-me\n",
+        )
 
         # stale profile では良例(context_effect 降格を含む)も契約違反になる(fail-closed)
         run_dir = os.path.join(td, "stale_profile")
@@ -1416,48 +1566,48 @@ def main(argv):
     if trusted is None:
         return EXIT_VIOLATION
 
-    prompt = build_prompt(
-        opts,
-        scope,
-        canonical,
-        slice_canonical,
-        slice_sha256,
-        resolved["origin"],
-        run_dir,
-        target_identity,
-    )
-    with open(os.path.join(run_dir, "prompt.txt"), "w", encoding="utf-8") as fh:
-        fh.write(prompt)
-
-    log_path = os.path.join(run_dir, "session.log")
-    codex_status = launch_codex(prompt, opts, log_path, run_dir)
-
-    session_id = extract_session_id(log_path)
-    if session_id:
-        print("", file=sys.stderr)
-        print("Session ID: %s" % session_id, file=sys.stderr)
-        print("Resume: env CODEX_HOME=\"%s\" codex exec resume --skip-git-repo-check %s"
-              % (opts["codex_home"], session_id), file=sys.stderr)
-
-    review_exists = os.path.isfile(os.path.join(run_dir, "review.json"))
-    if codex_status != 0 and not review_exists:
-        _err("codex が exit %d で失敗し、review.json も生成されていません(UNATTESTED)" % codex_status)
-        _err("セッションログ: %s" % log_path)
-        return codex_status
-
-    # ユーザーの明示 focus に a11y があるときのみ FORBIDDEN_TERM 検査を解除する
-    allow_a11y = bool(re.search(r"a11y|アクセシビリティ", opts["extra"], re.IGNORECASE))
-    validator_mode = "audit" if opts["review_mode"] == "codebase" else "review"
-    context = {
-        "review_mode": opts["review_mode"],
-        "reviewer_count": opts["reviewer_count"],
-        "codex_profile": opts["codex_profile"],
-        "fast_mode": opts["fast_mode"],
-        "session_id": session_id,
-        "base_ref": scope.get("base_ref") or "HEAD",
-        "target_identity": target_identity,
-    }
     try:
+        prompt = build_prompt(
+            opts,
+            scope,
+            canonical,
+            slice_canonical,
+            slice_sha256,
+            resolved["origin"],
+            run_dir,
+            target_identity,
+        )
+        with open(os.path.join(run_dir, "prompt.txt"), "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+
+        log_path = os.path.join(run_dir, "session.log")
+        codex_status = launch_codex(prompt, opts, log_path, run_dir)
+
+        session_id = extract_session_id(log_path)
+        if session_id:
+            print("", file=sys.stderr)
+            print("Session ID: %s" % session_id, file=sys.stderr)
+            print("Resume: env CODEX_HOME=\"%s\" codex exec resume --skip-git-repo-check %s"
+                  % (opts["codex_home"], session_id), file=sys.stderr)
+
+        review_exists = os.path.isfile(os.path.join(run_dir, "review.json"))
+        if codex_status != 0 and not review_exists:
+            _err("codex が exit %d で失敗し、review.json も生成されていません(UNATTESTED)" % codex_status)
+            _err("セッションログ: %s" % log_path)
+            return codex_status
+
+        # ユーザーの明示 focus に a11y があるときのみ FORBIDDEN_TERM 検査を解除する
+        allow_a11y = bool(re.search(r"a11y|アクセシビリティ", opts["extra"], re.IGNORECASE))
+        validator_mode = "audit" if opts["review_mode"] == "codebase" else "review"
+        context = {
+            "review_mode": opts["review_mode"],
+            "reviewer_count": opts["reviewer_count"],
+            "codex_profile": opts["codex_profile"],
+            "fast_mode": opts["fast_mode"],
+            "session_id": session_id,
+            "base_ref": scope.get("base_ref") or "HEAD",
+            "target_identity": target_identity,
+        }
         return finalize(
             run_dir,
             trusted,
