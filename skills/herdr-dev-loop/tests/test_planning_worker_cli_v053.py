@@ -2021,6 +2021,14 @@ class PlanningWorkerCliV053Tests(unittest.TestCase):
             )
             with mock.patch.object(hloop, "preflight_loop", return_value=state):
                 self.assertEqual(hloop.cmd_merge(merge_args), 0)
+            self.assertEqual(task_state["changed_files"], ["src/task.py"])
+            self.assertTrue(
+                all(
+                    path != hloop.LOOP_DIR.as_posix()
+                    and not path.startswith(hloop.LOOP_DIR.as_posix() + "/")
+                    for path in task_state["changed_files"]
+                )
+            )
             task_state["current_patch_review"]["candidate_sha"] = "d" * 40
             with (
                 mock.patch.object(hloop, "preflight_loop", return_value=state),

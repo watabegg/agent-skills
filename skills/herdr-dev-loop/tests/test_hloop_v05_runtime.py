@@ -2963,6 +2963,22 @@ class BrokerTransportAndAuthenticationTests(unittest.TestCase):
                         )
                     )
 
+    def test_done_status_is_stable_ready_state_for_staged_input_checks(self):
+        pane = {
+            "agent": "codex",
+            "agent_status": "done",
+            "session_id": "session-1",
+        }
+        with mock.patch.object(hloop, "pane_info", return_value=pane), mock.patch.object(
+            hloop, "pane_text", return_value="staged input"
+        ):
+            self.assertEqual(
+                hloop.same_idle_agent_session(
+                    "codex", "pane-1", "session-1"
+                ),
+                (pane, "staged input"),
+            )
+
     def test_working_status_and_text_fallback_still_block_tui_delivery(self):
         self.assertEqual(
             hloop.codex_tui_blocker(

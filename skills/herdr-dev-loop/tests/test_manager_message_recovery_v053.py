@@ -590,6 +590,121 @@ class ManagerMessageRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(stale_observed, "ambiguous")
 
+    def test_idle_long_staged_input_accepts_exact_end_marker_when_start_is_clipped(self):
+        state = self.state()
+        worker = self.role_state("T001-A001", "pane-worker")
+        state["tasks"]["T001"] = worker
+        message_id = self.add_unknown(state, "T001", worker)
+        entry = hloop.manager_message_by_id(worker, message_id)
+        self.assertIsNotNone(entry)
+        entry["transport_stage"] = "send-text-started"
+
+        observed = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "idle"},
+            "long input tail whose start is outside the viewport\n"
+            + entry["end_marker"]
+            + "\n\n─ gpt-test max · /tmp/worktree\n",
+        )
+
+        self.assertEqual(observed, "staged-idle")
+
+        footer_without_rule = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "idle"},
+            entry["end_marker"] + "\n\ngpt-test max · /tmp/worktree\n",
+        )
+        self.assertEqual(footer_without_rule, "staged-idle")
+
+        done_observed = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "done"},
+            entry["end_marker"] + "\n\ngpt-test max · /tmp/worktree\n",
+        )
+        self.assertEqual(done_observed, "staged-idle")
+
+        entry["end_marker_staged"] = False
+        unproven = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "idle"},
+            "long input tail whose start is outside the viewport\n"
+            + entry["end_marker"]
+            + "\n\n─ gpt-test max · /tmp/worktree\n",
+        )
+        self.assertEqual(unproven, "ambiguous")
+
+        entry["end_marker_staged"] = True
+        transcript_after_marker = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "idle"},
+            entry["end_marker"] + "\n› unrelated later prompt\n",
+        )
+        self.assertEqual(transcript_after_marker, "ambiguous")
+
+        footer_shaped_transcript = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "idle"},
+            entry["end_marker"] + "\nstatus · /tmp/worktree\n",
+        )
+        self.assertEqual(footer_shaped_transcript, "ambiguous")
+
+        submitted = hloop.recorded_manager_message_observation(
+            "codex",
+            entry,
+            {"agent_status": "working"},
+            entry["end_marker"]
+            + "\n\n• "
+            + hloop.manager_message_record_identity(entry)["ack_marker"]
+            + "\n",
+        )
+        self.assertEqual(submitted, "submitted-ack")
+
+    def test_confirmed_contract_message_preserves_artifact_digest_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            contract_path = hloop.task_file(repo, "T001")
+            contract_path.parent.mkdir(parents=True)
+            contract_path.write_text("original task contract\n", encoding="utf-8")
+            artifact_digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            message_digest = hashlib.sha256(b"approved contract extension").hexdigest()
+            message_id = "22222222-2222-4222-8222-222222222222"
+            task_state = {
+                "task_contract_digest": artifact_digest,
+                "active_report_contract_digest": message_digest,
+                "semantic_ack_barrier": {
+                    "kind": "message",
+                    "message_id": message_id,
+                    "digest": message_digest,
+                    "report_identity_status": "bound",
+                },
+            }
+            entry = {"message_id": message_id}
+
+            self.assertTrue(
+                hloop.apply_contract_message_digest_projection(task_state, entry)
+            )
+            self.assertEqual(task_state["task_contract_digest"], message_digest)
+            self.assertEqual(
+                task_state["task_contract_artifact_digest"], artifact_digest
+            )
+            self.assertFalse(
+                hloop.apply_contract_message_digest_projection(task_state, entry)
+            )
+            self.assertEqual(
+                hloop.exact_task_contract_digest(repo, "T001", task_state),
+                (artifact_digest, f"sha256:{message_digest}"),
+            )
+
+            contract_path.write_text("tampered task contract\n", encoding="utf-8")
+            with self.assertRaisesRegex(hloop.HLoopError, "digest drift"):
+                hloop.exact_task_contract_digest(repo, "T001", task_state)
+
     def test_status_inventory_surfaces_unknown_as_p1_next_action(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
