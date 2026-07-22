@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,16 @@ if spec is None:
     raise RuntimeError("could not load hloop runtime")
 hloop = importlib.util.module_from_spec(spec)
 loader.exec_module(hloop)
+
+runner_loader = importlib.machinery.SourceFileLoader(
+    "hloop_v053_synthetic_runner",
+    str(Path(__file__).parent / "run_synthetic_e2e.py"),
+)
+runner_spec = importlib.util.spec_from_loader(runner_loader.name, runner_loader)
+if runner_spec is None:
+    raise RuntimeError("could not load synthetic E2E runner")
+synthetic_runner = importlib.util.module_from_spec(runner_spec)
+runner_loader.exec_module(synthetic_runner)
 
 from hloop_lib.remediation import (  # noqa: E402
     CandidateClassificationConflict,
@@ -1467,6 +1478,277 @@ class HLoopV053E2ETests(unittest.TestCase):
             mismatch,
         )
         self.assertFalse(evidence["checkout_identity"]["verified"])
+
+    def test_synthetic_runner_rejects_dirty_skill_source_identity(self):
+        def git(repo: Path, *args: str) -> str:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=repo,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return completed.stdout.strip()
+
+        for mutation in ("unstaged", "staged", "untracked"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                skill_root = repo / "skills" / "herdr-dev-loop"
+                skill_root.mkdir(parents=True)
+                tracked = skill_root / "README.md"
+                tracked.write_text("baseline\n", encoding="utf-8")
+                git(repo, "init", "--initial-branch=main")
+                git(repo, "config", "user.email", "hloop-e2e@example.invalid")
+                git(repo, "config", "user.name", "HLoop E2E")
+                git(repo, "add", "skills/herdr-dev-loop/README.md")
+                git(repo, "commit", "-m", "baseline")
+                expected = git(repo, "rev-parse", "HEAD")
+
+                clean = synthetic_runner.checkout_identity_record(
+                    expected,
+                    skill_root=skill_root,
+                )
+                self.assertTrue(clean["verified"])
+                self.assertTrue(clean["skill_subtree_clean"])
+                self.assertEqual(clean["dirty_paths"], [])
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "HLOOP_SYNTHETIC_PRIVATE_SNAPSHOT_SHA": expected,
+                        "HLOOP_SYNTHETIC_SOURCE_SKILL_ROOT": str(skill_root),
+                    },
+                    clear=False,
+                ):
+                    spoofed = synthetic_runner.checkout_identity_record(
+                        expected,
+                        skill_root=skill_root,
+                        require_private_snapshot=True,
+                    )
+                self.assertFalse(spoofed["verified"])
+                self.assertFalse(spoofed["private_snapshot_verified"])
+                self.assertEqual(spoofed["execution_source"], "mutable-checkout")
+
+                if mutation == "untracked":
+                    (skill_root / "UNTRACKED.md").write_text(
+                        "not in the release commit\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    tracked.write_text("dirty\n", encoding="utf-8")
+                    if mutation == "staged":
+                        git(repo, "add", "skills/herdr-dev-loop/README.md")
+
+                dirty = synthetic_runner.checkout_identity_record(
+                    expected,
+                    skill_root=skill_root,
+                )
+                self.assertFalse(dirty["verified"])
+                self.assertFalse(dirty["skill_subtree_clean"])
+                self.assertTrue(dirty["dirty_paths"])
+                self.assertIn("source changes", dirty["error"])
+
+    def test_snapshot_output_path_uses_argparse_last_value(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_synthetic_e2e.py",
+                "--output",
+                "/tmp/first.json",
+                "--output=/tmp/second.json",
+                "--expected-integration-sha",
+                "a" * 40,
+                "--expected-integration-sha=" + "b" * 40,
+            ],
+        ):
+            self.assertEqual(
+                synthetic_runner._raw_output_path(), Path("/tmp/second.json")
+            )
+            self.assertEqual(
+                synthetic_runner._raw_expected_integration_sha(), "b" * 40
+            )
+
+    def test_parent_cleanup_attestation_validates_child_identity(self):
+        expected = "a" * 40
+        child = {
+            "status": "passed",
+            "checkout_identity": {
+                "expected_integration_sha": expected,
+                "resolved_head_sha": expected,
+                "private_snapshot_sha": expected,
+                "skill_subtree_clean": True,
+                "private_snapshot_verified": True,
+                "execution_verified": True,
+                "verified": False,
+                "parent_cleanup_attested": False,
+                "error": "parent cleanup attestation is pending",
+            },
+        }
+        attested = json.loads(
+            synthetic_runner._mark_snapshot_cleanup_passed(json.dumps(child))
+        )
+        self.assertTrue(attested["checkout_identity"]["verified"])
+        self.assertTrue(
+            attested["checkout_identity"]["parent_cleanup_attested"]
+        )
+        self.assertEqual(attested["checkout_identity"]["error"], "")
+        self.assertEqual(
+            attested["snapshot_cleanup"], {"status": "passed", "error": ""}
+        )
+
+        child["checkout_identity"]["execution_verified"] = False
+        rejected = json.loads(
+            synthetic_runner._mark_snapshot_cleanup_passed(json.dumps(child))
+        )
+        self.assertEqual(rejected["status"], "failed")
+        self.assertFalse(rejected["checkout_identity"]["verified"])
+        self.assertFalse(
+            rejected["checkout_identity"]["parent_cleanup_attested"]
+        )
+
+    def test_parent_extracts_final_json_after_incidental_stdout(self):
+        prefix = "sent manager message\n{\n  \"diagnostic\": true\n}\n"
+        final = {"status": "failed", "checkout_identity": {"verified": False}}
+        split = synthetic_runner._trailing_json_payload(
+            prefix + json.dumps(final, indent=2) + "\n"
+        )
+
+        self.assertIsNotNone(split)
+        incidental, payload = split
+        self.assertEqual(incidental, prefix)
+        self.assertEqual(json.loads(payload), final)
+
+    def test_synthetic_runner_main_fails_before_scenarios_on_dirty_skill_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            copied_skill = repo / "skills" / "herdr-dev-loop"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return completed.stdout.strip()
+
+            git("init", "--initial-branch=main")
+            git("config", "user.email", "hloop-e2e@example.invalid")
+            git("config", "user.name", "HLoop E2E")
+            git("add", "skills/herdr-dev-loop")
+            git("commit", "-m", "synthetic release candidate")
+            expected = git("rev-parse", "HEAD")
+            clean_completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(copied_skill / "tests" / "run_synthetic_e2e.py"),
+                    "--json",
+                    "--scenario",
+                    "user-stop-freeze",
+                    "--expected-integration-sha",
+                    expected,
+                ],
+                cwd=repo,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(clean_completed.returncode, 0, clean_completed.stderr)
+            clean_evidence = json.loads(clean_completed.stdout)
+            self.assertEqual(clean_evidence["status"], "passed")
+            self.assertEqual(clean_evidence["scenario_count"], 1)
+            self.assertTrue(clean_evidence["checkout_identity"]["verified"])
+            self.assertTrue(
+                clean_evidence["checkout_identity"]["parent_cleanup_attested"]
+            )
+            self.assertTrue(
+                clean_evidence["checkout_identity"]["execution_verified"]
+            )
+            self.assertEqual(
+                clean_evidence["checkout_identity"]["execution_source"],
+                "private-detached-worktree",
+            )
+            self.assertEqual(
+                clean_evidence["checkout_identity"]["private_snapshot_sha"],
+                expected,
+            )
+            self.assertTrue(
+                clean_evidence["checkout_identity"]["private_snapshot_verified"]
+            )
+            self.assertEqual(
+                clean_evidence["snapshot_cleanup"],
+                {"status": "passed", "error": ""},
+            )
+            self.assertEqual(git("status", "--porcelain"), "")
+
+            forbidden_output = copied_skill / "release-evidence.json"
+            output_completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(copied_skill / "tests" / "run_synthetic_e2e.py"),
+                    "--json",
+                    "--scenario",
+                    "user-stop-freeze",
+                    "--expected-integration-sha",
+                    expected,
+                    "--output",
+                    str(forbidden_output),
+                ],
+                cwd=repo,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(output_completed.returncode, 1, output_completed.stderr)
+            output_evidence = json.loads(output_completed.stdout)
+            self.assertEqual(output_evidence["scenario_count"], 0)
+            self.assertFalse(output_evidence["checkout_identity"]["verified"])
+            self.assertIn(
+                "output must be outside",
+                output_evidence["checkout_identity"]["error"],
+            )
+            self.assertFalse(forbidden_output.exists())
+            self.assertEqual(git("status", "--porcelain"), "")
+
+            with (copied_skill / "README.md").open("a", encoding="utf-8") as handle:
+                handle.write("dirty overlay\n")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(copied_skill / "tests" / "run_synthetic_e2e.py"),
+                    "--json",
+                    "--scenario",
+                    "user-stop-freeze",
+                    "--expected-integration-sha",
+                    expected,
+                ],
+                cwd=repo,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual(evidence["status"], "failed")
+            self.assertEqual(evidence["scenario_count"], 0)
+            identity = evidence["checkout_identity"]
+            self.assertFalse(identity["verified"])
+            self.assertFalse(identity["skill_subtree_clean"])
+            self.assertIn("README.md", identity["error"])
 
     def test_synthetic_runner_requires_external_checkout_identity(self):
         env = os.environ.copy()

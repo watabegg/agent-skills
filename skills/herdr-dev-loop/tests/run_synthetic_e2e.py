@@ -24,6 +24,461 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 
+sys.dont_write_bytecode = True
+
+_SNAPSHOT_ACTIVE_ENV = "HLOOP_SYNTHETIC_PRIVATE_SNAPSHOT_SHA"
+_SNAPSHOT_SOURCE_SKILL_ENV = "HLOOP_SYNTHETIC_SOURCE_SKILL_ROOT"
+_SNAPSHOT_BOOTSTRAP_ERROR_ENV = "HLOOP_SYNTHETIC_SNAPSHOT_BOOTSTRAP_ERROR"
+
+
+def _raw_expected_integration_sha() -> str:
+    """Read the release identity before any repository-local module import."""
+
+    expected = ""
+    for index, value in enumerate(sys.argv[1:]):
+        if value == "--expected-integration-sha":
+            argument_index = index + 2
+            expected = (
+                sys.argv[argument_index] if argument_index < len(sys.argv) else ""
+            )
+        elif value.startswith("--expected-integration-sha="):
+            expected = value.split("=", 1)[1]
+    return expected or str(
+        os.environ.get("HLOOP_EXPECTED_INTEGRATION_SHA") or ""
+    ).strip()
+
+
+def _raw_output_path() -> Path | None:
+    output_path: Path | None = None
+    for index, value in enumerate(sys.argv[1:]):
+        if value == "--output":
+            argument_index = index + 2
+            output_path = (
+                Path(sys.argv[argument_index])
+                if argument_index < len(sys.argv)
+                else None
+            )
+        elif value.startswith("--output="):
+            output_path = Path(value.split("=", 1)[1])
+    return output_path
+
+
+def _mark_snapshot_cleanup_failed(payload: str, detail: str) -> str:
+    """Turn child JSON evidence into a fail-closed cleanup result."""
+
+    try:
+        result = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
+    if not isinstance(result, dict):
+        return payload
+    result["status"] = "failed"
+    result["snapshot_cleanup"] = {"status": "failed", "error": detail}
+    identity = result.get("checkout_identity")
+    if isinstance(identity, dict):
+        identity["verified"] = False
+        identity["parent_cleanup_attested"] = False
+        identity["error"] = detail
+    return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _mark_snapshot_cleanup_passed(payload: str) -> str:
+    try:
+        result = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
+    if not isinstance(result, dict):
+        return payload
+    result["snapshot_cleanup"] = {"status": "passed", "error": ""}
+    identity = result.get("checkout_identity")
+    identity_error = ""
+    if not isinstance(identity, dict):
+        identity_error = "child evidence has no checkout identity"
+    elif identity.get("execution_verified") is not True:
+        identity_error = str(identity.get("error") or "") or (
+            "child execution identity was not verified"
+        )
+    elif identity.get("private_snapshot_verified") is not True:
+        identity_error = "child did not execute in the verified private snapshot"
+    elif identity.get("skill_subtree_clean") is not True:
+        identity_error = "child private snapshot skill subtree was not clean"
+    elif not str(identity.get("expected_integration_sha") or ""):
+        identity_error = "child expected integration SHA is missing"
+    elif len(
+        {
+            str(identity.get("expected_integration_sha") or ""),
+            str(identity.get("resolved_head_sha") or ""),
+            str(identity.get("private_snapshot_sha") or ""),
+        }
+    ) != 1:
+        identity_error = "child private snapshot SHA identity is inconsistent"
+    if identity_error:
+        result["status"] = "failed"
+        if isinstance(identity, dict):
+            identity["verified"] = False
+            identity["parent_cleanup_attested"] = False
+            identity["error"] = identity_error
+    else:
+        identity["verified"] = True
+        identity["parent_cleanup_attested"] = True
+        identity["error"] = ""
+    return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _snapshot_parent_attestation_present(payload: str) -> bool:
+    try:
+        result = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(result, dict):
+        return False
+    identity = result.get("checkout_identity")
+    cleanup = result.get("snapshot_cleanup")
+    return bool(
+        isinstance(identity, dict)
+        and identity.get("verified") is True
+        and identity.get("parent_cleanup_attested") is True
+        and isinstance(cleanup, dict)
+        and cleanup.get("status") == "passed"
+    )
+
+
+def _trailing_json_payload(payload: str) -> tuple[str, str] | None:
+    """Split incidental stdout from the final pretty-printed JSON object."""
+
+    starts = [match.start() for match in re.finditer(r"(?m)^\{", payload)]
+    for start in reversed(starts):
+        candidate = payload[start:].strip()
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return payload[:start], candidate + "\n"
+    return None
+
+
+def _private_snapshot_context_matches(expected: str) -> bool:
+    """Verify the private snapshot from Git topology, not self-reported env."""
+
+    if str(os.environ.get(_SNAPSHOT_ACTIVE_ENV) or "").strip() != expected:
+        return False
+    source_value = str(os.environ.get(_SNAPSHOT_SOURCE_SKILL_ENV) or "").strip()
+    if not source_value:
+        return False
+    snapshot_skill = Path(__file__).resolve().parents[1]
+    source_skill = Path(source_value).resolve()
+    if snapshot_skill == source_skill or not source_skill.is_dir():
+        return False
+
+    def git_text(skill: Path, *args: str) -> tuple[int, str]:
+        completed = subprocess.run(
+            ["git", "-C", str(skill), *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return completed.returncode, completed.stdout.strip()
+
+    snapshot_top_rc, snapshot_top_text = git_text(
+        snapshot_skill, "rev-parse", "--show-toplevel"
+    )
+    source_top_rc, source_top_text = git_text(
+        source_skill, "rev-parse", "--show-toplevel"
+    )
+    snapshot_common_rc, snapshot_common_text = git_text(
+        snapshot_skill,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    source_common_rc, source_common_text = git_text(
+        source_skill,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    snapshot_head_rc, snapshot_head = git_text(snapshot_skill, "rev-parse", "HEAD")
+    detached = subprocess.run(
+        ["git", "-C", str(snapshot_skill), "symbolic-ref", "-q", "HEAD"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if any(
+        code != 0
+        for code in (
+            snapshot_top_rc,
+            source_top_rc,
+            snapshot_common_rc,
+            source_common_rc,
+            snapshot_head_rc,
+        )
+    ):
+        return False
+    snapshot_top = Path(snapshot_top_text).resolve()
+    source_top = Path(source_top_text).resolve()
+    try:
+        same_relative_skill = (
+            snapshot_skill.relative_to(snapshot_top)
+            == source_skill.relative_to(source_top)
+        )
+    except ValueError:
+        return False
+    return bool(
+        same_relative_skill
+        and snapshot_head == expected
+        and detached.returncode == 1
+        and (snapshot_top / ".git").is_file()
+        and Path(snapshot_common_text).resolve()
+        == Path(source_common_text).resolve()
+    )
+
+
+def _bootstrap_private_release_snapshot() -> None:
+    """Re-exec pinned release runs from a private detached worktree.
+
+    The bootstrap runs before importing ``hloop`` or ``hloop_lib``. A clean
+    mutable checkout is used only to locate the repository and expected
+    commit; every release scenario then executes the committed bytes from a
+    disposable detached worktree. Dirty or mismatched checkouts fall through
+    to ``main`` solely to emit the normal structured fail-closed result.
+    """
+
+    expected = _raw_expected_integration_sha()
+    if _private_snapshot_context_matches(expected):
+        return
+    # A caller-provided marker is not evidence. Clear it and build a real
+    # snapshot when the current checkout is otherwise eligible.
+    os.environ.pop(_SNAPSHOT_ACTIVE_ENV, None)
+    os.environ.pop(_SNAPSHOT_SOURCE_SKILL_ENV, None)
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected) is None:
+        return
+    source_skill = Path(__file__).resolve().parents[1]
+    head = subprocess.run(
+        ["git", "-C", str(source_skill), "rev-parse", "HEAD"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_skill),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--",
+            ".",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if (
+        head.returncode != 0
+        or head.stdout.strip() != expected
+        or status.returncode != 0
+        or bool(status.stdout)
+    ):
+        return
+    top = subprocess.run(
+        ["git", "-C", str(source_skill), "rev-parse", "--show-toplevel"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if top.returncode != 0 or not top.stdout.strip():
+        os.environ[_SNAPSHOT_BOOTSTRAP_ERROR_ENV] = (
+            "could not resolve repository root for private release snapshot"
+        )
+        return
+    source_repo = Path(top.stdout.strip()).resolve()
+    relative_runner = Path(__file__).resolve().relative_to(source_repo)
+    temporary_root = Path(tempfile.mkdtemp(prefix="hloop-release-snapshot-"))
+    snapshot_repo = temporary_root / "checkout"
+    try:
+        added = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_repo),
+                "worktree",
+                "add",
+                "--detach",
+                str(snapshot_repo),
+                expected,
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        os.environ[_SNAPSHOT_BOOTSTRAP_ERROR_ENV] = (
+            f"could not create private release snapshot: {exc}"
+        )
+        return
+    if added.returncode != 0:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_repo),
+                "worktree",
+                "remove",
+                "--force",
+                str(snapshot_repo),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "-C", str(source_repo), "worktree", "prune"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        os.environ[_SNAPSHOT_BOOTSTRAP_ERROR_ENV] = (
+            "could not create private release snapshot: "
+            + (added.stderr.strip() or "git worktree add failed")
+        )
+        return
+    child_env = os.environ.copy()
+    child_env[_SNAPSHOT_ACTIVE_ENV] = expected
+    child_env[_SNAPSHOT_SOURCE_SKILL_ENV] = str(source_skill)
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed: subprocess.CompletedProcess[str] | None = None
+    child_error = ""
+    cleanup_errors: list[str] = []
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(snapshot_repo / relative_runner), *sys.argv[1:]],
+            check=False,
+            env=child_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except BaseException as exc:
+        child_error = f"private release snapshot child failed to run: {exc}"
+    finally:
+        try:
+            removed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source_repo),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(snapshot_repo),
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            cleanup_errors.append(f"git worktree remove could not run: {exc}")
+        else:
+            if removed.returncode != 0:
+                cleanup_errors.append(
+                    "git worktree remove failed: "
+                    + (removed.stderr.strip() or f"exit {removed.returncode}")
+                )
+        try:
+            shutil.rmtree(temporary_root)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            cleanup_errors.append(f"temporary snapshot removal failed: {exc}")
+        if snapshot_repo.exists() or temporary_root.exists():
+            cleanup_errors.append("private snapshot path still exists after cleanup")
+
+    if completed is None:
+        detail = "; ".join([item for item in (child_error, *cleanup_errors) if item])
+        os.environ[_SNAPSHOT_BOOTSTRAP_ERROR_ENV] = (
+            detail or "private release snapshot child did not produce a result"
+        )
+        return
+
+    if completed.stderr:
+        sys.stderr.write(completed.stderr)
+    json_requested = any(value == "--json" for value in sys.argv[1:])
+    structured_stdout = completed.stdout
+    if json_requested:
+        split_stdout = _trailing_json_payload(completed.stdout)
+        if split_stdout is not None:
+            incidental_stdout, structured_stdout = split_stdout
+            if incidental_stdout:
+                sys.stderr.write(incidental_stdout)
+        else:
+            output_path = _raw_output_path()
+            if output_path is not None and output_path.exists():
+                try:
+                    structured_stdout = output_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+            if completed.stdout:
+                sys.stderr.write(completed.stdout)
+    if cleanup_errors:
+        detail = "; ".join(cleanup_errors)
+        output = _mark_snapshot_cleanup_failed(structured_stdout, detail)
+        sys.stdout.write(output)
+        output_path = _raw_output_path()
+        if output_path is not None and output_path.exists():
+            try:
+                original = output_path.read_text(encoding="utf-8")
+                output_path.write_text(
+                    _mark_snapshot_cleanup_failed(original, detail),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                detail += f"; could not update output evidence: {exc}"
+        print(f"synthetic release snapshot cleanup failed: {detail}", file=sys.stderr)
+        raise SystemExit(1)
+    output = _mark_snapshot_cleanup_passed(structured_stdout)
+    output_path = _raw_output_path()
+    if output_path is not None and output_path.exists():
+        try:
+            original = output_path.read_text(encoding="utf-8")
+            output_path.write_text(
+                _mark_snapshot_cleanup_passed(original), encoding="utf-8"
+            )
+        except OSError as exc:
+            detail = f"could not attest cleanup in output evidence: {exc}"
+            sys.stdout.write(
+                _mark_snapshot_cleanup_failed(structured_stdout, detail)
+            )
+            print(
+                f"synthetic release evidence cleanup attestation write failed: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    sys.stdout.write(output)
+    if json_requested and not _snapshot_parent_attestation_present(output):
+        print(
+            "synthetic release evidence lacks a valid parent cleanup attestation",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    raise SystemExit(completed.returncode)
+
+
+if __name__ == "__main__":
+    _bootstrap_private_release_snapshot()
+
+
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = SKILL_ROOT / "scripts" / "hloop"
 sys.path.insert(0, str(SKILL_ROOT.parents[1]))
@@ -727,6 +1182,7 @@ def scenario_report_broker(ctx: dict[str, Any]) -> dict[str, Any]:
             state,
             report_credential_file=str(t001_credential),
             task_contract_digest=t001_digest,
+            manager_repo=str(repo.resolve()),
         )
         require(t001_token not in report_contract, "report token leaked into role prompt")
         store = hloop._open_broker_store(repo)
@@ -3227,7 +3683,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-integration-sha",
         help=(
-            "fail closed unless the resolved checkout HEAD equals this integration SHA; "
+            "fail closed unless the resolved checkout HEAD equals this integration SHA "
+            "and the skill subtree has no staged, unstaged, or untracked source changes; "
             "defaults to HLOOP_EXPECTED_INTEGRATION_SHA and is otherwise required"
         ),
     )
@@ -3240,9 +3697,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolved_checkout_head() -> str:
+def resolved_checkout_head(skill_root: Path = SKILL_ROOT) -> str:
     completed = subprocess.run(
-        ["git", "-C", str(SKILL_ROOT), "rev-parse", "HEAD"],
+        ["git", "-C", str(skill_root), "rev-parse", "HEAD"],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
@@ -3257,6 +3714,160 @@ def resolved_checkout_head() -> str:
     if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) is None:
         raise ScenarioFailure(f"resolved checkout HEAD is not a canonical Git SHA: {head!r}")
     return head
+
+
+def checkout_skill_source_status(
+    skill_root: Path = SKILL_ROOT,
+) -> tuple[bool | None, list[str], str]:
+    """Return whether the checked-out skill subtree exactly matches ``HEAD``.
+
+    Release evidence is tied to the bytes below ``SKILL_ROOT``, not merely to
+    the commit named by ``HEAD``.  Staged, unstaged, and untracked skill files
+    therefore all make the checkout ineligible for exact-SHA certification.
+    Loop evidence outside the skill subtree (for example repository-local
+    ``.ai/`` state) is intentionally outside this source-identity check.
+
+    ``None`` means the status could not be resolved, which preserves portable
+    named-scenario fixtures without Git metadata while still failing closed for
+    aggregate or explicitly pinned release runs.
+    """
+
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(skill_root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--",
+            ".",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        return None, [], detail or "git status failed for the skill subtree"
+    dirty_paths: list[str] = []
+    for raw_record in completed.stdout.split(b"\0"):
+        if not raw_record:
+            continue
+        if len(raw_record) < 4 or raw_record[2:3] != b" ":
+            return None, [], "git status returned a malformed porcelain record"
+        path = raw_record[3:].decode("utf-8", errors="surrogateescape")
+        if not path:
+            return None, [], "git status returned an empty dirty path"
+        dirty_paths.append(path)
+    return not dirty_paths, dirty_paths, ""
+
+
+def checkout_identity_record(
+    expected_integration_sha: str,
+    skill_root: Path = SKILL_ROOT,
+    *,
+    require_private_snapshot: bool = False,
+) -> dict[str, Any]:
+    """Resolve one fail-closed release source-identity snapshot."""
+
+    checkout_head = resolved_checkout_head(skill_root)
+    checkout_clean, dirty_paths, status_error = checkout_skill_source_status(skill_root)
+    expected_is_canonical = bool(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_integration_sha)
+    )
+    private_snapshot_sha = str(os.environ.get(_SNAPSHOT_ACTIVE_ENV) or "").strip()
+    private_snapshot_verified = bool(
+        _private_snapshot_context_matches(expected_integration_sha)
+        and private_snapshot_sha == expected_integration_sha
+        and checkout_head == expected_integration_sha
+        and checkout_clean is True
+    )
+    execution_verified = bool(
+        expected_is_canonical
+        and checkout_head == expected_integration_sha
+        and checkout_clean is True
+        and (not require_private_snapshot or private_snapshot_verified)
+    )
+    # A private child may verify that it is executing the requested bytes, but
+    # only the source-checkout parent can attest that the disposable worktree
+    # was removed afterwards.  The parent rewrites ``verified`` only after that
+    # cleanup succeeds.
+    verified = bool(execution_verified and not require_private_snapshot)
+    error = ""
+    if not expected_integration_sha:
+        error = (
+            "expected integration SHA is required via --expected-integration-sha "
+            "or HLOOP_EXPECTED_INTEGRATION_SHA"
+        )
+    elif not expected_is_canonical:
+        error = (
+            "expected integration SHA is not a canonical Git SHA: "
+            f"{expected_integration_sha!r}"
+        )
+    elif checkout_head != expected_integration_sha:
+        error = (
+            "resolved checkout HEAD does not match expected integration SHA: "
+            f"head={checkout_head} expected={expected_integration_sha}"
+        )
+    elif checkout_clean is None:
+        error = "skill subtree cleanliness could not be verified: " + status_error
+    elif dirty_paths:
+        preview = ", ".join(dirty_paths[:20])
+        suffix = "" if len(dirty_paths) <= 20 else f" (+{len(dirty_paths) - 20} more)"
+        error = (
+            "skill subtree has staged, unstaged, or untracked source changes: "
+            f"{preview}{suffix}"
+        )
+    elif require_private_snapshot:
+        if not private_snapshot_verified:
+            error = (
+                "release scenarios must execute from a private detached snapshot "
+                "of the expected integration SHA"
+            )
+        else:
+            error = "parent cleanup attestation is pending"
+    return {
+        "resolved_head_sha": checkout_head,
+        "expected_integration_sha": expected_integration_sha,
+        "skill_subtree_clean": checkout_clean,
+        "dirty_paths": dirty_paths,
+        "execution_source": (
+            "private-detached-worktree"
+            if private_snapshot_verified
+            else "mutable-checkout"
+        ),
+        "private_snapshot_sha": private_snapshot_sha,
+        "private_snapshot_verified": private_snapshot_verified,
+        "execution_verified": execution_verified,
+        "parent_cleanup_attested": False,
+        "verified": verified,
+        "error": error,
+    }
+
+
+def release_output_path_error(output_path: Path | None) -> str:
+    """Reject evidence writes that would dirty either release source tree."""
+
+    if output_path is None:
+        return ""
+    resolved = output_path.expanduser().resolve()
+    roots = [SKILL_ROOT.resolve()]
+    source_skill = str(os.environ.get(_SNAPSHOT_SOURCE_SKILL_ENV) or "").strip()
+    if source_skill:
+        roots.append(Path(source_skill).resolve())
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return (
+            "release evidence output must be outside the skill source subtree: "
+            f"{resolved}"
+        )
+    return ""
 
 
 def emit_result(args: argparse.Namespace, result: dict[str, Any]) -> None:
@@ -3276,8 +3887,9 @@ def emit_result(args: argparse.Namespace, result: dict[str, Any]) -> None:
             print(f"- {record['name']}: {record['status']}")
             if record["error"]:
                 print(f"  {record['error']}")
-        identity_error = str(result.get("checkout_identity", {}).get("error") or "")
-        if identity_error:
+        result_identity = result.get("checkout_identity", {})
+        identity_error = str(result_identity.get("error") or "")
+        if identity_error and not result_identity.get("execution_verified"):
             print(f"- checkout-identity: failed\n  {identity_error}")
 
 
@@ -3285,48 +3897,43 @@ def main() -> int:
     args = parse_args()
     started = now()
     runtime_version = (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    checkout_head = resolved_checkout_head()
     expected_integration_sha = str(
         args.expected_integration_sha
         or os.environ.get("HLOOP_EXPECTED_INTEGRATION_SHA")
         or ""
     ).strip()
-    expected_is_canonical = bool(
-        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_integration_sha)
-    )
-    checkout_identity_verified = (
-        expected_is_canonical and checkout_head == expected_integration_sha
-    )
-    checkout_identity_error = ""
-    if not expected_integration_sha:
-        checkout_identity_error = (
-            "expected integration SHA is required via --expected-integration-sha "
-            "or HLOOP_EXPECTED_INTEGRATION_SHA"
-        )
-    elif not expected_is_canonical:
-        checkout_identity_error = (
-            "expected integration SHA is not a canonical Git SHA: "
-            f"{expected_integration_sha!r}"
-        )
-    elif not checkout_identity_verified:
-        checkout_identity_error = (
-            "resolved checkout HEAD does not match expected integration SHA: "
-            f"head={checkout_head} expected={expected_integration_sha}"
-        )
     identity_is_release_blocking = bool(expected_integration_sha) or not args.scenarios
-    if checkout_identity_error and identity_is_release_blocking:
+    checkout_identity = checkout_identity_record(
+        expected_integration_sha,
+        require_private_snapshot=identity_is_release_blocking,
+    )
+    bootstrap_error = str(
+        os.environ.get(_SNAPSHOT_BOOTSTRAP_ERROR_ENV) or ""
+    ).strip()
+    output_error = (
+        release_output_path_error(args.output)
+        if identity_is_release_blocking
+        else ""
+    )
+    if output_error:
+        # Preserve stdout evidence while refusing the source-tree write itself.
+        args.output = None
+    if bootstrap_error or output_error:
+        checkout_identity["verified"] = False
+        checkout_identity["execution_verified"] = False
+        checkout_identity["parent_cleanup_attested"] = False
+        checkout_identity["error"] = bootstrap_error or output_error
+    checkout_head = str(checkout_identity.get("resolved_head_sha") or "")
+    if identity_is_release_blocking and not checkout_identity.get(
+        "execution_verified"
+    ):
         result = {
             "schema_version": 1,
             "runner": "herdr-dev-loop-synthetic-e2e",
             "runtime_version": runtime_version,
             "state_format_version": hloop.STATE_FORMAT_VERSION,
             "schema_revision": hloop.STATE_SCHEMA_REVISION,
-            "checkout_identity": {
-                "resolved_head_sha": checkout_head,
-                "expected_integration_sha": expected_integration_sha,
-                "verified": False,
-                "error": checkout_identity_error,
-            },
+            "checkout_identity": checkout_identity,
             "status": "failed",
             "started_at": started,
             "finished_at": now(),
@@ -3392,18 +3999,21 @@ def main() -> int:
             break
 
     retained = args.keep_workdir
+    final_checkout_identity = checkout_identity_record(
+        expected_integration_sha,
+        require_private_snapshot=identity_is_release_blocking,
+    )
+    if identity_is_release_blocking and not final_checkout_identity[
+        "execution_verified"
+    ]:
+        overall = "failed"
     result = {
         "schema_version": 1,
         "runner": "herdr-dev-loop-synthetic-e2e",
         "runtime_version": runtime_version,
         "state_format_version": hloop.STATE_FORMAT_VERSION,
         "schema_revision": hloop.STATE_SCHEMA_REVISION,
-        "checkout_identity": {
-            "resolved_head_sha": checkout_head,
-            "expected_integration_sha": expected_integration_sha,
-            "verified": checkout_identity_verified,
-            "error": checkout_identity_error,
-        },
+        "checkout_identity": final_checkout_identity,
         "status": overall,
         "started_at": started,
         "finished_at": now(),
