@@ -406,14 +406,39 @@ def compute_scope(opts):
         _, names = _git(["diff", "--name-only", diff_range])
         files_count = len(_nonempty_lines(names))
         ins, dels = _numstat_sums([diff_range])
+        _, dirty_names = _git(["diff", "--name-only", "HEAD"])
+        dirty_count = len(_nonempty_lines(dirty_names))
+        dirty_ins, dirty_dels = _numstat_sums(["HEAD"])
+        _, untracked = _git(["ls-files", "--others", "--exclude-standard"])
+        untracked_count = len(_nonempty_lines(untracked))
         if files_count == 0:
             _err("%s に差分がありません" % diff_range)
             return None
         return {
             "subject": "You are acting as a reviewer for a proposed code change made by another engineer.",
-            "scope": "- Compare this branch using: git diff %s" % diff_range,
-            "stats": "- Diff stats: %d files changed, %d insertions, %d deletions, %d total line changes."
-                     % (files_count, ins, dels, ins + dels),
+            "scope": "\n".join(
+                [
+                    "- Compare the committed branch change using: git diff %s"
+                    % diff_range,
+                    "- Also review all current tracked worktree changes using: git diff HEAD",
+                    "- Inspect every untracked path listed by: git ls-files --others --exclude-standard",
+                ]
+            ),
+            "stats": (
+                "- Diff stats: %d committed branch files changed, %d insertions, %d deletions, "
+                "%d total line changes; %d dirty tracked files, %d dirty insertions, %d dirty "
+                "deletions; %d untracked files."
+            )
+            % (
+                files_count,
+                ins,
+                dels,
+                ins + dels,
+                dirty_count,
+                dirty_ins,
+                dirty_dels,
+                untracked_count,
+            ),
             "base_ref": resolved,
         }
 
@@ -538,16 +563,23 @@ def capture_review_target(review_mode, base_ref):
         relative = raw_relative.decode("utf-8", errors="surrogateescape")
         path = os.path.join(repo_root, relative)
         try:
-            if os.path.islink(path):
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                kind = b"symlink"
                 contents = os.readlink(path).encode("utf-8", errors="surrogateescape")
-            else:
+            elif stat.S_ISREG(mode):
+                kind = b"regular"
                 with open(path, "rb") as fh:
                     contents = fh.read()
+            else:
+                return None
         except OSError:
             return None
         digest.update(
             b"untracked\0"
             + raw_relative
+            + b"\0"
+            + kind
             + b"\0"
             + str(len(contents)).encode("ascii")
             + b"\0"
@@ -1025,28 +1057,38 @@ def build_prompt(
 # codex 起動(旧関数の起動コマンド形を踏襲 + tee 永続化)
 # ---------------------------------------------------------------------------
 
+def build_codex_command(prompt, opts, run_dir):
+    """Build a Codex exec command with an explicit model write boundary."""
+
+    cmd = [
+        "codex",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--cd",
+        run_dir,
+        "--skip-git-repo-check",
+        "--model",
+        REVIEW_MODEL,
+        "-c",
+        'model_reasoning_effort="%s"' % REVIEW_REASONING_EFFORT,
+        "-c",
+        "features.fast_mode=false",
+        "-c",
+        "sandbox_workspace_write.writable_roots=[]",
+    ]
+    if opts["fast_mode"]:
+        cmd += ["-c", "features.fast_mode=true", "-c", 'service_tier="fast"']
+    return cmd + [prompt]
+
+
 def launch_codex(prompt, opts, log_path, run_dir):
     """Run Codex with only the artifact directory writable.
 
     The repository and trusted validator directory remain read-only to the model.
     Stdout is discarded and stderr is persisted to the session log.
     """
-    codex_args = [
-        "exec",
-        "--model", REVIEW_MODEL,
-        "-c", 'model_reasoning_effort="%s"' % REVIEW_REASONING_EFFORT,
-        "-c", "features.fast_mode=false",
-    ]
-    if opts["fast_mode"]:
-        codex_args += ["-c", "features.fast_mode=true", "-c", 'service_tier="fast"']
-    cmd = [
-        "codex",
-        "--sandbox",
-        "workspace-write",
-        "--cd",
-        run_dir,
-        "--skip-git-repo-check",
-    ] + codex_args + [prompt]
+    cmd = build_codex_command(prompt, opts, run_dir)
     env = dict(os.environ)
     env["CODEX_HOME"] = opts["codex_home"]
     with open(log_path, "wb") as log:
@@ -1434,6 +1476,19 @@ def _selftest_base_resolution(expect):
                 and branch_target_before["fingerprint"]
                 != branch_target_after["fingerprint"],
             )
+            untracked_path = os.path.join(repo, "untracked-kind")
+            with open(untracked_path, "w", encoding="utf-8") as fh:
+                fh.write("target")
+            regular_target = capture_review_target("branch", "HEAD")
+            os.unlink(untracked_path)
+            os.symlink("target", untracked_path)
+            symlink_target = capture_review_target("branch", "HEAD")
+            expect(
+                "target identity: untracked file kind changes fingerprint",
+                regular_target is not None
+                and symlink_target is not None
+                and regular_target["fingerprint"] != symlink_target["fingerprint"],
+            )
             # 改変が無ければ worktree 版をそのまま使う
             rc, _ = _git(["checkout", "--", profile_rel], cwd=repo)
             resolved2 = resolve_profile(opts, {"base_ref": "HEAD"}, run_dir)
@@ -1506,6 +1561,21 @@ def selftest():
 
     expect("review model policy", REVIEW_MODEL == "gpt-5.6-sol")
     expect("review reasoning policy", REVIEW_REASONING_EFFORT == "high")
+    command = build_codex_command(
+        "selftest prompt", {"fast_mode": False}, "/tmp/crv2-model"
+    )
+    expect(
+        "codex launch: exec subcommand precedes all exec options",
+        command[:2] == ["codex", "exec"]
+        and command[2:4] == ["--sandbox", "workspace-write"]
+        and command[-1] == "selftest prompt",
+        repr(command),
+    )
+    expect(
+        "codex launch: inherited writable roots are cleared",
+        "sandbox_workspace_write.writable_roots=[]" in command,
+        repr(command),
+    )
     expect(
         "target identity: dirty submodule state is rejected",
         _has_unpinned_submodule_state(b" m vendor/module\0")
@@ -1622,6 +1692,35 @@ def selftest():
                     "action_derivation.json",
                 )
             ),
+        )
+
+        # 実launcherと同じくmodel childとofficial outputを分離する
+        run_dir = os.path.join(td, "separated_output")
+        model_dir = os.path.join(run_dir, "model")
+        os.makedirs(model_dir)
+        trusted = prepare_trusted(run_dir, FIXTURE_PROFILE)
+        shutil.copyfile(
+            os.path.join(FIXTURES_DIR, "review_good.json"),
+            os.path.join(model_dir, "review.json"),
+        )
+        code = finalize(
+            run_dir,
+            trusted,
+            "review",
+            False,
+            context,
+            quiet=True,
+            today=FIXTURE_TODAY,
+            slice_info=slice_info,
+            model_dir=model_dir,
+        )
+        expect(
+            "model childからofficial parentへtrusted bundleだけを公開",
+            code == EXIT_OK
+            and os.path.isfile(os.path.join(run_dir, "attestation.json"))
+            and os.path.isfile(os.path.join(run_dir, "review.md"))
+            and not os.path.exists(os.path.join(model_dir, "attestation.json"))
+            and not os.path.exists(os.path.join(model_dir, "review.md")),
         )
 
         # stale profile では良例(context_effect 降格を含む)も契約違反になる(fail-closed)

@@ -1,9 +1,9 @@
 {
   "record_type": "external_review_protocol_adapter",
   "protocol": "codex-review-multi-v2",
-  "source": "https://github.com/watabegg/agent-skills.git#sha256-tree-v1=89f02cd82330e39e49b24a1502e259578bb209be8955e7627c8fe39fb0a107a3",
+  "source": "https://github.com/watabegg/agent-skills.git#sha256-tree-v1=b69429a09e3bf76b5188d7cca048b901c879a821514000e6cbbf98f50f0ca7f3",
   "version": "2.1.1",
-  "content_digest": "sha256:89f02cd82330e39e49b24a1502e259578bb209be8955e7627c8fe39fb0a107a3",
+  "content_digest": "sha256:b69429a09e3bf76b5188d7cca048b901c879a821514000e6cbbf98f50f0ca7f3",
   "capabilities": [
     "externally-planned-v1"
   ]
