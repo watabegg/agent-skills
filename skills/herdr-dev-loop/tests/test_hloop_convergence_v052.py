@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "hloop"
+SKILL_ROOT = SCRIPT.parents[1]
 sys.path.insert(0, str(SCRIPT.parent))
 from hloop_lib import review as hloop_review
 from hloop_lib.certification import (
@@ -89,16 +90,14 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.protocol_adapter = hloop_review.ExternalReviewProtocolAdapter(
-            protocol="codex-review-multi-v2",
-            source="https://example.invalid/codex-review-multi-v2.git@" + "a" * 40,
-            version="2.1.0",
-            content_digest="sha256:" + "b" * 64,
-            capabilities=("externally-planned-v1",),
+        self.protocol_adapter = hloop.hloop_release_dependency.load_release_dependencies(
+            SKILL_ROOT / "release-dependencies.json"
         )
-        self.protocol_capability_path = self.root / "review-capability.json"
-        self.protocol_capability_path.write_text(
-            json.dumps(self.protocol_adapter.to_record()), encoding="utf-8"
+        self.protocol_capability_path = (
+            SKILL_ROOT.parent
+            / "codex-review-multi-v2"
+            / "capabilities"
+            / "externally-planned-v1.json"
         )
         self.repo = self.root / "repo"
         self.repo.mkdir()

@@ -23,6 +23,7 @@
     ├── japanese-tech-writing/
     ├── pencil-pencli/
     ├── ealps-moodle-operator/
+    ├── codex-review-multi-v2/
     ├── herdr-dev-loop/
     └── shinshu-portal-auth/
         └── env.example
@@ -116,7 +117,7 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 
 - 目的:
   - Herdr 上で Manager / Worker / Gap Auditor / Reviewer / Advisor の Codex・Claude agent を、git worktree、integration branch、`.ai/herdr-dev-loop/loops/<namespace>` artifact によって安全に協調させる。
-  - Worker / Reviewer は既定でこの Skill 内蔵の HLoop protocol を使い、外部の `$codex-impl` / `$codex-review-multi-v2` は必要時だけ選ぶ互換モードにする。
+  - 0.5.3のWorkerはnativeを使い、ordinary review、pre-final、manual-finalはpin済みの`$codex-review-multi-v2`を既定にする。0.5.5ではnative manual-finalを追加し、外部companionを明示選択時だけの任意依存へ移す計画である。
   - Gap Auditor には元 repo の plan/spec と統合ブランチ実装の相違確認を担当させ、仕様判断が必要な場合は `DECISIONS.md` と `USER_ACTION_REQUIRED.md` に分離して止める。
   - `scripts/hloop` で init、task 作成、Worker/Gap Auditor/Reviewer 起動、harvest、merge、validation、pump、triage、report を実行する。
   - namespaced `PROFILE.md` で branch strategy、roleごとのprovider/model/effort、Worker protocol、Review lanes、QA profileを調整する。
@@ -131,6 +132,19 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - Herdr pane idやagent CLIの挙動を`hloop doctor`で確認しながら、bounded tickで運用したいとき。
 - 注意:
   - 実プロジェクトで生成される`.ai/herdr-dev-loop`、pane transcript、秘密値、社内URL、本番運用情報はこのpublic repoにcommitしない。
+
+### `codex-review-multi-v2`
+
+- 目的:
+  - PR差分、未commit差分、repository auditを複数の独立Reviewer laneで確認し、Coordinatorがactionable findingへ統合する。
+  - correctness、risk、operational UX、language/frameworkの観点を分離し、severityと修正要否を一貫したartifactへ正規化する。
+- 配布identity:
+  - `fullerene-inc/agent-skills`のcommit `49fd08742f7666efa1fd4775989317d2da73f077`にあるskill treeをsnapshotしている。
+  - release hardeningを加えたfork payloadはこのrepositoryのcommit `de40e11747edde38684f2e75f94c773b6b086ccc`へ固定する。
+  - HLoop 0.5.3向けadapter version `2.1.1`、payload digest、`externally-planned-v1` capabilityは`skills/herdr-dev-loop/release-dependencies.json`とskill内manifestで固定する。
+- 主な利用シーン:
+  - 実装後のuncommitted diff review、PR review、release前audit。
+  - HLoop 0.5.3のordinary review、pre-final、manual-final companion。
 
 ## Skill を追加する方法
 

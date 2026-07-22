@@ -584,8 +584,22 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
     def test_external_epoch_is_blocked_by_canonical_unavailable_release_dependency(self):
         with tempfile.TemporaryDirectory() as directory:
             skill_root = Path(directory)
+            release = json.loads(
+                (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
+            )
+            release["release"]["release_ready"] = False
+            dependency = release["dependencies"][0]
+            dependency.update(
+                {
+                    "availability": "unavailable",
+                    "blocking_reason": "immutable companion distribution is unavailable",
+                    "minimum_compatible_version": None,
+                    "distribution_identity": None,
+                }
+            )
+            dependency["capability_manifest"]["relative_path"] = None
             (skill_root / "release-dependencies.json").write_text(
-                (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8"),
+                json.dumps(release),
                 encoding="utf-8",
             )
             with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
@@ -597,30 +611,30 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     )
 
     def test_external_epoch_binds_capability_to_exact_release_pin(self):
-        with tempfile.TemporaryDirectory() as directory:
-            skill_root = Path(directory)
-            release = self.ready_release_dependency()
-            (skill_root / "release-dependencies.json").write_text(
-                json.dumps(release), encoding="utf-8"
-            )
-            adapter = hloop.hloop_release_dependency.validate_release_dependencies(
-                release
-            )
-            capability = skill_root / "capability.json"
-            capability.write_text(json.dumps(adapter.to_record()), encoding="utf-8")
-            with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
-                observed = hloop.validate_epoch_protocol_capabilities(
-                    self.external_epoch_plan("a" * 40), [str(capability)]
-                )
-            self.assertEqual(
-                observed["codex-review-multi-v2"], adapter.to_record()
-            )
+        adapter = hloop.hloop_release_dependency.load_release_dependencies(
+            SKILL_ROOT / "release-dependencies.json"
+        )
+        capability = (
+            SKILL_ROOT.parent
+            / "codex-review-multi-v2"
+            / "capabilities"
+            / "externally-planned-v1.json"
+        )
+        observed = hloop.validate_epoch_protocol_capabilities(
+            self.external_epoch_plan("a" * 40), [str(capability)]
+        )
+        self.assertEqual(observed["codex-review-multi-v2"], adapter.to_record())
 
     def test_external_epoch_rejects_all_release_pin_identity_drift(self):
-        release = self.ready_release_dependency()
-        expected = hloop.hloop_release_dependency.validate_release_dependencies(
-            release
+        expected = hloop.hloop_release_dependency.load_release_dependencies(
+            SKILL_ROOT / "release-dependencies.json"
         ).to_record()
+        capability = (
+            SKILL_ROOT.parent
+            / "codex-review-multi-v2"
+            / "capabilities"
+            / "externally-planned-v1.json"
+        )
         mutations = {
             "source": lambda record: record.update(
                 {"source": "https://mirror.invalid/review.git@" + "a" * 40}
@@ -645,17 +659,15 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
             ),
         }
         for label, mutate in mutations.items():
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
-                skill_root = Path(directory)
-                (skill_root / "release-dependencies.json").write_text(
-                    json.dumps(release), encoding="utf-8"
-                )
+            with self.subTest(label=label):
                 observed = dict(expected)
                 observed["capabilities"] = list(expected["capabilities"])
                 mutate(observed)
-                capability = skill_root / "capability.json"
-                capability.write_text(json.dumps(observed), encoding="utf-8")
-                with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
+                with mock.patch.object(
+                    hloop,
+                    "load_json_object",
+                    return_value=observed,
+                ):
                     with self.assertRaisesRegex(
                         hloop.HLoopError, "capability pin mismatch"
                     ):
@@ -736,6 +748,41 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                     source_kind="reviewer",
                     target_sha=head,
                 )
+
+            provider_root = Path(directory) / "provider" / "codex-review-multi-v2"
+            with (
+                mock.patch.object(
+                    hloop.hloop_release_dependency,
+                    "load_release_dependencies",
+                    return_value=adapter,
+                ),
+                mock.patch.object(
+                    hloop.hloop_release_dependency,
+                    "validate_provider_distribution",
+                    return_value=(provider_root, adapter),
+                ) as provider_validation,
+            ):
+                binding = hloop.epoch_execution_start_binding(
+                    state,
+                    role_id="R001",
+                    attempt_id="R001-A001",
+                    source_kind="reviewer",
+                    target_sha=head,
+                )
+            provider_validation.assert_called_once_with(
+                hloop.SKILL_ROOT / "release-dependencies.json",
+                "codex",
+            )
+            self.assertEqual(
+                binding["provider_distributions"]["codex"],
+                {
+                    "distribution_root": str(provider_root),
+                    "adapter": adapter.to_record(),
+                    "environment": {
+                        "CODEX_HOME": str(provider_root.parents[1])
+                    },
+                },
+            )
 
     def test_external_epoch_runtime_pin_rejects_every_identity_drift(self):
         plan = self.external_epoch_plan("a" * 40)

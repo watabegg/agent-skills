@@ -13178,15 +13178,31 @@ def validate_epoch_protocol_capabilities(
                 "protocol capability evidence was supplied for a native-only epoch"
             )
         return {}
+    release_dependency_path = SKILL_ROOT / "release-dependencies.json"
+    companion_root = SKILL_ROOT.parent / "codex-review-multi-v2"
+    capability_manifest_path = (
+        companion_root / "capabilities" / "externally-planned-v1.json"
+    )
     try:
         expected = hloop_release_dependency.load_release_dependencies(
-            SKILL_ROOT / "release-dependencies.json"
+            release_dependency_path
         )
     except hloop_release_dependency.ReleaseDependencyError as exc:
         raise HLoopError(
             "codex-review-multi-v2 is blocked by release dependency state: "
             f"{exc}"
         ) from exc
+    if len(capability_paths) != 1:
+        raise HLoopError(
+            "codex-review-multi-v2 epoch execution requires exactly one canonical "
+            "externally-planned-v1 capability manifest"
+        )
+    supplied_path = Path(capability_paths[0]).expanduser().resolve()
+    if supplied_path != capability_manifest_path.resolve():
+        raise HLoopError(
+            "external review capability must be the manifest inside the validated "
+            f"companion distribution: {capability_manifest_path}"
+        )
     adapters: dict[str, dict[str, Any]] = {}
     for path in capability_paths:
         try:
@@ -13259,6 +13275,38 @@ def validate_epoch_runtime_protocol_capabilities(
                 "external review epoch adapter does not match the canonical "
                 f"release dependency: {exc}"
             ) from exc
+
+
+def validate_external_execution_provider_distributions(
+    execution: hloop_review_epoch.EpochExecutionPlan,
+) -> dict[str, dict[str, Any]]:
+    """Bind an external execution to each provider's discoverable companion."""
+
+    if execution.protocol != "codex-review-multi-v2":
+        return {}
+    release_dependency_path = SKILL_ROOT / "release-dependencies.json"
+    evidence: dict[str, dict[str, Any]] = {}
+    for provider in sorted({process.provider for process in execution.processes}):
+        try:
+            root, adapter = hloop_release_dependency.validate_provider_distribution(
+                release_dependency_path,
+                provider,
+            )
+        except hloop_release_dependency.ReleaseDependencyError as exc:
+            raise HLoopError(
+                "external review provider companion is missing or does not match "
+                f"the release pin: provider={provider}, error={exc}"
+            ) from exc
+        evidence[provider] = {
+            "distribution_root": str(root),
+            "adapter": adapter.to_record(),
+            "environment": {
+                ("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"): str(
+                    root.parents[1]
+                )
+            },
+        }
+    return evidence
 
 
 def validate_epoch_process_identity_plan(
@@ -13726,6 +13774,11 @@ def epoch_execution_start_binding(
     validate_epoch_runtime_protocol_capabilities(
         state, collection.plan, execution_ids=(execution.execution_id,)
     )
+    provider_distributions = (
+        validate_external_execution_provider_distributions(execution)
+        if source_kind == "reviewer"
+        else {}
+    )
     required_start_ids = {process.process_id for process in execution.processes}
     starting_leases = tuple(
         lease
@@ -13747,6 +13800,7 @@ def epoch_execution_start_binding(
         "collection": collection,
         "lease_ids": tuple(lease.lease_id for lease in starting_leases),
         "identity": collection.plan.artifact_identity(role_id).to_record(),
+        "provider_distributions": provider_distributions,
     }
 
 
@@ -14595,9 +14649,14 @@ def _manual_final_protocol_adapter(
     *,
     stored_adapter: Any = None,
 ) -> hloop_review.ExternalReviewProtocolAdapter:
+    release_dependency_path = SKILL_ROOT / "release-dependencies.json"
+    companion_root = SKILL_ROOT.parent / "codex-review-multi-v2"
+    capability_manifest_path = (
+        companion_root / "capabilities" / "externally-planned-v1.json"
+    )
     try:
         expected = hloop_release_dependency.load_release_dependencies(
-            SKILL_ROOT / "release-dependencies.json"
+            release_dependency_path
         )
     except hloop_release_dependency.ReleaseDependencyError as exc:
         raise HLoopError(
@@ -14609,6 +14668,12 @@ def _manual_final_protocol_adapter(
         raise HLoopError("manual-final accepts exactly one protocol capability")
     supplied: Any = stored_adapter
     if paths:
+        supplied_path = Path(paths[0]).expanduser().resolve()
+        if supplied_path != capability_manifest_path.resolve():
+            raise HLoopError(
+                "manual-final capability must be the manifest inside the validated "
+                f"companion distribution: {capability_manifest_path}"
+            )
         supplied = load_json_object(
             paths[0], label="manual-final external review capability"
         )
@@ -17988,6 +18053,14 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         {"display_name", "short_description", "default_prompt"}.issubset(fields),
         "agents/openai.yaml interface fields are incomplete",
     )
+
+    try:
+        hloop_release_dependency.validate_release_distribution(
+            skill_root / "release-dependencies.json",
+            skill_root.parent / "codex-review-multi-v2",
+        )
+    except hloop_release_dependency.ReleaseDependencyError as exc:
+        errors.append(f"release dependency distribution is invalid: {exc}")
 
     schema_dir = skill_root / "references" / "schemas"
     schemas: dict[str, dict[str, Any]] = {}
@@ -26964,6 +27037,7 @@ def role_agent_command(
     role_id: str,
     attempt_id: str,
     output_rel: Path | None = None,
+    provider_environment: Mapping[str, str] | None = None,
 ) -> tuple[str, hloop_providers.ProviderInvocation]:
     writable = [git_common_dir(repo)] if config["provider"] == "codex" else []
     provider = normalize_agent_provider(config["provider"])
@@ -26985,6 +27059,7 @@ def role_agent_command(
         invocation, provider=provider, runner=runner, prompt_rel=prompt_rel, output_rel=output_rel
     )
     context = {
+        **dict(provider_environment or {}),
         ROLE_CONTEXT_ENV: "1",
         ROLE_ID_ENV: role_id,
         ROLE_ATTEMPT_ID_ENV: attempt_id,
@@ -31038,6 +31113,14 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         role_id=review_id,
         attempt_id=attempt_id,
         output_rel=review_rel if runner == "exec" and mode == "single" else None,
+        provider_environment=(
+            epoch_binding["provider_distributions"][agent_config["provider"]][
+                "environment"
+            ]
+            if epoch_binding is not None
+            and epoch_binding["provider_distributions"]
+            else None
+        ),
     )
     command = f"cd {shlex.quote(str(worktree))} && {agent_command}"
     require_role_snapshot(repo, state, head_sha, audit_snapshot_paths(repo))
@@ -31139,10 +31222,23 @@ def cmd_reviewer_start(args: argparse.Namespace) -> int:
         "baseline_dirty_files": baseline_dirty,
         "started_at": now_iso(),
         "provider_invocation": provider_invocation.as_record(),
+        "provider_environment": (
+            dict(
+                epoch_binding["provider_distributions"][agent_config["provider"]][
+                    "environment"
+                ]
+            )
+            if epoch_binding is not None
+            and epoch_binding["provider_distributions"]
+            else {}
+        ),
     }
     if epoch_binding is not None:
         state["reviews"][review_id]["review_epoch_identity"] = dict(
             epoch_binding["identity"]
+        )
+        state["reviews"][review_id]["provider_companion_distributions"] = dict(
+            epoch_binding["provider_distributions"]
         )
     arm_initial_semantic_ack_barrier(
         state["reviews"][review_id],

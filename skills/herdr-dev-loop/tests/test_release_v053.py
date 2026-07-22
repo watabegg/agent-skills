@@ -6,6 +6,7 @@ import copy
 import base64
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,10 @@ from hloop_lib import config  # noqa: E402
 from hloop_lib.release_dependency import (  # noqa: E402
     ReleaseDependencyError,
     ReleaseDependencyUnavailable,
+    sha256_tree_v1,
+    provider_companion_root,
+    validate_release_distribution,
+    validate_provider_distribution,
     validate_release_dependencies,
 )
 from hloop_lib.review import (  # noqa: E402
@@ -162,6 +167,10 @@ class ReleaseSelftestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             copied_skill = Path(directory) / "herdr-dev-loop"
             shutil.copytree(SKILL_ROOT, copied_skill)
+            shutil.copytree(
+                SKILL_ROOT.parent / "codex-review-multi-v2",
+                copied_skill.parent / "codex-review-multi-v2",
+            )
             wrappers = (
                 "final-review-plan.schema.json",
                 "final-review-manifest.schema.json",
@@ -221,17 +230,154 @@ class CompanionDependencyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.record = json.loads((SKILL_ROOT / "release-dependencies.json").read_text())
 
-    def test_unavailable_companion_blocks_the_release_without_placeholders(self):
+    def unavailable_record(self) -> dict:
+        record = copy.deepcopy(self.record)
+        record["release"]["release_ready"] = False
+        dependency = record["dependencies"][0]
+        dependency.update(
+            {
+                "availability": "unavailable",
+                "blocking_reason": "immutable companion distribution is unavailable",
+                "minimum_compatible_version": None,
+                "distribution_identity": None,
+            }
+        )
+        dependency["capability_manifest"]["relative_path"] = None
+        return record
+
+    def test_shipped_companion_matches_the_complete_immutable_pin(self):
+        adapter = validate_release_dependencies(self.record)
         dependency = self.record["dependencies"][0]
-        self.assertFalse(self.record["release"]["release_ready"])
+        self.assertTrue(self.record["release"]["release_ready"])
+        self.assertEqual(dependency["availability"], "available")
+        self.assertEqual(
+            adapter.source,
+            "https://github.com/watabegg/agent-skills.git#sha256-tree-v1="
+            "b61a068af3e018e0597f1ce1e9dd242efc7580b96305bbb8a803161d69478fac",
+        )
+        self.assertEqual(adapter.version, "2.1.1")
+        self.assertEqual(
+            adapter.content_digest,
+            "sha256:b61a068af3e018e0597f1ce1e9dd242efc7580b96305bbb8a803161d69478fac",
+        )
+        companion_root = SKILL_ROOT.parent / "codex-review-multi-v2"
+        self.assertEqual(
+            sha256_tree_v1(
+                companion_root,
+                capability_manifest_relative_path=dependency["capability_manifest"][
+                    "relative_path"
+                ],
+            ),
+            adapter.content_digest,
+        )
+        self.assertEqual(
+            validate_release_distribution(
+                SKILL_ROOT / "release-dependencies.json", companion_root
+            ),
+            adapter,
+        )
+
+    def test_provider_distribution_validation_uses_real_discovery_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_root = home / "codex-profile"
+            claude_root = home / "claude-profile"
+            environment = {
+                "HOME": str(home),
+                "CODEX_HOME": str(codex_root),
+                "CLAUDE_CONFIG_DIR": str(claude_root),
+            }
+            source = SKILL_ROOT.parent / "codex-review-multi-v2"
+            for root in (codex_root, claude_root):
+                shutil.copytree(
+                    source,
+                    root / "skills" / "codex-review-multi-v2",
+                )
+            release_path = SKILL_ROOT / "release-dependencies.json"
+            for provider, config_root in (
+                ("codex", codex_root),
+                ("claude", claude_root),
+            ):
+                with self.subTest(provider=provider):
+                    expected_root = config_root / "skills" / "codex-review-multi-v2"
+                    self.assertEqual(
+                        provider_companion_root(provider, environ=environment),
+                        expected_root.resolve(),
+                    )
+                    observed_root, adapter = validate_provider_distribution(
+                        release_path,
+                        provider,
+                        environ=environment,
+                    )
+                    self.assertEqual(observed_root, expected_root.resolve())
+                    self.assertEqual(
+                        adapter, validate_release_dependencies(self.record)
+                    )
+
+            codex_distribution = (
+                codex_root / "skills" / "codex-review-multi-v2"
+            )
+            shutil.rmtree(codex_distribution)
+            codex_distribution.symlink_to(source, target_is_directory=True)
+            with self.assertRaisesRegex(ReleaseDependencyError, "symlink"):
+                validate_provider_distribution(
+                    release_path,
+                    "codex",
+                    environ=environment,
+                )
+
+            (claude_root / "skills" / "codex-review-multi-v2" / "SKILL.md").write_text(
+                "drift\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ReleaseDependencyError, "digest"):
+                validate_provider_distribution(
+                    release_path,
+                    "claude",
+                    environ=environment,
+                )
+
+    def test_immutable_pin_archive_reconstructs_a_valid_distribution(self):
+        dependency = self.record["dependencies"][0]
+        immutable_id = dependency["distribution_identity"]["immutable_id"]
+        repository_root = SKILL_ROOT.parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "companion.tar"
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository_root),
+                    "archive",
+                    "--format=tar",
+                    f"--output={archive}",
+                    immutable_id,
+                    "skills/codex-review-multi-v2",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            extracted = root / "extracted"
+            extracted.mkdir()
+            shutil.unpack_archive(str(archive), str(extracted))
+            adapter = validate_release_distribution(
+                SKILL_ROOT / "release-dependencies.json",
+                extracted / "skills/codex-review-multi-v2",
+            )
+            self.assertEqual(adapter, validate_release_dependencies(self.record))
+
+    def test_unavailable_companion_blocks_the_release_without_placeholders(self):
+        unavailable = self.unavailable_record()
+        dependency = unavailable["dependencies"][0]
+        self.assertFalse(unavailable["release"]["release_ready"])
         self.assertEqual(dependency["availability"], "unavailable")
         self.assertIsNone(dependency["minimum_compatible_version"])
         self.assertIsNone(dependency["distribution_identity"])
         self.assertIsNone(dependency["capability_manifest"]["relative_path"])
         with self.assertRaisesRegex(ReleaseDependencyUnavailable, "release_ready"):
-            validate_release_dependencies(self.record)
+            validate_release_dependencies(unavailable)
 
-        placeholder = copy.deepcopy(self.record)
+        placeholder = copy.deepcopy(unavailable)
         placeholder["dependencies"][0]["distribution_identity"] = {
             "source": "mutable-installed-copy"
         }
@@ -239,8 +385,7 @@ class CompanionDependencyTests(unittest.TestCase):
             validate_release_dependencies(placeholder)
 
     def test_schema_version_requires_exact_json_integer_one(self):
-        with self.assertRaisesRegex(ReleaseDependencyUnavailable, "release_ready"):
-            validate_release_dependencies(copy.deepcopy(self.record))
+        validate_release_dependencies(copy.deepcopy(self.record))
         for value in (True, False, 1.0, "1"):
             with self.subTest(value=value, value_type=type(value).__name__):
                 record = copy.deepcopy(self.record)
@@ -249,6 +394,94 @@ class CompanionDependencyTests(unittest.TestCase):
                     ReleaseDependencyError, "schema_version"
                 ):
                     validate_release_dependencies(record)
+
+    def test_distribution_validation_rejects_payload_manifest_and_symlink_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dependency_path = root / "release-dependencies.json"
+            dependency_path.write_text(
+                json.dumps(self.record), encoding="utf-8"
+            )
+            companion_root = root / "codex-review-multi-v2"
+            shutil.copytree(SKILL_ROOT.parent / "codex-review-multi-v2", companion_root)
+
+            skill_path = companion_root / "SKILL.md"
+            original_skill = skill_path.read_bytes()
+            skill_path.write_bytes(original_skill + b"\n# drift\n")
+            with self.assertRaisesRegex(ReleaseDependencyError, "digest"):
+                validate_release_distribution(dependency_path, companion_root)
+            skill_path.write_bytes(original_skill)
+
+            manifest_path = (
+                companion_root / "capabilities" / "externally-planned-v1.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = "2.1.2"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ReleaseDependencyError, "version"):
+                validate_release_distribution(dependency_path, companion_root)
+            shutil.copy2(
+                SKILL_ROOT.parent
+                / "codex-review-multi-v2"
+                / "capabilities"
+                / "externally-planned-v1.json",
+                manifest_path,
+            )
+
+            (companion_root / "unexpected-link").symlink_to(skill_path)
+            with self.assertRaisesRegex(ReleaseDependencyError, "symlink"):
+                validate_release_distribution(dependency_path, companion_root)
+            (companion_root / "unexpected-link").unlink()
+
+            cache_dir = companion_root / "assets" / "__pycache__"
+            cache_dir.mkdir()
+            (cache_dir / "render_review.cpython-311.pyc").write_bytes(b"executable")
+            with self.assertRaisesRegex(ReleaseDependencyError, "forbidden"):
+                validate_release_distribution(dependency_path, companion_root)
+
+    def test_distribution_validation_rejects_unreadable_and_non_utf8_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dependency_path = root / "release-dependencies.json"
+            dependency_path.write_text(json.dumps(self.record), encoding="utf-8")
+            companion_root = root / "codex-review-multi-v2"
+            shutil.copytree(SKILL_ROOT.parent / "codex-review-multi-v2", companion_root)
+
+            opaque = companion_root / "opaque-extra"
+            opaque.mkdir()
+            (opaque / "untrusted.py").write_text("raise SystemExit\n", encoding="utf-8")
+            opaque.chmod(0)
+            try:
+                with self.assertRaisesRegex(
+                    ReleaseDependencyError, "enumerate|digest"
+                ):
+                    validate_release_distribution(dependency_path, companion_root)
+            finally:
+                opaque.chmod(0o700)
+            shutil.rmtree(opaque)
+
+            encoded_root = os.fsencode(companion_root)
+            invalid_name = encoded_root + b"/bad-\xff.py"
+            fd = os.open(invalid_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+            try:
+                with self.assertRaisesRegex(ReleaseDependencyError, "UTF-8"):
+                    validate_release_distribution(dependency_path, companion_root)
+            finally:
+                os.unlink(invalid_name)
+
+            manifest_path = (
+                companion_root / "capabilities" / "externally-planned-v1.json"
+            )
+            original_manifest = manifest_path.read_bytes()
+            manifest_path.write_bytes(b"\xff")
+            with self.assertRaisesRegex(ReleaseDependencyError, "cannot load"):
+                validate_release_distribution(dependency_path, companion_root)
+            manifest_path.write_bytes(original_manifest)
+
+            dependency_path.write_bytes(b"\xff")
+            with self.assertRaisesRegex(ReleaseDependencyError, "cannot load"):
+                validate_release_distribution(dependency_path, companion_root)
 
     def test_complete_pin_produces_exact_runtime_adapter(self):
         record = copy.deepcopy(self.record)
@@ -344,6 +577,16 @@ class CompanionDependencyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ReleaseDependencyError, "invalid"):
                     validate_release_dependencies(record)
 
+    def test_available_pin_requires_an_exact_commit_sha(self):
+        for immutable_id in ("master", "A" * 40, "a" * 39, "a" * 41):
+            with self.subTest(immutable_id=immutable_id):
+                record = copy.deepcopy(self.record)
+                record["dependencies"][0]["distribution_identity"][
+                    "immutable_id"
+                ] = immutable_id
+                with self.assertRaisesRegex(ReleaseDependencyError, "commit SHA"):
+                    validate_release_dependencies(record)
+
     def test_runtime_adapter_rejects_missing_capability_and_bad_digest(self):
         base = {
             "record_type": "external_review_protocol_adapter",
@@ -436,6 +679,30 @@ class ReleaseOperationsDocumentationTests(unittest.TestCase):
             with self.subTest(backup=backup):
                 self.assertIn(f'{backup}="', instructions)
                 self.assertIn(f'${backup}\" || cp -a', instructions)
+        self.assertIn(
+            'CLAUDE_BACKUP_ROOT="$(dirname "$CLAUDE_SKILLS_ROOT")/skill-backups/claude/${STAMP}"',
+            instructions,
+        )
+        self.assertIn(
+            'CLAUDE_SKILLS_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"',
+            instructions,
+        )
+        self.assertIn("unsafe {label} overlap", instructions)
+        self.assertIn("source/install overlap", instructions)
+        self.assertIn("backup/discovery overlap", instructions)
+        self.assertIn("staging/install overlap", instructions)
+        self.assertIn('test ! -e "$BACKUP"', instructions)
+        self.assertIn("archive_legacy_discovery_backups", instructions)
+        self.assertIn("rollback_partial_install", instructions)
+        self.assertIn("trap 'rollback_partial_install 130' INT", instructions)
+        self.assertIn("trap 'rollback_partial_install 143' TERM", instructions)
+        self.assertIn("STAGED=(", instructions)
+        self.assertIn("install-transaction", instructions)
+        self.assertIn("sys.version_info < (3, 11)", instructions)
+        self.assertIn("import tomllib", instructions)
+        self.assertIn("herdr-dev-loop.failed-*", instructions)
+        self.assertIn("codex-review-multi-v2.failed-*", instructions)
+        self.assertIn('test ! -L "$DESTINATION"', instructions)
 
     def test_migration_docs_distinguish_recovery_and_committed_rollback(self):
         instructions = (

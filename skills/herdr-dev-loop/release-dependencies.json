@@ -4,7 +4,7 @@
   "release": {
     "name": "herdr-dev-loop",
     "version": "0.5.3",
-    "release_ready": false
+    "release_ready": true
   },
   "required_release_evidence": [
     "hloop_codex_install_parity",
@@ -19,12 +19,18 @@
       "name": "codex-review-multi-v2",
       "kind": "external_review_protocol",
       "required": true,
-      "availability": "unavailable",
-      "blocking_reason": "A compatible immutable distribution identity has not been supplied to this release candidate.",
-      "minimum_compatible_version": null,
-      "distribution_identity": null,
+      "availability": "available",
+      "blocking_reason": "",
+      "minimum_compatible_version": "2.1.0",
+      "distribution_identity": {
+        "source": "https://github.com/watabegg/agent-skills.git",
+        "immutable_id": "de40e11747edde38684f2e75f94c773b6b086ccc",
+        "version": "2.1.1",
+        "digest_algorithm": "sha256-tree-v1",
+        "content_digest": "sha256:b61a068af3e018e0597f1ce1e9dd242efc7580b96305bbb8a803161d69478fac"
+      },
       "capability_manifest": {
-        "relative_path": null,
+        "relative_path": "capabilities/externally-planned-v1.json",
         "record_type": "external_review_protocol_adapter",
         "protocol": "codex-review-multi-v2",
         "required_capabilities": [
@@ -33,7 +39,7 @@
       },
       "install_destinations": {
         "codex": "${CODEX_HOME:-$HOME/.codex}/skills/codex-review-multi-v2",
-        "claude": "${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/codex-review-multi-v2"
+        "claude": "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/codex-review-multi-v2"
       }
     }
   ]

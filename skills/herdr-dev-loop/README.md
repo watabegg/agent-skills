@@ -17,8 +17,10 @@ git status --short --branch
 既存ループを再開するときは、スレッドの記憶ではなくリポジトリ上の `.ai/herdr-dev-loop/loops/<namespace>` を基準にします。namespaceは省略せず、セッション中の全コマンドで同じ値を使います。旧 `.ai/loop` は古い別形式として無視され、自動移行もされません。
 
 ```bash
+HLOOP_SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop"
 hloop() {
-  python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop/scripts/hloop" --namespace <namespace> "$@"
+  local skill_dir="${HLOOP_SKILL_DIR:-${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop}"
+  python3 "$skill_dir/scripts/hloop" --namespace <namespace> "$@"
 }
 hloop namespaces
 hloop version
@@ -55,7 +57,7 @@ hloop config explain --repo <repo> --json
 
 `[defaults]`にWorkerとReviewerのprovider、model、effort、同時Worker数、session cleanupを設定できます。`[[scope]]`は既定でcanonicalなrepository rootに一致し、同じrepository内のsubdirectoryから起動しても結果が変わりません。起動directory固有の設定だけ`match = "cwd"`を明示します。設定例は[`examples/config.toml`](examples/config.toml)にあります。
 
-新規0.5.3 loopは、ordinary reviewの`reviewer.protocol`、`review.pre_final_protocol`、`review.manual_final_protocol`をすべて`codex-review-multi-v2`にし、canonicalなReviewer topologyを6 laneにします。Gapは4 lane、epoch全体のAgent budgetは12、taskごとのPatch Reviewは最大2 roundです。`--review-protocol native`が変更するのはordinary reviewだけです。pre-finalでサポート済みのnative pathを使う場合は、`[defaults.review]`または一致するscopeで`pre_final_protocol = "native"`を別途設定します。manual-finalにnative overrideはなく、`manual_final_protocol`は`codex-review-multi-v2`だけを受理します。external protocolを選択した実行にはpin済みの`externally-planned-v1` companion capabilityが必要であり、欠落やdigest不一致からnativeへ黙ってfallbackしません。shipped recordの`release_ready=false`はimmutable companion distributionが供給されるまでpublicationをblockします。legacy loopをmigrationしても保存済みのmerge-count cadenceやfinish semanticsは暗黙に変更されません。
+新規0.5.3 loopは、ordinary reviewの`reviewer.protocol`、`review.pre_final_protocol`、`review.manual_final_protocol`をすべて`codex-review-multi-v2`にし、canonicalなReviewer topologyを6 laneにします。Gapは4 lane、epoch全体のAgent budgetは12、taskごとのPatch Reviewは最大2 roundです。`--review-protocol native`が変更するのはordinary reviewだけです。pre-finalでサポート済みのnative pathを使う場合は、`[defaults.review]`または一致するscopeで`pre_final_protocol = "native"`を別途設定します。manual-finalにnative overrideはなく、`manual_final_protocol`は`codex-review-multi-v2`だけを受理します。external protocolを選択した実行にはpin済みの`externally-planned-v1` companion capabilityが必要であり、欠落やdigest不一致からnativeへ黙ってfallbackしません。0.5.3のshipped recordはrelease-readyで、同梱snapshotをimmutable hardened-fork commit、exact adapter version、payload digestへ固定します。legacy loopをmigrationしても保存済みのmerge-count cadenceやfinish semanticsは暗黙に変更されません。
 
 解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、loop snapshot、task override、role start override、participant overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
 
@@ -180,13 +182,13 @@ convergenceが`converged`になったら、freshなmanual final reviewを準備�
 
 ```bash
 hloop final-review prepare --mode swarm \
-  --protocol-capability /path/to/pinned-adapter.json --json
+  --protocol-capability "$(dirname "$HLOOP_SKILL_DIR")/codex-review-multi-v2/capabilities/externally-planned-v1.json" --json
 # 固定SHA、PLAN.json、MANIFEST.json、reportへ手動review結果を記録
 hloop final-review record --json
 hloop final-review status --json
 ```
 
-manual finalは、finding数が0という自己申告だけでは合格しません。PLAN/MANIFESTは`manual_final_execution`、execution ID、source execution、source artifact ref/digest、固定target、pinned adapter identityを共有します。`independent`はcompleteなpre-final sourceとは別のReviewer execution IDを要求し、`reuse_epoch_reviewer`は同じtargetの成功済みepoch Reviewer executionとartifactだけを再利用できます。全lane完了、必要な独立verification、shortfallなし、manifest completeness、scope snapshot、report存在、verified actionable finding 0件も必要です。duplicate/synthetic source、artifact drift、adapter drift、complete-zeroにならないmanual finalは`finish`を通過できません。shipped dependencyが`release_ready: false`の間はprepare自体がpublication blockerとして停止します。
+manual finalは、finding数が0という自己申告だけでは合格しません。PLAN/MANIFESTは`manual_final_execution`、execution ID、source execution、source artifact ref/digest、固定target、pinned adapter identityを共有します。`independent`はcompleteなpre-final sourceとは別のReviewer execution IDを要求し、`reuse_epoch_reviewer`は同じtargetの成功済みepoch Reviewer executionとartifactだけを再利用できます。全lane完了、必要な独立verification、shortfallなし、manifest completeness、scope snapshot、report存在、verified actionable finding 0件も必要です。duplicate/synthetic source、artifact drift、adapter drift、complete-zeroにならないmanual finalは`finish`を通過できません。canonical dependency record、同梱companion、runtime capabilityのいずれかがpinと一致しなければprepareはfail-closedで停止します。
 
 PLAN/MANIFESTの公開schemaは[`schemas/final-review-plan.schema.json`](schemas/final-review-plan.schema.json)と[`schemas/final-review-manifest.schema.json`](schemas/final-review-manifest.schema.json)です。
 
@@ -240,7 +242,7 @@ paneは閉じられ、再投入時は古いworktreeを整理します。product�
 - **provider**：agentを起動するCLIです。`codex` または `claude` を指定します。
 - **model**：provider内で使うモデルです。`auto` はCLIの既定値です。
 
-たとえば `worker_protocol: native` と `worker_agent_provider: codex` は別々に指定します。`$codex-impl`は任意のWorker互換protocolです。新規0.5.3 loopではordinary review、pre-final、manual-finalがすべて`$codex-review-multi-v2`を既定にし、canonicalなReviewer topologyは6 laneです。`--review-protocol native`はordinary reviewだけを変更します。pre-finalのnative pathは`pre_final_protocol = "native"`で別途選択できます。manual-finalにnative overrideはなく、`manual_final_protocol`は`codex-review-multi-v2`だけを受理します。external protocolにはpin済みの`externally-planned-v1` companion capabilityが必要であり、shipped recordの`release_ready=false`がpublicationをblockしている間は実行可能と扱いません。
+たとえば `worker_protocol: native` と `worker_agent_provider: codex` は別々に指定します。`$codex-impl`は任意のWorker互換protocolです。新規0.5.3 loopではordinary review、pre-final、manual-finalがすべて`$codex-review-multi-v2`を既定にし、canonicalなReviewer topologyは6 laneです。`--review-protocol native`はordinary reviewだけを変更します。pre-finalのnative pathは`pre_final_protocol = "native"`で別途選択できます。manual-finalにnative overrideはなく、`manual_final_protocol`は`codex-review-multi-v2`だけを受理します。external protocolにはpin済みの`externally-planned-v1` companion capabilityが必要であり、同梱snapshot、release pin、runtime capabilityの完全一致を要求します。
 
 ### QAの2段階
 
@@ -571,31 +573,9 @@ hloop --repo <repo> report
 
 ## Skillを更新した後のinstall
 
-このリポジトリのSkillを編集したら、検証してからCodexとClaude Codeの両コピーを同期します。既存directoryをtimestamp付きでbackupしてから`rsync --delete`を実行します。
+このリポジトリのSkillを編集したら、[Migration And Install Parity](references/migration-install.md)の単一手順を先頭から実行します。短縮したinstall recipeを別に保守しません。正本はHLoopとpin済みcompanionの四つのdestinationを検証し、skill discovery対象外へbackupし、両方を同期してからinstalled selftestとbyte parityを確認します。
 
-```bash
-SKILL_DIR="skills/herdr-dev-loop"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-CODEX_SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/herdr-dev-loop"
-CLAUDE_SKILL_DIR="${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/herdr-dev-loop"
-
-QUICK_VALIDATE="$(find "${CODEX_HOME:-$HOME/.codex}" "$HOME/.claude" -iname quick_validate.py 2>/dev/null | head -n1)"
-test -n "$QUICK_VALIDATE" || { echo "quick_validate.py not found under the Codex or Claude skill-creator install" >&2; exit 1; }
-python3 "$QUICK_VALIDATE" "$SKILL_DIR"
-python3 "$SKILL_DIR/scripts/hloop" selftest
-test ! -e "$CODEX_SKILL_DIR" || cp -a "$CODEX_SKILL_DIR" "${CODEX_SKILL_DIR}.backup-${STAMP}"
-test ! -e "$CLAUDE_SKILL_DIR" || cp -a "$CLAUDE_SKILL_DIR" "${CLAUDE_SKILL_DIR}.backup-${STAMP}"
-rsync -a --delete "$SKILL_DIR/" "$CODEX_SKILL_DIR/"
-rsync -a --delete "$SKILL_DIR/" "$CLAUDE_SKILL_DIR/"
-diff -qr "$SKILL_DIR" "$CODEX_SKILL_DIR"
-diff -qr "$SKILL_DIR" "$CLAUDE_SKILL_DIR"
-python3 "$CODEX_SKILL_DIR/scripts/hloop" version --json
-python3 "$CLAUDE_SKILL_DIR/scripts/hloop" version --json
-python3 "$CODEX_SKILL_DIR/scripts/hloop" selftest
-python3 "$CLAUDE_SKILL_DIR/scripts/hloop" selftest
-```
-
-通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.3表示を確認します。続いて[`release-dependencies.json`](release-dependencies.json)がpinする`codex-review-multi-v2`を両providerへ同期し、fresh sessionから`externally-planned-v1` capability、version、content digestをhandshakeします。repository、Codex、Claudeのbyte parityとlive handshakeを実施していない場合は成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。schema 3.3へ移行済みのnamespaceを古いruntimeでmutateしません。詳しい手順は[Migration And Install Parity](references/migration-install.md)、release gateは[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)にあります。
+通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.3表示を確認します。fresh sessionから`externally-planned-v1` capability、version、content digestをhandshakeし、repository、Codex、Claudeのbyte parityとlive handshakeを実施していない場合は成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。schema 3.3へ移行済みのnamespaceを古いruntimeでmutateしません。release gateは[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)にあります。
 
 ## 公開時の注意
 

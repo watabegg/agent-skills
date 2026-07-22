@@ -2360,7 +2360,19 @@ def _record_convergence(fixture: dict[str, Any], fix_round: int) -> dict[str, An
 
 
 def _prepare_final_review(fixture: dict[str, Any]) -> None:
-    _fixture_cli(fixture, "final-review", "prepare", "--json")
+    _fixture_cli(
+        fixture,
+        "final-review",
+        "prepare",
+        "--protocol-capability",
+        str(
+            SKILL_ROOT.parent
+            / "codex-review-multi-v2"
+            / "capabilities"
+            / "externally-planned-v1.json"
+        ),
+        "--json",
+    )
 
 
 def _write_final_manifest(
@@ -2426,7 +2438,7 @@ def _write_final_manifest(
         for index, lane in enumerate(group.expected_lanes)
     )
     review_manifest = hloop_review.ReviewManifest(
-        review_id="R001",
+        review_id=plan.execution.execution_id,
         plan=group,
         lane_results=lane_results,
         findings=normalized,

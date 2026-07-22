@@ -168,6 +168,7 @@ def build_provider_invocation(
                 "never",
                 "--no-alt-screen",
             ]
+        argv.extend(["-c", "sandbox_workspace_write.writable_roots=[]"])
         if model != "auto":
             argv.extend(["--model", model])
         if effort != "auto":

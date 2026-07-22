@@ -2,14 +2,17 @@
 
 These notes describe the local command assumptions used by `scripts/hloop`. Re-check with `hloop doctor` because Herdr, Codex CLI, and Claude Code CLI can change.
 
-`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements because Codex is the default fallback provider. It reports `claude` when available and role starts require Claude only when that role selects `--*-agent-provider claude`. `$codex-impl` remains an optional Worker compatibility skill. Fresh 0.5.3 defaults set ordinary `reviewer.protocol`, `review.pre_final_protocol`, and `review.manual_final_protocol` to `$codex-review-multi-v2` with the canonical six-lane Reviewer topology. `--review-protocol native` changes only ordinary review. The supported native pre-final path is selected separately with `pre_final_protocol = "native"` in `[defaults.review]` or a matching scope. Manual-final has no native override and accepts only `codex-review-multi-v2`. An execution that selects the external protocol requires its pinned `externally-planned-v1` companion capability; the shipped `release_ready=false` record blocks publication until an immutable companion distribution is supplied. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
+`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements because Codex is the default fallback provider. It reports `claude` when available and role starts require Claude only when that role selects `--*-agent-provider claude`. `$codex-impl` remains an optional Worker compatibility skill. Fresh 0.5.3 defaults set ordinary `reviewer.protocol`, `review.pre_final_protocol`, and `review.manual_final_protocol` to `$codex-review-multi-v2` with the canonical six-lane Reviewer topology. `--review-protocol native` changes only ordinary review. The supported native pre-final path is selected separately with `pre_final_protocol = "native"` in `[defaults.review]` or a matching scope. Manual-final has no native override and accepts only `codex-review-multi-v2`. An execution that selects the external protocol requires its pinned `externally-planned-v1` companion capability. The shipped 0.5.3 record is release-ready and validates the vendored companion against an immutable hardened-fork commit, exact adapter version, and payload digest. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
 
 `hloop` is not assumed to be installed on `PATH`. Prefer an explicit shell variable in every Manager session:
 
 ```bash
-HLOOP="python3 /absolute/path/to/herdr-dev-loop/scripts/hloop --namespace <namespace>"
-$HLOOP version
-$HLOOP doctor
+HLOOP_SKILL_DIR="/absolute/path/to/herdr-dev-loop"
+hloop() {
+  python3 "$HLOOP_SKILL_DIR/scripts/hloop" --namespace <namespace> "$@"
+}
+hloop version
+hloop doctor
 ```
 
 If bare `hloop` fails with `command not found`, keep using the absolute helper path. Do not switch to hand-written Herdr/Codex/Claude orchestration for loop mutations.
@@ -17,8 +20,11 @@ If bare `hloop` fails with `command not found`, keep using the absolute helper p
 Include the namespace in the command prefix:
 
 ```bash
-HLOOP="python3 /absolute/path/to/herdr-dev-loop/scripts/hloop --namespace feature-x"
-$HLOOP namespaces
+HLOOP_SKILL_DIR="/absolute/path/to/herdr-dev-loop"
+hloop() {
+  python3 "$HLOOP_SKILL_DIR/scripts/hloop" --namespace feature-x "$@"
+}
+hloop namespaces
 ```
 
 `namespaces` lists coexisting loops and reports `.ai/loop` only as `legacy ignored`. `agent abort` and `agent requeue` recover roles that exited without artifacts. `experience show` and `experience recommend` expose the repo-local worktree setup history below `.ai/herdr-dev-loop/experience/`.
@@ -32,42 +38,42 @@ Use `config path`, `config validate`, `config explain`, `config init`, and `conf
 These commands are explicit state transitions; inspect with `--json` and keep the namespace prefix on every invocation:
 
 ```bash
-$HLOOP release-scope lock --source MISSION.md --source PLAN.md \
+hloop release-scope lock --source MISSION.md --source PLAN.md \
   --plan-item-ref P001 --requirement-ref R001 --scope-ref release-scope-contract
-$HLOOP release-scope status --json
-$HLOOP release-scope amend --kind editorial --reason 'fix a source typo' --source PLAN.md
+hloop release-scope status --json
+hloop release-scope amend --kind editorial --reason 'fix a source typo' --source PLAN.md
 
-$HLOOP dispatch freeze --reason 'awaiting review evidence' --user-input-id U0001
-$HLOOP dispatch status --json
-$HLOOP dispatch unfreeze --user-input-id U0002
+hloop dispatch freeze --reason 'awaiting review evidence' --user-input-id U0001
+hloop dispatch status --json
+hloop dispatch unfreeze --user-input-id U0002
 
-$HLOOP review readiness --json
-$HLOOP review epoch create --plan reviews/epochs/E001/PLAN.json \
-  --protocol-capability /path/to/pinned-capability.json
-$HLOOP review epoch reserve E001 --lease-id L001 --execution-id R001 \
+hloop review readiness --json
+hloop review epoch create --plan reviews/epochs/E001/PLAN.json \
+  --protocol-capability "$(dirname "$HLOOP_SKILL_DIR")/codex-review-multi-v2/capabilities/externally-planned-v1.json"
+hloop review epoch reserve E001 --lease-id L001 --execution-id R001 \
   --process-id reviewer-R001 --expires-at 2026-07-17T12:00:00+00:00
-$HLOOP review epoch record E001 --outcome reviews/epochs/E001/R001-outcome.json
-$HLOOP review epoch status E001 --json
-$HLOOP triage epoch E001 --record-candidates reviews/epochs/E001/candidates.json
-$HLOOP triage epoch E001 --approve-batch --approval-bundle approvals/E001.json
-$HLOOP triage epoch E001 --materialize-batch
+hloop review epoch record E001 --outcome reviews/epochs/E001/R001-outcome.json
+hloop review epoch status E001 --json
+hloop triage epoch E001 --record-candidates reviews/epochs/E001/candidates.json
+hloop triage epoch E001 --approve-batch --approval-bundle approvals/E001.json
+hloop triage epoch E001 --materialize-batch
 
-$HLOOP review convergence prepare --mode swarm --json
-$HLOOP review convergence record --fix-round 0 --json
-$HLOOP review reopen --action retry-certification --user-input-id U0003 --authorized-extra-rounds 1 --json
+hloop review convergence prepare --mode swarm --json
+hloop review convergence record --fix-round 0 --json
+hloop review reopen --action retry-certification --user-input-id U0003 --authorized-extra-rounds 1 --json
 
-$HLOOP final-review prepare --mode swarm --json
-$HLOOP final-review record --json
-$HLOOP final-review status --json
+hloop final-review prepare --mode swarm --json
+hloop final-review record --json
+hloop final-review status --json
 
-$HLOOP follow-up add --title 'next release item' --component 'component' \
+hloop follow-up add --title 'next release item' --component 'component' \
   --trigger-class 'trigger' --product-impact 'impact' --impact 'current impact' \
   --affected-path 'src/example.py' --source-review-fingerprint sha256:<64 hex> \
   --evidence reviews/R001.md --deferred-reason 'outside current scope' \
   --reconsider-condition 'next release scope lock'
-$HLOOP follow-up list --json
-$HLOOP follow-up show fu:v1:sha256:<64 hex> --json
-$HLOOP follow-up export --output docs/follow-ups.md
+hloop follow-up list --json
+hloop follow-up show fu:v1:sha256:<64 hex> --json
+hloop follow-up export --output docs/follow-ups.md
 ```
 
 `review epoch create` fixes the Reviewer/Gap plan, target, protocol capability, topology, and capacity policy. Reserve capacity before starting each process, record every terminal outcome, and require a closed collection barrier before triage. Candidate registration, approval, and materialization are separate idempotent transitions; classification conflict or digest drift blocks approval. `review convergence prepare` freezes a fixed integration SHA but does not start a Reviewer. `record` rejects stale targets, plan drift, incomplete lanes, verification shortfall, and nonzero actionable findings at the round limit. `review reopen` is the only path from failed/incomplete/exhausted certification back to task creation and requires a user input id. `final-review record` recomputes complete-zero evidence; a count of zero alone is insufficient.
@@ -180,7 +186,7 @@ Avoid direct `herdr pane run <pane> "<prompt>"` for Manager follow-ups. Empirica
 If no body was typed, the command records an `undelivered` message under `.ai/herdr-dev-loop/loops/<namespace>/inbox/pending/`; only these messages are eligible for `hloop message drain`, and only while the addressed role is still running. A terminal role is never a drain target: `hloop message list` emits an exact `message resolve ... --status superseded` command when its durable identity is current, or requires state inspection when it is not. If a drain retry becomes delivery-unknown, drain exits nonzero and reports the transition. If the body may already be typed, delivery is `unknown` and the body is never auto-resent. When the transport evidence says the end marker was staged, the diagnostic pins the absolute runtime, canonical Manager repo, namespace, role, and message id and offers Enter-only recovery:
 
 ```bash
-$HLOOP message submit T001 <message-id>
+hloop message submit T001 <message-id>
 ```
 
 If the end marker was not staged, the diagnostic does not offer `message submit`; inspect the pane and explicitly choose `acknowledged`, `applied --result ...`, or `superseded` with `message resolve` only after establishing the actual delivery or application result. No executable resolution command is preselected before that observation. If the staged input cannot be distinguished from transcript history, `message submit` also fails closed without sending Enter. A failed Enter transport attempt remains `unknown`, records the attempt, and requires another pane inspection before retry.
@@ -247,7 +253,7 @@ hloop pump --max-transitions 20 --max-workers 3 --stop-on-triage
 
 Use `hloop checkpoint --message "ai-loop: ..."` to commit Manager-owned `.ai/herdr-dev-loop/loops/<namespace>` changes without accidentally staging product files. By default it excludes `.ai/herdr-dev-loop/loops/<namespace>/prompts/` and `.ai/herdr-dev-loop/loops/<namespace>/LOCK`; pass `--include-prompts` or `--include-lock` only for deliberate debugging artifacts. Pass `--force` when `.ai/herdr-dev-loop/loops/<namespace>` is intentionally gitignored; it discovers ignored untracked loop files and stages only the filtered loop path set with `git add -f`.
 
-Use the same explicit `$HLOOP` variable when bare `hloop` is not on `PATH`.
+Use the same explicit `hloop()` function when bare `hloop` is not on `PATH`.
 
 Use `triage` to turn machine-readable `Fix Task Candidates` into a Manager-readable draft, and only then create queued fix tasks:
 

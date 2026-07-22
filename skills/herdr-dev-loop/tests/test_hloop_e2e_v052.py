@@ -55,7 +55,7 @@ AVAILABLE_RELEASE_DEPENDENCY = {
             },
             "install_destinations": {
                 "codex": "${CODEX_HOME:-$HOME/.codex}/skills/codex-review-multi-v2",
-                "claude": "${CLAUDE_SKILLS_HOME:-$HOME/.claude/skills}/codex-review-multi-v2",
+                "claude": "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/codex-review-multi-v2",
             },
         }
     ],
@@ -69,6 +69,20 @@ PROTOCOL_CAPABILITY = {
     "content_digest": "sha256:" + "b" * 64,
     "capabilities": ["externally-planned-v1"],
 }
+
+# The historical behavioral fixtures still use a copied runtime, but the
+# external adapter must now be the real validated sibling distribution.
+AVAILABLE_RELEASE_DEPENDENCY = json.loads(
+    (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
+)
+PROTOCOL_CAPABILITY = json.loads(
+    (
+        SKILL_ROOT.parent
+        / "codex-review-multi-v2"
+        / "capabilities"
+        / "externally-planned-v1.json"
+    ).read_text(encoding="utf-8")
+)
 
 SYNTHETIC_BOOTSTRAP = """\
 import importlib.machinery
@@ -131,17 +145,21 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
             cls.skill_root,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
+        shutil.copytree(
+            SKILL_ROOT.parent / "codex-review-multi-v2",
+            fixture_root / "codex-review-multi-v2",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         cls.runner = cls.skill_root / "tests" / RUNNER.name
         (cls.skill_root / "release-dependencies.json").write_text(
             json.dumps(AVAILABLE_RELEASE_DEPENDENCY, indent=2) + "\n",
             encoding="utf-8",
         )
-        capability_dir = cls.skill_root / "capabilities"
-        capability_dir.mkdir(exist_ok=True)
-        cls.protocol_capability = capability_dir / "externally-planned-v1.json"
-        cls.protocol_capability.write_text(
-            json.dumps(PROTOCOL_CAPABILITY, indent=2) + "\n",
-            encoding="utf-8",
+        cls.protocol_capability = (
+            fixture_root
+            / "codex-review-multi-v2"
+            / "capabilities"
+            / "externally-planned-v1.json"
         )
         cls.bootstrap = fixture_root / "run_synthetic_proxy.py"
         cls.bootstrap.write_text(SYNTHETIC_BOOTSTRAP, encoding="utf-8")

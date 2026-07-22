@@ -134,6 +134,8 @@ class ProviderPrimitiveTests(unittest.TestCase):
             "exec",
             "--sandbox",
             "workspace-write",
+            "-c",
+            "sandbox_workspace_write.writable_roots=[]",
             "--model",
             "gpt-test",
             "-c",
