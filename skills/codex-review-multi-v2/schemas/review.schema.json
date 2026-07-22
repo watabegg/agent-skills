@@ -1,0 +1,329 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "review.schema.json",
+  "title": "crv2 統一指摘スキーマ (review.json)",
+  "description": "crv2 レビューの構造化正本。モデル(エージェント)が書くのは本スキーマの agent fields のみ。Action・P・verdict・件数・KPI は renderer / validator が本データから references/output-format.md の固定写像で機械導出し、モデルには一切書かせない(action フィールドはモデル記入禁止のためスキーマに存在しない)。日本語 Markdown は assets/render_review.py が生成する。",
+  "type": "object",
+  "required": ["target", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "target": {
+      "description": "レビュー対象。QA 側 plan.json の target と同形。",
+      "type": "object",
+      "required": ["repo", "head_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": { "type": "string", "minLength": 1 },
+        "pr": { "type": ["integer", "null"] },
+        "head_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" }
+      }
+    },
+    "findings": {
+      "description": "指摘の配列。文脈適用で omit/降格された sentinel 候補も監査のため残す。表示件数上限は renderer が適用するためスキーマでは制限しない。",
+      "type": "array",
+      "items": { "$ref": "#/definitions/finding" }
+    },
+    "residual_risks": {
+      "description": "残留リスク / 未確認点。置けるのは (1) behavior uncertainty の clarify-spec 質問、(2) confidence: low(evidence uncertainty)の指摘、(3) assurance gap(実害経路は無いが検証・診断を困難にする欠如)。いずれか単独で該当すれば置く(AND 条件ではない)。各項目は具体的な質問または確認手順で終える。",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title", "check_procedure"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "minLength": 1 },
+          "check_procedure": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "profile_gaps": {
+      "description": "run-level の profile 欠落事実。operational uncertainty は finding の Action に混ぜず(finding 側は operational_rate: unknown のまま通常導出)ここへ記録する。全件保存し、人間向け表示は renderer が 3 件まで。同じ field への質問は 1 件に dedupe する。質問として提示してよいのは回答で Action が変わる場合のみ(oracle §1.3)。",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["field", "proposed_question", "action_changes_if_answered"],
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "description": "profile 内の欠落フィールドへの JSON Pointer(例: /facts/concurrency/same_record_overlap_rate)。",
+            "type": "string",
+            "pattern": "^/"
+          },
+          "proposed_question": { "type": "string", "minLength": 1 },
+          "action_changes_if_answered": {
+            "description": "回答によって導出 Action が変わる場合のみ true。true の項目だけを人間への質問として提示する(どちらの回答でも Action が同じなら質問しない)。",
+            "type": "boolean"
+          },
+          "related_finding_ids": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+          }
+        }
+      }
+    },
+    "review_env_notes": {
+      "description": "レビュー環境の注意(未追跡ファイル・stale QAレポート・worktree 状態などのメタ問題)。P は付けない。",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "impact",
+        "exposure",
+        "mitigation",
+        "confidence",
+        "confidence_evidence_type",
+        "defect_class",
+        "uncertainty",
+        "sentinel",
+        "invariant",
+        "symptom_or_cause",
+        "trigger",
+        "evidence",
+        "counterevidence_checked"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "finding の安定識別子(例: F-01)。",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "impact": {
+          "description": "「この指摘が真だった場合に何が起きるか」のみで決める。判定材料: 影響範囲 Scope(record/user/tenant/cross-tenant/all)、回復可能性(外部送信・確定・支払・削除など復旧困難は critical、永続化されたが特定して復旧可能なら 1 段下、preview・表示・一時状態のみはさらに下)、business criticality(profile の critical_workflows)、data_class。confidence・セッション内の相対比較・レビューラウンドで調整しない。",
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"]
+        },
+        "exposure": {
+          "description": "Exposure の二軸分離(oracle §1.2)。trigger_class は発生条件の種類でコードのみから判定する。operational_rate はこの製品での実運用頻度で、fresh な profile 事実のみから判定する。使える事実が無ければ unknown — unknown は降格根拠にならず通常の Action 導出に乗る(fail-closed)。clarify-spec の代用にしない。",
+          "type": "object",
+          "required": ["trigger_class", "operational_rate"],
+          "additionalProperties": false,
+          "properties": {
+            "trigger_class": {
+              "description": "routine = その機能の通常フローで成立 / conditional = 特定データ・状態・タイミングが必要 / adversarial = 侵害済み主体・特殊権限・非現実的操作が必要。「直接 API のみ到達」は降格要因にせず security_reachability に記録する。",
+              "type": "string",
+              "enum": ["routine", "conditional", "adversarial"]
+            },
+            "operational_rate": {
+              "description": "frequent / occasional / rare / unknown。rare による降格には有効な context_effect が必須(無ければ renderer は降格しない)。",
+              "type": "string",
+              "enum": ["frequent", "occasional", "rare", "unknown"]
+            }
+          }
+        },
+        "mitigation": {
+          "description": "回避策・復旧の容易さ。easy-recovery を主張できるのは 4 条件(事故を検知できる・影響レコードを一意に特定できる・文書化された復旧手順がある・復旧コストが有界)を全て満たす場合のみ。Impact は下げず Action 導出だけに反映する。",
+          "type": "string",
+          "enum": ["none", "manual-workaround", "easy-recovery"]
+        },
+        "confidence": {
+          "description": "指摘が真である見込み(severity とは独立の軸)。low = evidence uncertainty: renderer が導出 Action を保持したまま残留リスクへ移す。Impact を下げて誤魔化さない。clarify-spec に倒すのは behavior uncertainty のみで、confidence low を clarify-spec にしない。",
+          "type": "string",
+          "enum": ["high", "medium", "low"]
+        },
+        "confidence_evidence_type": {
+          "description": "confidence の根拠種別。high は reproduced か code-trace のみ。inference(推測)の finding は block / fix-before-merge 相当に導出されない前提で扱う。",
+          "type": "string",
+          "enum": ["reproduced", "code-trace", "inference"]
+        },
+        "defect_class": {
+          "description": "欠陥クラス。authz-boundary / destructive-data-loss / irreversible-external-effect / production-credential は非降格クラス: 環境(VPN・SSO・社内ネットワーク)・規模・利用実態を理由に降格できない(validator が強制)。preview_allowed は QA 実行ポリシーであり本番不可逆性の代理にしない。",
+          "type": "string",
+          "enum": [
+            "authz-boundary",
+            "destructive-data-loss",
+            "irreversible-external-effect",
+            "production-credential",
+            "data-integrity",
+            "availability",
+            "correctness",
+            "performance",
+            "operational-ux",
+            "other"
+          ]
+        },
+        "uncertainty": {
+          "description": "不確実性の 3 分離(oracle §1.3)。behavior = 期待仕様・権限ポリシー不明で成否が決まる(renderer が Action=clarify-spec に上書き)/ operational = 頻度・規模の事実が無いだけ(operational_rate: unknown のまま通常導出し、run-level profile_gaps に記録)/ evidence = コード経路の成立未確認(confidence: low として残留リスクへ)。「profile 事実が無い → clarify-spec」は禁止。",
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": ["none", "behavior", "operational", "evidence"]
+            },
+            "note": { "type": "string" }
+          }
+        },
+        "sentinel": {
+          "description": "context-blind sentinel レーン(Correctness)由来なら true。sentinel 候補は製品文脈を理由に候補段階で消してはならない。文脈適用で omit/降格された sentinel 候補は監査対象として review.json に残す。",
+          "type": "boolean"
+        },
+        "context_effect": {
+          "description": "製品文脈による降格を主張する場合のみ記載(それ以外は省略する)。validator が検査する: basis の profile_field が実在する JSON Pointer であること、source_type が降格適格(telemetry / user-confirmed / incident-review のみ。shared-default / draft / stale / expired / 未来日 as_of は拒否)、counterfactual があること。「社内ツールで小規模だから」のようなゴム印は invalid。",
+          "type": "object",
+          "required": ["effect", "basis", "causal_link", "counterfactual"],
+          "additionalProperties": false,
+          "properties": {
+            "effect": {
+              "description": "文脈が正当化する効果(正準値: lower-operational-rate-one-step)。",
+              "type": "string",
+              "minLength": 1
+            },
+            "basis": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["profile_field", "source_type", "as_of", "relation"],
+                "additionalProperties": false,
+                "properties": {
+                  "profile_field": {
+                    "description": "resolved profile 内の実在フィールドへの JSON Pointer。",
+                    "type": "string",
+                    "pattern": "^/"
+                  },
+                  "source_type": {
+                    "description": "降格に使えるのは telemetry / user-confirmed / incident-review のみ。他は宣言可能だが validator が降格根拠として拒否する。",
+                    "type": "string",
+                    "enum": [
+                      "telemetry",
+                      "user-confirmed",
+                      "incident-review",
+                      "code-scan",
+                      "document",
+                      "shared-default"
+                    ]
+                  },
+                  "as_of": {
+                    "description": "その事実の観測日(YYYY-MM-DD)。期限切れ・未来日は降格根拠にならない。",
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "relation": {
+                    "description": "事実と Trigger の因果関係の型(例: required-trigger / opportunity-count / trigger-rate)。",
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "causal_link": {
+              "description": "なぜその事実がこの Trigger の発生率を下げるのかの因果説明(人間監査対象)。",
+              "type": "string",
+              "minLength": 1
+            },
+            "counterfactual": {
+              "description": "どんな観測があればこの降格を取り消すか(例: 月1件以上の重複保存が観測されたら降格しない)。",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "invariant": {
+          "description": "壊れる不変条件。単純な off-by-one 等に壮大な spec-level invariant を捏造せず、local-contract / unknown を正直に使う。",
+          "type": "object",
+          "required": ["type", "text"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["domain-invariant", "local-contract", "unknown"]
+            },
+            "text": { "type": "string", "minLength": 1 }
+          }
+        },
+        "symptom_or_cause": {
+          "description": "この finding が症状か原因そのものか。クラスタ親は cause。",
+          "type": "string",
+          "enum": ["symptom", "cause"]
+        },
+        "cluster_id": {
+          "description": "根本原因クラスタの ID(例: RC-01)。クラスタ化の条件は「一つの修正機構で全子症状が消える」という因果仮説を説明できること。無関係な指摘の束ねは禁止。",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "children": {
+          "description": "クラスタ親(cause)のみ。表示は親 1 件でも、修正後の追跡のため子 finding の識別子・impact・trigger を構造化データに保持する。",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "impact", "trigger"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+              "impact": {
+                "type": "string",
+                "enum": ["critical", "high", "medium", "low"]
+              },
+              "trigger": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "trigger": {
+          "description": "具体的なユーザー操作とデータ条件の時系列(例: 「初回表示から 60 分後に編集ボタンを押すと」)。全 finding 必須。",
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "description": "根拠となるコード位置。全 finding 1 件以上必須。",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "line"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "line": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "counterevidence_checked": {
+          "description": "指摘を無効化しうるガード・制約・仕様(計画書/テスト/コメント)を探した仮説と場所。where_checked は file:line または文書名。全 finding 必須。",
+          "type": "object",
+          "required": ["hypothesis", "where_checked"],
+          "additionalProperties": false,
+          "properties": {
+            "hypothesis": { "type": "string", "minLength": 1 },
+            "where_checked": { "type": "string", "minLength": 1 }
+          }
+        },
+        "security_reachability": {
+          "description": "security finding のみ記録。ordinary-authenticated + browser-devtools-or-http-client は severity を自動で一段下げない。",
+          "type": "object",
+          "required": ["caller_capability", "reachability"],
+          "additionalProperties": false,
+          "properties": {
+            "caller_capability": {
+              "type": "string",
+              "enum": [
+                "ordinary-authenticated",
+                "privileged-role",
+                "compromised-component",
+                "unauthenticated"
+              ]
+            },
+            "reachability": {
+              "type": "string",
+              "enum": [
+                "normal-ui",
+                "browser-devtools-or-http-client",
+                "non-default-feature",
+                "implausible-sequence"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

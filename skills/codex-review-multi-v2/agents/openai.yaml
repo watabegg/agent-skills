@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Review Multi V2"
+  short_description: "Run crv2 multi-reviewer Codex reviews"
+  default_prompt: "Use $codex-review-multi-v2 to run a crv2-style multi-reviewer review of the current diff and report actionable findings."

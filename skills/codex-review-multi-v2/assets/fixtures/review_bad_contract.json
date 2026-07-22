@@ -1,0 +1,252 @@
+{
+  "target": { "repo": "example/app", "pr": 456, "head_sha": "0f1e2d3c4b" },
+  "findings": [
+    {
+      "id": "G-01",
+      "title": "operational_rate=rare なのに context_effect が無い降格主張",
+      "impact": "medium",
+      "exposure": { "trigger_class": "routine", "operational_rate": "rare" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "invariant": { "type": "local-contract", "text": "保存結果は入力内容と一致する" },
+      "symptom_or_cause": "cause",
+      "trigger": "特定の保存操作で値がずれる",
+      "evidence": [{ "path": "server/report/save.go", "line": 10 }],
+      "counterevidence_checked": {
+        "hypothesis": "補正処理があるはず",
+        "where_checked": "server/report/save.go:1-40 を確認、なし"
+      }
+    },
+    {
+      "id": "G-02",
+      "title": "実在しない profile フィールドを引用した降格",
+      "impact": "medium",
+      "exposure": { "trigger_class": "routine", "operational_rate": "rare" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "context_effect": {
+        "effect": "lower-operational-rate-one-step",
+        "basis": [
+          {
+            "profile_field": "/facts/concurrency/nonexistent_metric",
+            "source_type": "telemetry",
+            "as_of": "2026-07-01",
+            "relation": "trigger-rate"
+          }
+        ],
+        "causal_link": "存在しない事実を引用している",
+        "counterfactual": "該当事実が観測されたら降格しない"
+      },
+      "invariant": { "type": "local-contract", "text": "再送は重複登録にならない" },
+      "symptom_or_cause": "cause",
+      "trigger": "再送で重複登録される",
+      "evidence": [{ "path": "server/report/retry.go", "line": 22 }],
+      "counterevidence_checked": {
+        "hypothesis": "冪等キーがあるはず",
+        "where_checked": "server/report/retry.go:1-60 を確認、なし"
+      }
+    },
+    {
+      "id": "G-03",
+      "title": "shared 既定・未来日・期限切れ as_of を根拠にした降格",
+      "impact": "medium",
+      "exposure": { "trigger_class": "routine", "operational_rate": "rare" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "context_effect": {
+        "effect": "lower-operational-rate-one-step",
+        "basis": [
+          {
+            "profile_field": "/facts/audience",
+            "source_type": "shared-default",
+            "as_of": "2027-01-01",
+            "relation": "required-trigger"
+          },
+          {
+            "profile_field": "/facts/scale/active_users_30d",
+            "source_type": "telemetry",
+            "as_of": "2026-01-01",
+            "relation": "opportunity-count"
+          }
+        ],
+        "causal_link": "社内ツールで利用者が少ないため",
+        "counterfactual": "利用者が増えたら降格しない"
+      },
+      "invariant": { "type": "local-contract", "text": "集計は締め後に変わらない" },
+      "symptom_or_cause": "cause",
+      "trigger": "締め後の再計算で集計が変わる",
+      "evidence": [{ "path": "server/report/aggregate.go", "line": 88 }],
+      "counterevidence_checked": {
+        "hypothesis": "締めロックがあるはず",
+        "where_checked": "server/report/aggregate.go:60-120 を確認、なし"
+      }
+    },
+    {
+      "id": "G-04",
+      "title": "authz-boundary を VPN 環境を理由に降格しようとする指摘",
+      "impact": "high",
+      "exposure": { "trigger_class": "routine", "operational_rate": "rare" },
+      "mitigation": "none",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "authz-boundary",
+      "uncertainty": { "kind": "none" },
+      "sentinel": true,
+      "context_effect": {
+        "effect": "lower-operational-rate-one-step",
+        "basis": [
+          {
+            "profile_field": "/facts/environment/network_access",
+            "source_type": "user-confirmed",
+            "as_of": "2026-07-01",
+            "relation": "required-trigger"
+          }
+        ],
+        "causal_link": "VPN 内からしか到達できないため実質的に安全",
+        "counterfactual": "外部公開されたら降格しない"
+      },
+      "invariant": { "type": "domain-invariant", "text": "他店舗のデータは所属店舗のユーザーから参照できない" },
+      "symptom_or_cause": "cause",
+      "trigger": "認可チェックの無いエンドポイントに他店舗の ID を指定すると一覧を取得できる",
+      "evidence": [{ "path": "internal/api/list.go", "line": 33 }],
+      "counterevidence_checked": {
+        "hypothesis": "ミドルウェアで店舗スコープを検証しているはず",
+        "where_checked": "internal/middleware/scope.go:1-50 を確認、対象ルート外"
+      },
+      "security_reachability": {
+        "caller_capability": "ordinary-authenticated",
+        "reachability": "browser-devtools-or-http-client"
+      }
+    },
+    {
+      "id": "G-05",
+      "title": "children を保持する cause 親が居ない cluster_id 参照",
+      "impact": "medium",
+      "exposure": { "trigger_class": "conditional", "operational_rate": "unknown" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "cluster_id": "RC-X",
+      "invariant": { "type": "local-contract", "text": "状態遷移は定義済みの順序に従う" },
+      "symptom_or_cause": "symptom",
+      "trigger": "特定の順序で操作すると状態が壊れる",
+      "evidence": [{ "path": "web/src/state/machine.ts", "line": 70 }],
+      "counterevidence_checked": {
+        "hypothesis": "遷移ガードがあるはず",
+        "where_checked": "web/src/state/machine.ts:50-90 を確認、なし"
+      }
+    },
+    {
+      "id": "G-06",
+      "title": "コントラストが低く読みにくいラベル",
+      "impact": "low",
+      "exposure": { "trigger_class": "routine", "operational_rate": "unknown" },
+      "mitigation": "easy-recovery",
+      "confidence": "medium",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "operational-ux",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "invariant": { "type": "local-contract", "text": "ラベルは読める" },
+      "symptom_or_cause": "symptom",
+      "trigger": "設定画面のラベルがスクリーンリーダーで読み上げられない",
+      "evidence": [{ "path": "web/src/settings/form.tsx", "line": 41 }],
+      "counterevidence_checked": {
+        "hypothesis": "共通コンポーネントが対応しているはず",
+        "where_checked": "web/src/shared/label.tsx:1-30 を確認"
+      }
+    },
+    {
+      "id": "G-07",
+      "title": "認可チェックの欠落した削除 API",
+      "impact": "high",
+      "exposure": { "trigger_class": "routine", "operational_rate": "unknown" },
+      "mitigation": "none",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "authz-boundary",
+      "uncertainty": { "kind": "none" },
+      "sentinel": true,
+      "invariant": { "type": "domain-invariant", "text": "削除は権限保持者のみが実行できる" },
+      "symptom_or_cause": "cause",
+      "trigger": "権限の無いユーザーが削除 API を直接呼ぶと成功する",
+      "evidence": [{ "path": "internal/api/delete.go", "line": 18 }],
+      "counterevidence_checked": {
+        "hypothesis": "ルーター層で権限を検証しているはず",
+        "where_checked": "internal/router/routes.go:1-80 を確認、なし"
+      }
+    },
+    {
+      "id": "G-08",
+      "title": "無関係な指摘を束ねたクラスタ親",
+      "impact": "medium",
+      "exposure": { "trigger_class": "conditional", "operational_rate": "unknown" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "cluster_id": "RC-Y",
+      "children": [
+        { "id": "G-08a", "impact": "medium", "trigger": "フロントの表示が崩れる" }
+      ],
+      "invariant": { "type": "local-contract", "text": "表示は入力と一致する" },
+      "symptom_or_cause": "cause",
+      "trigger": "フロントの表示崩れ",
+      "evidence": [{ "path": "web/src/report/view.tsx", "line": 12 }],
+      "counterevidence_checked": {
+        "hypothesis": "スナップショットテストがあるはず",
+        "where_checked": "web/src/report/__tests__/ を確認、なし"
+      }
+    },
+    {
+      "id": "G-09",
+      "title": "同一クラスタに束ねられたバックエンドの別問題",
+      "impact": "medium",
+      "exposure": { "trigger_class": "conditional", "operational_rate": "unknown" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "cluster_id": "RC-Y",
+      "invariant": { "type": "local-contract", "text": "バッチは冪等に再実行できる" },
+      "symptom_or_cause": "symptom",
+      "trigger": "バッチ再実行で重複行が入る",
+      "evidence": [{ "path": "batch/job/reconcile.go", "line": 99 }],
+      "counterevidence_checked": {
+        "hypothesis": "unique 制約があるはず",
+        "where_checked": "db/schema.sql を確認、なし"
+      }
+    }
+  ],
+  "profile_gaps": [
+    {
+      "field": "/facts/concurrency/duplicate_ui_submit",
+      "proposed_question": "二重クリック起因の重複保存は月に何件ありますか",
+      "action_changes_if_answered": true
+    },
+    {
+      "field": "/facts/concurrency/duplicate_ui_submit",
+      "proposed_question": "同じフィールドへの重複質問(dedupe されていない)",
+      "action_changes_if_answered": false
+    }
+  ]
+}

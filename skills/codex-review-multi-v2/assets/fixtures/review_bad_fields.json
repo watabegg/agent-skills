@@ -1,0 +1,37 @@
+{
+  "findings": [
+    {
+      "id": "B-01",
+      "title": "action と P を直書きし exposure を旧文字列形式で書いた壊れた指摘",
+      "impact": "huge",
+      "exposure": "conditional",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "invariant": { "type": "local-contract", "text": "検証用の違反例" },
+      "symptom_or_cause": "cause",
+      "evidence": [],
+      "action": "block",
+      "P": "P0"
+    },
+    {
+      "id": "B-02",
+      "title": "推測(inference)のまま block 相当に導出される指摘",
+      "impact": "critical",
+      "exposure": { "trigger_class": "routine", "operational_rate": "unknown" },
+      "mitigation": "none",
+      "confidence": "high",
+      "confidence_evidence_type": "inference",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "invariant": { "type": "local-contract", "text": "推測に基づく不変条件" },
+      "symptom_or_cause": "cause",
+      "trigger": "特定の操作をすると問題が起きるかもしれない",
+      "evidence": [ { "path": "src/x.ts", "line": 1 } ],
+      "counterevidence_checked": {
+        "hypothesis": "ガードがあるかもしれない",
+        "where_checked": "src/x.ts:1-10"
+      }
+    }
+  ]
+}

@@ -1,0 +1,207 @@
+{
+  "target": {
+    "repo": "example/app",
+    "pr": 123,
+    "head_sha": "a1b2c3d4e5"
+  },
+  "findings": [
+    {
+      "id": "F-01",
+      "title": "保存応答の世代検証がなく古い snapshot が新しい編集を上書きする",
+      "impact": "high",
+      "exposure": { "trigger_class": "routine", "operational_rate": "unknown" },
+      "mitigation": "none",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "data-integrity",
+      "uncertainty": { "kind": "operational", "note": "同一レコード編集の重複頻度は profile に無い(profile_gaps に記録)" },
+      "sentinel": true,
+      "invariant": {
+        "type": "domain-invariant",
+        "text": "画面に表示・保存される値は最後に確定した保存内容と一致する"
+      },
+      "symptom_or_cause": "cause",
+      "cluster_id": "RC-01",
+      "children": [
+        {
+          "id": "F-01a",
+          "impact": "high",
+          "trigger": "求人の並行追加で古い snapshot が詳細表示を巻き戻す"
+        },
+        {
+          "id": "F-01b",
+          "impact": "medium",
+          "trigger": "保存中にモーダルを閉じると選択状態が後から古い値に戻される"
+        }
+      ],
+      "trigger": "同じ編集画面を2つのタブで開き、古いタブから保存すると新しいタブで保存済みの内容が通知なく消える",
+      "evidence": [
+        { "path": "src/app/save.ts", "line": 42 },
+        { "path": "src/app/store.ts", "line": 118 }
+      ],
+      "counterevidence_checked": {
+        "hypothesis": "楽観ロックか updated_at 比較が repository 層にあるはず",
+        "where_checked": "src/app/save.ts:30-80 と src/app/store.ts:100-140 を確認、世代検証なし"
+      }
+    },
+    {
+      "id": "F-02",
+      "title": "一覧の全選択削除が確認なしで実行され復元手段がない",
+      "impact": "critical",
+      "exposure": { "trigger_class": "routine", "operational_rate": "unknown" },
+      "mitigation": "none",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "destructive-data-loss",
+      "uncertainty": { "kind": "none" },
+      "sentinel": true,
+      "invariant": {
+        "type": "domain-invariant",
+        "text": "破壊的操作は明示的な確認なしに実行されない"
+      },
+      "symptom_or_cause": "cause",
+      "trigger": "一覧画面でヘッダーの全選択チェックを入れて削除ボタンを押すと、確認ダイアログなしで表示外の全件が物理削除される",
+      "evidence": [
+        { "path": "src/app/list.tsx", "line": 120 }
+      ],
+      "counterevidence_checked": {
+        "hypothesis": "確認ダイアログ・soft delete・undo のいずれかがあるはず",
+        "where_checked": "src/app/list.tsx:100-160 と server/handler/delete.go:20-60 を確認、いずれもなし"
+      }
+    },
+    {
+      "id": "F-03",
+      "title": "同時編集の競合で後勝ち上書きが通知なく起きる",
+      "impact": "medium",
+      "exposure": { "trigger_class": "routine", "operational_rate": "rare" },
+      "mitigation": "manual-workaround",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "none" },
+      "sentinel": false,
+      "context_effect": {
+        "effect": "lower-operational-rate-one-step",
+        "basis": [
+          {
+            "profile_field": "/facts/concurrency/human_same_record_overlap",
+            "source_type": "telemetry",
+            "as_of": "2026-07-01",
+            "relation": "trigger-rate"
+          }
+        ],
+        "causal_link": "競合には同一レコードへの保存が時間的に重なる必要があり、telemetry 上の同時編集観測率が rare",
+        "counterfactual": "同一レコードへの重複保存が月1件以上観測されたらこの降格を取り消す"
+      },
+      "invariant": {
+        "type": "local-contract",
+        "text": "競合する保存はユーザーに通知されるか検知される"
+      },
+      "symptom_or_cause": "cause",
+      "trigger": "2人が同じレコードを同時に編集して保存すると、後から保存した側が先の変更を通知なく上書きする",
+      "evidence": [
+        { "path": "src/app/save.ts", "line": 88 }
+      ],
+      "counterevidence_checked": {
+        "hypothesis": "コンフリクト検知か行バージョン比較があるはず",
+        "where_checked": "src/app/save.ts:80-120 と docs/design.md を確認、検知機構なし"
+      }
+    },
+    {
+      "id": "F-04",
+      "title": "一括更新の対象にアーカイブ済みレコードを含めるのが仕様か不明",
+      "impact": "high",
+      "exposure": { "trigger_class": "conditional", "operational_rate": "unknown" },
+      "mitigation": "manual-workaround",
+      "confidence": "medium",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "correctness",
+      "uncertainty": { "kind": "behavior", "note": "アーカイブ済みを含めるのが期待仕様かバグか、正本仕様の記述が無い" },
+      "sentinel": false,
+      "invariant": {
+        "type": "unknown",
+        "text": "一括更新の対象範囲について期待仕様が確認できない"
+      },
+      "symptom_or_cause": "cause",
+      "trigger": "アーカイブ済みを含む検索結果に対して一括更新を実行すると、アーカイブ済みレコードも更新される",
+      "evidence": [
+        { "path": "src/app/bulk.ts", "line": 15 }
+      ],
+      "counterevidence_checked": {
+        "hypothesis": "仕様書に一括更新の対象範囲の定義があるはず",
+        "where_checked": "docs/spec.md と AGENTS.md を確認、該当記述なし"
+      }
+    },
+    {
+      "id": "F-05",
+      "title": "通信タイムアウト後の自動リトライで外部請求要求が二重送信される可能性",
+      "impact": "high",
+      "exposure": { "trigger_class": "conditional", "operational_rate": "unknown" },
+      "mitigation": "none",
+      "confidence": "low",
+      "confidence_evidence_type": "inference",
+      "defect_class": "availability",
+      "uncertainty": { "kind": "evidence", "note": "リトライ経路が実際に到達可能かのコードトレースが未完" },
+      "sentinel": false,
+      "invariant": {
+        "type": "local-contract",
+        "text": "同一操作の外部呼び出しは高々一度だけ実行される"
+      },
+      "symptom_or_cause": "cause",
+      "trigger": "通信タイムアウト直後にクライアントが自動リトライすると、同じ請求要求が2回送信される可能性がある",
+      "evidence": [
+        { "path": "src/app/client.ts", "line": 200 }
+      ],
+      "counterevidence_checked": {
+        "hypothesis": "冪等キーがリクエストへ付与されているはず",
+        "where_checked": "src/app/client.ts:180-240 を確認、冪等キーは未発見(経路全体は未追跡)"
+      }
+    },
+    {
+      "id": "F-06",
+      "title": "更新 API が対象 ID の所有者チェックをせず他ユーザーのレコードを更新できる",
+      "impact": "high",
+      "exposure": { "trigger_class": "routine", "operational_rate": "unknown" },
+      "mitigation": "none",
+      "confidence": "high",
+      "confidence_evidence_type": "code-trace",
+      "defect_class": "authz-boundary",
+      "uncertainty": { "kind": "none" },
+      "sentinel": true,
+      "invariant": {
+        "type": "domain-invariant",
+        "text": "レコードの更新は所有者または権限保持者のみが実行できる"
+      },
+      "symptom_or_cause": "cause",
+      "trigger": "認証済みユーザーが更新リクエストの対象 ID を書き換えて送信すると、他人のレコードを更新できる",
+      "evidence": [
+        { "path": "internal/api/update.go", "line": 55 }
+      ],
+      "counterevidence_checked": {
+        "hypothesis": "ハンドラかミドルウェアに所有者チェックがあるはず",
+        "where_checked": "internal/api/update.go:40-90 と internal/middleware/ を確認、所有者チェックなし"
+      },
+      "security_reachability": {
+        "caller_capability": "ordinary-authenticated",
+        "reachability": "browser-devtools-or-http-client"
+      }
+    }
+  ],
+  "residual_risks": [
+    {
+      "title": "マイグレーションのロック保持時間が本番規模で許容内か未確認",
+      "check_procedure": "本番相当行数のステージングで ALTER TABLE 実行時の保持ロックと所要時間を計測する"
+    }
+  ],
+  "profile_gaps": [
+    {
+      "field": "/facts/concurrency/duplicate_ui_submit",
+      "proposed_question": "保存ボタンの二重クリック起因の重複保存は月に何件程度観測されますか",
+      "action_changes_if_answered": true,
+      "related_finding_ids": ["F-01"]
+    }
+  ],
+  "review_env_notes": [
+    "worktree に未追跡のデバッグスクリプトが 1 件あり、レビュー対象から除外した"
+  ]
+}

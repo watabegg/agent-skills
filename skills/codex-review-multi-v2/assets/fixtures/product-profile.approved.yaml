@@ -1,0 +1,62 @@
+# crv2 selftest 用の承認済み product profile fixture(schema_version 2)。
+# 各 selftest は --today 2026-07-12 固定で呼ぶため、鮮度判定は決定論的:
+#   approved_at 2026-07-01(過去)/ review_by 2026-10-01(期限内)/ facts as_of 2026-07-01(90日以内)。
+# review_good.json の context_effect は /facts/concurrency/human_same_record_overlap
+# (telemetry, 2026-07-01)を引用しており、この fixture と正確に一致する必要がある。
+metadata:
+  schema_version: 2
+  status: approved
+  owner: fixture-team
+  approved_at: 2026-07-01
+  review_by: 2026-10-01
+  scope: ["**"]
+
+facts:
+  audience:
+    value: internal
+    source: user-confirmed
+    as_of: 2026-07-01
+    confidence: high
+  scale:
+    active_users_30d: { value: 37, source: telemetry, as_of: 2026-07-01, confidence: high }
+    data_volume_rows: { value: unknown, source: unknown }
+    monthly_growth_pct: { value: unknown, source: unknown }
+  usage_patterns:
+    operations_per_day: { value: unknown, source: unknown }
+    peak_usage_window: { value: unknown, source: unknown }
+  environment:
+    # ENV_AS_AUTHZ_BASIS の検査対象として実在させる(実在しても authz 系の降格根拠には使えない)
+    network_access: { value: vpn-only, source: user-confirmed, as_of: 2026-07-01, confidence: high }
+    managed_clients: { value: unknown, source: unknown }
+  concurrency:
+    human_same_record_overlap: { value: rare, source: telemetry, as_of: 2026-07-01, confidence: high }
+    duplicate_ui_submit: { value: unknown, source: unknown }
+    transport_retry: { value: unknown, source: unknown }
+    job_redelivery: { value: unknown, source: unknown }
+    webhook_redelivery: { value: unknown, source: unknown }
+  roles: { value: unknown, source: unknown }
+  permission_dimensions: { value: unknown, source: unknown }
+
+review_risk_policy:
+  non_demotable:
+    - authz-boundary
+    - destructive-data-loss
+    - irreversible-external-effect
+    - production-credential
+  a11y_review_by_default: false
+  critical_workflows:
+    - external-send
+  data_classes:
+    general-business: medium
+  cross_tenant_access:
+    allowed_by_spec: false
+    technically_prevented: unknown
+
+qa_execution_policy:
+  external_side_effects:
+    payment: { preview_allowed: false }
+
+spec_sources: []
+
+provenance:
+  /review_risk_policy/critical_workflows: { source_type: user-confirmed, as_of: 2026-07-01 }
