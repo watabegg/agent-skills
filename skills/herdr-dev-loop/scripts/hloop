@@ -7114,6 +7114,37 @@ def message_visible_in_text(message: str, text: str) -> bool:
     return bool(anchors) and all(anchor in text for anchor in anchors)
 
 
+def manager_message_end_marker_is_current_input(
+    provider: str,
+    text: str,
+    end_marker: str,
+) -> bool:
+    """Return whether the exact end marker terminates the staged TUI input.
+
+    Herdr's Codex snapshots include the read-only status footer after the input
+    buffer.  Treat only that single footer line as terminal chrome; arbitrary
+    prompt, agent, or transcript text after the marker remains ambiguous.
+    """
+
+    end_index = text.rfind(end_marker)
+    if end_index < 0:
+        return False
+    after = text[end_index + len(end_marker) :]
+    nonempty = [line.strip() for line in after.splitlines() if line.strip()]
+    if not nonempty:
+        return True
+    if normalize_agent_provider(provider) != "codex" or len(nonempty) != 1:
+        return False
+    footer = nonempty[0].removeprefix("─ ")
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._+/-]* "
+            r"[A-Za-z0-9][A-Za-z0-9._+-]* · (?:/|~/).+",
+            footer,
+        )
+    )
+
+
 def codex_output_after_message(message: str, text: str) -> bool:
     anchors = message_anchors(message)
     if not anchors:
@@ -7135,7 +7166,8 @@ def exact_message_ack_after_message(message: str, text: str) -> bool:
     after = text[end_index + len(transport["end_marker"]) :]
     return bool(
         re.search(
-            rf"(?m)^[^\S\r\n]*{re.escape(transport['ack_marker'])}[^\S\r\n]*$",
+            rf"(?m)^[^\S\r\n]*(?:•[^\S\r\n]+)?"
+            rf"{re.escape(transport['ack_marker'])}[^\S\r\n]*$",
             after,
         )
     )
@@ -7322,7 +7354,10 @@ def same_agent_session_observation(
                 return None
         elif observed_provider not in {normalized_provider, "shell"}:
             return None
-        if require_idle and str(observed.get("agent_status") or "unknown") != "idle":
+        if require_idle and str(observed.get("agent_status") or "unknown") not in {
+            "idle",
+            "done",
+        }:
             return None
         return observed, observed_provider
 
@@ -7370,7 +7405,9 @@ def manager_message_staged_for_retry(
         return False
     _, text = observation
     identity = manager_message_transport_identity(message)
-    if identity is None or not text.rstrip().endswith(identity["end_marker"]):
+    if identity is None or not manager_message_end_marker_is_current_input(
+        provider, text, identity["end_marker"]
+    ):
         return False
     return (
         not exact_message_ack_after_message(message, text)
@@ -7637,7 +7674,9 @@ def send_agent_tui_message(
             )
             if (
                 typed_observation is None
-                or not typed_observation[1].rstrip().endswith(identity["end_marker"])
+                or not manager_message_end_marker_is_current_input(
+                    provider, typed_observation[1], identity["end_marker"]
+                )
             ):
                 raise ManagerMessageDeliveryUnknown(
                     "Manager message pane changed or the exact staged input was lost "
@@ -7901,10 +7940,12 @@ def resend_pending_manager_messages(
             transition_manager_message(
                 agent_state, original, delivery_status="delivered"
             )
+            apply_contract_message_digest_projection(agent_state, original)
         else:
-            record_manager_message(
+            recorded = record_manager_message(
                 agent_state, "drain", message, transport=transport
             )
+            apply_contract_message_digest_projection(agent_state, recorded)
         try:
             full_path.unlink()
         except OSError:
@@ -8815,18 +8856,29 @@ def recorded_manager_message_observation(
         else ""
     )
     if re.search(
-        rf"(?m)^[^\S\r\n]*{re.escape(identity['ack_marker'])}[^\S\r\n]*$",
+        rf"(?m)^[^\S\r\n]*(?:•[^\S\r\n]+)?"
+        rf"{re.escape(identity['ack_marker'])}[^\S\r\n]*$",
         after,
     ):
         return "submitted-ack"
     if end_index < 0:
         return "marker-missing"
     if (
-        str((pane or {}).get("agent_status") or "unknown") == "idle"
-        and text.rstrip().endswith(identity["end_marker"])
+        str((pane or {}).get("agent_status") or "unknown") in {"idle", "done"}
+        and manager_message_end_marker_is_current_input(
+            provider, text, identity["end_marker"]
+        )
         and (
             transport_stage == "typed-confirmed"
             or identity["start_marker"] in text
+            # A long Codex input can scroll its start marker out of the
+            # terminal snapshot even though the exact structured end marker
+            # is still the current staged input.  The durable transport record
+            # sets this bit only after the end-marker send-text call succeeds;
+            # together with the pinned session, idle state, and exact input
+            # suffix checked by ``message submit``, it is sufficient for the
+            # same fail-closed Enter-only recovery without resending the body.
+            or entry.get("end_marker_staged") is True
         )
     ):
         return "staged-idle"
@@ -8895,6 +8947,46 @@ def transition_manager_message(
         }
     )
     return entry
+
+
+def apply_contract_message_digest_projection(
+    agent_state: dict[str, Any],
+    entry: Mapping[str, Any],
+) -> bool:
+    """Project one confirmed contract message as the role's effective contract.
+
+    The task artifact remains independently pinned so Worker candidate gates can
+    still detect file tampering after a message-based contract extension.
+    """
+
+    barrier = agent_state.get("semantic_ack_barrier")
+    if not isinstance(barrier, Mapping):
+        return False
+    if (
+        str(barrier.get("kind") or "") != "message"
+        or str(barrier.get("message_id") or "")
+        != str(entry.get("message_id") or "")
+        or str(barrier.get("report_identity_status") or "") != "bound"
+    ):
+        return False
+    digest = str(barrier.get("digest") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise HLoopError("confirmed contract message has an invalid barrier digest")
+    previous = str(agent_state.get("task_contract_digest") or "")
+    if previous == digest:
+        return False
+    if previous and not re.fullmatch(r"[0-9a-f]{64}", previous):
+        raise HLoopError("role task contract digest is invalid before message projection")
+    if previous:
+        artifact_digest = str(
+            agent_state.get("task_contract_artifact_digest") or previous
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", artifact_digest):
+            raise HLoopError("role task contract artifact digest is invalid")
+        agent_state["task_contract_artifact_digest"] = artifact_digest
+    agent_state["task_contract_digest"] = digest
+    agent_state["contract_message_projected_at"] = now_iso()
+    return True
 
 
 SEMANTIC_ACK_DECISIONS = frozenset({"approve", "reject", "timeout"})
@@ -9961,11 +10053,22 @@ def exact_task_contract_digest(
             f"task contract digest projection is missing or invalid for {task_id}"
         )
     if recorded != raw_digest:
-        raise HLoopError(
-            f"task contract digest drift for {task_id}: "
-            f"state={recorded} artifact={raw_digest}"
+        barrier = task_state.get("semantic_ack_barrier")
+        artifact_digest = str(task_state.get("task_contract_artifact_digest") or "")
+        message_projection = bool(
+            isinstance(barrier, Mapping)
+            and str(barrier.get("kind") or "") == "message"
+            and str(barrier.get("digest") or "") == recorded
+            and str(task_state.get("active_report_contract_digest") or "")
+            == recorded
+            and artifact_digest == raw_digest
         )
-    return raw_digest, _labelled_contract_digest(raw_digest)
+        if not message_projection:
+            raise HLoopError(
+                f"task contract digest drift for {task_id}: "
+                f"state={recorded} artifact={raw_digest}"
+            )
+    return raw_digest, _labelled_contract_digest(recorded)
 
 
 def candidate_revision_numbers(
@@ -10119,7 +10222,11 @@ def current_candidate_evidence(
     )
     if candidate.task_contract_digest != labelled_contract_digest:
         raise HLoopError(f"candidate task contract is stale for {task_id}")
-    if str(task_state.get("task_contract_digest") or raw_contract_digest) != raw_contract_digest:
+    effective_contract_digest = labelled_contract_digest.removeprefix("sha256:")
+    if (
+        str(task_state.get("task_contract_digest") or raw_contract_digest)
+        != effective_contract_digest
+    ):
         raise HLoopError(f"candidate task contract projection is stale for {task_id}")
     approved_ack = approved_semantic_ack_event_id(task_id, task_state)
     if candidate.semantic_ack_event_id != approved_ack:
@@ -22995,6 +23102,7 @@ def cmd_task_update(args: argparse.Namespace) -> int:
     if "worker_agent_model" in updates:
         task_state["agent_model"] = normalize_agent_model(updates["worker_agent_model"])
     task_state["task_contract_digest"] = task_contract_digest
+    task_state["task_contract_artifact_digest"] = task_contract_digest
     task_state["contract_updated_at"] = now_iso()
     task_state.pop("candidate", None)
     task_state.pop("implementation_candidate", None)
@@ -23658,7 +23766,9 @@ def cmd_worker_candidate_seal(args: argparse.Namespace) -> int:
         write_text(manager_path, payload.decode("utf-8"), durable=True)
     task_state.update(
         {
-            "task_contract_digest": raw_contract_digest,
+            "task_contract_digest": str(
+                task_state.get("task_contract_digest") or raw_contract_digest
+            ),
             "candidate_revision": candidate.candidate_revision,
             "implementation_candidate": candidate.to_record(),
             "candidate_seal": seal.to_record(),
@@ -27460,7 +27570,10 @@ def send_manager_message_and_record(
             message=message,
             error=exc,
         )
-    record_manager_message(agent_state, source, message, transport=transport)
+    recorded = record_manager_message(
+        agent_state, source, message, transport=transport
+    )
+    apply_contract_message_digest_projection(agent_state, recorded)
     save_state(repo, state)
     journal(repo, f"Sent Manager message to {role} `{agent_id}` in pane `{pane_id}` from {source}.")
     print(f"sent manager message to {agent_id} in pane {pane_id}")
@@ -27659,6 +27772,8 @@ def cmd_message_submit(args: argparse.Namespace) -> int:
         )
     delivery_status = str(entry.get("delivery_status") or "")
     if delivery_status in {"delivered", "acknowledged", "applied"}:
+        if apply_contract_message_digest_projection(agent_state, entry):
+            save_state(repo, state)
         print(
             f"{args.agent_id}/{args.message_id}: already {delivery_status}; "
             "no Enter sent"
@@ -27739,6 +27854,7 @@ def cmd_message_submit(args: argparse.Namespace) -> int:
             entry,
             delivery_status="acknowledged" if acknowledged else "delivered",
         )
+        apply_contract_message_digest_projection(agent_state, entry)
         remove_unknown_manager_message_marker(agent_state, args.message_id)
         save_state(repo, state)
         journal(
@@ -29196,6 +29312,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
     if not is_ancestor(repo, base_sha, integration_head):
         raise HLoopError(f"worker base is not an ancestor of integration head for {task_id}")
     files = changed_files(repo, base_sha, actual_head)
+    if state_persistence(state) == "local-only":
+        loop_prefix = LOOP_DIR.as_posix() + "/"
+        files = [
+            path
+            for path in files
+            if path != LOOP_DIR.as_posix() and not path.startswith(loop_prefix)
+        ]
     task_state["head_sha"] = actual_head
     task_state["changed_files"] = files
     files = normalize_list(task_state.get("changed_files"))
