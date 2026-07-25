@@ -1,0 +1,37 @@
+{
+  "chrome": {
+    "userDataDir": "/home/your-user/.config/google-chrome",
+    "profileDirectory": "Default"
+  },
+  "accounts": {
+    "googleEmail": "you@example.com",
+    "teamsLoginEmail": "you@example.com"
+  },
+  "teams": {
+    "tenantId": "your-microsoft-tenant-id",
+    "chatName": "Your attendance chat",
+    "chatId": "",
+    "authorDisplayName": "Your Teams display name",
+    "verificationSender": "account-security-noreply@accountprotection.microsoft.com",
+    "messages": {
+      "start": ["開始します", "出勤します"],
+      "pause": ["中断します", "休憩します"],
+      "resume": ["再開します"],
+      "end": ["終了します", "退勤します", "終わります"]
+    }
+  },
+  "spreadsheet": {
+    "url": "https://docs.google.com/spreadsheets/d/your-spreadsheet-id/edit?gid=0#gid=0",
+    "layoutContract": "integrated-attendance-v1",
+    "headerAliases": {
+      "date": ["日付", "勤務日", "date"],
+      "start": ["出勤", "開始", "始業", "start", "clock in"],
+      "end": ["退勤", "終了", "終業", "end", "clock out"]
+    }
+  },
+  "sync": {
+    "timezone": "Asia/Tokyo",
+    "overlapDays": 2,
+    "defaultLookbackDays": 31
+  }
+}
