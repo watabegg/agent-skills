@@ -23,6 +23,7 @@
     ├── japanese-tech-writing/
     ├── pencil-pencli/
     ├── ealps-moodle-operator/
+    ├── sync-teams-attendance/
     ├── codex-review-multi-v2/
     ├── herdr-dev-loop/
     └── shinshu-portal-auth/
@@ -113,6 +114,22 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - 課題ファイルの提出、小テスト回答、提出後の `評定のために提出済み` や `ステータス 終了` の確認を行う。
   - `/tmp` に保存した Moodle 操作 JSON から、提出状況を表形式で要約する。
 
+### `sync-teams-attendance`
+
+- 目的:
+  - Teamsの本人による開始・中断・再開・終了メッセージを、勤怠・月次集計・請求書を統合したGoogle Sheetsへ不足分だけ同期する。
+  - ヘッダーを意味から推定したうえで、`integrated-attendance-v1`の固定契約（1行目のA=`日付`、B=`出勤`、C=`退勤`、D=`労働時間`）に一致する場合だけ処理する。
+  - 既定をdry-runとし、明示的な`--apply`時だけ`勤怠明細`のA:Cへ追記して、CSV再取得で反映を検証する。
+- 個人設定:
+  - 実値は`~/.config/sync-teams-attendance/config.json`へ置き、ディレクトリを`700`、ファイルを`600`にする。
+  - `spreadsheet.url`は`勤怠明細`タブを指定し、`spreadsheet.layoutContract`は`integrated-attendance-v1`を使用する。
+  - Microsoftはパスワードを使わず、設定メールアドレスへ送られる確認コードだけで認証する。
+  - このpublic repoにはメールアドレス、tenant/chat ID、Spreadsheet URL、Cookie、MFAコードをcommitしない。
+- 主な利用シーン:
+  - ChromeのGoogleログインを使ってGmailのMicrosoft確認コードを取得し、Teams打刻履歴を同期する。
+  - `設定`、`月次集計`、`請求書`、表示月ドロップダウン、PDF出力、`請求履歴`の所有境界を保ったまま勤怠を追記する。
+  - 意図的なフォーマット変更後にread-only検査し、契約と一致しなければ書き込み前に停止する。
+
 ### `herdr-dev-loop`
 
 - 目的:
@@ -171,7 +188,7 @@ description: <このSkillの目的と、どんな依頼で使うか>
 ### 3. 動作確認する
 
 ```bash
-python3 /home/watabegg/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/<new-skill>
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/<new-skill>
 ```
 
 public repo に置く前に、秘密値、cookie、token、社内 URL、本番運用手順が混ざっていないか確認してください。
