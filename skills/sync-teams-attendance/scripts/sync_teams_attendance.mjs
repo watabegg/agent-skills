@@ -10,6 +10,15 @@ import path from 'node:path';
 const DEFAULT_CONFIG = path.join(os.homedir(), '.config', 'sync-teams-attendance', 'config.json');
 const INTEGRATED_LAYOUT_CONTRACT = 'integrated-attendance-v1';
 const CHROME_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
+const MICROSOFT_AUTH_ORIGINS = [
+  'https://login.microsoftonline.com',
+  'https://login.live.com',
+  'https://account.live.com',
+  'https://account.microsoft.com',
+  'https://teams.microsoft.com',
+  'https://teams.cloud.microsoft',
+];
+const TEAMS_HOSTS = ['teams.microsoft.com', 'teams.cloud.microsoft'];
 const CACHE_DIR_NAMES = new Set([
   'Cache', 'Code Cache', 'DawnCache', 'GPUCache', 'GrShaderCache',
   'GraphiteDawnCache', 'ShaderCache', 'Service Worker',
@@ -571,6 +580,35 @@ async function pageState(cdp) {
   }))()`);
 }
 
+function isMicrosoftCodePrompt(state) {
+  const haystack = `${state.title || ''} ${state.text || ''}`;
+  const hasCodeInput = (state.inputs || []).some((input) => ['tel', 'text', 'number'].includes(input.type));
+  return hasCodeInput
+    && /verification code|confirmation code|security code|enter code|code entry|確認コード|セキュリティ コード|コード(?:を|の)入力|コードを送信しました|メール.*コード/i.test(haystack);
+}
+
+function isMicrosoftEmailEntryState(state) {
+  return (state.inputs || []).some((input) =>
+    input.type === 'email' || input.id === 'i0116' || input.name === 'loginfmt');
+}
+
+function isMicrosoftInvalidLoginState(state) {
+  return /AADSTS90100|login parameter is empty or not valid/i.test(`${state.title || ''} ${state.text || ''}`);
+}
+
+function isTeamsHost(host) {
+  return TEAMS_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+}
+
+async function clearMicrosoftAuthState(cdp) {
+  for (const origin of MICROSOFT_AUTH_ORIGINS) {
+    await cdp.send('Storage.clearDataForOrigin', {
+      origin,
+      storageTypes: 'cookies,local_storage,session_storage,indexeddb,cache_storage,service_workers',
+    });
+  }
+}
+
 async function setFirstVisibleInput(cdp, types, value) {
   return evaluate(cdp, `((types, value) => {
     const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
@@ -609,7 +647,7 @@ async function typeMicrosoftEmail(cdp, email) {
   })()`);
 }
 
-async function typeMicrosoftCode(cdp, code) {
+async function typeMicrosoftCode(cdp, code, email) {
   const focused = await evaluate(cdp, `(() => {
     const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
     const input = [...document.querySelectorAll('input')].filter(visible)
@@ -619,15 +657,21 @@ async function typeMicrosoftCode(cdp, code) {
   })()`);
   if (!focused) return false;
   await cdp.send('Input.insertText', { text: code });
-  return evaluate(cdp, `(() => {
+  return evaluate(cdp, `((email) => {
     const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    for (const input of document.querySelectorAll('input[name="login"], input[name="loginfmt"]')) {
+      setter.call(input, email);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
     const submit = document.getElementById('idSIButton9') || [...document.querySelectorAll('button,input[type=submit]')]
       .filter(visible).find((e) => /next|次へ|sign in|サインイン|continue|続行|verify|確認/i.test(e.innerText || e.value || e.id || ''));
     if (submit) { submit.click(); return true; }
     const input = document.activeElement;
     if (input?.form) { input.form.requestSubmit(); return true; }
     return false;
-  })()`);
+  })(${JSON.stringify(email)})`);
 }
 
 async function chooseMicrosoftEmailCode(cdp) {
@@ -722,11 +766,14 @@ async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
   let codeRouteAttempts = 0;
   let codeRequestedAt = null;
   let codeSubmittedAt = null;
+  let authRecoveryAttempts = 0;
+  let emailSubmitAttempts = 0;
+  let emailSubmittedAt = null;
   while (Date.now() - started < timeoutMs) {
     await sleep(1000);
     const state = await pageState(cdp).catch(() => null);
     if (!state) continue;
-    if (state.host === 'teams.microsoft.com' || state.host.endsWith('.teams.microsoft.com')) {
+    if (isTeamsHost(state.host)) {
       teamsSeenAt ||= Date.now();
       const appReady = await evaluate(cdp, `!!document.querySelector('[data-tid="app-layout-area--main"], [data-tid="message-pane-list-viewport"], [data-tid="chat-pane-list"]')`).catch(() => false);
       if (appReady || Date.now() - teamsSeenAt > 8000) return;
@@ -734,16 +781,41 @@ async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
     }
     teamsSeenAt = null;
     const haystack = `${state.title} ${state.text}`;
+    if (isMicrosoftInvalidLoginState(state)) {
+      if (authRecoveryAttempts >= 1) throw new Error('Microsoft rejected the reconstructed sign-in request with AADSTS90100');
+      authRecoveryAttempts += 1;
+      await clearMicrosoftAuthState(cdp);
+      await navigate(cdp, targetUrl);
+      emailSubmitted = false;
+      codeSubmitted = false;
+      staySignedInHandled = false;
+      codeRouteAttempts = 0;
+      codeRequestedAt = null;
+      codeSubmittedAt = null;
+      emailSubmitAttempts = 0;
+      emailSubmittedAt = null;
+      continue;
+    }
     if (codeSubmittedAt && Date.now() - codeSubmittedAt > 1500 && /try again|もう一度お試しください|正しくありません|incorrect/i.test(haystack)) {
       throw new Error('Microsoft rejected the newly retrieved email verification code');
     }
     if (!emailSubmitted && /login\.microsoftonline\.com/.test(state.host) && /sign in|サインイン|email|メール|account/i.test(haystack)) {
       if (await typeMicrosoftEmail(cdp, config.accounts.teamsLoginEmail)) {
         emailSubmitted = true;
+        emailSubmitAttempts += 1;
+        emailSubmittedAt = Date.now();
         continue;
       }
     }
     const hasPassword = state.inputs.some((input) => input.type === 'password');
+    if (hasPassword && emailSubmitted && isMicrosoftEmailEntryState(state)) {
+      if (Date.now() - emailSubmittedAt < 4000) continue;
+      if (emailSubmitAttempts < 2 && await typeMicrosoftEmail(cdp, config.accounts.teamsLoginEmail)) {
+        emailSubmitAttempts += 1;
+        emailSubmittedAt = Date.now();
+        continue;
+      }
+    }
     if (hasPassword) {
       const choice = await chooseMicrosoftEmailCode(cdp);
       if (choice) { codeRouteAttempts += 1; codeRequestedAt = Date.now(); await sleep(1200); continue; }
@@ -771,12 +843,11 @@ async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
       const choice = await chooseMicrosoftEmailCode(cdp);
       if (choice) { codeRouteAttempts += 1; codeRequestedAt = Date.now(); await sleep(1200); continue; }
     }
-    const requestsCode = /verification code|確認コード|enter code|コードを入力|email code|メール.*コード/i.test(haystack)
-      && state.inputs.some((input) => ['tel', 'text', 'number'].includes(input.type));
+    const requestsCode = isMicrosoftCodePrompt(state);
     if (!codeSubmitted && requestsCode) {
       const verification = await obtainVerificationCode(browser, config, Math.min(timeoutMs, 120000), codeRequestedAt || Date.now());
       if (!verification.senderMatches) throw new Error('The newest verification email did not match the configured Microsoft sender');
-      if (!await typeMicrosoftCode(cdp, verification.code)) throw new Error('Microsoft verification-code input was not found');
+      if (!await typeMicrosoftCode(cdp, verification.code, config.accounts.teamsLoginEmail)) throw new Error('Microsoft verification-code input was not found');
       codeSubmitted = true;
       codeSubmittedAt = Date.now();
       continue;
@@ -817,6 +888,7 @@ function teamsTargetUrl(config) {
 
 async function openTeamsChat(cdp, browser, config, timeoutMs) {
   const url = teamsTargetUrl(config);
+  await clearMicrosoftAuthState(cdp);
   await navigate(cdp, url);
   await settleTeamsLogin(cdp, browser, config, timeoutMs, url);
   try {
@@ -998,6 +1070,50 @@ function runSelfTest() {
   assert.equal(paired.anomalies.length, 0);
   assert.equal(deriveSince({ datedRows: [{ year: 2026, month: 7, day: 20 }], existingKeys: new Set() }, { sync: { overlapDays: 2, defaultLookbackDays: 31 }, timezone: 'Asia/Tokyo' }, null), '2026-07-18');
   assert.equal(sheetExportUrl('https://docs.google.com/spreadsheets/d/abc/edit?gid=17#gid=17'), 'https://docs.google.com/spreadsheets/d/abc/export?format=csv&gid=17');
+  assert.equal(isMicrosoftCodePrompt({
+    title: 'アカウントにサインイン',
+    text: 'コードの入力 <email> にコードを送信しました',
+    inputs: [{ type: 'tel', id: 'idTxtBx_OTC_Password' }],
+  }), true);
+  assert.equal(isMicrosoftCodePrompt({
+    title: 'Sign in to your account',
+    text: 'Enter code',
+    inputs: [{ type: 'tel', id: 'otc' }],
+  }), true);
+  assert.equal(isMicrosoftCodePrompt({
+    title: 'アカウントにサインイン',
+    text: 'メールアドレスを入力してください',
+    inputs: [{ type: 'text', id: 'i0116' }],
+  }), false);
+  assert.equal(isMicrosoftEmailEntryState({
+    inputs: [
+      { type: 'email', id: 'i0116', name: 'loginfmt' },
+      { type: 'password', id: 'i0118', name: 'passwd' },
+    ],
+  }), true);
+  assert.equal(isMicrosoftEmailEntryState({
+    inputs: [{ type: 'tel', id: 'idTxtBx_OTC_Password', name: 'npotc' }],
+  }), false);
+  assert.equal(isMicrosoftInvalidLoginState({
+    title: 'アカウントにサインイン',
+    text: 'AADSTS90100: login parameter is empty or not valid.',
+  }), true);
+  assert.equal(isMicrosoftInvalidLoginState({
+    title: 'アカウントにサインイン',
+    text: 'コードの入力',
+  }), false);
+  assert.deepEqual(MICROSOFT_AUTH_ORIGINS, [
+    'https://login.microsoftonline.com',
+    'https://login.live.com',
+    'https://account.live.com',
+    'https://account.microsoft.com',
+    'https://teams.microsoft.com',
+    'https://teams.cloud.microsoft',
+  ]);
+  assert.equal(isTeamsHost('teams.microsoft.com'), true);
+  assert.equal(isTeamsHost('teams.cloud.microsoft'), true);
+  assert.equal(isTeamsHost('chat.teams.cloud.microsoft'), true);
+  assert.equal(isTeamsHost('teams.cloud.microsoft.example.com'), false);
   console.log('SELF_TEST_OK');
 }
 
