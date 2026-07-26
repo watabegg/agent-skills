@@ -15,7 +15,7 @@ Use `~/.config/sync-teams-attendance/config.json` by default. Copy `config.examp
 
 Never print or commit the config, cookies, Microsoft verification codes, OAuth URLs, tokens, or copied Chrome profile data. The script copies only the configured Chrome profile into a temporary directory and removes it in `finally`.
 
-The configured Chrome profile must already be signed into the Google account that can read Gmail and edit the target spreadsheet. Enter the configured Teams email on Microsoft's sign-in page, choose the passwordless email-code action, and retrieve that newly requested code from Gmail. Never enter, read, configure, or persist a Microsoft password.
+The configured Chrome profile must already be signed into the Google account that can read Gmail and edit the target spreadsheet. The script clears only Microsoft and Teams authentication state from the temporary profile copy before login, then enters the configured Teams email, chooses the passwordless email-code action, and retrieves that newly requested code from Gmail. Never enter, read, configure, or persist a Microsoft password.
 
 Set `spreadsheet.url` to the `勤怠明細` tab URL. The default `spreadsheet.layoutContract` is `integrated-attendance-v1`; set it explicitly in new configs.
 
