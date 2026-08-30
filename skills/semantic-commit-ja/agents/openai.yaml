@@ -1,0 +1,7 @@
+interface:
+  display_name: "Semantic Commit Ja"
+  short_description: "日本語の Conventional Commit を一貫して作成・確認"
+  default_prompt: "Use $semantic-commit-ja to draft or review a Japanese Conventional Commit."
+
+policy:
+  allow_implicit_invocation: true

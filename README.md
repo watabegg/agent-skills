@@ -20,6 +20,7 @@
 ├── AGENTS.md
 ├── README.md
 └── skills/
+    ├── semantic-commit-ja/
     ├── japanese-tech-writing/
     ├── pencil-pencli/
     ├── ealps-moodle-operator/
@@ -65,6 +66,15 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 ```
 
 ## 各 Skill の説明
+
+### `semantic-commit-ja`
+
+- 目的:
+  - 実際の Git 差分を確認して、日本語の件名・本文を持つ Conventional Commit を作成、レビュー、検証する。
+  - 明示的に別の言語や規約を指定されない限り、コミット関連の作業で既定の規約として使う。
+- 主な利用シーン:
+  - コミット、コミットメッセージ作成、amend、revert、コミット分割、コミット形式レビュー。
+  - `feat(scope): 日本語の件名` 形式で、変更理由が必要な場合は日本語本文を付ける。
 
 ### `japanese-tech-writing`
 
