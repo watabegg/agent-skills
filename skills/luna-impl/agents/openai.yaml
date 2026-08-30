@@ -1,0 +1,4 @@
+interface:
+  display_name: "Luna Implementation Orchestrator"
+  short_description: "Shape cohesive, bounded tasks for Luna workers"
+  default_prompt: "Use $luna-impl to orchestrate this implementation with the fewest cohesive, independently verifiable Luna tasks."
