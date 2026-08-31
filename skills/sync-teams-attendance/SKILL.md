@@ -9,6 +9,13 @@ description: Synchronize Microsoft Teams attendance punch messages into the conf
 
 Use the bundled script to read the configured Teams chat through the user's existing Chrome/Gmail session, convert punch messages into closed work intervals, validate the integrated workbook contract, and append only missing intervals to `勤怠明細`. Keep personal identifiers, spreadsheet IDs, and browser state outside this repository.
 
+## Execution Gate
+
+- Normal entry order is fixed: run `--self-test`, then `--inspect-sheet`, then a dry-run without `--apply`. Review the result before any write.
+- Use `--apply` only when the user explicitly requests attendance synchronization or entry. An explicit end-to-end attendance-to-invoice request also authorizes its requested sync step; do not ask for another approval between successful steps.
+- For a strict no-side-effect audit or confirmation, use static review and `--self-test` only. Do not run `--inspect-sheet` or the normal dry-run: they access Sheets/Teams/Gmail, and the dry-run can trigger a verification email or mark mail read.
+- After every apply, require the built-in export/read-back verification before reporting completion.
+
 ## Configuration
 
 Use `~/.config/sync-teams-attendance/config.json` by default. Copy `config.example.json` there, fill the user-specific values, and set the file mode to `600` and its directory to `700`.
@@ -33,25 +40,34 @@ The workbook owns `労働時間`, hidden legacy columns, settings, rates, monthl
 
 ## Standard Workflow
 
-1. Confirm the config exists without printing it:
+1. Run the deterministic self-test first:
+   ```bash
+   node skills/sync-teams-attendance/scripts/sync_teams_attendance.mjs --self-test
+   ```
+
+2. Confirm the config exists without printing it:
    ```bash
    test -f ~/.config/sync-teams-attendance/config.json && \
      stat -c '%a %n' ~/.config/sync-teams-attendance/config.json
    ```
-2. Inspect the `勤怠明細` contract read-only:
+
+3. Inspect the `勤怠明細` contract read-only:
    ```bash
    node skills/sync-teams-attendance/scripts/sync_teams_attendance.mjs --inspect-sheet
    ```
-3. Run a dry run. This may sign into Teams and retrieve a newly delivered Microsoft verification code from Gmail, but it does not edit the sheet:
+
+4. Run a dry run without `--apply`. This may sign into Teams and retrieve a newly delivered Microsoft verification code from Gmail, but it does not edit the sheet:
    ```bash
    node skills/sync-teams-attendance/scripts/sync_teams_attendance.mjs
    ```
-4. Confirm inspection reports header row 1 with `日付`/`出勤`/`退勤` in A/B/C and `労働時間` in D. Review proposed intervals and anomalies. Do not invent a missing start or end. Stop if the contract, header mapping, or event ordering is invalid.
-5. Run with `--apply` only when the user explicitly asked to update the sheet:
+
+5. Confirm inspection reports header row 1 with `日付`/`出勤`/`退勤` in A/B/C and `労働時間` in D. Review proposed intervals and anomalies. Do not invent a missing start or end. Stop if the contract, header mapping, or event ordering is invalid.
+6. Run with `--apply` only when the user explicitly asked to update the sheet (or included this sync in an explicit end-to-end attendance-to-invoice request):
    ```bash
    node skills/sync-teams-attendance/scripts/sync_teams_attendance.mjs --apply
    ```
-6. Report the number and date range of appended intervals plus the verification result. Do not report the verification code or private chat content.
+
+7. Require the post-write export/read-back verification, then report the number and date range of appended intervals plus the verification result. Do not report the verification code or private chat content.
 
 Use `--since YYYY-MM-DD` when the user specifies a range or when the sheet has no parseable existing attendance rows. Use `--config <path>` only for a non-default config location.
 

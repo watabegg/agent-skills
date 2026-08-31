@@ -1,4 +1,4 @@
 interface:
   display_name: "Teams 勤怠・請求同期"
   short_description: "Teams打刻を統合勤怠・請求ブックへ安全に追記同期します"
-  default_prompt: "Use $sync-teams-attendance to append only missing Teams attendance intervals to the configured integrated attendance and invoicing workbook."
+  default_prompt: "Use $sync-teams-attendance: run --self-test, --inspect-sheet, then a no-apply dry-run; use --apply only for an explicit attendance-sync/entry request, including a requested end-to-end attendance-to-invoice flow, and require post-write verification. For strict no-side-effect audits, use static checks and --self-test only."

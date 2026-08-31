@@ -13,10 +13,17 @@ Use `~/.config/sync-teams-attendance/config.json` by default. It must be mode `6
 
 If the request also includes Teams attendance synchronization, finish `$sync-teams-attendance` first and verify its appended rows before preparing the invoice.
 
+## Execution Gate
+
+- Resolve and state exactly one target month in `YYYY-MM` before any export, draft, or recipient operation. If the month is missing or ambiguous, ask for confirmation first.
+- Run `--export`, `--draft`, or the normal recipient normalizer (without `--inspect`) only for an explicit request to create the invoice/PDF/draft or correct recipients. For confirmation or audit only, use static review and `--self-test`; do not open the browser.
+- An explicit end-to-end attendance-to-invoice request authorizes the requested steps in order after the month is confirmed. Do not ask for sequential re-approval, but require the default verification after every change and stop on failure.
+- Sending is never authorized: keep `sent=false` and never activate Send or scheduling.
+
 ## Target Month
 
 - Use the user's explicit `YYYY-MM` month when supplied.
-- Otherwise use the latest completed billing month with synchronized attendance. In the usual monthly workflow this is the previous calendar month.
+- Otherwise propose the latest completed billing month with synchronized attendance (usually the previous calendar month) and obtain confirmation before running an action.
 - Never create a current partial-month invoice unless the user explicitly requests it.
 
 Read [references/invoice-workbook-contract.md](references/invoice-workbook-contract.md) before changing the month selector, export range, PDF checks, or invoice sheet discovery. Read [references/gmail-draft-policy.md](references/gmail-draft-policy.md) before changing recipient inference or Gmail draft behavior.
@@ -33,14 +40,14 @@ invoice_pdf="$invoice_tmp_dir/invoice-YYYY-MM.pdf"
 
 Replace `YYYY-MM` consistently in every command.
 
-1. Export the invoice. The script selects the `請求書` tab, records `U2`, switches it to the target month, exports only `A1:R34`, and restores the original `U2` value in `finally`.
+1. After the target month is confirmed, export the invoice. The script selects the `請求書` tab, records `U2`, switches it to the target month, exports only `A1:R34`, and restores the original `U2` value in `finally`.
 
    ```bash
    node "$invoice_skill_dir/scripts/invoice_email_draft.mjs" \
      --export --month YYYY-MM --pdf "$invoice_pdf"
    ```
 
-   Require `EXPORT_OK` and, when the selector changed, `MONTH_RESTORED true`.
+   Require `EXPORT_OK` and, when the selector changed, `MONTH_RESTORED true` before continuing.
 
 2. Run deterministic PDF verification:
 
@@ -49,7 +56,7 @@ Replace `YYYY-MM` consistently in every command.
      --verify-pdf --month YYYY-MM --pdf "$invoice_pdf"
    ```
 
-   Require `PDF_OK`. It proves one A4 page, an invoice title, and the target period. Also render the single page and visually confirm that it is the invoice—not `勤怠明細`—with no clipping, overlap, or mojibake before attaching it.
+   Require `PDF_OK`. It proves one A4 page, an invoice title, and the target period. Also render the single page and visually confirm that it is the invoice—not `勤怠明細`—with no clipping, overlap, or mojibake before attaching it; stop if this verification fails.
 
 3. Create or resume the matching Gmail draft and attach the verified PDF:
 
@@ -58,7 +65,7 @@ Replace `YYYY-MM` consistently in every command.
      --draft --month YYYY-MM --pdf "$invoice_pdf"
    ```
 
-   The script takes the subject, body style, and primary recipient from the most recent sent invoice email, updates the billing period, saves and closes the compose window, and verifies the message under `in:drafts`. Require `DRAFT_OK ... sent=false`.
+   The script takes the subject, body style, and primary recipient from the most recent sent invoice email, updates the billing period, saves and closes the compose window, and verifies the message under `in:drafts`. Require `DRAFT_OK ... sent=false` before recipient changes.
 
 4. Inspect recipient normalization without changing the draft:
 
@@ -74,7 +81,7 @@ Replace `YYYY-MM` consistently in every command.
      --month YYYY-MM --pdf "$invoice_pdf"
    ```
 
-   Preserve the first external prior To recipient as the sole To recipient. Move additional prior To recipients and preserve prior CC recipients in CC. Require `DRAFT_UPDATED to=1 cc=<n> bcc=0 sent=false`.
+   Preserve the first external prior To recipient as the sole To recipient. Move additional prior To recipients and preserve prior CC recipients in CC. Require `DRAFT_UPDATED to=1 cc=<n> bcc=0 sent=false` before reporting completion.
 
 6. Report the invoice month, PDF verification, To/CC/BCC counts, attachment name, draft verification, and `sent=false`. Delete the local temporary PDF and render only after the Gmail draft and attachment are verified.
 
