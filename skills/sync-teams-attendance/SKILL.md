@@ -1,6 +1,6 @@
 ---
 name: sync-teams-attendance
-description: Synchronize Microsoft Teams attendance punch messages into the configured integrated Google Sheets attendance and invoicing workbook through temporary-profile Chrome automation, including Gmail-delivered Microsoft verification codes, punch pairing, deduplication, append-only writes to 勤怠明細, workbook-contract checks, and post-write verification. Use when Codex needs to collect start, pause, resume, end, or clock-out messages, update this workbook safely, or reason about its 設定, 月次集計, 請求書, PDF export, and 請求履歴 boundaries.
+description: Synchronize Microsoft Teams attendance punch messages into the configured integrated Google Sheets attendance and invoicing workbook through temporary-profile Chrome automation, including edited punch replacements, Gmail-delivered Microsoft verification codes, punch pairing, deduplication, append-only writes to 勤怠明細, workbook-contract checks, and post-write verification. Use when Codex needs to collect start, pause, resume, end, or clock-out messages, update this workbook safely, or reason about its 設定, 月次集計, 請求書, PDF export, and 請求履歴 boundaries.
 ---
 
 # Sync Teams Attendance
@@ -73,10 +73,14 @@ Read [references/sheet-adaptation.md](references/sheet-adaptation.md) before cha
 - Start or resume opens an interval.
 - Pause, end, clock-out, or configured equivalent closes the current interval.
 - A pause closes an interval even when no later resume occurs.
+- Treat an edited Teams message as one event at its original timestamp. When Teams exposes the old punch as struck-through text followed by the replacement, ignore the struck-through value and classify the final configured punch phrase. For example, `~中断します~終了します` and the DOM fallback `中断します終了します` both mean `終了します`.
+- Accept a concatenated edit fallback only when the whole text can be segmented into two or more configured punch phrases; otherwise ignore it as unrelated text.
 - Preserve the Teams `<time datetime>` instant and convert it to the configured timezone; use minute precision to match the visible Teams timestamp.
 - Ignore unrelated chat messages and other authors.
 - Allow a trailing open interval in dry-run output, but never write it.
 - Refuse `--apply` when a non-trailing duplicate open or orphan close affects the candidate window.
+
+Read [references/teams-message-parsing.md](references/teams-message-parsing.md) before changing Teams DOM scraping, edited-message handling, or punch classification.
 
 ## Safety Boundaries
 

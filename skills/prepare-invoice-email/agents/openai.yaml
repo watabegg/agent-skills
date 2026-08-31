@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Invoice Email"
+  short_description: "請求書PDFを検証して宛先を整えたGmail下書きを安全に作成"
+  default_prompt: "Use $prepare-invoice-email to export this month's invoice PDF, verify it, and prepare an unsent Gmail draft."

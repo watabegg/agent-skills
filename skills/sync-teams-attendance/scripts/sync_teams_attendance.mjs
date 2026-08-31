@@ -449,11 +449,51 @@ function localParts(instant, timezone = 'Asia/Tokyo') {
 }
 
 function classifyMessage(text, messages) {
-  const normalized = normalizeText(text);
+  const candidates = [];
   for (const kind of ['start', 'pause', 'resume', 'end']) {
-    if (messages[kind].some((candidate) => normalizeText(candidate) === normalized)) return kind;
+    for (const candidate of messages[kind]) candidates.push({ kind, text: normalizeText(candidate) });
   }
-  return null;
+  const exactKind = (value) => candidates.find((candidate) => candidate.text === value)?.kind || null;
+  const withoutEditMarker = (value) => normalizeText(value)
+    .replace(/\s*(?:\(?edited\)?|\(?編集済み\)?)\s*$/iu, '')
+    .trim();
+  const normalized = withoutEditMarker(text);
+  const exact = exactKind(normalized);
+  if (exact) return exact;
+
+  // Teams can render an edited punch as a struck-through old value followed by
+  // the replacement. Support both textual representations produced by Teams
+  // DOM snapshots and the concatenated fallback when strikethrough styling is
+  // unavailable. Only accept a full sequence of configured punch phrases.
+  const withoutStruckText = withoutEditMarker(normalized
+    .replace(/~~[^~]+~~/gu, ' ')
+    .replace(/~[^~]+~/gu, ' '));
+  const replacement = exactKind(withoutStruckText);
+  if (replacement) return replacement;
+
+  const compact = normalized.replace(/\s+/gu, '');
+  const compactCandidates = candidates
+    .map((candidate) => ({ ...candidate, text: candidate.text.replace(/\s+/gu, '') }))
+    .filter((candidate) => candidate.text)
+    .sort((a, b) => b.text.length - a.text.length);
+  const memo = new Map();
+  const split = (offset) => {
+    if (offset === compact.length) return [];
+    if (memo.has(offset)) return memo.get(offset);
+    for (const candidate of compactCandidates) {
+      if (!compact.startsWith(candidate.text, offset)) continue;
+      const tail = split(offset + candidate.text.length);
+      if (tail) {
+        const result = [candidate, ...tail];
+        memo.set(offset, result);
+        return result;
+      }
+    }
+    memo.set(offset, null);
+    return null;
+  };
+  const sequence = split(0);
+  return sequence && sequence.length > 1 ? sequence.at(-1).kind : null;
 }
 
 function buildIntervals(events, config, sinceDate) {
@@ -941,11 +981,32 @@ async function scrapeTeamsEvents(cdp, cutoffDate, timeoutMs) {
         const author = root.querySelector('[data-tid="message-author-name"]')
           || root.closest('[data-tid="chat-pane-item"]')?.querySelector('[data-tid="message-author-name"]');
         const content = root.querySelector('[data-message-content], [data-tid="chat-pane-message"]') || root;
-        return { datetime: time?.getAttribute('datetime') || '', author: compact(author?.textContent), text: compact(content?.innerText) };
+        const originalNodes = [content, ...content.querySelectorAll('*')];
+        const clone = content.cloneNode(true);
+        const clonedNodes = [clone, ...clone.querySelectorAll('*')];
+        for (let index = originalNodes.length - 1; index >= 0; index -= 1) {
+          const original = originalNodes[index];
+          const tag = original.tagName?.toLowerCase();
+          const decoration = getComputedStyle(original).textDecorationLine || '';
+          if (['s', 'strike', 'del'].includes(tag) || decoration.includes('line-through')) {
+            if (index === 0) clone.textContent = '';
+            else clonedNodes[index]?.remove();
+          }
+        }
+        const messageId = root.getAttribute('data-message-id')
+          || root.querySelector('[data-message-id]')?.getAttribute('data-message-id')
+          || root.closest('[data-message-id]')?.getAttribute('data-message-id')
+          || '';
+        return {
+          messageId,
+          datetime: time?.getAttribute('datetime') || '',
+          author: compact(author?.textContent),
+          text: compact(clone.textContent),
+        };
       }).filter((item) => item.datetime && item.text);
       return { items, top: viewport.scrollTop, height: viewport.scrollHeight };
     })()`);
-    for (const item of batch.items) records.set(`${item.datetime}|${item.author}|${item.text}`, item);
+    for (const item of batch.items) records.set(item.messageId || `${item.datetime}|${item.author}`, item);
     const instants = [...records.values()].map((item) => new Date(item.datetime).valueOf()).filter(Number.isFinite);
     if (instants.length && Math.min(...instants) <= cutoffInstant) break;
     const signature = `${records.size}:${Math.min(...instants, Infinity)}:${batch.height}`;
@@ -1055,6 +1116,12 @@ function runSelfTest() {
     },
     sync: { timezone: 'Asia/Tokyo' },
   };
+  assert.equal(classifyMessage('中断します', config.teams.messages), 'pause');
+  assert.equal(classifyMessage('~中断します~終了します', config.teams.messages), 'end');
+  assert.equal(classifyMessage('~~中断します~~ 終了します（編集済み）', config.teams.messages), 'end');
+  assert.equal(classifyMessage('中断します終了します', config.teams.messages), 'end');
+  assert.equal(classifyMessage('中断します 終了します', config.teams.messages), 'end');
+  assert.equal(classifyMessage('中断します。終了します', config.teams.messages), null);
   const events = [
     { datetime: '2026-07-20T00:00:02Z', author: 'Example User', text: '開始します' },
     { datetime: '2026-07-20T03:00:59Z', author: 'Example User', text: '中断します' },
@@ -1068,6 +1135,14 @@ function runSelfTest() {
     { date: '7/20', start: '13:00', end: '18:00' },
   ]);
   assert.equal(paired.anomalies.length, 0);
+  const editedPair = buildIntervals([
+    { datetime: '2026-07-22T00:00:00Z', author: 'Example User', text: '開始します' },
+    { datetime: '2026-07-22T09:00:00Z', author: 'Example User', text: '中断します終了します（編集済み）' },
+  ], config, '2026-07-22');
+  assert.deepEqual(editedPair.intervals.map(({ date, start, end }) => ({ date, start, end })), [
+    { date: '7/22', start: '09:00', end: '18:00' },
+  ]);
+  assert.equal(editedPair.anomalies.length, 0);
   assert.equal(deriveSince({ datedRows: [{ year: 2026, month: 7, day: 20 }], existingKeys: new Set() }, { sync: { overlapDays: 2, defaultLookbackDays: 31 }, timezone: 'Asia/Tokyo' }, null), '2026-07-18');
   assert.equal(sheetExportUrl('https://docs.google.com/spreadsheets/d/abc/edit?gid=17#gid=17'), 'https://docs.google.com/spreadsheets/d/abc/export?format=csv&gid=17');
   assert.equal(isMicrosoftCodePrompt({

@@ -25,6 +25,7 @@
     ├── pencil-pencli/
     ├── ealps-moodle-operator/
     ├── sync-teams-attendance/
+    ├── prepare-invoice-email/
     ├── codex-review-multi-v2/
     ├── herdr-dev-loop/
     └── shinshu-portal-auth/
@@ -137,8 +138,23 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
   - このpublic repoにはメールアドレス、tenant/chat ID、Spreadsheet URL、Cookie、MFAコードをcommitしない。
 - 主な利用シーン:
   - ChromeのGoogleログインを使ってGmailのMicrosoft確認コードを取得し、Teams打刻履歴を同期する。
+  - `~中断します~終了します`やDOM上の取り消し線付き旧メッセージのような編集済み打刻を、元の時刻を保った最終メッセージとして解釈する。
   - `設定`、`月次集計`、`請求書`、表示月ドロップダウン、PDF出力、`請求履歴`の所有境界を保ったまま勤怠を追記する。
   - 意図的なフォーマット変更後にread-only検査し、契約と一致しなければ書き込み前に停止する。
+
+### `prepare-invoice-email`
+
+- 目的:
+  - 統合勤怠Google Sheetsの`請求書`タブで対象月を選び、A4縦1ページのPDFを出力・検証する。
+  - 過去の請求書メールから件名・本文・宛先を復元し、PDF付きGmail下書きを作成する。
+  - 主担当1名をTo、その他の過去To/CC宛先をCC、BCCなしへ正規化し、絶対に送信しない。
+- 主な利用シーン:
+  - `$sync-teams-attendance`完了後に請求書PDFとメール下書きまで一気通貫で準備する。
+  - 前月の請求書を再現しつつ、誤って全員Toになっていた宛先をTo 1名・CC複数名へ直す。
+  - PDFが`勤怠明細`ではなく正しい請求書タブか、対象月・A4・1ページ・表示崩れを確認する。
+- 個人設定:
+  - `~/.config/sync-teams-attendance/config.json`のChrome、Googleアカウント、Spreadsheet設定を共用する。
+  - PDF、宛先、メール本文、口座情報、Cookieなどはpublic repoへcommitしない。
 
 ### `herdr-dev-loop`
 
