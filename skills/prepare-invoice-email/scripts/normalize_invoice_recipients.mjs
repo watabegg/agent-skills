@@ -176,13 +176,23 @@ async function openFirstRow(cdp, pattern) {
   if (!opened) throw new Error('Expected Gmail message was not found');
 }
 function buildRecipientPlan(recipients, ownEmail) {
-  const own = String(ownEmail).toLowerCase();
-  const externalTo = recipients.to.filter((email) => email.toLowerCase() !== own);
-  const priorCc = recipients.cc.filter((email) => email.toLowerCase() !== own);
-  const priorBcc = recipients.bcc.filter((email) => email.toLowerCase() !== own);
+  const key = (email) => String(email || '').trim().toLowerCase();
+  const own = key(ownEmail);
+  const isNoReply = (email) => /^(?:no[._-]?reply|do[._-]?not[._-]?reply)@/i.test(key(email));
+  const externalTo = recipients.to.filter((email) => key(email) !== own && !isNoReply(email));
+  const priorCc = recipients.cc.filter((email) => key(email) !== own && !isNoReply(email));
+  const priorBcc = recipients.bcc.filter((email) => key(email));
   if (!externalTo.length) throw new Error('Previous invoice mail has no external To recipient');
   if (priorBcc.length) throw new Error('Previous invoice mail contains BCC recipients; refusing to infer a no-BCC draft');
-  return { primary: externalTo[0], cc: [...new Set([...externalTo.slice(1), ...priorCc])] };
+  const primary = externalTo[0];
+  const seen = new Set([key(primary)]);
+  const cc = [...externalTo.slice(1), ...priorCc].filter((email) => {
+    const normalized = key(email);
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+  return { primary, cc };
 }
 async function readPriorTo(cdp, config) {
   await gmailSearch(cdp, config, 'in:sent has:attachment filename:pdf 請求書');
@@ -204,47 +214,81 @@ async function readPriorTo(cdp, config) {
     const read = (pattern) => {
       const row = rows.findLast((candidate) => pattern.test(String(candidate.querySelector('td,th')?.innerText || '').trim()));
       if (!row) return [];
-      const attrs = [...row.querySelectorAll('[email]')].map((e) => e.getAttribute('email'));
-      const text = String(row.innerText || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig) || [];
-      return [...new Set([...attrs, ...text].filter(Boolean))];
+      return [...new Set([...row.querySelectorAll('[email]')].map((e) => e.getAttribute('email')).filter(Boolean))];
     };
     return { to: read(/^(to|宛先)[：:]?$/i), cc: read(/^cc[：:]?$/i), bcc: read(/^bcc[：:]?$/i) };
   })()`);
   return buildRecipientPlan(recipients, config.accounts.googleEmail);
 }
-async function recipientPresent(cdp, email) {
-  return evaluate(cdp, `((email) => {
-    const target = email.toLowerCase();
-    const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-    const chips = [...document.querySelectorAll('.oL.aDm.az9, [role="option"], [data-email], [data-hovercard-id]')].filter(visible);
-    return chips.some((e) => [e.getAttribute('email'), e.getAttribute('data-email'), e.getAttribute('data-hovercard-id'), e.getAttribute('aria-label'), e.getAttribute('title'), e.innerText]
-      .some((value) => String(value || '').toLowerCase().includes(target)))
-      || [...document.querySelectorAll('input,textarea')].filter(visible).some((e) => String(e.value || '').toLowerCase() === target);
-  })(${JSON.stringify(email)})`);
+const composeRecipientHelpers = `
+  const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const inputs = [...document.querySelectorAll('input,textarea')].filter(visible);
+  const marker = (e) => ((e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('placeholder') || '')).trim();
+  const fieldFor = (e) => {
+    const name = String(e.name || '').toLowerCase();
+    if (name === 'bcc' || /bcc recipients|bcc の宛先|^bcc$/i.test(marker(e))) return 'bcc';
+    if (name === 'cc' || /cc recipients|cc の宛先|^cc$/i.test(marker(e))) return 'cc';
+    if (name === 'to' || e.matches('input[peoplekit-id], textarea[name="to"]') || /to recipients|宛先|^recipients$/i.test(marker(e))) return 'to';
+    return null;
+  };
+  const recipientInputs = inputs.map((e) => ({e, field: fieldFor(e)})).filter(({field}) => field);
+  const inputFor = (field) => recipientInputs.find((item) => item.field === field)?.e || null;
+  const scopeFor = (field) => {
+    const input = inputFor(field);
+    if (!input) return null;
+    let scope = input.parentElement;
+    while (scope?.parentElement && scope.parentElement !== document.body) {
+      const parent = scope.parentElement;
+      const containsOtherField = recipientInputs.some(({e, field: other}) => other !== field && parent.contains(e));
+      if (containsOtherField) break;
+      scope = parent;
+    }
+    return scope;
+  };
+  const emailPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig;
+  const emailsFor = (field) => {
+    const input = inputFor(field);
+    const scope = scopeFor(field);
+    if (!input || !scope) return null;
+    const nodes = [input, ...scope.querySelectorAll('.vR, [email], [data-email], [data-hovercard-id]')];
+    const values = nodes.flatMap((node) => [node.value, node.getAttribute?.('email'), node.getAttribute?.('data-email'), node.getAttribute?.('data-hovercard-id'), node.getAttribute?.('aria-label'), node.getAttribute?.('title')]
+      .filter(Boolean).flatMap((value) => String(value).match(emailPattern) || []));
+    const seen = new Set();
+    return values.filter((email) => { const key = email.toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
+  };
+`;
+async function recipientPresent(cdp, email, field) {
+  return evaluate(cdp, `((email, field) => {
+    ${composeRecipientHelpers}
+    const fields = field ? [field] : ['to', 'cc', 'bcc'];
+    return fields.some((name) => (emailsFor(name) || []).some((candidate) => candidate.toLowerCase() === email.toLowerCase()));
+  })(${JSON.stringify(email)}, ${JSON.stringify(field || '')})`);
 }
-async function removeRecipient(cdp, email) {
-  const result = await evaluate(cdp, `((email) => {
+async function removeRecipient(cdp, email, field) {
+  const result = await evaluate(cdp, `((email, field) => {
+    ${composeRecipientHelpers}
     const target = email.toLowerCase();
-    const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-    const candidates = [...document.querySelectorAll('.oL.aDm.az9, [role="option"], [data-email], [data-hovercard-id]')].filter(visible).filter((e) =>
-      [e.getAttribute('email'), e.getAttribute('data-email'), e.getAttribute('data-hovercard-id'), e.getAttribute('aria-label'), e.getAttribute('title'), e.innerText]
-        .some((value) => String(value || '').toLowerCase().includes(target)));
+    const scope = scopeFor(field);
+    if (!scope) return {ok: false};
+    const candidates = [...scope.querySelectorAll('.vR, [email], [data-email], [data-hovercard-id]')].filter(visible).filter((e) =>
+      [e.getAttribute('email'), e.getAttribute('data-email'), e.getAttribute('data-hovercard-id'), e.getAttribute('aria-label'), e.getAttribute('title')]
+        .filter(Boolean).flatMap((value) => String(value).match(emailPattern) || []).some((candidate) => candidate.toLowerCase() === target));
     candidates.sort((a, b) => a.outerHTML.length - b.outerHTML.length);
     const found = candidates[0];
     if (!found) return {ok: false};
-    const chip = found.closest('[role="option"]') || found.closest('[data-hovercard-id]') || found.parentElement;
+    const chip = found.closest('.vR, [role="option"]') || found.closest('[data-hovercard-id]') || found.parentElement;
     const remove = chip?.querySelector('[aria-label*="Remove" i], [aria-label*="削除"], [data-tooltip*="Remove" i], [data-tooltip*="削除"]');
     if (remove) { remove.click(); return {ok: true, method: 'button'}; }
     (chip || found).click();
     return {ok: true, method: 'keyboard'};
-  })(${JSON.stringify(email)})`);
+  })(${JSON.stringify(email)}, ${JSON.stringify(field)})`);
   if (!result.ok) throw new Error('A secondary To recipient could not be located');
   if (result.method === 'keyboard') {
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
   }
   await sleep(600);
-  if (await recipientPresent(cdp, email)) throw new Error('A secondary To recipient was not removed');
+  if (await recipientPresent(cdp, email, field)) throw new Error(`A ${field.toUpperCase()} recipient was not removed`);
 }
 async function findCcInput(cdp) {
   return evaluate(cdp, `(() => {
@@ -283,7 +327,45 @@ async function addCc(cdp, email) {
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
   await sleep(600);
-  if (!await recipientPresent(cdp, email)) throw new Error('A CC recipient could not be verified');
+  if (!await recipientPresent(cdp, email, 'cc')) throw new Error('A CC recipient could not be verified');
+}
+async function revealBcc(cdp) {
+  const hasInput = await evaluate(cdp, `(() => {
+    ${composeRecipientHelpers}
+    return !!inputFor('bcc');
+  })()`);
+  if (hasInput) return;
+  const clicked = await evaluate(cdp, `(() => {
+    const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+    const control = [...document.querySelectorAll('span,button,[role="button"]')].filter(visible)
+      .find((e) => /^(bcc|密送)$/i.test(String(e.innerText || e.textContent || '').trim()));
+    if (!control) return false;
+    control.click(); return true;
+  })()`);
+  if (!clicked) throw new Error('BCC control was not found; refusing to claim bcc=0');
+  await waitFor(cdp, async () => evaluate(cdp, `(() => {
+    ${composeRecipientHelpers}
+    return inputFor('bcc') ? true : null;
+  })()`), 'BCC recipient field', 10000);
+}
+async function readDraftRecipients(cdp) {
+  return evaluate(cdp, `(() => {
+    ${composeRecipientHelpers}
+    return {to: emailsFor('to'), cc: emailsFor('cc'), bcc: emailsFor('bcc')};
+  })()`);
+}
+function verifyRecipientState(actual, recipientPlan) {
+  if (!actual || !Array.isArray(actual.to) || !Array.isArray(actual.cc) || !Array.isArray(actual.bcc)) return false;
+  const keys = (values) => values.map((email) => String(email).toLowerCase());
+  const to = keys(actual.to);
+  const cc = keys(actual.cc);
+  const expectedCc = keys(recipientPlan.cc);
+  return to.length === 1
+    && to[0] === String(recipientPlan.primary).toLowerCase()
+    && cc.length === expectedCc.length
+    && cc.every((email, index) => email === expectedCc[index])
+    && new Set(cc).size === cc.length
+    && actual.bcc.length === 0;
 }
 async function updateDraft(cdp, config, recipientPlan) {
   await gmailSearch(cdp, config, `in:drafts has:attachment filename:"${targetAttachment.replaceAll('"', '')}" ${targetMonth}`);
@@ -324,11 +406,28 @@ async function updateDraft(cdp, config, recipientPlan) {
     console.log(`RECIPIENT_DIAGNOSTIC ${JSON.stringify(diagnostics)}`);
     return;
   }
-  if (!await recipientPresent(cdp, recipientPlan.primary)) throw new Error('Primary To recipient was missing');
-  for (const email of recipientPlan.cc) if (await recipientPresent(cdp, email)) await removeRecipient(cdp, email);
   await revealCc(cdp);
+  await revealBcc(cdp);
+  const initialRecipients = await readDraftRecipients(cdp);
+  if (!initialRecipients || !Array.isArray(initialRecipients.to) || !Array.isArray(initialRecipients.cc) || !Array.isArray(initialRecipients.bcc)) {
+    throw new Error('Draft recipient fields could not be read safely');
+  }
+  const allowed = new Set([recipientPlan.primary, ...recipientPlan.cc].map((email) => email.toLowerCase()));
+  if (initialRecipients.bcc.length || [...initialRecipients.to, ...initialRecipients.cc].some((email) => !allowed.has(email.toLowerCase()))) {
+    throw new Error('Draft contains unexpected recipients; refusing to normalize it');
+  }
+  if (!initialRecipients.to.some((email) => email.toLowerCase() === recipientPlan.primary.toLowerCase())) {
+    throw new Error('Primary To recipient was missing');
+  }
+  for (const email of initialRecipients.to) {
+    if (email.toLowerCase() !== recipientPlan.primary.toLowerCase()) await removeRecipient(cdp, email, 'to');
+  }
+  for (const email of initialRecipients.cc) await removeRecipient(cdp, email, 'cc');
   for (const email of recipientPlan.cc) await addCc(cdp, email);
-  if (!await recipientPresent(cdp, recipientPlan.primary)) throw new Error('Primary To recipient changed unexpectedly');
+  const actualRecipients = await readDraftRecipients(cdp);
+  if (!verifyRecipientState(actualRecipients, recipientPlan)) {
+    throw new Error('Draft recipient verification failed; refusing to report normalized recipients');
+  }
   await sleep(7000);
   const closed = await evaluate(cdp, `(() => {
     const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
@@ -343,7 +442,7 @@ async function updateDraft(cdp, config, recipientPlan) {
   const verified = await evaluate(cdp, `(() => [...document.querySelectorAll('tr.zA, table[role="grid"] tr')]
     .some((e) => new RegExp(${JSON.stringify(`${targetMonth}|${targetMonthNumber}月分`)}).test(e.innerText || '')))()`);
   if (!verified) throw new Error('Updated draft was not found');
-  console.log(`DRAFT_UPDATED to=1 cc=${recipientPlan.cc.length} bcc=0 sent=false`);
+  console.log(`DRAFT_UPDATED to=${actualRecipients.to.length} cc=${actualRecipients.cc.length} bcc=${actualRecipients.bcc.length} sent=false`);
 }
 
 function runSelfTest() {
@@ -355,9 +454,29 @@ function runSelfTest() {
   if (plan.primary !== 'primary@example.com' || plan.cc.join(',') !== 'secondary@example.com,reviewer@example.com') {
     throw new Error('recipient plan self-test failed');
   }
+  const noReplyPlan = buildRecipientPlan({
+    to: ['no-reply@example.com', 'primary@example.com', 'owner@example.com'],
+    cc: ['noreply@example.com', 'do_not_reply@example.com', 'reviewer@example.com'],
+    bcc: [],
+  }, 'owner@example.com');
+  if (noReplyPlan.primary !== 'primary@example.com' || noReplyPlan.cc.join(',') !== 'reviewer@example.com') {
+    throw new Error('no-reply exclusion self-test failed');
+  }
+  if (!verifyRecipientState({
+    to: ['PRIMARY@example.com'], cc: ['secondary@example.com', 'reviewer@example.com'], bcc: [],
+  }, plan)) throw new Error('recipient state verification self-test failed');
+  if (verifyRecipientState({
+    to: ['primary@example.com'], cc: ['secondary@example.com', 'reviewer@example.com'], bcc: ['hidden@example.com'],
+  }, plan)) throw new Error('draft BCC verification self-test failed');
   try {
     buildRecipientPlan({ to: ['primary@example.com'], cc: [], bcc: ['hidden@example.com'] }, 'owner@example.com');
     throw new Error('BCC refusal self-test failed');
+  } catch (error) {
+    if (!/contains BCC/.test(error.message)) throw error;
+  }
+  try {
+    buildRecipientPlan({ to: ['primary@example.com'], cc: [], bcc: ['owner@example.com'] }, 'owner@example.com');
+    throw new Error('own-address BCC refusal self-test failed');
   } catch (error) {
     if (!/contains BCC/.test(error.message)) throw error;
   }

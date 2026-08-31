@@ -1,4 +1,4 @@
 interface:
   display_name: "Prepare Invoice Email"
   short_description: "請求書PDFを検証して宛先を整えたGmail下書きを安全に作成"
-  default_prompt: "Use $prepare-invoice-email to export this month's invoice PDF, verify it, and prepare an unsent Gmail draft."
+  default_prompt: "Use $prepare-invoice-email only after confirming one YYYY-MM target. For an explicit invoice/PDF/draft or recipient-correction request, run export→verify→draft→normalizer with verification after each change; an explicit end-to-end request authorizes the sequence. For audits, use static checks and --self-test only. Never send."
