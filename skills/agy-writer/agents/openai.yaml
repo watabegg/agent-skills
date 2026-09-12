@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gemini Japanese Writer"
+  short_description: "Gemini が日本語を執筆し、依頼元が技術内容を照合する"
+  default_prompt: "Use $agy-writer to turn verified material into a Japanese document and check its meaning."

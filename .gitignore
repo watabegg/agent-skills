@@ -4,6 +4,8 @@
 tmp/
 repos/
 node_modules/
+__pycache__/
+*.py[cod]
 
 # Local secrets
 .env

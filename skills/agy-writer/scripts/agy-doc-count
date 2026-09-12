@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Count characters in one UTF-8 Markdown or text file."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+HOME_ROOT = Path.home().resolve()
+TMP_ROOT = Path("/tmp").resolve()
+ALLOWED_SUFFIXES = {".md", ".txt"}
+SENSITIVE_PARTS = {
+    ".agents",
+    ".aws",
+    ".codex",
+    ".gemini",
+    ".git",
+    ".gnupg",
+    ".kube",
+    ".ssh",
+}
+
+
+def within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: ./bin/agy-doc-count /absolute/path/to/document.md", file=sys.stderr)
+        return 2
+
+    path = Path(sys.argv[1]).expanduser().resolve(strict=True)
+    lowered_parts = {part.lower() for part in path.parts}
+    if (
+        not path.is_file()
+        or path.suffix.lower() not in ALLOWED_SUFFIXES
+        or not (within(path, HOME_ROOT) or within(path, TMP_ROOT))
+        or bool(lowered_parts & SENSITIVE_PARTS)
+        or path.name in {"AGENTS.md", "GEMINI.md"}
+    ):
+        print("refusing to read a non-document or protected path", file=sys.stderr)
+        return 2
+
+    text = path.read_text(encoding="utf-8")
+    result = {
+        "characters": len(text),
+        "characters_without_newlines": len(text.replace("\n", "")),
+        "characters_without_whitespace": len("".join(text.split())),
+        "lines": len(text.splitlines()),
+    }
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
