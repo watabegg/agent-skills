@@ -20,7 +20,7 @@ python3 scripts/sync_installed_skills.py --only agy-writer --writer-runtime --ap
 
 Gemini reads the workspace `GEMINI.md` at startup. It contains both meaning-preservation and Japanese vocabulary preferences. The old `style-profile.md` path links to this file for existing callers. The automation no longer repeats those instructions in each prompt; `--profile <file>` supplies an optional request-specific addition.
 
-`agy-writer` defaults to Gemini 3.8 Flash High with high effort. Its remaining arguments are passed literally to `agy`, so explicit `--model` or `--effort` options override the defaults. Set `AGY_WRITER_DIR` when using a separately installed workspace; changing this variable alone does not install its instructions or hook. `agent-write-ja` always requests a new conversation; interactive `agy-writer` follows the CLI's normal conversation selection.
+`agy-writer` defaults to Gemini 3.8 Flash High with high effort. Its remaining arguments are passed literally to `agy`, so explicit `--model` or `--effort` options override the defaults. Set `AGY_WRITER_DIR` when using a separately installed workspace; changing this variable alone does not install its instructions or hook. `agent-write-ja` requests a new **Gemini** conversation for each writing, editing or repair call. This is separate from the continuing **Codex** meaning-review conversation. Interactive `agy-writer` follows the CLI's normal conversation selection.
 
 The installer migrates only the known `document-writer-policy` registration from `~/.gemini/config/hooks.json` to the writer workspace and preserves unrelated hooks. An unexpected definition requires inspection. An existing legacy hook executable becomes a symlink so running sessions can still call it. General CLI permissions and authentication are separate account settings, outside this installation. The tool policy preserves document-only editing; it is not an OS sandbox.
 
@@ -32,6 +32,7 @@ Validate changes offline:
 
 ```sh
 python3 skills/agy-writer/scripts/test_write_ja.py
+python3 skills/agy-writer/scripts/test_chapters.py
 python3 skills/agy-writer/scripts/test_runtime.py
 ```
 

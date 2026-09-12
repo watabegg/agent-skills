@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 
 
@@ -106,24 +107,62 @@ def decode_repair(body, count):
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
-    for operation in ("draft", "repair"):
+    for operation in ("chapters", "draft", "repair"):
         command = commands.add_parser(operation)
         command.add_argument("--model", default=MODEL)
         command.add_argument("--timeout", type=int, default=1200, help="seconds; default 1200")
         command.add_argument("--writer", default="agy-writer", help="writer executable, without shell arguments")
         command.add_argument("--profile", type=Path, help="optional extra style instructions for this request")
-        if operation == "draft":
+        if operation in {"chapters", "draft"}:
             command.add_argument("--packet", type=Path, required=True)
             command.add_argument("--out", type=Path, required=True)
+            if operation == "chapters":
+                command.add_argument("--plan", type=Path, help="chapter groups referring to the packet's level-two headings")
+                command.add_argument("--jobs", type=int, default=3, help="concurrent chapters; default 3")
         else:
             command.add_argument("--run", type=Path, required=True)
             command.add_argument("--findings", type=Path, required=True)
     return parser
 
 
+def generate(args, run, record, prompt):
+    """One fresh Gemini conversation; preserve its evidence without printing prose."""
+    started = time.monotonic()
+    record.update(status="running", model_requested=args.model, effort="high")
+    record.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+    (run / "prompt.md").write_text(prompt, encoding="utf-8")
+    command = [args.writer, "--new-project", "--model", args.model, "--effort", "high",
+               "--output-format", "json", "--print-timeout", f"{args.timeout}s", "-p", prompt]
+    save_json(run / "run.json", record)
+    try:
+        with (run / "response.json").open("wb") as stdout, (run / "stderr.log").open("wb") as stderr:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                    timeout=args.timeout + 15, check=False)
+        if result.returncode:
+            raise ValueError(f"agy-writer exited with {result.returncode}; inspect stderr.log")
+        response = json.loads((run / "response.json").read_text(encoding="utf-8"))
+        if not isinstance(response, dict) or response.get("status") != "SUCCESS":
+            raise ValueError("agy-writer did not report SUCCESS; inspect response.json")
+        body = response.get("response")
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError("agy-writer returned no document")
+        record.update(status="generated", conversation_id=response.get("conversation_id"), usage=response.get("usage"))
+        return body
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        record["status"] = "failed"
+        raise
+    finally:
+        record.update(elapsed_seconds=round(time.monotonic() - started, 3),
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        save_json(run / "run.json", record)
+
+
 def execute(args, run, record):
     if args.timeout <= 0:
         raise ValueError("timeout must be positive")
+    if args.operation == "chapters":
+        from write_chapters import execute_chapters
+        return execute_chapters(args, run, record, generate)
     spans = []
     if args.operation == "draft":
         packet = read_text(args.packet)
@@ -167,23 +206,7 @@ def execute(args, run, record):
 {"replacements":[{"id":0,"text":"置き換える本文"}],"needs_input":""}
 すべての id を一度ずつ含めます。原資料だけで修正できない場合は replacements を空配列にし、needs_input に不足を記載してください。
 説明、コードフェンス、完了通知、JSON の繰り返しは不要です。"""
-    (run / "prompt.md").write_text(prompt, encoding="utf-8")
-    command = [args.writer, "--new-project", "--model", args.model, "--effort", "high",
-               "--output-format", "json", "--print-timeout", f"{args.timeout}s", "-p", prompt]
-    record.update(status="running", model_requested=args.model, effort="high")
-    save_json(run / "run.json", record)
-    with (run / "response.json").open("wb") as stdout, (run / "stderr.log").open("wb") as stderr:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                timeout=args.timeout + 15, check=False)
-    if result.returncode:
-        raise ValueError(f"agy-writer exited with {result.returncode}; inspect stderr.log")
-    response = json.loads((run / "response.json").read_text(encoding="utf-8"))
-    if not isinstance(response, dict) or response.get("status") != "SUCCESS":
-        raise ValueError("agy-writer did not report SUCCESS; inspect response.json")
-    body = response.get("response")
-    if not isinstance(body, str) or not body.strip():
-        raise ValueError("agy-writer returned no document")
-    record.update(conversation_id=response.get("conversation_id"), usage=response.get("usage"))
+    body = generate(args, run, record, prompt)
     if args.operation == "repair":
         answer = decode_repair(body, len(findings))
         if answer["needs_input"]:
@@ -211,10 +234,12 @@ def execute(args, run, record):
 
 def main():
     args = make_parser().parse_args()
+    started = time.monotonic()
     state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agy-writer/runs"
     state.mkdir(parents=True, exist_ok=True)
     run = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-"), dir=state))
-    record = {"operation": args.operation, "run_dir": str(run), "status": "failed"}
+    record = {"operation": args.operation, "run_dir": str(run), "status": "failed", "review_mode": "continue",
+              "started_at": datetime.now(timezone.utc).isoformat()}
     try:
         code = execute(args, run, record)
     except subprocess.TimeoutExpired:
@@ -224,8 +249,9 @@ def main():
         record.update(status="failed", error=str(error))
         code = 1
     record["finished_at"] = datetime.now(timezone.utc).isoformat()
+    record["elapsed_seconds"] = round(time.monotonic() - started, 3)
     save_json(run / "run.json", record)
-    fields = ("status", "operation", "output", "run_dir", "changes", "reason", "error")
+    fields = ("status", "operation", "output", "run_dir", "chapters", "review_mode", "elapsed_seconds", "changes", "reason", "error")
     print(json.dumps({key: record[key] for key in fields if key in record}, ensure_ascii=False))
     return code
 
