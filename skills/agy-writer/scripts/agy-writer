@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+writer_workspace=${AGY_WRITER_DIR:-"$HOME/agy-writer"}
+cd "$writer_workspace"
+exec agy --mode accept-edits --model gemini-3.8-flash-high --effort high "$@"

@@ -20,6 +20,7 @@
 ├── AGENTS.md
 ├── README.md
 └── skills/
+    ├── agy-writer/
     ├── semantic-commit-ja/
     ├── japanese-tech-writing/
     ├── pencil-pencli/
@@ -67,6 +68,14 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 ```
 
 ## 各 Skill の説明
+
+### `agy-writer`
+
+ユーザーが読む日本語の設計書・PR 本文を、確認済みの材料から Gemini に書かせます。依頼元は意味を照合し、問題箇所だけを Gemini に返します。一般的な言葉遣いや訳し方を元の原稿へ戻しません。
+
+`skills/agy-writer/scripts/write_ja.py` は `agy-writer` CLI を呼び、結果の保存と指摘箇所の差し替えを行います。このマシンでは `agent-write-ja` で実行できます。材料や生成稿は公開リポジトリの外へ置きます。
+
+起動スクリプト、Gemini 向けの指示、writer 用 hook も同じ skill 内で管理します。[配置と同期の手順](skills/agy-writer/references/setup.md)を参照してください。
 
 ### `semantic-commit-ja`
 
