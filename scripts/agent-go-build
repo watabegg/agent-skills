@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run an explicitly selected heavy Go build once at low priority.
+set -euo pipefail
+if [[ $# -eq 0 || ${1-} == --help ]]; then
+  printf 'Usage: agent-go-build [go build flags] <package-or-file>\nRun from the module directory. A busy machine-wide lock exits with code 75.\n'
+  exit 0
+fi
+lock_dir=${XDG_RUNTIME_DIR:-/tmp}
+exec flock -n -E 75 "$lock_dir/agent-go-build-$(id -u).lock" \
+  nice -n 10 ionice -c3 env GOMAXPROCS=2 GOTOOLCHAIN=local go build -p=1 "$@"

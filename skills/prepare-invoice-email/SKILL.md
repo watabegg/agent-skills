@@ -1,110 +1,30 @@
 ---
 name: prepare-invoice-email
-description: Export a selected month from the integrated Google Sheets invoice tab as a verified one-page PDF, create or resume a matching Gmail draft from prior invoice mail, and normalize recipients to one primary To plus the remaining prior recipients in CC without sending. Use for invoice PDF creation, invoice-email drafting, recipient correction, or an end-to-end attendance-to-invoice workflow after sync-teams-attendance.
+description: Export and verify a monthly invoice PDF from the configured Google Sheets workbook, then create a Gmail draft with one primary To, remaining prior recipients in CC and no sending.
 ---
 
-# Prepare Invoice Email
+Use the requested target month. If it is missing and cannot be inferred, ask for it. Reuse attendance synchronization authorization when it was part of the same end-to-end request. The configuration is shared with `sync-teams-attendance`; do not print it.
 
-## Purpose
+Resolve `invoice_skill_dir` to the absolute directory containing this SKILL.md. Use an absolute PDF path in a unique temporary directory. Replace the month consistently:
 
-Use the bundled scripts instead of ad-hoc browser code. They copy the configured Chrome profile to a temporary directory, export the invoice, verify the PDF, create or resume one Gmail draft, attach the PDF, and normalize recipients. They contain no send action.
-
-Use `~/.config/sync-teams-attendance/config.json` by default. It must be mode `600` and provide `chrome.userDataDir`, `chrome.profileDirectory`, `accounts.googleEmail`, and the integrated workbook's `spreadsheet.url`. Never print or commit the config, addresses, cookies, account data, invoice contents, or browser profile.
-
-If the request also includes Teams attendance synchronization, finish `$sync-teams-attendance` first and verify its appended rows before preparing the invoice.
-
-## Execution Gate
-
-- Resolve and state exactly one target month in `YYYY-MM` before any export, draft, or recipient operation. If the month is missing or ambiguous, ask for confirmation first.
-- Run `--export`, `--draft`, or the normal recipient normalizer (without `--inspect`) only for an explicit request to create the invoice/PDF/draft or correct recipients. For confirmation or audit only, use static review and `--self-test`; do not open the browser.
-- An explicit end-to-end attendance-to-invoice request authorizes the requested steps in order after the month is confirmed. Do not ask for sequential re-approval, but require the default verification after every change and stop on failure.
-- Sending is never authorized: keep `sent=false` and never activate Send or scheduling.
-
-## Target Month
-
-- Use the user's explicit `YYYY-MM` month when supplied.
-- Otherwise propose the latest completed billing month with synchronized attendance (usually the previous calendar month) and obtain confirmation before running an action.
-- Never create a current partial-month invoice unless the user explicitly requests it.
-
-Read [references/invoice-workbook-contract.md](references/invoice-workbook-contract.md) before changing the month selector, export range, PDF checks, or invoice sheet discovery. Read [references/gmail-draft-policy.md](references/gmail-draft-policy.md) before changing recipient inference or Gmail draft behavior.
-
-## Standard Workflow
-
-Resolve the installed skill directory once, then use an absolute temporary PDF path:
-
-```bash
-invoice_skill_dir="${CODEX_HOME:-$HOME/.codex}/skills/prepare-invoice-email"
-invoice_tmp_dir="$(mktemp -d)"
-invoice_pdf="$invoice_tmp_dir/invoice-YYYY-MM.pdf"
+```sh
+node "$invoice_skill_dir/scripts/invoice_workflow.mjs" \
+  --prepare --month YYYY-MM --pdf /tmp/invoice-run/invoice-YYYY-MM.pdf
 ```
 
-Replace `YYYY-MM` consistently in every command.
+The command exports `請求書!A1:R34`, restores U2, verifies one A4 page with the invoice title and target period, then renders a PNG. Its JSON result has `status: needs_input`, `reason: visual_review_required` and PDF/preview/log paths; exit 2 is the expected review checkpoint. Open the preview and confirm the invoice, target month and no clipping, overlap or mojibake. `PDF_OK` alone does not verify appearance or the business correctness of the amount. If only a PDF was requested, deliver it after this check.
 
-1. After the target month is confirmed, export the invoice. The script selects the `請求書` tab, records `U2`, switches it to the target month, exports only `A1:R34`, and restores the original `U2` value in `finally`.
+When a draft was requested and the same PDF has passed visual review:
 
-   ```bash
-   node "$invoice_skill_dir/scripts/invoice_email_draft.mjs" \
-     --export --month YYYY-MM --pdf "$invoice_pdf"
-   ```
-
-   Require `EXPORT_OK` and, when the selector changed, `MONTH_RESTORED true` before continuing.
-
-2. Run deterministic PDF verification:
-
-   ```bash
-   node "$invoice_skill_dir/scripts/invoice_email_draft.mjs" \
-     --verify-pdf --month YYYY-MM --pdf "$invoice_pdf"
-   ```
-
-   Require `PDF_OK`. It proves one A4 page, an invoice title, and the target period. Also render the single page and visually confirm that it is the invoice—not `勤怠明細`—with no clipping, overlap, or mojibake before attaching it; stop if this verification fails.
-
-3. Create or resume the matching Gmail draft and attach the verified PDF:
-
-   ```bash
-   node "$invoice_skill_dir/scripts/invoice_email_draft.mjs" \
-     --draft --month YYYY-MM --pdf "$invoice_pdf"
-   ```
-
-   The script takes the subject, body style, and primary recipient from the most recent sent invoice email, updates the billing period, saves and closes the compose window, and verifies the message under `in:drafts`. Require `DRAFT_OK ... sent=false` before recipient changes.
-
-4. Inspect recipient normalization without changing the draft:
-
-   ```bash
-   node "$invoice_skill_dir/scripts/normalize_invoice_recipients.mjs" \
-     --inspect --month YYYY-MM --pdf "$invoice_pdf"
-   ```
-
-5. Normalize the draft recipients:
-
-   ```bash
-   node "$invoice_skill_dir/scripts/normalize_invoice_recipients.mjs" \
-     --month YYYY-MM --pdf "$invoice_pdf"
-   ```
-
-   Preserve the first external prior To recipient as the sole To recipient. Move additional prior To recipients and preserve prior CC recipients in CC. Require `DRAFT_UPDATED to=1 cc=<n> bcc=0 sent=false` before reporting completion.
-
-6. Report the invoice month, PDF verification, To/CC/BCC counts, attachment name, draft verification, and `sent=false`. Delete the local temporary PDF and render only after the Gmail draft and attachment are verified.
-
-Use `--config /absolute/path/config.json` with both scripts only for a non-default config.
-
-## Stop Conditions
-
-- Stop before drafting when the PDF verification fails or visual inspection is not clearly an invoice.
-- Stop when no prior sent invoice email exists; do not invent recipients or organization-specific wording.
-- Stop when the prior invoice contains BCC. The script intentionally refuses to infer a no-BCC draft from that state.
-- Stop when Google authentication is missing. Do not automate Google password entry.
-- If a run fails after opening a draft, search the exact target subject and attachment before retrying. The script reuses a matching draft, but do not create duplicates manually.
-- Never click Send, press `Ctrl+Enter`, use Gmail scheduling, or call a mail-sending API. User authorization to create a draft is not authorization to send it.
-
-## Validation
-
-After changing either script or these instructions, run:
-
-```bash
-node skills/prepare-invoice-email/scripts/invoice_email_draft.mjs --self-test
-node skills/prepare-invoice-email/scripts/normalize_invoice_recipients.mjs --self-test
-node --check skills/prepare-invoice-email/scripts/invoice_email_draft.mjs
-node --check skills/prepare-invoice-email/scripts/normalize_invoice_recipients.mjs
-python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
-  skills/prepare-invoice-email
+```sh
+node "$invoice_skill_dir/scripts/invoice_workflow.mjs" \
+  --draft --month YYYY-MM --pdf /tmp/invoice-run/invoice-YYYY-MM.pdf --visual-checked
 ```
+
+This rechecks the PDF, creates/resumes a matching draft and normalizes recipients. `--visual-checked` records the agent's completed visual check; it is not another user approval. Do not use it for an unseen or subsequently changed PDF.
+
+Exit 0 / `completed` / `draft_verified` means a draft was verified, with `sent: false`. Exit 1 / `failed` identifies the failing step and log. If `changed` is null, inspect the sheet or draft before retrying; do not assume the operation rolled back. Never click Send.
+
+Keep one primary To from the previous invoice mail, the remaining prior To/CC recipients in CC, and BCC empty. The existing script rejects unexpected recipients. Preserve workbook formulas, rates, history and layout; do not use a fallback worksheet when the invoice cannot be identified. Keep PDFs, mail content, recipient data and browser state outside this public repository.
+
+For repair or lower-level recipient inspection, read [maintenance.md](references/maintenance.md). Routine operation only needs the two commands and their artifacts.

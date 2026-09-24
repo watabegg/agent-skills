@@ -35,6 +35,7 @@ Options:
   --apply            Append verified missing intervals. The default is a dry run.
   --headed           Run Chrome with a visible window when DISPLAY is available.
   --timeout-ms <n>   Navigation/authentication timeout. Default: 180000.
+  --json             Emit one result object on stdout; progress goes to stderr.
   --self-test        Run deterministic parser, layout, and pairing tests.
   --help             Show this help.
 `);
@@ -52,6 +53,7 @@ function parseArgs(argv) {
     else if (arg === '--headed') args.headed = true;
     else if (arg === '--timeout-ms') args.timeoutMs = Number(argv[++i]);
     else if (arg === '--self-test') args.selfTest = true;
+    else if (arg === '--json') args.json = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!Number.isFinite(args.timeoutMs) || args.timeoutMs < 1000) throw new Error('--timeout-ms must be at least 1000');
@@ -1192,6 +1194,8 @@ function runSelfTest() {
   console.log('SELF_TEST_OK');
 }
 
+let writeAttempted = false;
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) { usage(); return; }
@@ -1203,7 +1207,7 @@ async function main() {
     cdp = await connectPage(browser);
     const model = await inspectSheet(cdp, config);
     console.log(`SHEET ${JSON.stringify(printableModel(model))}`);
-    if (args.inspectSheet) return;
+    if (args.inspectSheet) return {status: 'completed', reason: 'sheet_inspected', changed: 0, artifacts: [], sheet: printableModel(model)};
 
     const since = deriveSince(model, config, args.since);
     console.log(`WINDOW since=${since} timezone=${config.sync.timezone}`);
@@ -1215,27 +1219,41 @@ async function main() {
     console.log(`RESULT matched_events=${paired.relevant.length} closed_intervals=${paired.intervals.length} missing=${missing.length} anomalies=${paired.anomalies.length}`);
     for (const interval of missing) console.log(`PROPOSE ${interval.date} ${interval.start}-${interval.end}`);
     for (const anomaly of paired.anomalies) console.log(`ANOMALY ${anomaly.type} ${anomaly.date} ${anomaly.time}`);
-    if (!args.apply) { console.log('DRY_RUN no spreadsheet changes were made'); return; }
-    if (blockers.length) throw new Error(`Refusing to apply because ${blockers.length} punch-order anomalies affect the candidate window`);
-    if (!missing.length) { console.log('APPLY no missing intervals'); return; }
+    const result = {status: blockers.length ? 'needs_input' : 'completed',
+      reason: blockers.length ? 'punch_order_anomaly' : args.apply ? 'already_synced' : 'dry_run',
+      changed: 0, artifacts: [], since, proposed: missing.map(({date, start, end, isoDate}) => ({date, start, end, isoDate})),
+      anomalies: paired.anomalies.map(({type, date, time}) => ({type, date, time}))};
+    if (blockers.length) { process.exitCode = 2; return result; }
+    if (!args.apply) { console.log('DRY_RUN no spreadsheet changes were made'); return result; }
+    if (!missing.length) { console.log('APPLY no missing intervals'); return result; }
 
     await navigate(cdp, config.spreadsheet.url);
     await sleep(3000);
     const freshModel = workbookModel(parseCsv(await fetchSheetCsv(cdp, config)), config);
     const stillMissing = missing.filter((interval) => !freshModel.existingKeys.has(intervalKey(interval.date, interval.start, interval.end)));
-    if (!stillMissing.length) { console.log('APPLY no missing intervals after pre-write refresh'); return; }
+    if (!stillMissing.length) { console.log('APPLY no missing intervals after pre-write refresh'); return result; }
+    writeAttempted = true;
     await applyIntervals(cdp, config, freshModel, stillMissing);
     const verifiedModel = workbookModel(parseCsv(await fetchSheetCsv(cdp, config)), config);
     const unverified = stillMissing.filter((interval) => !verifiedModel.existingKeys.has(intervalKey(interval.date, interval.start, interval.end)));
     if (unverified.length) throw new Error(`Post-write verification failed for ${unverified.length} intervals; do not retry blindly`);
     console.log(`APPLIED count=${stillMissing.length} verified=true first=${stillMissing[0].isoDate} last=${stillMissing.at(-1).isoDate}`);
+    return {...result, reason: 'applied', changed: stillMissing.length, verified: true, first: stillMissing[0].isoDate, last: stillMissing.at(-1).isoDate};
   } finally {
     cdp?.close();
     await stopChrome(browser);
   }
 }
 
-main().catch((error) => {
+const jsonOutput = process.argv.includes('--json');
+const helpRequested = process.argv.includes('--help') || process.argv.includes('-h');
+const printResult = console.log.bind(console);
+if (jsonOutput && !helpRequested) console.log = (...args) => console.error(...args);
+main().then((result) => {
+  if (jsonOutput && !helpRequested) printResult(JSON.stringify(result || {status: 'completed', reason: 'self_test', changed: 0, artifacts: []}));
+}).catch((error) => {
   console.error(`ERROR ${error.message}`);
+  if (jsonOutput) printResult(JSON.stringify({status: 'failed', reason: writeAttempted ? 'write_unverified' : 'operation_failed',
+    changed: writeAttempted ? null : 0, artifacts: [], retry: writeAttempted ? 'inspect_before_retry' : 'diagnose'}));
   process.exitCode = 1;
 });
