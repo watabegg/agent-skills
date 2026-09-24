@@ -22,7 +22,6 @@
 └── skills/
     ├── agy-writer/
     ├── semantic-commit-ja/
-    ├── japanese-tech-writing/
     ├── pencil-pencli/
     ├── ealps-moodle-operator/
     ├── sync-teams-attendance/
@@ -50,7 +49,7 @@ CODEX_HOME があればそちらを優先して、なければ ~/.codex を使�
 ### 依頼例 2. 特定 Skill だけインストール
 
 ```text
-skills/japanese-tech-writing だけをグローバル環境にインストールして。
+skills/semantic-commit-ja だけをグローバル環境にインストールして。
 既存の同名 Skill があれば上書きして、完了後に確認結果を教えて。
 ```
 
@@ -86,19 +85,6 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 - 主な利用シーン:
   - コミット、コミットメッセージ作成、amend、revert、コミット分割、コミット形式レビュー。
   - `feat(scope): 日本語の件名` 形式で、変更理由が必要な場合は日本語本文を付ける。
-
-### `japanese-tech-writing`
-
-- 目的:
-  - 日本語の長文・高負荷な技術文書、設計 Markdown、仕様書、レビュー、調査報告、推敲の文章規範を定める。
-  - 段落構成、論証の厳密さ、読み手の負荷、LLM っぽい表現の抑制を扱う。
-  - 短い進捗報告、単純な質問回答、通常の会話では使わない。
-- 出典:
-  - この Skill は [k16shikano 氏の Gist「日本語技術文書の文章規範」](https://gist.github.com/k16shikano/fd287c3133457c4fd8f5601d34aa817d) を元にしたものです。
-  - この repo では Codex Skill として使うための frontmatter と、個人運用上の調整を加えています。
-- 主な利用シーン:
-  - 設計書、仕様書、実装計画、技術記事の執筆や推敲。
-  - コードレビュー、調査報告、PR 向け説明のような、読み手の判断に使われる長めの日本語文書。
 
 ### `pencil-pencli`
 
@@ -237,3 +223,18 @@ public repo に置く前に、秘密値、cookie、token、社内 URL、本番�
 追加した skills/<new-skill> をグローバル環境にインストールして。
 完了後に SKILL.md 一覧で反映確認して、必要なら再起動が必要か教えて。
 ```
+
+## 個人 skill の同期
+
+このマシンで使う個人 skill の配置は次のコマンドで確認できます。`--apply` を付けると Codex の配置を更新し、Claude 側を symlink に揃えます。CRV2 の固定版と HLoop は対象に含めません。
+
+```sh
+python3 scripts/sync_installed_skills.py
+python3 scripts/sync_installed_skills.py --apply
+```
+
+`--codex-home`、`--shared-skills`、`--claude-home` で配置先を変更できます。通常の skill は Codex home、`semantic-commit-ja` は既存の共有 skill ディレクトリへ配置します。
+
+勤怠は `--json` を付けた一回の preview または apply、請求は `invoice_workflow.mjs --prepare` の PDF 確認後に `--draft --visual-checked` を使います。eALPS の保存証跡は `--verify` で、証跡不足と集計成功を区別できます。詳しい引数は各 skill の入口を参照してください。
+
+`scripts/rtk_codex_hook.py` は Codex PreToolUse 向けの RTK アダプタ、`scripts/agent-go-build` は明示した Go build を直列かつ低優先度で実行するローカル運用用スクリプトです。hook 設定と有効化はマシン側で行います。
