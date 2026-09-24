@@ -13,12 +13,13 @@ const month = argValue('--month');
 const pdfPath = argValue('--pdf');
 const selfTest = argv.includes('--self-test');
 if (!selfTest && (!/^\d{4}-\d{2}$/.test(month || '') || !pdfPath || !path.isAbsolute(pdfPath))) {
-  throw new Error('Usage: node normalize_invoice_recipients.mjs --month YYYY-MM --pdf /absolute/path.pdf [--config /path/config.json] [--inspect]\n       node normalize_invoice_recipients.mjs --self-test');
+  throw new Error('Usage: node normalize_invoice_recipients.mjs --month YYYY-MM --pdf /absolute/path.pdf [--config /path/config.json] [--inspect|--apply]\n       node normalize_invoice_recipients.mjs --self-test');
 }
 const [targetYear, targetMonthNumber] = selfTest ? [2000, 1] : month.split('-').map(Number);
 const targetMonth = `${targetYear}年${targetMonthNumber}月`;
 const targetAttachment = selfTest ? 'invoice.pdf' : path.basename(pdfPath);
-const inspectOnly = process.argv.includes('--inspect');
+if (argv.includes('--inspect') && argv.includes('--apply')) throw new Error('--inspect and --apply cannot be combined');
+const inspectOnly = !argv.includes('--apply');
 const cacheNames = new Set(['Cache', 'Code Cache', 'DawnCache', 'GPUCache', 'GrShaderCache', 'GraphiteDawnCache', 'ShaderCache', 'Service Worker']);
 const userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
 

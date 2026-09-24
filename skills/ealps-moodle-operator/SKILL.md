@@ -1,67 +1,28 @@
 ---
 name: ealps-moodle-operator
-description: "Operate Shinshu University eALPS Moodle course pages after ACSU login: inspect course sections, collect assignment and quiz requirements, snapshot Moodle DOM, upload assignment files through Moodle filemanager, fill and final-submit quizzes, and verify submission status. Use when Codex needs browser-based Moodle/eALPS task discovery, evidence collection, or explicitly authorized assignment/quiz submission."
+description: Inspect eALPS Moodle courses and submission evidence, or perform explicitly authorized assignment uploads and quiz submissions after ACSU login.
 ---
 
-# eALPS Moodle Operator
+Choose saved-evidence analysis or live Moodle operation. Saved evidence needs no login skill, browser or credentials.
 
-## Overview
+Resolve `moodle_skill_dir` to the absolute directory containing this SKILL.md. Summarize a saved JSON file or directory with:
 
-Use this skill for Moodle-specific work inside eALPS after authentication: course page discovery, assignment and quiz inspection, Moodle filemanager uploads, quiz answer entry, final submission, and verification.
-
-Use `shinshu-portal-auth` for login and generic portal access. This skill assumes that authentication path and adds Moodle/eALPS operational recipes.
-
-## Safety Boundary
-
-- Default to read-only inspection.
-- Do not start a quiz attempt, submit a quiz, upload assignment files, delete files, or edit a saved submission unless the user explicitly asked for that final action in the current task.
-- For broad requests such as "try operations", only run read-only probes unless a target course/activity and mutation are explicitly named.
-- Keep credentials, cookies, long ACSU/Microsoft redirect URLs, and personal identifiers out of repo files and final reports.
-- Keep generated screenshots and JSON evidence in `/tmp` unless the user asks for sanitized artifacts in a repo.
-
-## Standard Workflow
-
-1. Load `shinshu-portal-auth` and confirm the credential env file exists without printing values.
-2. Use the auth script to open the course or activity URLs and save evidence in `/tmp`.
-3. Inspect Moodle activity links and infer activity types from paths:
-   - `mod/assign/view.php?id=...`
-   - `mod/quiz/view.php?id=...`
-   - `mod/resource/view.php?id=...`
-   - `mod/url/view.php?id=...`
-4. For assignment and quiz work, read [references/moodle-operations.md](references/moodle-operations.md).
-5. Solve or prepare local files outside Moodle first. Run the relevant local validation before submitting.
-6. If submission is authorized, use Moodle's own form/API flow:
-   - online text: fill `onlinetext_editor[text]` and save
-   - file submissions: upload to the current draft item id through `repository_ajax.php?action=upload`, then save
-   - quizzes: fill fields by `name`, finish attempt, confirm the modal, then verify `review.php`
-7. Verify from Moodle after every mutation. Trust completion status only after a fresh view/review page shows it.
-
-## Useful Evidence Commands
-
-Run the generic auth script from the sibling skill:
-
-```bash
-node ~/agent-skills/skills/shinshu-portal-auth/scripts/shinshu_portal_cdp.mjs \
-  --url 'https://lms.ealps.shinshu-u.ac.jp/2026/t/course/view.php?id=202' \
-  --out-dir /tmp/ealps-course-probe
+```sh
+python3 "$moodle_skill_dir/scripts/summarize_ealps_evidence.py" /tmp/ealps-evidence --verify
 ```
 
-Summarize saved JSON evidence:
+Run the bundled command directly for routine summaries; read its implementation only when diagnosing or changing it. Read raw JSON only if the returned rows lack information the user needs.
 
-```bash
-python3 ~/agent-skills/skills/ealps-moodle-operator/scripts/summarize_ealps_evidence.py /tmp/ealps-course-probe
-```
+`--verify` returns `{status, reason, changed, artifacts, rows}`. Rows include `state` such as `submitted`, `draft`, `not_submitted`, `completed`, `in_progress` or `unknown`. Exit 0 means the evidence was summarized, not that every activity was submitted: inspect each row's `ok`. Exit 2 means `missing_input` or `empty_evidence`, so the submission state is unknown. Exit 1 means invalid evidence. `--json` retains the older row-array interface; use `--verify` for routine agent operation. Saved evidence establishes only the captured state, not the live site's latest state.
 
-## Verification Rules
+For live work, use the available `shinshu-portal-auth` skill to collect the target course/activity pages. Read [moodle-operations.md](references/moodle-operations.md) before assignment/quiz operation. Discover activities from the current page: assignments use `mod/assign/view.php`, quizzes `mod/quiz/view.php`; check headings because section numbers can differ from display labels.
 
-- Assignment submitted: activity view text includes `提出ステータス 評定のために提出済み` and the expected file name or online text summary.
-- Quiz submitted: final URL is `mod/quiz/review.php?...` and review text includes `ステータス 終了`.
-- File upload succeeded: repository upload JSON is HTTP 200 without `error`, then the assignment save returns to the activity view.
-- If a file upload reports a file type error, retry only after checking the current `M.form_filemanager.init` options. Do not send an empty `accepted_types[]` field when Moodle's accepted type list is empty.
+Prepare and validate the requested local files before upload. Use Moodle's current form/API flow and extract fresh draft itemid, sesskey, client_id and field names. These values belong to the current session. A quiz summary button may open a confirmation modal; it is not itself final submission.
 
-## Common Pitfalls
+After an authorized mutation, refresh the activity view/review page:
 
-- Moodle section numbers and `course/view.php?section=N` can be offset from display section labels. Verify by reading headings and activity titles.
-- Quiz summary buttons open a confirmation modal. Clicking the page button once is not final submission.
-- Moodle filemanager draft `itemid`, `sesskey`, and `client_id` are session-specific. Extract them from the current edit form every time.
-- Some assignment pages show `この状態で提出する` even after an upload failure. Check the view page for `評定のために提出済み`, not just the save button click.
+- Assignment: `提出ステータス 評定のために提出済み` plus the expected file name or online-text summary.
+- Quiz: `mod/quiz/review.php` plus `ステータス 終了`.
+- Upload: successful HTTP response without an upload error, followed by a saved assignment and the above submission evidence. A save/submit button alone proves nothing.
+
+Use existing explicit authorization for the specified upload, edit, quiz attempt or final submission. Broad requests to inspect or try operations do not authorize those mutations. Keep credentials, cookies, redirect URLs and personal evidence outside public repositories and reports. If the page layout or submission evidence is unclear, report the unresolved state before attempting further mutations.

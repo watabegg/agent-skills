@@ -1,75 +1,24 @@
 ---
 name: shinshu-portal-auth
-description: Safely access Shinshu University ACSU-authenticated portals through browser automation. Use when Codex needs to open, inspect, QA, or collect DOM evidence from *.ealps.shinshu-u.ac.jp, lms.ealps.shinshu-u.ac.jp, timetable.ealps.shinshu-u.ac.jp, gakumu-web02.shinshu-u.ac.jp/campus, or shinshuuniversity.sharepoint.com pages, including ACSU login, WisePoint image-password MFA, Shibboleth consent, and SharePoint Microsoft-to-ACSU federation without relying on Tampermonkey.
+description: Open ACSU-authenticated Shinshu University eALPS, timetable, Campus Information System and SharePoint pages, and capture DOM/screenshot evidence with the bundled login script.
 ---
 
-# Shinshu Portal Auth
+Use the bundled script for the user's normal login flow. Resolve `auth_skill_dir` to the absolute directory containing this SKILL.md; it is not the working directory. Use that absolute path in each shell invocation.
 
-## Overview
+```sh
+node "$auth_skill_dir/scripts/shinshu_portal_cdp.mjs" \
+  --url 'https://timetable.ealps.shinshu-u.ac.jp/portal/#/' \
+  --out-dir /tmp/shinshu-portal-probe
+```
 
-Use this skill for read-only browser access to Shinshu University portals protected by ACSU, eALPS, Campus Information System, or Shinshu SharePoint authentication. Keep secrets out of logs, command lines, commits, and skill files.
+Repeat `--url` for multiple targets in one browser session. Use a unique evidence directory per run. Target the final portal page, not an intermediate login URL.
 
-Prefer the bundled CDP script over ad hoc Playwright snippets. It launches a temporary Chrome profile, logs in through ACSU, handles WisePoint image-password MFA without Tampermonkey, clicks one-time Shibboleth consent, captures a DOM summary, and removes the temporary profile.
+The last stdout line is a result JSON. `completed`/exit 0 means each requested origin reached a loaded page without a recognized login gate; this is navigation evidence, not independent proof of account identity. Per-page `status` is `ready`, `auth_required`, `timeout` or `layout_changed`. `needs_input`/exit 2 means authentication is still required; `failed`/exit 1 means navigation or execution failed. Inspect the reported artifacts before reporting success. Do not treat a screenshot's existence as successful login.
 
-## Secret Handling
+Credentials come from `--env-file`, `SHINSHU_AUTH_ENV`, `~/.config/shinshu-portal-auth/env`, then cwd `.env`; process environment values override the selected file. Required keys are `ACSU_LOGIN_ID`, `ACSU_LOGIN_PASSWORD`, `ACSU_LOGIN_MULTIFACTOR`. The optional `SHINSHU_MICROSOFT_UPN` overrides the derived university address. `CHROME_BIN` selects Chrome. Use `env.example` for key names and keep real values outside git, normally in the user config file with mode 600.
 
-Never commit or print credential values. Read them only from environment variables or a local env file outside git.
+Use `--check-config` to diagnose missing configuration without opening a browser or printing values. `--help` is also offline. Ordinary runs already check configuration, so do not add a separate preflight to every task.
 
-Required keys:
+Read [site-dom.md](references/site-dom.md) only for site-specific inspection. Read [auth-flow.md](references/auth-flow.md) when diagnosing an unfamiliar login screen or repairing the script. A routine operator reports the failure and evidence; repairing the script is a separate task.
 
-- `ACSU_LOGIN_ID`
-- `ACSU_LOGIN_PASSWORD`
-- `ACSU_LOGIN_MULTIFACTOR`
-
-Optional keys:
-
-- `SHINSHU_AUTH_ENV`: path to the local env file. If unset, the script reads `.env` in the current directory when present, plus process environment.
-- `SHINSHU_MICROSOFT_UPN`: Microsoft/SharePoint sign-in UPN. If unset, the script derives `${ACSU_LOGIN_ID}@shinshu-u.ac.jp`.
-- `CHROME_BIN`: override Chrome binary.
-
-Recommended storage:
-
-- Put secrets in `~/.config/shinshu-portal-auth/env` with mode `600`.
-- Use `skills/shinshu-portal-auth/env.example` as the template; never put real values in the skill repo.
-- Use `SHINSHU_AUTH_ENV` or `--env-file` only when you need a different local secret file.
-- Keep secret files out of git. For public repositories, commit only example files with key names and dummy values.
-- Do not copy Chrome `Login Data`, cookies, or profile state into a repo.
-- Keep generated screenshots and JSON summaries in `/tmp` or another ignored path unless the user explicitly asks for sanitized evidence.
-
-## Standard Workflow
-
-1. Confirm the target URL is one of the expected domains or a direct ACSU/Microsoft login continuation for those domains.
-2. Confirm the local secret source exists without printing values:
-   ```bash
-   node -e "const fs=require('fs'), os=require('os'), path=require('path'); const f=process.env.SHINSHU_AUTH_ENV||path.join(os.homedir(),'.config/shinshu-portal-auth/env'); if(fs.existsSync(f)) console.log('env file present:', f)"
-   ```
-3. Run the bundled script:
-   ```bash
-   node skills/shinshu-portal-auth/scripts/shinshu_portal_cdp.mjs \
-     --url 'https://timetable.ealps.shinshu-u.ac.jp/portal/#/' \
-     --out-dir /tmp/shinshu-portal-probe
-   ```
-4. Inspect the generated JSON summary and screenshot. Do not paste secrets or personal identifiers into final answers.
-5. If the task needs site-specific DOM knowledge, read [references/site-dom.md](references/site-dom.md).
-6. If login fails or a new ACSU screen appears, read [references/auth-flow.md](references/auth-flow.md) and update the script conservatively.
-
-## Script Capabilities
-
-`scripts/shinshu_portal_cdp.mjs` supports:
-
-- Multiple `--url` flags in one browser session.
-- ACSU login ID/password form submission.
-- WisePoint MFA using `ACSU_LOGIN_MULTIFACTOR` and the 25-letter image map `ABCDEFGHIJKLMNOPRSTUVWXYZ` (`Q` is absent).
-- Shibboleth attribute-release consent with the one-time option.
-- Microsoft sign-in for `shinshuuniversity.sharepoint.com`, using `SHINSHU_MICROSOFT_UPN` or the derived UPN, then following federation into ACSU.
-- JSON summaries of title, URL, text snippet, headings, links, buttons, inputs, iframes, tables, and app-specific hints.
-- Per-target screenshots.
-
-Run `node scripts/shinshu_portal_cdp.mjs --help` from the skill directory for options.
-
-## Boundaries
-
-- Default to read-only inspection. Do not submit assignments, change registration, alter passwords, publish SharePoint pages, or mutate account settings unless the user explicitly asks and the action is clearly reversible or intentionally final.
-- Do not implement bypasses. This skill automates the user's normal login flow with user-provided credentials and MFA secret.
-- Do not rely on Tampermonkey. Tampermonkey can be used as historical reference only; the maintained path is the bundled script.
-- Do not expose full Microsoft OAuth URLs in reports; they can contain long state parameters. Report the host, page title, and outcome instead.
+Keep credentials, cookies, redirect tokens and personal identifiers out of reports and repositories. Store evidence outside public repositories. Inspection is read-only; assignment submission, registration and account changes require the user's authorization for that action. Do not use Tampermonkey or bypass authentication. Report host, title and outcome instead of full OAuth redirect URLs.

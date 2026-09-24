@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import { pathToFileURL } from 'node:url';
 
 const WISEPOINT_ALPHABET = 'ABCDEFGHIJKLMNOPRSTUVWXYZ';
 const DEFAULT_ENV_FILE = path.join(os.homedir(), '.config', 'shinshu-portal-auth', 'env');
@@ -18,6 +19,7 @@ Options:
   --env-file <file>  Env file containing ACSU_LOGIN_ID, ACSU_LOGIN_PASSWORD, ACSU_LOGIN_MULTIFACTOR.
                      Defaults to SHINSHU_AUTH_ENV, then ~/.config/shinshu-portal-auth/env, then .env.
   --timeout-ms <n>   Per-page auth/navigation loop timeout. Default: 160000.
+  --check-config     Check credential availability without printing values or opening a browser.
   --headed           Do not use xvfb-run even when DISPLAY is absent.
   --help             Show this help.
 `);
@@ -33,8 +35,10 @@ function parseArgs(argv) {
     else if (a === '--env-file') args.envFile = argv[++i];
     else if (a === '--timeout-ms') args.timeoutMs = Number(argv[++i]);
     else if (a === '--headed') args.headed = true;
+    else if (a === '--check-config') args.checkConfig = true;
     else throw new Error(`Unknown argument: ${a}`);
   }
+  if (!Number.isFinite(args.timeoutMs) || args.timeoutMs < 1) throw new Error('--timeout-ms must be positive');
   return args;
 }
 
@@ -319,9 +323,28 @@ async function fillMicrosoftPassword(cdp, secrets) {
   })(${JSON.stringify(secrets.password)})`);
 }
 
-async function settleAuth(cdp, secrets, timeoutMs) {
+// "ready" describes navigation evidence, not proof of the account's identity.
+export function navigationOutcome(summary, targetUrl, expired = false) {
+  let actual, target;
+  try { actual = new URL(summary?.href); target = new URL(targetUrl); }
+  catch { return expired ? 'timeout' : null; }
+  const hay = `${summary.title || ''} ${summary.href} ${summary.text || ''}`;
+  const login = /login\.microsoftonline\.com|gakunin\.ealps\.shinshu-u\.ac\.jp|WisePoint|送信情報の選択|Loading Session Information|Authn\/External/i.test(hay)
+    || (summary.inputs || []).some((input) => input.type === 'password');
+  if (login) return expired ? 'auth_required' : null;
+  if (summary.ready !== 'complete' || !(summary.title || summary.text)) return expired ? 'timeout' : null;
+  if (actual.origin !== target.origin || /access denied|page not found|このサイトにアクセスできません|アクセスが拒否|ERR_/i.test(hay)) {
+    return expired ? 'layout_changed' : null;
+  }
+  return 'ready';
+}
+
+export async function settleAuth(cdp, secrets, timeoutMs, targetUrl, runtime = {}) {
+  const readSnapshot = runtime.snapshot || snapshot;
+  const pause = runtime.sleep || sleep;
+  const now = runtime.now || Date.now;
   const events = [];
-  const started = Date.now();
+  const started = now();
   let last = null;
   let acsuLoginTried = false;
   let wiseTried = false;
@@ -329,10 +352,10 @@ async function settleAuth(cdp, secrets, timeoutMs) {
   let microsoftUserTried = false;
   let microsoftPasswordTried = false;
 
-  while (Date.now() - started < timeoutMs) {
-    await sleep(1000);
+  while (now() - started < timeoutMs) {
+    await pause(1000);
     try {
-      last = await snapshot(cdp);
+      last = await readSnapshot(cdp);
     } catch {
       continue;
     }
@@ -354,7 +377,7 @@ async function settleAuth(cdp, secrets, timeoutMs) {
       const r = await fillMicrosoftUser(cdp, secrets).catch(() => 'error');
       microsoftUserTried = true;
       events.push(`microsoft_user=${r}`);
-      await sleep(5000);
+      await pause(5000);
       continue;
     }
 
@@ -362,7 +385,7 @@ async function settleAuth(cdp, secrets, timeoutMs) {
       const r = await fillMicrosoftPassword(cdp, secrets).catch(() => 'error');
       microsoftPasswordTried = true;
       events.push(`microsoft_password=${r}`);
-      await sleep(6000);
+      await pause(6000);
       continue;
     }
 
@@ -370,7 +393,7 @@ async function settleAuth(cdp, secrets, timeoutMs) {
       const r = await fillAcsuLogin(cdp, secrets).catch(() => 'error');
       acsuLoginTried = true;
       events.push(`acsu_login=${r}`);
-      await sleep(2500);
+      await pause(2500);
       continue;
     }
 
@@ -378,7 +401,7 @@ async function settleAuth(cdp, secrets, timeoutMs) {
       const r = await fillWisePoint(cdp, secrets).catch(() => ({ ok: false, reason: 'error' }));
       wiseTried = true;
       events.push(`wisepoint=${r.ok ? r.action : r.reason}:count=${r.count ?? 0}`);
-      await sleep(5000);
+      await pause(5000);
       continue;
     }
 
@@ -386,16 +409,16 @@ async function settleAuth(cdp, secrets, timeoutMs) {
       const r = await clickConsent(cdp).catch(() => 'error');
       consentTried = true;
       events.push(`consent=${r}`);
-      await sleep(4000);
+      await pause(4000);
       continue;
     }
 
-    if (!/login\.microsoftonline\.com|gakunin\.ealps\.shinshu-u\.ac\.jp|WisePoint|送信情報の選択|Loading Session Information/.test(hay) && last.ready === 'complete') {
-      return { summary: last, events };
+    if (navigationOutcome(last, targetUrl) === 'ready') {
+      return { summary: last, events, status: 'ready' };
     }
   }
 
-  return { summary: last || {}, events };
+  return { summary: last || {}, events, status: navigationOutcome(last, targetUrl, true) };
 }
 
 async function launchChrome(outDir, headed) {
@@ -435,9 +458,12 @@ async function main() {
     usage();
     return;
   }
-  if (!args.urls.length) throw new Error('At least one --url is required');
-
+  if (!args.checkConfig && !args.urls.length) throw new Error('At least one --url is required');
   const secrets = loadSecrets(args.envFile);
+  if (args.checkConfig) {
+    console.log(JSON.stringify({status: 'completed', reason: 'config_available', changed: false, artifacts: []}));
+    return;
+  }
   const outDir = args.outDir || path.join(os.tmpdir(), `shinshu-portal-${Date.now()}`);
   fs.mkdirSync(outDir, { recursive: true });
 
@@ -462,7 +488,7 @@ async function main() {
       const label = safeFilename(`${String(idx + 1).padStart(2, '0')}-${new URL(url).hostname}`);
       await cdp.send('Page.navigate', { url });
       await sleep(2000);
-      const { summary, events } = await settleAuth(cdp, secrets, args.timeoutMs);
+      const { summary, events } = await settleAuth(cdp, secrets, args.timeoutMs, url);
       await sleep(3000);
       const finalSummary = await snapshot(cdp).catch(() => summary);
       const screenshotPath = path.join(outDir, `${label}.png`);
@@ -470,7 +496,9 @@ async function main() {
         const shot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
         if (shot?.data) fs.writeFileSync(screenshotPath, Buffer.from(shot.data, 'base64'));
       } catch {}
+      const navigationStatus = navigationOutcome(finalSummary, url, true);
       const result = {
+        status: navigationStatus,
         requestedUrl: url,
         finalUrl: finalSummary.href,
         finalTitle: finalSummary.title,
@@ -481,17 +509,23 @@ async function main() {
       const jsonPath = path.join(outDir, `${label}.json`);
       fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2));
       results.push({
+        status: navigationStatus,
         requestedUrl: url,
         finalUrl: finalSummary.href,
         finalTitle: finalSummary.title,
         json: jsonPath,
         screenshot: result.screenshot,
       });
-      console.log(`DONE ${new URL(url).hostname} -> ${finalSummary.title || '(no title)'} | ${safeUrl(finalSummary.href || '')}`);
+      console.log(`${navigationStatus === 'ready' ? 'DONE' : 'INCOMPLETE'} ${new URL(url).hostname} -> ${finalSummary.title || '(no title)'} | ${safeUrl(finalSummary.href || '')}`);
     }
 
     fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(results, null, 2));
     console.log(`OUT_DIR ${outDir}`);
+    const incomplete = results.filter((result) => result.status !== 'ready');
+    const status = incomplete.length ? (incomplete.every((result) => result.status === 'auth_required') ? 'needs_input' : 'failed') : 'completed';
+    console.log(JSON.stringify({ status, reason: incomplete[0]?.status || 'target_ready', changed: false,
+      artifacts: [path.join(outDir, 'summary.json')], results: results.map(({status, json}) => ({status, json})) }));
+    process.exitCode = status === 'completed' ? 0 : status === 'needs_input' ? 2 : 1;
     cdp.close();
   } finally {
     try { browser.child.kill('SIGTERM'); } catch {}
@@ -501,7 +535,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`ERROR ${err.message}`);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error(`ERROR ${err.message}`);
+    console.log(JSON.stringify({status: 'failed', reason: 'operation_failed', changed: false, artifacts: []}));
+    process.exitCode = 1;
+  });
+}
