@@ -1,6 +1,6 @@
 ---
 name: luna-impl
-description: Orchestrate non-trivial implementation work that benefits from subagents by converting it into bounded, cohesive, objective, independently verifiable tasks for GPT-5.6 Luna/max workers. Use by default when delegating implementation, investigation, tests, migrations, or verification to the Codex luna-worker role or to Luna agents in Herdr. Keep architectural, product, visual, creative, and ambiguity-resolving judgment with the lead agent.
+description: Orchestrate non-trivial implementation work that benefits from subagents by converting it into bounded, cohesive, objective, independently verifiable tasks for GPT-6 Luna/max workers. Use by default when delegating implementation, investigation, tests, migrations, or verification to the Codex luna-worker role or to Luna agents in Herdr. Keep architectural, product, visual, creative, and ambiguity-resolving judgment with the lead agent.
 ---
 
 # Luna Implementation Orchestrator
@@ -45,11 +45,13 @@ If none applies, merge it into the nearest cohesive task. Avoid dependency graph
 
 For a medium, strongly coupled feature, start from one implementation owner plus an optional independent contract-test owner. Expand only when repository evidence shows multiple independent ownership surfaces. An independent test worker may receive the fixed public contract and fixture, but not the implementation rationale, suspected defects, or another worker's report.
 
-Read [references/task-contract.md](references/task-contract.md) before writing Luna prompts. Use its full contract for write tasks; the compact form is sufficient for narrow read-only investigation.
+For implementation write tasks, read [references/task-contract.md](references/task-contract.md) before writing Luna prompts. Use its compact form for narrow investigation.
+
+For an existing routine operation with no implementation changes, supply only: the requested outcome, exact skill/input paths, the permitted action or command, completion evidence, and the condition for reporting a failure. Name any permitted external mutation explicitly. The worker runs the existing operation and reports its result; script repair is a separate task. Do not make that worker load this orchestration skill as well.
 
 ## Direct Codex subagents
 
-Use the `luna-worker` agent role. That role selects GPT-5.6 Luna with `max` reasoning; do not replace it with a generic worker and assume the same configuration. Use `fork_turns: "none"` or a bounded positive history so the role-specific configuration applies, and make the prompt self-contained when history is not inherited.
+Use the `luna-worker` agent role, configured for `gpt-6-luna` with `max` reasoning. Use `fork_turns: "none"` or a bounded positive history so the role-specific configuration applies, and make the prompt self-contained when history is not inherited.
 
 Every write delegation must name exact ownership and say that other agents share the workspace, that the worker must not revert others' edits, and that it must accommodate concurrent in-scope changes. Prefer disjoint tasks that can complete in one focused turn. The worker must not redesign the surrounding system or delegate again.
 
@@ -71,4 +73,4 @@ For every completed task, the lead must:
 
 Send one focused follow-up when the implementation has a local defect and the contract is still valid. If the result exposes a missing requirement or design decision, do not broaden the Luna prompt; the lead must decide and issue a new contract. Repeated failure on the same bounded task is a signal to take the task back or use a stronger model, not to add vague encouragement.
 
-If `luna-worker` or the requested Herdr model configuration is unavailable, state the actual limitation. Do not silently substitute a different model while claiming Luna/max was used.
+If `luna-worker` or the requested Herdr model configuration is unavailable, state the actual limitation. Do not silently substitute a different model while claiming GPT-6 Luna/max was used.
