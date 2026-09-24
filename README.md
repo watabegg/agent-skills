@@ -27,6 +27,7 @@
     ├── ealps-moodle-operator/
     ├── sync-teams-attendance/
     ├── prepare-invoice-email/
+    ├── prepare-pr/
     ├── herdr-dev-loop/
     └── shinshu-portal-auth/
         └── env.example
