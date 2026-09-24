@@ -27,6 +27,7 @@
     ├── ealps-moodle-operator/
     ├── sync-teams-attendance/
     ├── prepare-invoice-email/
+    ├── prepare-pr/
     ├── codex-review-multi-v2/
     ├── herdr-dev-loop/
     └── shinshu-portal-auth/
