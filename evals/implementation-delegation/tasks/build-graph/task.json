@@ -1,0 +1,33 @@
+{
+  "id": "build-graph",
+  "version": "1.0.0",
+  "title": "Incremental build graph",
+  "difficulty": "medium",
+  "use_cases": [
+    "Plan incremental rebuilds for dependency graphs.",
+    "Explain why a build target is affected by changed inputs."
+  ],
+  "runtime": "Python 3.11+; standard library only",
+  "module": "buildgraph",
+  "entrypoint": "BuildGraph",
+  "origin": {
+    "kind": "historical_synthetic",
+    "historical_task_id": "M2",
+    "adaptations": [
+      "Repackaged under the clean id build-graph with the requested portable directory layout.",
+      "Preserved the English specification, starter, public smoke test, and evaluator assertions verbatim; only their package paths and the evaluator filename changed."
+    ]
+  },
+  "public_reproducibility": "runnable",
+  "commands": {
+    "public": "PYTHONPATH=/absolute/path/to/submission python3 -m unittest discover -s evals/implementation-delegation/tasks/build-graph/tests/public",
+    "evaluator": "PYTHONPATH=/absolute/path/to/submission python3 -m unittest discover -s evals/implementation-delegation/tasks/build-graph/tests/evaluator"
+  },
+  "artifacts": {
+    "SPEC.md": "31129811e849473756e9b2e0126428263117a6504485fb343313f16da5aa45fc",
+    "starter/buildgraph.py": "d9aa5eb549ac66e6c0f7da17a10aa2754687a2d9fbe73768bf59bb73990c61c2",
+    "tests/evaluator/test_contract.py": "6f873610cd80c3682ea6318a3bd1af1c991924a99b95af20fb02b884b486a572",
+    "tests/public/test_smoke.py": "38de0dab2f56776cd7c996b8f52de507fa87d346398b8b7968b780df11e20ae1",
+    "README.md": "d1e319fa36e1a127df7bfb6ce3017f7374175b9c4fe91cce27579cf5895acea0"
+  }
+}

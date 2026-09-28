@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "workflow-dag",
+  "title": "Initial workflow DAG delegation exercise",
+  "period": "2026-08",
+  "task_catalog": [
+    {
+      "id": "workflow-dag",
+      "title": "Workflow DAG",
+      "package": null,
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    }
+  ],
+  "protocol": {
+    "execution": "single worker versus two-task parallel delegation",
+    "grading": "13 shared checks",
+    "blinding": "not filesystem isolated"
+  },
+  "limitations": [
+    "One trial per condition; evaluator filesystem-accessible, not fully blind.",
+    "Code line counts are not quality scores.",
+    "Separate forward implementation had 14 passing tests; excluded from the 13-case comparison.",
+    "Original temporary files missing; historical timing and cost not established."
+  ],
+  "results": "results.jsonl"
+}

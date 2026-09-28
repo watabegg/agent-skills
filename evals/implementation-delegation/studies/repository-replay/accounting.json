@@ -1,0 +1,28 @@
+{
+  "type": "historical_standard_api_equivalent_estimate",
+  "currency": "USD",
+  "rate_period": "2026-09",
+  "actual_billed_usd": null,
+  "all_nine_workers_usd": 1.5874182000000001,
+  "parent_by_role_usd": {
+    "fixture_setup_and_evaluator_repair": 8.014152,
+    "dispatchers": 14.564686000000002,
+    "qualitative_reviews_including_superseded_review": 6.5672120000000005,
+    "orchestration_including_monitoring": 69.29074
+  },
+  "parent_usd": 98.43679,
+  "known_subtotal_usd": 100.0242082,
+  "excluded": [
+    "outer lead",
+    "additional audit",
+    "final processing tail"
+  ],
+  "limitations": [
+    "Not a complete bill or service-tier attestation.",
+    "Orchestration/monitoring category is not a separately measured polling-only cost.",
+    "Includes exploratory trials, setup repair and superseded review.",
+    "Parent amounts are retained from the historical accounting report; raw per-call usage and its rate calculation are not reproduced in this public archive."
+  ],
+  "parent_rate_table": null,
+  "parent_usage": null
+}

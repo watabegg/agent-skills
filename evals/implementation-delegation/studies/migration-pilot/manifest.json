@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "migration-pilot",
+  "title": "Small migration pilot: one module, three functions",
+  "period": "2026-09",
+  "task_catalog": [
+    {
+      "id": "three-function-module",
+      "title": "Interval normalization, stable topological sort, atomic dictionary updates",
+      "package": null,
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    }
+  ],
+  "protocol": {
+    "execution": "CLI code generation; tools forbidden",
+    "arms": [
+      "old_max",
+      "new_max",
+      "new_high",
+      "new_prompt"
+    ],
+    "prompt_change": "new_prompt adds stopping guidance; observed time does not establish improvement"
+  },
+  "limitations": [
+    "283 correlated checks do not represent 283 independent tasks.",
+    "Tools forbidden: not the full luna-impl workflow.",
+    "Two trials per condition; all pass, so this suite is saturated.",
+    "Requested model/effort only; no backend identity attestation.",
+    "Context configuration differed across model generations."
+  ],
+  "results": "results.jsonl"
+}

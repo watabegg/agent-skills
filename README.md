@@ -3,6 +3,8 @@
 個人用の Codex Skill をまとめるリポジトリです。
 このリポジトリ内の `skills/<skill-name>/SKILL.md` を起点に、各 Skill の手順、スクリプト、テンプレートを利用します。
 
+[実装委譲の公開評価アーカイブ](evals/implementation-delegation/README.md)
+
 ## 取り込み方針
 
 この repo は public 前提です。既存のインストール済み skill のうち、次の条件に合うものだけを入れています。

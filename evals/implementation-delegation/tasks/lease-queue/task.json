@@ -1,0 +1,59 @@
+{
+  "id": "lease-queue",
+  "version": "1.0.0",
+  "title": "Dependency-aware lease queue",
+  "difficulty": "hard",
+  "use_cases": [
+    "Coordinate dependency-ordered jobs with expiring worker leases and retries.",
+    "Persist and validate deterministic queue state across restoration."
+  ],
+  "runtime": "Python 3.11+; standard library only",
+  "module": "leasequeue",
+  "entrypoint": "LeaseQueue, normalize_specs, topological_layers",
+  "origin": {
+    "kind": "historical_synthetic",
+    "historical_task_id": "lease-queue",
+    "adaptations": [
+      "Recovered the original stub starter, five visible tests, and 43-case evaluator from retained session tool payloads; reorganized their file paths into this portable task layout.",
+      "Authored SPEC.md from the explicit fixed-contract material and recovered evaluator assertions; it expressly requires heartbeat to return the renewed Lease.",
+      "The revised trial prompt omitted heartbeat\u2019s successful return value, so this package does not claim prompt identity with the 42/43 revised-prompt result.",
+      "The original worktrees are absent and no solution is included. A production-worker candidate was privately reconstructed from retained patch payloads and scored 42/43; a copy with only heartbeat's successful return changed from None to the renewed Lease scored 43/43. Neither copy is claimed to be a byte-identical final historical worktree or is included in this package.",
+      "Historical results and recovery commentary are kept in README.md rather than the solver-facing SPEC.md."
+    ]
+  },
+  "public_reproducibility": "runnable",
+  "commands": {
+    "public": "PYTHONPATH=/absolute/path/to/submission python3 -m unittest discover -s evals/implementation-delegation/tasks/lease-queue/tests/public",
+    "evaluator": "PYTHONPATH=/absolute/path/to/submission python3 evals/implementation-delegation/tasks/lease-queue/tests/evaluator/evaluate.py"
+  },
+  "artifacts": {
+    "README.md": "b7c9e7d9691008fda203a57fc331f8fa2f418eb6048ad012c5a3b022b88a479a",
+    "SPEC.md": "c2eb09725e3067644a526a482a8f7a59904caa33eec46f4a5fb79d55ce4552d7",
+    "starter/README.md": "3a8f5dffe5ffd021c63a68b7f247d137c3dcbcd4e5291be88c5f0d1c0e4ffbd4",
+    "starter/leasequeue/__init__.py": "93456b32ed120a194983de07a59526f02342a346dbcc355ae91ce14030b2d43b",
+    "starter/leasequeue/codec.py": "94b2196db080a2d363f43c919d9b2c26e3d739e82f65df8cd5cbb4c85b215abe",
+    "starter/leasequeue/errors.py": "9921e6739b6cfd4a174df64bac5c6777ca65a73e811c949fc7c186cb7007cda5",
+    "starter/leasequeue/graph.py": "27d7a114a72617d5c6c781b97b45b2d895bfd137be07086dd4baa45975d0a4c8",
+    "starter/leasequeue/model.py": "1f914b059eba575968c26b556a1fa962098b448e5e806eb9b3415f13c733f650",
+    "starter/leasequeue/queue.py": "b0c7bf4e765d7fc9391c3a0d1fec53fb77a032b6282db95cc5fd0ea664a1f82f",
+    "tests/evaluator/evaluate.py": "f03f22c81111de33d238e49ca9ec57f4a6b558447a572a88b3307a8e247f47c9",
+    "tests/public/test_visible.py": "835417ea85293639eb251b8e726a31ff83200c82128d855f4a5988bb69f4ad7f"
+  },
+  "calibration": {
+    "kind": "offline_packaging_check_not_model_trial",
+    "historical_candidate": {
+      "public_passed": 5,
+      "public_total": 5,
+      "evaluator_passed": 42,
+      "evaluator_total": 43
+    },
+    "heartbeat_return_corrected_copy": {
+      "public_passed": 5,
+      "public_total": 5,
+      "evaluator_passed": 43,
+      "evaluator_total": 43
+    },
+    "starter": "Expected NotImplementedError failures",
+    "reference_published": false
+  }
+}

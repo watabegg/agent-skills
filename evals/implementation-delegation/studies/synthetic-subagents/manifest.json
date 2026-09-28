@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "id": "synthetic-subagents",
+  "title": "Four synthetic tasks with Luna subagents",
+  "period": "2026-09",
+  "task_catalog": [
+    {
+      "id": "revisioned-ledger",
+      "title": "Revisioned atomic ledger",
+      "package": null,
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    },
+    {
+      "id": "build-graph",
+      "title": "Incremental build graph",
+      "package": "../../tasks/build-graph",
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    },
+    {
+      "id": "mvcc",
+      "title": "Serializable MVCC and savepoints",
+      "package": "../../tasks/mvcc",
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    },
+    {
+      "id": "exact-scheduler",
+      "title": "Exact calendar scheduler",
+      "package": null,
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    }
+  ],
+  "protocol": {
+    "parent_model": "gpt-6-astra",
+    "parent_effort": "low",
+    "grader_model": "gpt-6-astra",
+    "grader_effort": "low",
+    "blinding": "fresh graders, anonymous submissions; not a claim of OS isolation",
+    "score_weights": {
+      "correctness": 80,
+      "maintainability": 10,
+      "submitted_test_quality": 10
+    },
+    "prompt_variant": "fixed per-task public contract; Luna workers through delegation skill"
+  },
+  "limitations": [
+    "One trial per task/condition; difficulty labels are author estimates.",
+    "Subjective maintainability and submitted-test scores are not objective correctness.",
+    "One timing-sensitive frozen failure; supplemental reruns never replace the original score.",
+    "Small score differences do not establish a general model ranking.",
+    "Published graders are no longer globally secret."
+  ],
+  "results": "results.jsonl"
+}

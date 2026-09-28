@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "lease-queue",
+  "title": "Lease queue contract and orchestration study",
+  "period": "2026-08",
+  "task_catalog": [
+    {
+      "id": "lease-queue",
+      "title": "Lease-based dependency queue",
+      "package": "../../tasks/lease-queue",
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    }
+  ],
+  "protocol": {
+    "grading": "43 fixed-contract cases; own tests reported separately",
+    "model_generation": "GPT-5.6",
+    "skill_versions": [
+      "initial orchestration",
+      "revised cohesive ownership"
+    ],
+    "prompt_variants": {
+      "vague": "Behavior goal without the full detailed API contract.",
+      "explicit": "Full detailed contract including successful return values.",
+      "initial-skill": "Sol/high parent with five Luna/max workers.",
+      "sol-vague": "Sol/high alone, same vague goal.",
+      "revised-skill": "Fresh Sol/high parent; one cohesive implementation owner plus independent tests; heartbeat success return omitted."
+    }
+  },
+  "limitations": [
+    "One trial per condition; neither randomization nor double blinding.",
+    "Vague arms omitted details required by the detailed-contract grader; not a pure capability comparison.",
+    "Revised prompt omitted heartbeat success return; the 42/43 result is not an identical-prompt regression.",
+    "Grader authored after implementations by a condition-aware author; no OS isolation.",
+    "Reported historical cost estimates retained; detailed usage breakdown is unavailable in these curated records."
+  ],
+  "results": "results.jsonl"
+}

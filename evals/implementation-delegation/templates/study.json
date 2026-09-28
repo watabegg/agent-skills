@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "REPLACE_ME",
+  "title": "REPLACE_ME",
+  "period": "YYYY-MM",
+  "task_catalog": [
+    {
+      "id": "REPLACE_ME",
+      "version": "1.0.0",
+      "package": "../../tasks/REPLACE_ME"
+    }
+  ],
+  "protocol": {
+    "repetitions": null,
+    "budget": null,
+    "intervention_policy": null,
+    "blinding_level": null
+  },
+  "limitations": [],
+  "results": "results.jsonl"
+}

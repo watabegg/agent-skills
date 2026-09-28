@@ -1,0 +1,33 @@
+{
+  "id": "mvcc",
+  "version": "1.0.0",
+  "title": "Serializable MVCC store",
+  "difficulty": "hard",
+  "use_cases": [
+    "Model historical snapshot reads and ordered range scans in an in-memory store.",
+    "Validate serializable optimistic transactions with phantom detection and savepoints."
+  ],
+  "runtime": "Python 3.11+; standard library only",
+  "module": "mvcc",
+  "entrypoint": "Store",
+  "origin": {
+    "kind": "historical_synthetic",
+    "historical_task_id": "H1",
+    "adaptations": [
+      "Repackaged under the clean id mvcc with the requested portable directory layout.",
+      "Preserved the English specification, starter, public smoke test, and evaluator assertions verbatim; only their package paths and the evaluator filename changed."
+    ]
+  },
+  "public_reproducibility": "runnable",
+  "commands": {
+    "public": "PYTHONPATH=/absolute/path/to/submission python3 -m unittest discover -s evals/implementation-delegation/tasks/mvcc/tests/public",
+    "evaluator": "PYTHONPATH=/absolute/path/to/submission python3 -m unittest discover -s evals/implementation-delegation/tasks/mvcc/tests/evaluator"
+  },
+  "artifacts": {
+    "SPEC.md": "4f8be9dae6a7572722efd47229d1d6c75d5379a683120431b93250405d269203",
+    "starter/mvcc.py": "88d0c79bac87314f79a38fad8ad131d8b27a8bdf3e99d782c4c146301a3a9d22",
+    "tests/evaluator/test_contract.py": "f4e91cc303e5890604e1da45e7b539771c41de7ff5d4d7a9ac24d83b0e08a648",
+    "tests/public/test_smoke.py": "e4cd2264694fdbd229266c0140ed2cbff103af54074f3435e1ad3d6e70948da3",
+    "README.md": "adaef438dc227d2f7c5e6d7c31b5869a3c9d1f90e0066eeda8afc614a3bf4b40"
+  }
+}

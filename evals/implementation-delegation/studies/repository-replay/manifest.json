@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "id": "repository-replay",
+  "title": "Anonymous historical repository repair replay",
+  "period": "2026-09",
+  "task_catalog": [
+    {
+      "id": "case-a",
+      "title": "Multi-step save and retry",
+      "package": null,
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    },
+    {
+      "id": "case-b",
+      "title": "Stale revision rejection across callers",
+      "package": null,
+      "version": "historical",
+      "packaged_version_equivalence": "See package origin/adaptations; historical source hashes are not public attestation."
+    }
+  ],
+  "protocol": {
+    "parent_model": "gpt-6-astra",
+    "parent_effort": "low",
+    "grader_model": "gpt-6-astra",
+    "grader_effort": "low",
+    "worker_model": "gpt-6-luna",
+    "efforts": [
+      "high",
+      "max",
+      "xhigh"
+    ],
+    "timeout_seconds": 2400,
+    "primary": "original valid case A plus clean replay case B",
+    "blinding": "anonymous candidate reviews; source retained privately"
+  },
+  "limitations": [
+    "Summary only: original repository, source, task contracts, patches and graders are not published.",
+    "One trial per task/effort; test counts are not independent task counts.",
+    "Case A grader adapter repaired after submission, uniformly for baseline/reference/all candidates; behavioral assertions unchanged.",
+    "Initial case B had missing frontend dependencies in all three candidate directories; graders had dependencies. Initial timings excluded from primary comparisons; all arms rerun after preflight and warmup.",
+    "Missing dependencies confound timing; not proven to cause the initial timeout.",
+    "UI coverage partial, including static audit; no full live-service E2E.",
+    "Exact execution timestamps and source identifiers omitted."
+  ],
+  "results": "results.jsonl",
+  "timing_summary": {
+    "elapsed_to_summary_seconds": 14862.264225,
+    "scope": "Historical experiment wall time through summary, including setup and exploratory reruns; not the sum of solver durations and not the final publication tail."
+  }
+}
