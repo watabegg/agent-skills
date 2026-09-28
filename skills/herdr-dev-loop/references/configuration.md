@@ -46,15 +46,15 @@ The review table accepts the following independent policy fields:
 ```toml
 [defaults.review]
 cadence = "batch"
-pre_final_protocol = "external-review"
-manual_final_protocol = "external-review"
+pre_final_protocol = "native"
+manual_final_protocol = "native"
 manual_final_execution = "independent"
 max_fix_rounds = 2
 scope_expansion_action = "follow_up"
 final_required = "complete_zero_verified_actionable_findings"
 ```
 
-`cadence = "batch"` defers ordinary review-gate opening until the current task batch is closed; it does not start a fixed-target Reviewer by itself. `merge-count` remains supported for explicitly configured or migrated legacy loops. `max_fix_rounds` is bounded from 0 through 2. Scope expansion may be routed to a follow-up, disable a feature, mark it experimental, or require a user decision; it cannot silently create a new in-scope fix task. `final_required` requires complete lanes, required independent verification, complete PLAN/MANIFEST evidence, and zero verified actionable findings for manual final certification. `manual_final_protocol` is intentionally narrower than the ordinary review protocol and currently accepts only the implemented `external-review`; `native` is invalid for manual-final configuration and is never silently substituted. `manual_final_execution = "independent"` requires a separate final execution; `reuse_epoch_reviewer` is accepted only when the certification path can prove that the fixed-target epoch execution satisfies that policy.
+`cadence = "batch"` defers ordinary review-gate opening until the current task batch is closed; it does not start a fixed-target Reviewer by itself. `merge-count` remains supported for explicitly configured or migrated legacy loops. `max_fix_rounds` is bounded from 0 through 2. Scope expansion may be routed to a follow-up, disable a feature, mark it experimental, or require a user decision; it cannot silently create a new in-scope fix task. `final_required` requires complete lanes, required independent verification, complete PLAN/MANIFEST evidence, and zero verified actionable findings for manual final certification. New loops default ordinary review, pre-final, and manual-final to `native`. `external-review` is an explicit compatibility choice and requires an exact source, version, payload digest, and `externally-planned-v1` capability pin; missing or changed pins fail closed. A saved external-review plan does not fall back to native. `manual_final_execution = "independent"` requires a separate final execution; `reuse_epoch_reviewer` is accepted only when the certification path can prove that the fixed-target epoch execution satisfies that policy.
 
 ## Review modes
 

@@ -27,6 +27,7 @@ from . import config as hloop_config
 from . import release_scope as hloop_release_scope
 from .review import (
     CRITICAL_SEVERITIES,
+    EXTERNAL_REVIEW_PROTOCOL,
     ExternalReviewProtocolAdapter,
     ManifestCompleteness,
     ReviewManifest,
@@ -37,7 +38,11 @@ from .review import (
 )
 
 
-MANUAL_FINAL_PROTOCOL = "external-review"
+MANUAL_FINAL_PROTOCOL = EXTERNAL_REVIEW_PROTOCOL
+DEFAULT_MANUAL_FINAL_PROTOCOL = "native"
+SUPPORTED_MANUAL_FINAL_PROTOCOLS = frozenset(
+    hloop_config.SUPPORTED_MANUAL_FINAL_PROTOCOLS
+)
 CERTIFICATION_STATUSES = frozenset({"passed", "incomplete", "failed"})
 PATCH_VERDICTS = frozenset({"passed", "failed", "incomplete"})
 REOPENABLE_PHASES = frozenset(
@@ -138,6 +143,29 @@ def _digest(value: Any, field_name: str) -> str:
             f"{field_name} must be a lowercase SHA-256 digest"
         )
     return text
+
+
+def _validate_execution_protocol(
+    protocol: str,
+    execution: "ManualFinalExecutionProvenance",
+    *,
+    field_name: str,
+) -> None:
+    adapter = execution.protocol_adapter
+    if protocol == "native":
+        if adapter is not None:
+            raise CertificationModelError(
+                f"{field_name} must omit protocol_adapter for native execution"
+            )
+    elif protocol == EXTERNAL_REVIEW_PROTOCOL:
+        if adapter is None or adapter.protocol != protocol:
+            raise CertificationModelError(
+                f"{field_name} requires matching external review adapter evidence"
+            )
+    else:
+        raise CertificationModelError(
+            f"unsupported manual final protocol: {protocol}"
+        )
 
 
 def canonical_json(value: Any) -> str:
@@ -461,7 +489,7 @@ class ManualFinalExecutionProvenance:
     source_artifact_ref: str
     source_artifact_digest: str
     target_sha: str
-    protocol_adapter: ExternalReviewProtocolAdapter
+    protocol_adapter: ExternalReviewProtocolAdapter | None = None
 
     def __post_init__(self) -> None:
         if self.execution_policy not in MANUAL_FINAL_EXECUTION_POLICIES:
@@ -493,7 +521,7 @@ class ManualFinalExecutionProvenance:
             _digest(self.source_artifact_digest, "source_artifact_digest"),
         )
         adapter = self.protocol_adapter
-        if not isinstance(adapter, ExternalReviewProtocolAdapter):
+        if adapter is not None and not isinstance(adapter, ExternalReviewProtocolAdapter):
             try:
                 adapter = ExternalReviewProtocolAdapter.from_record(adapter)
             except (TypeError, ValueError, ReviewModelError) as exc:
@@ -501,9 +529,9 @@ class ManualFinalExecutionProvenance:
                     f"protocol_adapter is invalid: {exc}"
                 ) from exc
             object.__setattr__(self, "protocol_adapter", adapter)
-        if adapter.protocol != MANUAL_FINAL_PROTOCOL:
+        if adapter is not None and adapter.protocol != EXTERNAL_REVIEW_PROTOCOL:
             raise CertificationModelError(
-                "manual-final protocol_adapter does not match the protocol"
+                "manual-final protocol_adapter must identify external-review"
             )
         if self.execution_policy == "independent":
             if self.source_kind != "pre-final-review":
@@ -525,7 +553,7 @@ class ManualFinalExecutionProvenance:
                 )
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "execution_policy": self.execution_policy,
             "execution_id": self.execution_id,
             "source_kind": self.source_kind,
@@ -533,8 +561,10 @@ class ManualFinalExecutionProvenance:
             "source_artifact_ref": self.source_artifact_ref,
             "source_artifact_digest": self.source_artifact_digest,
             "target_sha": self.target_sha,
-            "protocol_adapter": self.protocol_adapter.to_record(),
         }
+        if self.protocol_adapter is not None:
+            record["protocol_adapter"] = self.protocol_adapter.to_record()
+        return record
 
     @classmethod
     def from_record(cls, value: Any) -> "ManualFinalExecutionProvenance":
@@ -549,20 +579,21 @@ class ManualFinalExecutionProvenance:
             "source_artifact_ref",
             "source_artifact_digest",
             "target_sha",
-            "protocol_adapter",
         }
-        if set(record) != expected:
+        if set(record) not in (expected, expected | {"protocol_adapter"}):
             raise CertificationModelError(
                 "manual-final execution provenance fields are not canonical"
             )
-        try:
-            adapter = ExternalReviewProtocolAdapter.from_record(
-                record["protocol_adapter"]
-            )
-        except (TypeError, ValueError, ReviewModelError) as exc:
-            raise CertificationModelError(
-                f"protocol_adapter is invalid: {exc}"
-            ) from exc
+        adapter = None
+        if "protocol_adapter" in record:
+            try:
+                adapter = ExternalReviewProtocolAdapter.from_record(
+                    record["protocol_adapter"]
+                )
+            except (TypeError, ValueError, ReviewModelError) as exc:
+                raise CertificationModelError(
+                    f"protocol_adapter is invalid: {exc}"
+                ) from exc
         return cls(
             execution_policy=record["execution_policy"],
             execution_id=record["execution_id"],
@@ -741,9 +772,9 @@ class CertificationPlan:
             object.__setattr__(
                 self, field_name, _required_text(getattr(self, field_name), field_name)
             )
-        if self.protocol != MANUAL_FINAL_PROTOCOL:
+        if self.protocol not in SUPPORTED_MANUAL_FINAL_PROTOCOLS:
             raise CertificationModelError(
-                f"manual final protocol must be {MANUAL_FINAL_PROTOCOL}"
+                "manual final protocol is unsupported: " + self.protocol
             )
         if bool(self.execution_kind) != bool(self.protocol_key):
             raise CertificationModelError(
@@ -806,6 +837,11 @@ class CertificationPlan:
                 raise CertificationModelError(
                     "manual-final execution target_sha must match certification target_sha"
                 )
+            _validate_execution_protocol(
+                self.protocol,
+                execution,
+                field_name="manual-final plan execution",
+            )
             object.__setattr__(self, "execution", execution)
         processes = tuple(
             FinalReviewProcessPlan.from_record(item) for item in self.process_plan
@@ -1038,9 +1074,9 @@ class FinalReviewManifest:
             object.__setattr__(
                 self, field_name, _required_text(getattr(self, field_name), field_name)
             )
-        if self.protocol != MANUAL_FINAL_PROTOCOL:
+        if self.protocol not in SUPPORTED_MANUAL_FINAL_PROTOCOLS:
             raise CertificationModelError(
-                f"manual final protocol must be {MANUAL_FINAL_PROTOCOL}"
+                "manual final protocol is unsupported: " + self.protocol
             )
         if bool(self.execution_kind) != bool(self.protocol_key):
             raise CertificationModelError(
@@ -1110,6 +1146,11 @@ class FinalReviewManifest:
                 raise CertificationModelError(
                     "manual-final execution target_sha must match manifest target_sha"
                 )
+            _validate_execution_protocol(
+                self.protocol,
+                execution,
+                field_name="manual-final manifest execution",
+            )
             object.__setattr__(self, "execution", execution)
         process_identities = tuple(
             sorted(
@@ -2047,6 +2088,7 @@ validate_reopen = validate_reopen_transition
 
 __all__ = [
     "MANUAL_FINAL_PROTOCOL",
+    "DEFAULT_MANUAL_FINAL_PROTOCOL",
     "CERTIFICATION_STATUSES",
     "PATCH_VERDICTS",
     "REOPENABLE_PHASES",

@@ -55,7 +55,7 @@
     "source_digest": {"$ref": "#/$defs/digest"},
     "execution_kind": {"const": "manual-final"},
     "protocol_key": {"const": "review.manual_final_protocol"},
-    "protocol": {"const": "external-review"},
+    "protocol": {"enum": ["native", "external-review"]},
     "execution": {"$ref": "final-review-plan.schema.json#/$defs/execution"},
     "process_identities": {
       "type": "array",
@@ -70,6 +70,14 @@
     "patch_verdict": {"enum": ["passed", "failed", "incomplete"]}
   },
   "allOf": [
+    {
+      "if": {"properties": {"protocol": {"const": "external-review"}}, "required": ["protocol"]},
+      "then": {"properties": {"execution": {"required": ["protocol_adapter"]}}}
+    },
+    {
+      "if": {"properties": {"protocol": {"const": "native"}}, "required": ["protocol"]},
+      "then": {"properties": {"execution": {"not": {"required": ["protocol_adapter"]}}}}
+    },
     {
       "if": {"properties": {"mode": {"enum": ["single", "swarm"]}}},
       "then": {"properties": {"providers": {"minItems": 1, "maxItems": 1}}}

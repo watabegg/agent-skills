@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - minimal installations fail explicitly
 SCRIPT = Path(__file__).parents[1] / "scripts" / "hloop"
 SKILL_ROOT = SCRIPT.parents[1]
 sys.path.insert(0, str(SCRIPT.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 loader = importlib.machinery.SourceFileLoader(
     "hloop_review_remediation_cli_v053", str(SCRIPT)
 )
@@ -49,6 +50,7 @@ from hloop_lib.review_epoch import (  # noqa: E402
     canonical_digest,
 )
 from hloop_lib.config import project_agent_identity  # noqa: E402
+from adapter_fixture import make_external_fixture, write_release_record  # noqa: E402
 
 fixtures = __import__(
     "skills.herdr-dev-loop.tests.test_remediation_v053",
@@ -265,30 +267,23 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
             plan, required_executions=(reviewer, plan.required_executions[1])
         )
 
+    def external_distribution_fixture(
+        self, parent: Path
+    ) -> tuple[Path, Path, Path, dict]:
+        distribution_root, record = make_external_fixture(parent)
+        companion_root = parent / "external-review"
+        distribution_root.rename(companion_root)
+        skill_root = parent / "herdr-dev-loop"
+        skill_root.mkdir()
+        release_path = write_release_record(
+            skill_root / "release-dependencies.json", record
+        )
+        return skill_root, release_path, companion_root, record
+
     def ready_release_dependency(self) -> dict:
-        record = json.loads(
-            (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
-        )
-        record["release"]["release_ready"] = True
-        dependency = record["dependencies"][0]
-        dependency.update(
-            {
-                "availability": "available",
-                "blocking_reason": "",
-                "minimum_compatible_version": "2.1.0",
-                "distribution_identity": {
-                    "source": "https://example.invalid/external-review.git",
-                    "immutable_id": "a" * 40,
-                    "version": "2.1.0",
-                    "digest_algorithm": "sha256-tree-v1",
-                    "content_digest": "sha256:" + "b" * 64,
-                },
-            }
-        )
-        dependency["capability_manifest"]["relative_path"] = (
-            "capabilities/externally-planned-v1.json"
-        )
-        return record
+        with tempfile.TemporaryDirectory() as directory:
+            _, record = make_external_fixture(Path(directory))
+            return record
 
     def namespace_args(self, repo: Path, **kwargs) -> argparse.Namespace:
         return argparse.Namespace(repo=str(repo), **kwargs)
@@ -583,9 +578,8 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
 
     def test_external_epoch_is_blocked_by_canonical_unavailable_release_dependency(self):
         with tempfile.TemporaryDirectory() as directory:
-            skill_root = Path(directory)
-            release = json.loads(
-                (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
+            skill_root, release_path, _, release = self.external_distribution_fixture(
+                Path(directory)
             )
             release["release"]["release_ready"] = False
             dependency = release["dependencies"][0]
@@ -598,82 +592,81 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                 }
             )
             dependency["capability_manifest"]["relative_path"] = None
-            (skill_root / "release-dependencies.json").write_text(
-                json.dumps(release),
-                encoding="utf-8",
-            )
+            write_release_record(release_path, release)
             with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
                 with self.assertRaisesRegex(
-                    hloop.HLoopError, "release dependency state.*release_ready"
+                    hloop.HLoopError, "release dependency state"
                 ):
                     hloop.validate_epoch_protocol_capabilities(
                         self.external_epoch_plan("a" * 40), []
                     )
 
     def test_external_epoch_binds_capability_to_exact_release_pin(self):
-        adapter = hloop.hloop_release_dependency.load_release_dependencies(
-            SKILL_ROOT / "release-dependencies.json"
-        )
-        capability = (
-            SKILL_ROOT.parent
-            / "external-review"
-            / "capabilities"
-            / "externally-planned-v1.json"
-        )
-        observed = hloop.validate_epoch_protocol_capabilities(
-            self.external_epoch_plan("a" * 40), [str(capability)]
-        )
-        self.assertEqual(observed["external-review"], adapter.to_record())
+        with tempfile.TemporaryDirectory() as directory:
+            skill_root, release_path, companion_root, _ = (
+                self.external_distribution_fixture(Path(directory))
+            )
+            adapter = hloop.hloop_release_dependency.load_release_dependencies(
+                release_path
+            )
+            capability = companion_root / "capabilities" / "externally-planned-v1.json"
+            with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
+                observed = hloop.validate_epoch_protocol_capabilities(
+                    self.external_epoch_plan("a" * 40), [str(capability)]
+                )
+            self.assertEqual(observed["external-review"], adapter.to_record())
 
     def test_external_epoch_rejects_all_release_pin_identity_drift(self):
-        expected = hloop.hloop_release_dependency.load_release_dependencies(
-            SKILL_ROOT / "release-dependencies.json"
-        ).to_record()
-        capability = (
-            SKILL_ROOT.parent
-            / "external-review"
-            / "capabilities"
-            / "externally-planned-v1.json"
-        )
-        mutations = {
-            "source": lambda record: record.update(
-                {"source": "https://mirror.invalid/review.git@" + "a" * 40}
-            ),
-            "immutable-id": lambda record: record.update(
-                {
-                    "source": "https://example.invalid/external-review.git@"
-                    + "c" * 40
-                }
-            ),
-            "version": lambda record: record.update({"version": "2.2.0"}),
-            "digest": lambda record: record.update(
-                {"content_digest": "sha256:" + "c" * 64}
-            ),
-            "capabilities": lambda record: record.update(
-                {
-                    "capabilities": [
-                        "externally-planned-v1",
-                        "synthetic-extra-capability",
-                    ]
-                }
-            ),
-        }
-        for label, mutate in mutations.items():
-            with self.subTest(label=label):
-                observed = dict(expected)
-                observed["capabilities"] = list(expected["capabilities"])
-                mutate(observed)
-                with mock.patch.object(
-                    hloop,
-                    "load_json_object",
-                    return_value=observed,
-                ):
-                    with self.assertRaisesRegex(
-                        hloop.HLoopError, "capability pin mismatch"
-                    ):
-                        hloop.validate_epoch_protocol_capabilities(
-                            self.external_epoch_plan("a" * 40), [str(capability)]
-                        )
+        with tempfile.TemporaryDirectory() as directory:
+            skill_root, release_path, companion_root, _ = (
+                self.external_distribution_fixture(Path(directory))
+            )
+            expected = hloop.hloop_release_dependency.load_release_dependencies(
+                release_path
+            ).to_record()
+            capability = companion_root / "capabilities" / "externally-planned-v1.json"
+            mutations = {
+                "source": lambda record: record.update(
+                    {"source": "https://mirror.invalid/review.git"}
+                ),
+                "source digest": lambda record: record.update(
+                    {
+                        "source": "https://example.invalid/external-review.git"
+                        "#sha256-tree-v1="
+                        + "c" * 64
+                    }
+                ),
+                "version": lambda record: record.update({"version": "2.2.0"}),
+                "digest": lambda record: record.update(
+                    {"content_digest": "sha256:" + "c" * 64}
+                ),
+                "capabilities": lambda record: record.update(
+                    {
+                        "capabilities": [
+                            "externally-planned-v1",
+                            "synthetic-extra-capability",
+                        ]
+                    }
+                ),
+            }
+            with mock.patch.object(hloop, "SKILL_ROOT", skill_root):
+                for label, mutate in mutations.items():
+                    with self.subTest(label=label):
+                        observed = dict(expected)
+                        observed["capabilities"] = list(expected["capabilities"])
+                        mutate(observed)
+                        with mock.patch.object(
+                            hloop,
+                            "load_json_object",
+                            return_value=observed,
+                        ):
+                            with self.assertRaisesRegex(
+                                hloop.HLoopError, "capability pin mismatch"
+                            ):
+                                hloop.validate_epoch_protocol_capabilities(
+                                    self.external_epoch_plan("a" * 40),
+                                    [str(capability)],
+                                )
 
     def test_external_epoch_revalidates_canonical_pin_before_reserve_and_start(self):
         with tempfile.TemporaryDirectory() as directory:

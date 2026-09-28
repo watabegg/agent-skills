@@ -369,6 +369,12 @@ class CanonicalProtocolSelectionTests(unittest.TestCase):
     def test_v053_defaults_make_manual_final_independent(self):
         resolved = config.resolve_config(config.V053_BUILT_IN_CONFIG_DEFAULTS)
 
+        self.assertEqual(resolved.get("reviewer", "protocol"), "native")
+        self.assertEqual(resolved.get("review", "pre_final_protocol"), "native")
+        self.assertEqual(resolved.get("review", "manual_final_protocol"), "native")
+        self.assertNotIn(
+            "required_capabilities", resolved.as_dict().get("reviewer", {})
+        )
         self.assertEqual(
             resolved.get("review", "manual_final_execution"), "independent"
         )

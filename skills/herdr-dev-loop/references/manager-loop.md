@@ -143,16 +143,16 @@ Use `.ai/herdr-dev-loop/loops/<namespace>/PROFILE.md` as the Manager-owned polic
 
 - branch strategy: default `integration`, or product-specific `pr-per-task` / `custom`
 - Worker protocol: default `native`, or compatibility `codex-impl`
-- ordinary Reviewer protocol: fresh 0.5.3 default `external-review`, or explicit `native` override
-- pre-final protocol: default `external-review`, with a separate supported `native` setting
-- manual-final protocol: only `external-review`; no `native` override
+- ordinary Reviewer protocol: default `native`, or explicitly configured `external-review` with its exact capability pin
+- pre-final protocol: default `native`, or explicitly configured `external-review` with its exact capability pin
+- manual-final protocol: default `native`, or explicitly configured `external-review` with its exact capability pin
 - Worker / Reviewer / Gap Auditor / Advisor agent provider and model
 - review lanes: canonical fresh Reviewer topology is six lanes
 - Worker QA profile
 - Manager final QA profile
 - Advisor policy: disabled by default; explicit request only
 
-Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = "external-review"` with the canonical six-lane Reviewer topology. `--review-protocol native` is an explicit override for ordinary review only. Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = "native"`. Manual-final has no native override; `manual_final_protocol` accepts only `external-review`.
+Fresh loops default ordinary review, pre-final, and manual-final to the HLoop Native Review Protocol, with the canonical six-lane Reviewer topology. Native review has no companion dependency. `external-review` is an explicit compatibility choice and requires its exact capability pin. Protocol and configuration source are snapshotted when a loop or review plan is created; an unavailable pin blocks a saved external-review plan instead of falling back to native or relabeling its certification.
 
 If `branch_strategy` is `pr-per-task` or `custom`, update `PLAN.md` with the exact merge, PR, release, and QA handoff before dispatching Workers. `hloop` can still coordinate tasks, panes, artifacts, review, gap checks, and triage, but Manager must not silently apply the default integration-branch assumptions.
 

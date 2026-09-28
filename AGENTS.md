@@ -6,4 +6,4 @@ Find a skill through its `SKILL.md` name and description. Resolve its scripts an
 
 Validate changed skill frontmatter with the installed skill-creator `quick_validate.py`, then run the smallest relevant offline script tests. Do not contact live services merely to validate documentation or local logic. Keep credentials, cookies, private URLs, generated evidence and browser profiles outside this public repository.
 
-`herdr-dev-loop` have their own release relationship; do not synchronize them over a separately managed installation without an explicit request.
+`herdr-dev-loop` has a separately managed release and installation. Do not synchronize its installed copy without an explicit request.

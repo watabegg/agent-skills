@@ -29,10 +29,7 @@ SUPPORTED_REVIEW_MODES = ("single", "swarm", "dual", "dual-swarm")
 SUPPORTED_SPECIFICATION_SCOUT_MODES = ("auto", "always", "off")
 SUPPORTED_REVIEW_CADENCES = ("batch", "merge-count")
 SUPPORTED_REVIEW_PROTOCOLS = ("native", "external-review")
-# The manual-final command currently has only one implemented protocol. Keep
-# this separate from the ordinary review protocol set so an unsupported
-# ``native`` value cannot be accepted and silently routed elsewhere.
-SUPPORTED_MANUAL_FINAL_PROTOCOLS = ("external-review",)
+SUPPORTED_MANUAL_FINAL_PROTOCOLS = ("native", "external-review")
 SUPPORTED_MANUAL_FINAL_EXECUTIONS = ("independent", "reuse_epoch_reviewer")
 SUPPORTED_MANAGER_IDENTITY_POLICIES = ("strict", "warn-unavailable")
 AGENT_IDENTITY_FIELDS = ("provider", "model", "effort")
@@ -69,8 +66,8 @@ _REVIEW_POLICY_KEYS = (
 )
 REVIEW_POLICY_DEFAULTS = {
     "cadence": "batch",
-    "pre_final_protocol": "external-review",
-    "manual_final_protocol": "external-review",
+    "pre_final_protocol": "native",
+    "manual_final_protocol": "native",
     "max_fix_rounds": 2,
     "scope_expansion_action": "follow_up",
     "final_required": "complete_zero_verified_actionable_findings",
@@ -167,8 +164,7 @@ V053_BUILT_IN_CONFIG_DEFAULTS = {
         **_identity_defaults("codex", "gpt-5.6-sol", "xhigh"),
         "mode": "swarm",
         "lane_count": 6,
-        "protocol": "external-review",
-        "required_capabilities": ["externally-planned-v1"],
+        "protocol": "native",
         "coordinator": _identity_defaults("codex", "gpt-5.6-sol", "xhigh"),
         "lane": _identity_defaults("codex", "gpt-5.6-sol", "xhigh"),
         "verifier": _identity_defaults("codex", "gpt-5.6-sol", "xhigh"),

@@ -98,7 +98,13 @@ def review_plan(*, mode: str = "single", max_verifications: int = 64, verifier_p
     )
 
 
-def certification_plan(group, *, target_sha: str = HEAD) -> CertificationPlan:
+def certification_plan(
+    group,
+    *,
+    target_sha: str = HEAD,
+    protocol: str = MANUAL_FINAL_PROTOCOL,
+    protocol_adapter=ADAPTER,
+) -> CertificationPlan:
     processes = [
         FinalReviewProcessPlan(
             process_id="manual-final-coordinator",
@@ -151,7 +157,7 @@ def certification_plan(group, *, target_sha: str = HEAD) -> CertificationPlan:
         source_digest=SOURCE_DIGEST,
         execution_kind="manual-final",
         protocol_key="review.manual_final_protocol",
-        protocol=MANUAL_FINAL_PROTOCOL,
+        protocol=protocol,
         process_plan=tuple(processes),
         final_coordinator_config={
             "provider": "codex",
@@ -191,7 +197,7 @@ def certification_plan(group, *, target_sha: str = HEAD) -> CertificationPlan:
             source_artifact_ref="reviews/convergence/MANIFEST.json",
             source_artifact_digest="sha256:" + "e" * 64,
             target_sha=target_sha,
-            protocol_adapter=ADAPTER,
+            protocol_adapter=protocol_adapter,
         ),
     )
 
@@ -293,6 +299,29 @@ def candidate(
 
 
 class PlanIdentityTests(unittest.TestCase):
+    def test_native_plan_and_manifest_omit_external_adapter_evidence(self):
+        group = review_plan(mode="swarm")
+        plan = certification_plan(
+            group,
+            protocol="native",
+            protocol_adapter=None,
+        )
+        plan_record = plan.to_record()
+        self.assertNotIn("protocol_adapter", plan_record["execution"])
+        self.assertEqual(CertificationPlan.from_record(plan_record), plan)
+
+        manifest = final_manifest(plan, group)
+        manifest_record = manifest.to_record()
+        self.assertNotIn("protocol_adapter", manifest_record["execution"])
+        self.assertEqual(FinalReviewManifest.from_record(manifest_record), manifest)
+
+    def test_native_and_external_protocols_cannot_forge_or_omit_adapter(self):
+        group = review_plan()
+        with self.assertRaisesRegex(ValueError, "omit protocol_adapter for native"):
+            certification_plan(group, protocol="native", protocol_adapter=ADAPTER)
+        with self.assertRaisesRegex(ValueError, "requires matching external review adapter"):
+            certification_plan(group, protocol="external-review", protocol_adapter=None)
+
     def test_digest_is_canonical_and_plan_is_immutable(self):
         group = review_plan()
         plan = certification_plan(group)
@@ -1118,6 +1147,22 @@ class FinalReviewSchemaTests(unittest.TestCase):
             )
         )
         self.assertEqual(errors, [])
+
+    def test_native_plan_and_manifest_schemas_omit_adapter_conditionally(self):
+        group = review_plan(mode="swarm")
+        plan = certification_plan(
+            group, protocol="native", protocol_adapter=None
+        )
+        manifest = final_manifest(plan, group)
+        for path, record in (
+            (SCHEMAS / "final-review-plan.schema.json", plan.to_record()),
+            (SCHEMAS / "final-review-manifest.schema.json", manifest.to_record()),
+        ):
+            with self.subTest(schema=path.name):
+                self.assertEqual(list(self._validator(path).iter_errors(record)), [])
+                invalid = json.loads(json.dumps(record))
+                invalid["execution"]["protocol_adapter"] = ADAPTER.to_record()
+                self.assertTrue(list(self._validator(path).iter_errors(invalid)))
 
     def test_public_wrappers_match_canonical_execution_semantics_offline(self):
         group = review_plan()

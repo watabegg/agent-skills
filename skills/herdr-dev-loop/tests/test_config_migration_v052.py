@@ -52,7 +52,7 @@ class ReviewPolicyConfigTests(unittest.TestCase):
         self.assertEqual(resolved.get("review", "cadence"), "batch")
         self.assertEqual(
             resolved.get("review", "pre_final_protocol"),
-            "external-review",
+            "native",
         )
         self.assertEqual(resolved.get("review", "max_fix_rounds"), 2)
         self.assertEqual(
@@ -80,7 +80,7 @@ class ReviewPolicyConfigTests(unittest.TestCase):
         cases = (
             ({"cadence": "per-merge"}, "cadence"),
             ({"pre_final_protocol": "chat"}, "pre_final_protocol"),
-            ({"manual_final_protocol": "native"}, "manual_final_protocol"),
+            ({"manual_final_protocol": "unknown"}, "manual_final_protocol"),
             ({"max_fix_rounds": 3}, "max_fix_rounds"),
             ({"scope_expansion_action": "fix_now"}, "scope_expansion_action"),
             ({"final_required": "finding_count_only"}, "final_required"),
@@ -301,10 +301,12 @@ class StateSchemaTests(unittest.TestCase):
         state["review_policy"]["max_fix_rounds"] = 3
         self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid(state))
 
-    def test_state_schema_rejects_native_manual_final_protocol(self):
+    def test_state_schema_accepts_native_and_rejects_unknown_manual_final_protocol(self):
         schema = json.loads((SCHEMAS / "state.schema.json").read_text(encoding="utf-8"))
         state = current_state_with_v052_blocks()
         state["review_policy"]["manual_final_protocol"] = "native"
+        self.assertTrue(jsonschema.Draft202012Validator(schema).is_valid(state))
+        state["review_policy"]["manual_final_protocol"] = "unknown"
         self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid(state))
 
 

@@ -16,74 +16,6 @@ RUNNER = Path(__file__).with_name("run_synthetic_e2e.py")
 SKILL_ROOT = RUNNER.parents[1]
 
 
-AVAILABLE_RELEASE_DEPENDENCY = {
-    "record_type": "herdr_dev_loop_release_dependencies",
-    "schema_version": 1,
-    "release": {
-        "name": "herdr-dev-loop",
-        "version": "0.5.3",
-        "release_ready": True,
-    },
-    "required_release_evidence": [
-        "hloop_codex_install_parity",
-        "hloop_claude_install_parity",
-        "companion_codex_install_parity",
-        "companion_claude_install_parity",
-        "codex_fresh_session_handshake",
-        "claude_fresh_session_handshake",
-    ],
-    "dependencies": [
-        {
-            "name": "external-review",
-            "kind": "external_review_protocol",
-            "required": True,
-            "availability": "available",
-            "blocking_reason": "",
-            "minimum_compatible_version": "2.1.0",
-            "distribution_identity": {
-                "source": "https://example.invalid/external-review.git",
-                "immutable_id": "a" * 40,
-                "version": "2.1.0",
-                "digest_algorithm": "sha256-tree-v1",
-                "content_digest": "sha256:" + "b" * 64,
-            },
-            "capability_manifest": {
-                "relative_path": "capabilities/externally-planned-v1.json",
-                "record_type": "external_review_protocol_adapter",
-                "protocol": "external-review",
-                "required_capabilities": ["externally-planned-v1"],
-            },
-            "install_destinations": {
-                "codex": "${CODEX_HOME:-$HOME/.codex}/skills/external-review",
-                "claude": "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/external-review",
-            },
-        }
-    ],
-}
-
-PROTOCOL_CAPABILITY = {
-    "record_type": "external_review_protocol_adapter",
-    "protocol": "external-review",
-    "source": "https://example.invalid/external-review.git@" + "a" * 40,
-    "version": "2.1.0",
-    "content_digest": "sha256:" + "b" * 64,
-    "capabilities": ["externally-planned-v1"],
-}
-
-# The historical behavioral fixtures still use a copied runtime, but the
-# external adapter must now be the real validated sibling distribution.
-AVAILABLE_RELEASE_DEPENDENCY = json.loads(
-    (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
-)
-PROTOCOL_CAPABILITY = json.loads(
-    (
-        SKILL_ROOT.parent
-        / "external-review"
-        / "capabilities"
-        / "externally-planned-v1.json"
-    ).read_text(encoding="utf-8")
-)
-
 SYNTHETIC_BOOTSTRAP = """\
 import importlib.machinery
 import importlib.util
@@ -91,7 +23,6 @@ from pathlib import Path
 import sys
 
 runner = Path(sys.argv[1])
-capability = sys.argv[2]
 loader = importlib.machinery.SourceFileLoader("hloop_v052_synthetic_proxy", str(runner))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 synthetic = importlib.util.module_from_spec(spec)
@@ -102,8 +33,6 @@ def prepare_final_review(fixture):
         fixture,
         "final-review",
         "prepare",
-        "--protocol-capability",
-        capability,
         "--json",
     )
 
@@ -127,7 +56,7 @@ def write_final_manifest(fixture, **kwargs):
 
 synthetic._prepare_final_review = prepare_final_review
 synthetic._write_final_manifest = write_final_manifest
-sys.argv = [str(runner), *sys.argv[3:]]
+sys.argv = [str(runner), *sys.argv[2:]]
 raise SystemExit(synthetic.main())
 """
 
@@ -145,22 +74,7 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
             cls.skill_root,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
-        shutil.copytree(
-            SKILL_ROOT.parent / "external-review",
-            fixture_root / "external-review",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-        )
         cls.runner = cls.skill_root / "tests" / RUNNER.name
-        (cls.skill_root / "release-dependencies.json").write_text(
-            json.dumps(AVAILABLE_RELEASE_DEPENDENCY, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        cls.protocol_capability = (
-            fixture_root
-            / "external-review"
-            / "capabilities"
-            / "externally-planned-v1.json"
-        )
         cls.bootstrap = fixture_root / "run_synthetic_proxy.py"
         cls.bootstrap.write_text(SYNTHETIC_BOOTSTRAP, encoding="utf-8")
 
@@ -176,7 +90,6 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
                 sys.executable,
                 str(self.bootstrap),
                 str(self.runner),
-                str(self.protocol_capability),
                 "--json",
                 "--scenario",
                 name,
@@ -297,8 +210,6 @@ class HLoopBoundedConvergenceE2ETests(unittest.TestCase):
                     fixture,
                     "final-review",
                     "prepare",
-                    "--protocol-capability",
-                    str(self.protocol_capability),
                     "--json",
                 )
 

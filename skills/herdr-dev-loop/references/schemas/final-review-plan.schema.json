@@ -35,7 +35,7 @@
     "source_digest": {"$ref": "#/$defs/digest"},
     "execution_kind": {"const": "manual-final"},
     "protocol_key": {"const": "review.manual_final_protocol"},
-    "protocol": {"const": "external-review"},
+    "protocol": {"enum": ["native", "external-review"]},
     "execution": {"$ref": "#/$defs/execution"},
     "process_plan": {
       "type": "array",
@@ -52,6 +52,16 @@
     },
     "verification_policy": {"$ref": "#/$defs/verificationPolicy"}
   },
+  "allOf": [
+    {
+      "if": {"properties": {"protocol": {"const": "external-review"}}, "required": ["protocol"]},
+      "then": {"properties": {"execution": {"required": ["protocol_adapter"]}}}
+    },
+    {
+      "if": {"properties": {"protocol": {"const": "native"}}, "required": ["protocol"]},
+      "then": {"properties": {"execution": {"not": {"required": ["protocol_adapter"]}}}}
+    }
+  ],
   "additionalProperties": false,
   "$defs": {
     "digest": {
@@ -150,8 +160,7 @@
         "source_execution_id",
         "source_artifact_ref",
         "source_artifact_digest",
-        "target_sha",
-        "protocol_adapter"
+        "target_sha"
       ],
       "properties": {
         "execution_policy": {"enum": ["independent", "reuse_epoch_reviewer"]},

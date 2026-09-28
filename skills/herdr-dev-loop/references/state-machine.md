@@ -126,25 +126,27 @@ policy-driven:
 - `max_reviewers: 1`
 - `max_gap_auditors: 1`
 - `review_policy.cadence: batch` for new 0.5.3 loops
-- `review_policy.pre_final_protocol: external-review`
-- `review_policy.manual_final_protocol: external-review`
+- `review_policy.pre_final_protocol: native`
+- `review_policy.manual_final_protocol: native`
 - `review_policy.max_fix_rounds: 2`
 - `review_policy.final_required: complete_zero_verified_actionable_findings`
 - `review_after_merges: 1` and `gap_after_merges: 3` remain legacy/merge-count knobs
 - `branch_strategy: integration`
 - `worker_protocol: native`
-- `review_protocol: external-review` for fresh ordinary review
+- `review_protocol: native` for fresh ordinary review
 - canonical Reviewer topology: six lanes
 - role agent providers/models: Codex `auto` by default
 - `worker_qa_profile: repo-default`
 - `manager_qa_profile: none`
 
-Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = "external-review"` with the canonical six-lane Reviewer topology. `--review-protocol native` is an explicit override for ordinary review only. Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = "native"`. Manual-final has no native override; `manual_final_protocol` accepts only `external-review`.
-
-The manual-final policy is fail-closed: its schema accepts only the implemented
-`external-review` protocol. Neither an ordinary `--review-protocol native`
-override nor a separate native pre-final setting makes `native` valid for
-manual-final certification.
+Fresh loops default ordinary review, pre-final, and manual-final to `native`,
+with the canonical six-lane Reviewer topology. Native review has no companion
+dependency. `external-review` is available as an explicit compatibility
+protocol when the selected source, version, content digest, and
+`externally-planned-v1` capability are pinned. Missing or drifted pin evidence
+blocks that execution. A saved external plan never falls back to native, and
+prior external certificates are not relabeled or reused under another
+protocol.
 
 For new loops, ordinary review waits for a closed batch and the Manager explicitly
 prepares fixed-target convergence; it is not restarted after every incremental

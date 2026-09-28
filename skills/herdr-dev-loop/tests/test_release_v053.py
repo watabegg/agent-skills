@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,21 +19,25 @@ from pathlib import Path
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SKILL_ROOT / "tests"))
 
 from hloop_lib import config  # noqa: E402
 from hloop_lib.release_dependency import (  # noqa: E402
     ReleaseDependencyError,
     ReleaseDependencyUnavailable,
+    load_release_catalog,
     sha256_tree_v1,
     provider_companion_root,
     validate_release_distribution,
     validate_provider_distribution,
+    validate_release_catalog,
     validate_release_dependencies,
 )
 from hloop_lib.review import (  # noqa: E402
     ExternalReviewProtocolAdapter,
     ReviewModelError,
 )
+from adapter_fixture import make_external_fixture, write_release_record  # noqa: E402
 
 
 class ReleaseIdentityTests(unittest.TestCase):
@@ -69,81 +74,25 @@ class ReleaseIdentityTests(unittest.TestCase):
         historical = (SKILL_ROOT / "docs/RELEASE-0.5.2.md").read_text()
         self.assertIn("0.5.2", historical)
 
-    def test_protocol_docs_distinguish_execution_kind_defaults(self):
-        documents = {
-            relative_path: (SKILL_ROOT / relative_path).read_text(encoding="utf-8")
-            for relative_path in (
+    def test_protocol_docs_describe_native_defaults_and_optional_external_execution(self):
+        documents = [
+            (SKILL_ROOT / path).read_text(encoding="utf-8").lower()
+            for path in (
                 "SKILL.md",
                 "README.md",
                 "references/cli-notes.md",
                 "references/manager-loop.md",
                 "references/reviewer-contract.md",
                 "references/state-machine.md",
+                "references/migration-install.md",
             )
-        }
-        expected_semantics = {
-            "SKILL.md": (
-                "Fresh 0.5.3 defaults set ordinary `reviewer.protocol`, `review.pre_final_protocol`, and `review.manual_final_protocol` to `$external-review` and use the canonical six-lane Reviewer topology.",
-                "`--review-protocol native` changes only ordinary review.",
-                "To select the supported native pre-final path, set `pre_final_protocol = \"native\"` separately in `[defaults.review]` or a matching scope.",
-                "Manual-final has no native override: `manual_final_protocol` accepts only `external-review`.",
-            ),
-            "README.md": (
-                "新規0.5.3 loopではordinary review、pre-final、manual-finalがすべて`$external-review`を既定にし、canonicalなReviewer topologyは6 laneです。",
-                "`--review-protocol native`はordinary reviewだけを変更します。",
-                "pre-finalのnative pathは`pre_final_protocol = \"native\"`で別途選択できます。",
-                "manual-finalにnative overrideはなく、`manual_final_protocol`は`external-review`だけを受理します。",
-            ),
-            "references/cli-notes.md": (
-                "Fresh 0.5.3 defaults set ordinary `reviewer.protocol`, `review.pre_final_protocol`, and `review.manual_final_protocol` to `$external-review` with the canonical six-lane Reviewer topology.",
-                "`--review-protocol native` changes only ordinary review.",
-                "The supported native pre-final path is selected separately with `pre_final_protocol = \"native\"` in `[defaults.review]` or a matching scope.",
-                "Manual-final has no native override and accepts only `external-review`.",
-            ),
-            "references/manager-loop.md": (
-                "Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = \"external-review\"` with the canonical six-lane Reviewer topology.",
-                "`--review-protocol native` is an explicit override for ordinary review only.",
-                "Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = \"native\"`.",
-                "Manual-final has no native override; `manual_final_protocol` accepts only `external-review`.",
-            ),
-            "references/reviewer-contract.md": (
-                "Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = \"external-review\"` with the canonical six-lane Reviewer topology.",
-                "`--review-protocol native` is an explicit override for ordinary review only.",
-                "Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = \"native\"`.",
-                "Manual-final has no native override; `manual_final_protocol` accepts only `external-review`.",
-            ),
-            "references/state-machine.md": (
-                "Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = \"external-review\"` with the canonical six-lane Reviewer topology.",
-                "`--review-protocol native` is an explicit override for ordinary review only.",
-                "Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = \"native\"`.",
-                "Manual-final has no native override; `manual_final_protocol` accepts only `external-review`.",
-            ),
-        }
-        for relative_path, expected_fragments in expected_semantics.items():
-            with self.subTest(relative_path=relative_path):
-                for expected in expected_fragments:
-                    self.assertIn(expected, documents[relative_path])
-        combined = "\n".join(documents.values())
-        self.assertNotIn(
-            "optional compatibility protocols, not default dependencies",
-            combined,
-        )
-        self.assertNotIn(
-            "`$codex-impl` と `$external-review` は互換protocolで、通常の既定値ではありません。",
-            combined,
-        )
-        self.assertNotIn(
-            "optional compatibility skills; native HLoop Worker and Reviewer protocols do not require them",
-            combined,
-        )
-        self.assertNotIn(
-            "follow the HLoop Native Review Protocol by default",
-            documents["references/reviewer-contract.md"],
-        )
-        self.assertNotIn(
-            "Reviewer protocol: default `native`",
-            documents["references/manager-loop.md"],
-        )
+        ]
+        self.assertTrue(all("native" in document for document in documents))
+        self.assertTrue(all("external-review" in document for document in documents))
+        defaults = config.V053_BUILT_IN_CONFIG_DEFAULTS
+        self.assertEqual(defaults["reviewer"]["protocol"], "native")
+        self.assertEqual(defaults["review"]["pre_final_protocol"], "native")
+        self.assertEqual(defaults["review"]["manual_final_protocol"], "native")
 
 
 class ReleaseSelftestTests(unittest.TestCase):
@@ -167,10 +116,6 @@ class ReleaseSelftestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             copied_skill = Path(directory) / "herdr-dev-loop"
             shutil.copytree(SKILL_ROOT, copied_skill)
-            shutil.copytree(
-                SKILL_ROOT.parent / "external-review",
-                copied_skill.parent / "external-review",
-            )
             wrappers = (
                 "final-review-plan.schema.json",
                 "final-review-manifest.schema.json",
@@ -226,58 +171,89 @@ class ReleaseSelftestTests(unittest.TestCase):
                         path.write_bytes(original)
 
 
-class CompanionDependencyTests(unittest.TestCase):
+class ReleaseCatalogTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.record = json.loads((SKILL_ROOT / "release-dependencies.json").read_text())
-
-    def unavailable_record(self) -> dict:
-        record = copy.deepcopy(self.record)
-        record["release"]["release_ready"] = False
-        dependency = record["dependencies"][0]
-        dependency.update(
-            {
-                "availability": "unavailable",
-                "blocking_reason": "immutable companion distribution is unavailable",
-                "minimum_compatible_version": None,
-                "distribution_identity": None,
-            }
+        self.record = json.loads(
+            (SKILL_ROOT / "release-dependencies.json").read_text(encoding="utf-8")
         )
-        dependency["capability_manifest"]["relative_path"] = None
-        return record
 
-    def test_shipped_companion_matches_the_complete_immutable_pin(self):
-        adapter = validate_release_dependencies(self.record)
-        dependency = self.record["dependencies"][0]
+    def test_shipped_release_catalog_is_native_only_and_selftest_needs_no_sibling(self):
+        self.assertEqual(self.record["dependencies"], [])
         self.assertTrue(self.record["release"]["release_ready"])
-        self.assertEqual(dependency["availability"], "available")
         self.assertEqual(
-            adapter.source,
-            "https://github.com/watabegg/agent-skills.git#sha256-tree-v1="
-            "b61a068af3e018e0597f1ce1e9dd242efc7580b96305bbb8a803161d69478fac",
+            self.record["required_release_evidence"],
+            [
+                "hloop_codex_install_parity",
+                "hloop_claude_install_parity",
+                "codex_fresh_session_handshake",
+                "claude_fresh_session_handshake",
+            ],
         )
-        self.assertEqual(adapter.version, "2.1.1")
-        self.assertEqual(
-            adapter.content_digest,
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        companion_root = SKILL_ROOT.parent / "external-review"
-        self.assertEqual(
-            sha256_tree_v1(
-                companion_root,
-                capability_manifest_relative_path=dependency["capability_manifest"][
-                    "relative_path"
-                ],
-            ),
-            adapter.content_digest,
-        )
-        self.assertEqual(
-            validate_release_distribution(
-                SKILL_ROOT / "release-dependencies.json", companion_root
-            ),
-            adapter,
-        )
+        release_path = SKILL_ROOT / "release-dependencies.json"
+        self.assertEqual(load_release_catalog(release_path), ())
+        self.assertEqual(validate_release_catalog(self.record), ())
 
-    def test_provider_distribution_validation_uses_real_discovery_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            copied_skill = Path(directory) / "herdr-dev-loop"
+            shutil.copytree(SKILL_ROOT, copied_skill)
+            self.assertFalse((copied_skill.parent / "external-review").exists())
+            self.assertEqual(
+                load_release_catalog(copied_skill / "release-dependencies.json"), ()
+            )
+            result = ReleaseSelftestTests()._run_selftest(copied_skill)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_strict_external_lookup_rejects_native_only_catalog_clearly(self):
+        from hloop_lib.release_dependency import load_release_dependencies
+
+        with self.assertRaisesRegex(
+            ReleaseDependencyUnavailable, "no external-review adapter is configured"
+        ):
+            validate_release_dependencies(self.record)
+        with self.assertRaisesRegex(
+            ReleaseDependencyUnavailable, "no external-review adapter is configured"
+        ):
+            load_release_dependencies(SKILL_ROOT / "release-dependencies.json")
+
+    def test_optional_catalog_load_needs_no_distribution_but_strict_lookup_stays_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            distribution_root, record = make_external_fixture(parent)
+            record["dependencies"][0]["required"] = False
+            shutil.rmtree(distribution_root)
+            record_path = write_release_record(parent / "catalog.json", record)
+
+            adapters = load_release_catalog(record_path)
+            self.assertEqual(len(adapters), 1)
+            self.assertEqual(adapters[0].version, "2.1.1")
+            self.assertEqual(validate_release_dependencies(record), adapters[0])
+            with self.assertRaisesRegex(ReleaseDependencyError, "manifest is missing"):
+                validate_release_distribution(record_path, distribution_root)
+
+    def test_synthetic_fixture_matches_its_immutable_adapter_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            distribution_root, record = make_external_fixture(parent)
+            dependency_path = write_release_record(parent / "release.json", record)
+            adapter = validate_release_dependencies(record)
+            dependency = record["dependencies"][0]
+            self.assertEqual(adapter.version, "2.1.1")
+            self.assertEqual(adapter.capabilities, ("externally-planned-v1",))
+            self.assertEqual(
+                sha256_tree_v1(
+                    distribution_root,
+                    capability_manifest_relative_path=dependency[
+                        "capability_manifest"
+                    ]["relative_path"],
+                ),
+                adapter.content_digest,
+            )
+            self.assertEqual(
+                validate_release_distribution(dependency_path, distribution_root),
+                adapter,
+            )
+
+    def test_provider_distribution_validation_uses_synthetic_discovery_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             codex_root = home / "codex-profile"
@@ -287,13 +263,11 @@ class CompanionDependencyTests(unittest.TestCase):
                 "CODEX_HOME": str(codex_root),
                 "CLAUDE_CONFIG_DIR": str(claude_root),
             }
-            source = SKILL_ROOT.parent / "external-review"
+            source, record = make_external_fixture(home / "fixture")
+            release_path = write_release_record(home / "release.json", record)
             for root in (codex_root, claude_root):
-                shutil.copytree(
-                    source,
-                    root / "skills" / "external-review",
-                )
-            release_path = SKILL_ROOT / "release-dependencies.json"
+                shutil.copytree(source, root / "skills" / "external-review")
+
             for provider, config_root in (
                 ("codex", codex_root),
                 ("claude", claude_root),
@@ -310,13 +284,9 @@ class CompanionDependencyTests(unittest.TestCase):
                         environ=environment,
                     )
                     self.assertEqual(observed_root, expected_root.resolve())
-                    self.assertEqual(
-                        adapter, validate_release_dependencies(self.record)
-                    )
+                    self.assertEqual(adapter, validate_release_dependencies(record))
 
-            codex_distribution = (
-                codex_root / "skills" / "external-review"
-            )
+            codex_distribution = codex_root / "skills" / "external-review"
             shutil.rmtree(codex_distribution)
             codex_distribution.symlink_to(source, target_is_directory=True)
             with self.assertRaisesRegex(ReleaseDependencyError, "symlink"):
@@ -336,178 +306,128 @@ class CompanionDependencyTests(unittest.TestCase):
                     environ=environment,
                 )
 
-    def test_immutable_pin_archive_reconstructs_a_valid_distribution(self):
-        dependency = self.record["dependencies"][0]
-        immutable_id = dependency["distribution_identity"]["immutable_id"]
-        repository_root = SKILL_ROOT.parents[1]
+    def test_unavailable_required_adapter_cannot_be_selected_or_claim_a_pin(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            archive = root / "companion.tar"
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repository_root),
-                    "archive",
-                    "--format=tar",
-                    f"--output={archive}",
-                    immutable_id,
-                    "skills/external-review",
-                ],
-                check=True,
-                capture_output=True,
-            )
-            extracted = root / "extracted"
-            extracted.mkdir()
-            shutil.unpack_archive(str(archive), str(extracted))
-            adapter = validate_release_distribution(
-                SKILL_ROOT / "release-dependencies.json",
-                extracted / "skills/external-review",
-            )
-            self.assertEqual(adapter, validate_release_dependencies(self.record))
-
-    def test_unavailable_companion_blocks_the_release_without_placeholders(self):
-        unavailable = self.unavailable_record()
+            _, available = make_external_fixture(Path(directory))
+        unavailable = copy.deepcopy(available)
+        unavailable["release"]["release_ready"] = False
         dependency = unavailable["dependencies"][0]
+        dependency.update(
+            {
+                "availability": "unavailable",
+                "blocking_reason": "immutable adapter distribution is unavailable",
+                "minimum_compatible_version": None,
+                "distribution_identity": None,
+            }
+        )
+        dependency["capability_manifest"]["relative_path"] = None
+        self.assertEqual(validate_release_catalog(unavailable), ())
         self.assertFalse(unavailable["release"]["release_ready"])
-        self.assertEqual(dependency["availability"], "unavailable")
-        self.assertIsNone(dependency["minimum_compatible_version"])
-        self.assertIsNone(dependency["distribution_identity"])
-        self.assertIsNone(dependency["capability_manifest"]["relative_path"])
-        with self.assertRaisesRegex(ReleaseDependencyUnavailable, "release_ready"):
+        with self.assertRaisesRegex(
+            ReleaseDependencyUnavailable, "adapter is unavailable"
+        ):
             validate_release_dependencies(unavailable)
 
         placeholder = copy.deepcopy(unavailable)
         placeholder["dependencies"][0]["distribution_identity"] = {
             "source": "mutable-installed-copy"
         }
-        with self.assertRaisesRegex(ValueError, "cannot claim a distribution identity"):
+        with self.assertRaisesRegex(
+            ValueError, "cannot claim a distribution identity"
+        ):
             validate_release_dependencies(placeholder)
 
-    def test_schema_version_requires_exact_json_integer_one(self):
-        validate_release_dependencies(copy.deepcopy(self.record))
+    def test_schema_and_required_flag_require_exact_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, base = make_external_fixture(Path(directory))
+        validate_release_dependencies(copy.deepcopy(base))
         for value in (True, False, 1.0, "1"):
             with self.subTest(value=value, value_type=type(value).__name__):
-                record = copy.deepcopy(self.record)
+                record = copy.deepcopy(base)
                 record["schema_version"] = value
-                with self.assertRaisesRegex(
-                    ReleaseDependencyError, "schema_version"
-                ):
-                    validate_release_dependencies(record)
+                with self.assertRaisesRegex(ReleaseDependencyError, "schema_version"):
+                    validate_release_catalog(record)
+        for value in (0, 1, "true"):
+            with self.subTest(required=value):
+                record = copy.deepcopy(base)
+                record["dependencies"][0]["required"] = value
+                with self.assertRaisesRegex(ReleaseDependencyError, "required must be boolean"):
+                    validate_release_catalog(record)
 
     def test_distribution_validation_rejects_payload_manifest_and_symlink_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            dependency_path = root / "release-dependencies.json"
-            dependency_path.write_text(
-                json.dumps(self.record), encoding="utf-8"
-            )
-            companion_root = root / "external-review"
-            shutil.copytree(SKILL_ROOT.parent / "external-review", companion_root)
+            source, record = make_external_fixture(root / "fixture")
+            dependency_path = write_release_record(root / "release.json", record)
+            distribution_root = root / "external-review"
+            shutil.copytree(source, distribution_root)
 
-            skill_path = companion_root / "SKILL.md"
+            skill_path = distribution_root / "SKILL.md"
             original_skill = skill_path.read_bytes()
             skill_path.write_bytes(original_skill + b"\n# drift\n")
             with self.assertRaisesRegex(ReleaseDependencyError, "digest"):
-                validate_release_distribution(dependency_path, companion_root)
+                validate_release_distribution(dependency_path, distribution_root)
             skill_path.write_bytes(original_skill)
 
-            manifest_path = (
-                companion_root / "capabilities" / "externally-planned-v1.json"
-            )
+            manifest_path = distribution_root / "capabilities" / "externally-planned-v1.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["version"] = "2.1.2"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ReleaseDependencyError, "version"):
-                validate_release_distribution(dependency_path, companion_root)
-            shutil.copy2(
-                SKILL_ROOT.parent
-                / "external-review"
-                / "capabilities"
-                / "externally-planned-v1.json",
-                manifest_path,
-            )
+                validate_release_distribution(dependency_path, distribution_root)
+            original_manifest = source / "capabilities" / "externally-planned-v1.json"
+            shutil.copy2(original_manifest, manifest_path)
 
-            (companion_root / "unexpected-link").symlink_to(skill_path)
+            (distribution_root / "unexpected-link").symlink_to(skill_path)
             with self.assertRaisesRegex(ReleaseDependencyError, "symlink"):
-                validate_release_distribution(dependency_path, companion_root)
-            (companion_root / "unexpected-link").unlink()
+                validate_release_distribution(dependency_path, distribution_root)
+            (distribution_root / "unexpected-link").unlink()
 
-            cache_dir = companion_root / "assets" / "__pycache__"
-            cache_dir.mkdir()
+            cache_dir = distribution_root / "assets" / "__pycache__"
+            cache_dir.mkdir(parents=True)
             (cache_dir / "render_review.cpython-311.pyc").write_bytes(b"executable")
             with self.assertRaisesRegex(ReleaseDependencyError, "forbidden"):
-                validate_release_distribution(dependency_path, companion_root)
+                validate_release_distribution(dependency_path, distribution_root)
 
     def test_distribution_validation_rejects_unreadable_and_non_utf8_content(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            dependency_path = root / "release-dependencies.json"
-            dependency_path.write_text(json.dumps(self.record), encoding="utf-8")
-            companion_root = root / "external-review"
-            shutil.copytree(SKILL_ROOT.parent / "external-review", companion_root)
+            source, record = make_external_fixture(root / "fixture")
+            dependency_path = write_release_record(root / "release.json", record)
+            distribution_root = root / "external-review"
+            shutil.copytree(source, distribution_root)
 
-            opaque = companion_root / "opaque-extra"
+            opaque = distribution_root / "opaque-extra"
             opaque.mkdir()
             (opaque / "untrusted.py").write_text("raise SystemExit\n", encoding="utf-8")
             opaque.chmod(0)
             try:
-                with self.assertRaisesRegex(
-                    ReleaseDependencyError, "enumerate|digest"
-                ):
-                    validate_release_distribution(dependency_path, companion_root)
+                with self.assertRaisesRegex(ReleaseDependencyError, "enumerate|digest"):
+                    validate_release_distribution(dependency_path, distribution_root)
             finally:
                 opaque.chmod(0o700)
             shutil.rmtree(opaque)
 
-            encoded_root = os.fsencode(companion_root)
+            encoded_root = os.fsencode(distribution_root)
             invalid_name = encoded_root + b"/bad-\xff.py"
             fd = os.open(invalid_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
             try:
                 with self.assertRaisesRegex(ReleaseDependencyError, "UTF-8"):
-                    validate_release_distribution(dependency_path, companion_root)
+                    validate_release_distribution(dependency_path, distribution_root)
             finally:
                 os.unlink(invalid_name)
 
-            manifest_path = (
-                companion_root / "capabilities" / "externally-planned-v1.json"
-            )
+            manifest_path = distribution_root / "capabilities" / "externally-planned-v1.json"
             original_manifest = manifest_path.read_bytes()
             manifest_path.write_bytes(b"\xff")
             with self.assertRaisesRegex(ReleaseDependencyError, "cannot load"):
-                validate_release_distribution(dependency_path, companion_root)
+                validate_release_distribution(dependency_path, distribution_root)
             manifest_path.write_bytes(original_manifest)
 
             dependency_path.write_bytes(b"\xff")
             with self.assertRaisesRegex(ReleaseDependencyError, "cannot load"):
-                validate_release_distribution(dependency_path, companion_root)
-
-    def test_complete_pin_produces_exact_runtime_adapter(self):
-        record = copy.deepcopy(self.record)
-        record["release"]["release_ready"] = True
-        dependency = record["dependencies"][0]
-        dependency.update(
-            {
-                "availability": "available",
-                "blocking_reason": "",
-                "minimum_compatible_version": "2.1.0",
-                "distribution_identity": {
-                    "source": "https://example.invalid/external-review.git",
-                    "immutable_id": "a" * 40,
-                    "version": "2.1.0",
-                    "digest_algorithm": "sha256-tree-v1",
-                    "content_digest": "sha256:" + "b" * 64,
-                },
-            }
-        )
-        dependency["capability_manifest"]["relative_path"] = (
-            "capabilities/externally-planned-v1.json"
-        )
-        adapter = validate_release_dependencies(record)
-        self.assertEqual(adapter.version, "2.1.0")
-        self.assertEqual(adapter.capabilities, ("externally-planned-v1",))
-        self.assertEqual(adapter.content_digest, "sha256:" + "b" * 64)
+                validate_release_distribution(dependency_path, distribution_root)
 
     def test_available_pin_enforces_semantic_version_lower_bound(self):
         for exact, expected in (
@@ -516,31 +436,17 @@ class CompanionDependencyTests(unittest.TestCase):
             ("2.2.0", None),
         ):
             with self.subTest(exact=exact):
-                record = copy.deepcopy(self.record)
-                record["release"]["release_ready"] = True
+                with tempfile.TemporaryDirectory() as directory:
+                    _, record = make_external_fixture(Path(directory))
                 dependency = record["dependencies"][0]
-                dependency.update(
-                    {
-                        "availability": "available",
-                        "blocking_reason": "",
-                        "minimum_compatible_version": "2.1.0",
-                        "distribution_identity": {
-                            "source": "https://example.invalid/review.git",
-                            "immutable_id": "a" * 40,
-                            "version": exact,
-                            "digest_algorithm": "sha256-tree-v1",
-                            "content_digest": "sha256:" + "b" * 64,
-                        },
-                    }
-                )
-                dependency["capability_manifest"]["relative_path"] = (
-                    "capabilities/externally-planned-v1.json"
-                )
+                dependency["distribution_identity"]["version"] = exact
                 if expected:
                     with self.assertRaisesRegex(ReleaseDependencyError, expected):
                         validate_release_dependencies(record)
                 else:
-                    self.assertEqual(validate_release_dependencies(record).version, exact)
+                    self.assertEqual(
+                        validate_release_dependencies(record).version, exact
+                    )
 
     def test_available_pin_rejects_leading_zero_semantic_versions(self):
         for field, value in (
@@ -552,35 +458,21 @@ class CompanionDependencyTests(unittest.TestCase):
             ("exact", "2.1.00"),
         ):
             with self.subTest(field=field, value=value):
-                record = copy.deepcopy(self.record)
-                record["release"]["release_ready"] = True
+                with tempfile.TemporaryDirectory() as directory:
+                    _, record = make_external_fixture(Path(directory))
                 dependency = record["dependencies"][0]
-                dependency.update(
-                    {
-                        "availability": "available",
-                        "blocking_reason": "",
-                        "minimum_compatible_version": (
-                            value if field == "minimum" else "2.1.0"
-                        ),
-                        "distribution_identity": {
-                            "source": "https://example.invalid/review.git",
-                            "immutable_id": "a" * 40,
-                            "version": value if field == "exact" else "2.1.0",
-                            "digest_algorithm": "sha256-tree-v1",
-                            "content_digest": "sha256:" + "b" * 64,
-                        },
-                    }
-                )
-                dependency["capability_manifest"]["relative_path"] = (
-                    "capabilities/externally-planned-v1.json"
-                )
+                if field == "minimum":
+                    dependency["minimum_compatible_version"] = value
+                else:
+                    dependency["distribution_identity"]["version"] = value
                 with self.assertRaisesRegex(ReleaseDependencyError, "invalid"):
                     validate_release_dependencies(record)
 
     def test_available_pin_requires_an_exact_commit_sha(self):
         for immutable_id in ("master", "A" * 40, "a" * 39, "a" * 41):
             with self.subTest(immutable_id=immutable_id):
-                record = copy.deepcopy(self.record)
+                with tempfile.TemporaryDirectory() as directory:
+                    _, record = make_external_fixture(Path(directory))
                 record["dependencies"][0]["distribution_identity"][
                     "immutable_id"
                 ] = immutable_id
@@ -656,71 +548,67 @@ class HistoricalQaReconstructionTests(unittest.TestCase):
 
 
 class ReleaseOperationsDocumentationTests(unittest.TestCase):
-    def test_install_and_restore_cover_hloop_and_companion_for_both_providers(self):
+    def test_install_recipe_has_two_hloop_targets_and_safe_staging_roots(self):
         instructions = (
             SKILL_ROOT / "references/migration-install.md"
         ).read_text(encoding="utf-8")
-        destinations = (
+        heading = "## HLoop-only install"
+        self.assertIn(heading, instructions)
+        section = instructions.split(heading, 1)[1].split("\n## ", 1)[0]
+
+        for name in (
+            "CODEX_CONFIG_ROOT",
+            "CLAUDE_CONFIG_ROOT",
+            "CODEX_SKILLS_ROOT",
+            "CLAUDE_SKILLS_ROOT",
             "CODEX_SKILL_DIR",
             "CLAUDE_SKILL_DIR",
-            "CODEX_COMPANION_DIR",
-            "CLAUDE_COMPANION_DIR",
-        )
-        for destination in destinations:
-            with self.subTest(destination=destination):
-                self.assertIn(f'{destination}="', instructions)
-                self.assertIn(f'${destination}\" || cp -a', instructions)
-        for backup in (
+            "CODEX_BACKUP_ROOT",
+            "CLAUDE_BACKUP_ROOT",
+            "CODEX_STAGE_ROOT",
+            "CLAUDE_STAGE_ROOT",
             "CODEX_SKILL_BACKUP",
             "CLAUDE_SKILL_BACKUP",
-            "CODEX_COMPANION_BACKUP",
-            "CLAUDE_COMPANION_BACKUP",
+            "DESTINATIONS=(",
+            "STAGED=(",
+            "OLD=(",
+            "FAILED=(",
+            "rollback_partial_install()",
         ):
-            with self.subTest(backup=backup):
-                self.assertIn(f'{backup}="', instructions)
-                self.assertIn(f'${backup}\" || cp -a', instructions)
-        self.assertIn(
-            'CLAUDE_BACKUP_ROOT="$(dirname "$CLAUDE_SKILLS_ROOT")/skill-backups/claude/${STAMP}"',
-            instructions,
+            with self.subTest(marker=name):
+                self.assertIn(name, section)
+        self.assertNotIn("COMPANION", section.upper())
+        self.assertNotIn("external-review", section)
+        self.assertIn('CODEX_BACKUP_ROOT="${CODEX_CONFIG_ROOT}/skill-backups/codex/${STAMP}"', section)
+        self.assertIn('CLAUDE_BACKUP_ROOT="${CLAUDE_CONFIG_ROOT}/skill-backups/claude/${STAMP}"', section)
+        self.assertIn('CODEX_STAGE_ROOT="${CODEX_CONFIG_ROOT}/.hloop-install-stage-${STAMP}"', section)
+        self.assertIn('CLAUDE_STAGE_ROOT="${CLAUDE_CONFIG_ROOT}/.hloop-install-stage-${STAMP}"', section)
+        self.assertIn("selftest", section)
+        self.assertIn("scripts/hloop", section)
+        self.assertIn("CODEX_SKILL_BACKUP", section)
+        self.assertIn("CLAUDE_SKILL_BACKUP", section)
+        for array_name in ("DESTINATIONS", "STAGED", "OLD", "FAILED"):
+            match = re.search(
+                rf"(?m)^{array_name}=\(([^)]*)\)", section, flags=re.DOTALL
+            )
+            self.assertIsNotNone(match, array_name)
+            self.assertEqual(len(re.findall(r'"[^"\n]+"', match.group(1))), 2)
+        destinations = re.search(
+            r"(?m)^DESTINATIONS=\(([^)]*)\)", section, flags=re.DOTALL
         )
-        self.assertIn(
-            'CLAUDE_SKILLS_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"',
-            instructions,
+        self.assertEqual(
+            re.findall(r'"([^"\n]+)"', destinations.group(1)),
+            ["$CODEX_SKILL_DIR", "$CLAUDE_SKILL_DIR"],
         )
-        self.assertIn("unsafe {label} overlap", instructions)
-        self.assertIn("source/install overlap", instructions)
-        self.assertIn("backup/discovery overlap", instructions)
-        self.assertIn("staging/install overlap", instructions)
-        self.assertIn('test ! -e "$BACKUP"', instructions)
-        self.assertIn("archive_legacy_discovery_backups", instructions)
-        self.assertIn("rollback_partial_install", instructions)
-        self.assertIn("trap 'rollback_partial_install 130' INT", instructions)
-        self.assertIn("trap 'rollback_partial_install 143' TERM", instructions)
-        self.assertIn("STAGED=(", instructions)
-        self.assertIn("install-transaction", instructions)
-        self.assertIn("sys.version_info < (3, 11)", instructions)
-        self.assertIn("import tomllib", instructions)
-        self.assertIn("herdr-dev-loop.failed-*", instructions)
-        self.assertIn("external-review.failed-*", instructions)
-        self.assertIn('test ! -L "$DESTINATION"', instructions)
 
-    def test_migration_docs_distinguish_recovery_and_committed_rollback(self):
-        instructions = (
-            SKILL_ROOT / "references/migration-install.md"
-        ).read_text(encoding="utf-8")
+    def test_historical_release_notes_are_marked_as_historical(self):
         release_note = (
             SKILL_ROOT / "docs/2026-07-17-v0.5.3-release-notes.md"
-        ).read_text(encoding="utf-8")
-        for expected in (
-            "Prepared/partial recovery rollback",
-            "Committed pre-first-mutation rollback",
-            "rollback-prepared",
-            "first_v053_mutation_at",
-            "first_v053_mutation_command",
-        ):
-            self.assertIn(expected, instructions)
-        self.assertIn("prepared/running", release_note)
-        self.assertIn("committed", release_note)
+        ).read_text(encoding="utf-8").lower()
+        self.assertTrue(
+            "historical" in release_note or "history" in release_note,
+            "the old release note must not remain current install/default authority",
+        )
 
 
 if __name__ == "__main__":

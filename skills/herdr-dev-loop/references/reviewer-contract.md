@@ -59,11 +59,11 @@ Prefer no finding over weak or speculative findings.
 
 ## 0.5.3 Review epoch and convergence contract
 
-For new loops, Reviewer and Gap executions are scheduled in one immutable review epoch after a batch closes. The plan pins `base_sha`, `target_sha`, release-scope and planning snapshots, selected protocol, lane identity, provider/model/effort, required capability adapter, and verification policy. Every lane, finding, verification, and execution outcome must target that plan revision. A stale target, incomplete required execution, or unmatched adapter keeps the collection gate open.
+For new loops, Reviewer and Gap executions are scheduled in one immutable review epoch after a batch closes. The plan pins `base_sha`, `target_sha`, release-scope and planning snapshots, selected protocol, lane identity, provider/model/effort, and verification policy. An `external-review` plan also pins its exact capability adapter; native plans do not require one. Every lane, finding, verification, and execution outcome must target that plan revision. A stale target, incomplete required execution, or unmatched external adapter keeps the collection gate open.
 
-Fresh 0.5.3 ordinary review defaults to `reviewer.protocol = "external-review"` with the canonical six-lane Reviewer topology. `--review-protocol native` is an explicit override for ordinary review only. Select the supported native pre-final path separately with `[defaults.review] pre_final_protocol = "native"`. Manual-final has no native override; `manual_final_protocol` accepts only `external-review`.
+Fresh loops default ordinary review, pre-final, and manual-final to `native`, with the canonical six-lane Reviewer topology. The native path does not depend on an adapter. `external-review` can be selected explicitly for a new execution when its exact capability pin is available. Configuration and plan identity are fixed when saved; an unavailable external adapter blocks that plan, with no automatic native fallback or certification relabeling.
 
-The default external execution uses one HLoop Coordinator and six exact lanes. The companion must expose `externally-planned-v1` with the source, version, and content digest pinned by `release-dependencies.json`; it must not start its own default Coordinator or child lanes. Native fallback is allowed only when the execution kind's own resolved policy explicitly selects it. Capacity is reserved before process start and remains consumed by an expired quarantined process until exit or forced abort is confirmed.
+An explicitly selected external execution uses the HLoop-planned lanes and requires a pinned `externally-planned-v1` capability record containing its exact source, version, and content digest. The companion must execute only those lanes and must not start its own default Coordinator or child lanes. Missing or drifted pin evidence blocks the execution; it never causes an existing external plan to be run under native policy. Capacity is reserved before process start and remains consumed by an expired quarantined process until exit or forced abort is confirmed.
 
 The Reviewer reports evidence. The Manager owns the seven finding axes
 (`fact_status`, `origin`, `contract_relation`, `decision_requirement`,
@@ -112,7 +112,7 @@ See [Review Swarm And Dual Review Contract](review-swarm.md) for the normalized 
 
 ## Compatibility Mode
 
-Use the fresh `reviewer.protocol: external-review` default only with the pinned `externally-planned-v1` adapter. The companion executes only the HLoop-planned lanes and returns them one-to-one; HLoop retains ownership of epoch identity, capacity, normalization, triage, and gates. Missing capability evidence fails closed. `--review-protocol native` changes only ordinary review and does not alter pre-final or manual-final policy.
+`external-review` is an optional compatibility protocol, not a fresh-loop default. Configure it only when its exact source, version, digest, and `externally-planned-v1` capability are pinned. The companion executes only the HLoop-planned lanes and returns them one-to-one; HLoop retains ownership of epoch identity, capacity, normalization, triage, and gates. Missing capability evidence fails closed. A saved external plan or certification is never silently converted to native; prepare a new plan only after an authorized protocol change.
 
 ## Manager Action Labels
 

@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -90,15 +91,16 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.protocol_adapter = hloop.hloop_release_dependency.load_release_dependencies(
-            SKILL_ROOT / "release-dependencies.json"
+        self._config_env = mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.root / "home"),
+                "HLOOP_CONFIG_HOME": str(self.root / "hloop-config"),
+                "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+            },
         )
-        self.protocol_capability_path = (
-            SKILL_ROOT.parent
-            / "external-review"
-            / "capabilities"
-            / "externally-planned-v1.json"
-        )
+        self._config_env.start()
+        self.protocol_adapter = None
         self.repo = self.root / "repo"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True)
@@ -141,16 +143,12 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self._make_ready_state()
 
     def tearDown(self) -> None:
+        self._config_env.stop()
         self.tmp.cleanup()
 
-    def run_cli(self, *args: str) -> tuple[int, str, str]:
-        args = tuple(args)
-        if args[:2] == ("final-review", "prepare") and "--protocol-capability" not in args:
-            args = (
-                *args,
-                "--protocol-capability",
-                str(self.protocol_capability_path),
-            )
+    def run_cli(
+        self, *args: str, allow_release_lookup: bool = False
+    ) -> tuple[int, str, str]:
         if args[:2] == ("task", "new") and "--preserved-invariant" not in args:
             args = (
                 *args,
@@ -167,14 +165,33 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             )
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with (
-            contextlib.redirect_stdout(stdout),
-            contextlib.redirect_stderr(stderr),
-            mock.patch.object(
+        release_lookup = (
+            contextlib.nullcontext()
+            if allow_release_lookup
+            else mock.patch.object(
                 hloop.hloop_release_dependency,
                 "load_release_dependencies",
-                return_value=self.protocol_adapter,
-            ),
+                side_effect=AssertionError(
+                    "native CLI command attempted an external adapter lookup"
+                ),
+            )
+        )
+        catalog_lookup = (
+            contextlib.nullcontext()
+            if allow_release_lookup
+            else mock.patch.object(
+                hloop.hloop_release_dependency,
+                "load_release_catalog",
+                side_effect=AssertionError(
+                    "native CLI command attempted a release catalog lookup"
+                ),
+            )
+        )
+        with (
+            release_lookup,
+            catalog_lookup,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
         ):
             code = hloop.main(
                 ["--repo", str(self.repo), "--namespace", self.namespace, *args]
@@ -1126,7 +1143,7 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             source_artifact_ref="reviews/convergence/MANIFEST.json",
             source_artifact_digest=hloop._sha256_labelled(source_path.read_bytes()),
             target_sha=source.plan.head_sha,
-            protocol_adapter=self.protocol_adapter,
+            protocol_adapter=None,
         )
         with self.assertRaisesRegex(
             hloop.HLoopError, "must exactly match the validated source artifact"
@@ -1337,10 +1354,10 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         }
         self.assertFalse(hloop._validation_identity_matches(record, reordered))
 
-    def test_manual_final_protocol_does_not_fallback_to_implemented_protocol(self):
+    def test_unknown_manual_final_protocol_is_rejected_without_fallback(self):
         target = self.state()["integration_head_sha"]
         state = self.state()
-        state["review_policy"]["manual_final_protocol"] = "native"
+        state["review_policy"]["manual_final_protocol"] = "unknown"
         state["review_convergence"] = {
             "status": "converged",
             "target_sha": target,
@@ -1353,6 +1370,32 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertIn("unsupported manual-final protocol", err)
+
+    def test_explicit_external_manual_final_still_fails_closed_without_adapter(self):
+        self.prepare_convergence()
+        self.complete_convergence_manifest()
+        code, out, err = self.run_cli("review", "convergence", "record", "--json")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(json.loads(out)["status"], "converged")
+        target = self.state()["integration_head_sha"]
+        state = self.state()
+        state["resolved_config"]["review"]["manual_final_protocol"] = "external-review"
+        state["review_policy"]["manual_final_protocol"] = "external-review"
+        self.save_state(state)
+        with mock.patch.object(
+            hloop.hloop_release_dependency,
+            "load_release_dependencies",
+            side_effect=hloop.hloop_release_dependency.ReleaseDependencyUnavailable(
+                "no external-review adapter is configured for external execution"
+            ),
+        ) as load_dependency:
+            code, out, err = self.run_cli(
+                "final-review", "prepare", "--json", allow_release_lookup=True
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("external-review", err)
+        load_dependency.assert_called_once()
 
     def test_readiness_requires_first_class_follow_up_for_deferred_candidate(self):
         fingerprint = "sha256:" + "d" * 64
@@ -1439,6 +1482,9 @@ class HLoopConvergenceV052Tests(unittest.TestCase):
             json.loads((loop / "reviews" / "final" / "PLAN.json").read_text(encoding="utf-8"))
         )
         current_record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(plan.protocol, "native")
+        self.assertNotIn("protocol_adapter", plan.execution.to_record())
+        self.assertNotIn("protocol_adapter", current_record["execution"])
         group = hloop_review.ReviewGroupPlan.from_record(current_record)
         review = hloop_review.ReviewManifest(
             review_id=(plan.execution.execution_id if plan.execution else "R001"),

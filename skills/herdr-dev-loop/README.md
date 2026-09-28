@@ -2,7 +2,7 @@
 
 `herdr-dev-loop` は、Herdr 上で複数の Codex または Claude agent に実装、仕様との突合、レビュー、修正を分担させるための Skill です。Manager が `.ai/herdr-dev-loop/loops/<namespace>` を管理し、Worker が実装し、Gap Auditor が元の計画や仕様との差分を調べ、Reviewer が統合後の変更を確認します。
 
-このREADMEは0.5.3運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、review epochは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。release gateは[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)と[`release-dependencies.json`](release-dependencies.json)を正本にします。
+このREADMEは0.5.3運用の入口です。設定は[Configuration Contract](references/configuration.md)、報連相とManagerの待機は[Agent Report And Manager Wake Contract](references/report-protocol.md)、要件と判断は[Requirements, Decisions, And Outcomes](references/requirements-decisions-outcomes.md)、review epochは[Review Swarm And Dual Review Contract](references/review-swarm.md)、移行とinstallは[Migration And Install Parity](references/migration-install.md)を参照してください。artifactの形式や状態遷移の厳密な契約は、[Managerのチェックリスト](references/manager-loop.md)、[状態遷移](references/state-machine.md)、[ブランチ方針](references/branch-policy.md)、[Worker契約](references/worker-contract.md)、[Gap Auditor契約](references/gap-contract.md)、[Reviewer契約](references/reviewer-contract.md)、[artifact形式](references/artifact-contract.md)、[validation方針](references/validation-policy.md)に分けています。現在の運用とインストールの正本は[Migration And Install Parity](references/migration-install.md)、[`release-dependencies.json`](release-dependencies.json)、実行時スキーマであり、[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)は過去の経緯を示し、必須のインストール正本ではありません。
 
 ## 最初に確認すること
 
@@ -57,7 +57,7 @@ hloop config explain --repo <repo> --json
 
 `[defaults]`にWorkerとReviewerのprovider、model、effort、同時Worker数、session cleanupを設定できます。`[[scope]]`は既定でcanonicalなrepository rootに一致し、同じrepository内のsubdirectoryから起動しても結果が変わりません。起動directory固有の設定だけ`match = "cwd"`を明示します。設定例は[`examples/config.toml`](examples/config.toml)にあります。
 
-新規0.5.3 loopは、ordinary reviewの`reviewer.protocol`、`review.pre_final_protocol`、`review.manual_final_protocol`をすべて`external-review`にし、canonicalなReviewer topologyを6 laneにします。Gapは4 lane、epoch全体のAgent budgetは12、taskごとのPatch Reviewは最大2 roundです。`--review-protocol native`が変更するのはordinary reviewだけです。pre-finalでサポート済みのnative pathを使う場合は、`[defaults.review]`または一致するscopeで`pre_final_protocol = "native"`を別途設定します。manual-finalにnative overrideはなく、`manual_final_protocol`は`external-review`だけを受理します。external protocolを選択した実行にはpin済みの`externally-planned-v1` companion capabilityが必要であり、欠落やdigest不一致からnativeへ黙ってfallbackしません。0.5.3のshipped recordはrelease-readyで、同梱snapshotをimmutable hardened-fork commit、exact adapter version、payload digestへ固定します。legacy loopをmigrationしても保存済みのmerge-count cadenceやfinish semanticsは暗黙に変更されません。
+新規の0.5.3ループでは、Worker、通常レビューを制御する`reviewer.protocol`、`review.pre_final_protocol`、および`review.manual_final_protocol`のすべてにおいて`native`を既定値とし、標準的なレビュアートポロジーは既定で6レーンに設定されます。Gap Auditorは4レーン、エポック全体のAgent予算は12、タスクごとのパッチレビュー上限は最大2ラウンドのまま維持されます。`--review-protocol`オプションが変更するのは通常レビューのみです。pre-finalとmanual-finalの設定項目は独立した状態を保ちますが、いずれも既定値は`native`となり、manual-finalでも`native`が受理されます。native実行時には外部アダプターの証拠や機能引数を保持せず、nativeのmanual-finalが外部アダプターの証拠を受け入れることもありません。汎用の外部レビュー（external-review）は、厳密なピン留め、バージョン、ダイジェスト、および機能検証を伴う明示的なオプトインによってのみ利用可能であり、暗黙的にnativeへフォールバックすることはありません。同梱される`release-dependencies.json`の依存関係（`dependencies`）は空（`[]`）で、ベンダー提供の連携ツールは含まれません。保存されている既存の外部状態、エポック、PLANが暗黙にnativeへ変換または再解釈されることはなく、未知の保存済みプロトコルや旧形式の識別子は再ラベル付けや暗黙のフォールバックを行わずに安全に停止（fail-closed）し、設定の明示的な変更や再生成を要求します。従来のループから移行した場合でも、保存されたマージ周期や完了時の動作仕様（finish semantics）が暗黙に変更されることはありません。
 
 解決順はbuilt-in default、`[defaults]`、浅いscopeから深いscope、loop snapshot、task override、role start override、participant overrideです。`init`は設定元と解決値を`STATE.json`へsnapshotするため、global configを書き換えても既存loopは暗黙に変わりません。credential、token、任意shell commandは設定ファイルへ書きません。
 
@@ -181,14 +181,13 @@ manifestが不完全、またはverified actionable findingが残る場合は、
 convergenceが`converged`になったら、freshなmanual final reviewを準備します。
 
 ```bash
-hloop final-review prepare --mode swarm \
-  --protocol-capability "$(dirname "$HLOOP_SKILL_DIR")/external-review/capabilities/externally-planned-v1.json" --json
+hloop final-review prepare --mode swarm --json
 # 固定SHA、PLAN.json、MANIFEST.json、reportへ手動review結果を記録
 hloop final-review record --json
 hloop final-review status --json
 ```
 
-manual finalは、finding数が0という自己申告だけでは合格しません。PLAN/MANIFESTは`manual_final_execution`、execution ID、source execution、source artifact ref/digest、固定target、pinned adapter identityを共有します。`independent`はcompleteなpre-final sourceとは別のReviewer execution IDを要求し、`reuse_epoch_reviewer`は同じtargetの成功済みepoch Reviewer executionとartifactだけを再利用できます。全lane完了、必要な独立verification、shortfallなし、manifest completeness、scope snapshot、report存在、verified actionable finding 0件も必要です。duplicate/synthetic source、artifact drift、adapter drift、complete-zeroにならないmanual finalは`finish`を通過できません。canonical dependency record、同梱companion、runtime capabilityのいずれかがpinと一致しなければprepareはfail-closedで停止します。
+manual finalは、指摘数が0件であるという自己申告だけでは合格しません。PLANとMANIFESTの間で、`manual_final_execution`、実行ID、起点となる実行情報、起点成果物の参照とダイジェスト、固定された対象コミット（target SHA）、および検証範囲が共有されている必要があります。`independent`設定では完了したpre-finalの起点とは異なるReviewer実行IDが要求され、`reuse_epoch_reviewer`設定では同一の対象コミットに対して成功したエポックのReviewer実行と成果物のみを再利用できます。最終認定にあたっては、明示的なモードとしてsingle、swarm、dual、dual-swarmが存在するため、一律に全6レーンを義務付けるのではなく、計画されたすべてのレーン（PLANNED lanes）の完了が必須です。さらに、必要に応じた独立検証、不足（shortfall）がないこと、マニフェストの完全性、レポートの存在、検証済みで対処が必要な指摘が0件であること、ならびに対象コミットの一致や成果物の乖離を防ぐ検査（independent/reuse/sameSHA drift gates）および起点情報の同一性確認も求められます。nativeのmanual-finalでは外部アダプターの証拠を一切受け入れず、アダプターに関する項目や検証は明示的な外部プロトコルにのみ適用されます。重複または偽装された起点情報、成果物の乖離、外部プロトコル使用時のアダプターの乖離、および完全な0件を達成しないmanual finalは`finish`処理を通過できません。なお、prepare処理によってAgentが自動起動されることはありません。保存されている外部状態、エポック、PLANが暗黙にnativeへ変換または再解釈されることはなく、未知の保存済みプロトコルや旧形式の識別子が存在する場合は、再ラベル付けや暗黙のフォールバックを行わずにフェイルクローズ（fail-closed）として停止し、明示的な変更や新規作成を要求します。
 
 PLAN/MANIFESTの公開schemaは[`schemas/final-review-plan.schema.json`](schemas/final-review-plan.schema.json)と[`schemas/final-review-manifest.schema.json`](schemas/final-review-manifest.schema.json)です。
 
@@ -242,7 +241,7 @@ paneは閉じられ、再投入時は古いworktreeを整理します。product�
 - **provider**：agentを起動するCLIです。`codex` または `claude` を指定します。
 - **model**：provider内で使うモデルです。`auto` はCLIの既定値です。
 
-たとえば `worker_protocol: native` と `worker_agent_provider: codex` は別々に指定します。`$codex-impl`は任意のWorker互換protocolです。新規0.5.3 loopではordinary review、pre-final、manual-finalがすべて`$external-review`を既定にし、canonicalなReviewer topologyは6 laneです。`--review-protocol native`はordinary reviewだけを変更します。pre-finalのnative pathは`pre_final_protocol = "native"`で別途選択できます。manual-finalにnative overrideはなく、`manual_final_protocol`は`external-review`だけを受理します。external protocolにはpin済みの`externally-planned-v1` companion capabilityが必要であり、同梱snapshot、release pin、runtime capabilityの完全一致を要求します。
+たとえば `worker_protocol: native` と `worker_agent_provider: codex` は別々に指定します。`$codex-impl`は任意のWorker互換protocolです。新規0.5.3 loopではWorker、ordinary review、pre-final、manual-finalがすべて`native`を既定にし、canonicalなReviewer topologyは6 laneです。`--review-protocol native`が変更するのはordinary reviewだけであり、pre-finalとmanual-finalの各設定キーは独立していますが、双方がnativeを既定としmanual-finalも`native`を受理します。native実行では外部adapter evidenceやcapability引数を保持しません。汎用のexternal-reviewプロトコルは、厳格なpin、バージョン、digest、capability検証を伴う明示的なオプトインとして利用でき、nativeへの暗黙のfallbackは行いません。
 
 ### QAの2段階
 
@@ -419,7 +418,7 @@ hloop --repo <repo> init \
 
 `--create-branch` はintegration branchの準備も行います。未commitの変更がある場合は、先に状態を確認してください。ループ以外のdirty fileがあるとmutating commandが停止することがあります。
 
-この例の`--review-protocol native`はordinary reviewだけを上書きします。pre-finalのprotocolは`[defaults.review]`の`pre_final_protocol`で別途設定し、manual-finalにはnative overrideがありません。
+この例の`--review-protocol native`はordinary reviewだけを上書きします。pre-finalとmanual-finalの各設定キーは独立していますが、両者とも既定でnativeとなり、manual-finalも`native`を受理します。
 
 `--worktree-root` を指定すると、Worker、Reviewer、Gap Auditor、Advisorのworktreeがすべてその配下へ作られます。相対パスは対象リポジトリを基準に解決されます。`init --force`で再初期化した場合、旧loopは`.ai/herdr-dev-loop/archive/<namespace>/`へ退避され、新しい`run_id`が発行されます。
 
@@ -573,9 +572,9 @@ hloop --repo <repo> report
 
 ## Skillを更新した後のinstall
 
-このリポジトリのSkillを編集したら、[Migration And Install Parity](references/migration-install.md)の単一手順を先頭から実行します。短縮したinstall recipeを別に保守しません。正本はHLoopとpin済みcompanionの四つのdestinationを検証し、skill discovery対象外へbackupし、両方を同期してからinstalled selftestとbyte parityを確認します。
+このリポジトリのSkillを編集したら、[Migration And Install Parity](references/migration-install.md)の単一手順を先頭から実行します。短縮したinstall recipeを別に保守しません。通常のインストール対象はHLoopのみであり、CodexとClaudeの2つの宛先を検証してskill discovery対象外へバックアップし、staging、selftest、parity検証、およびrollback保護を備えて同期します。外部コンポーネントのインストールは別途明示的なオプトインで行います。
 
-通常の配布では、同期後に新しいCodexとClaude Code sessionでskill discoveryと最初の0.5.3表示を確認します。fresh sessionから`externally-planned-v1` capability、version、content digestをhandshakeし、repository、Codex、Claudeのbyte parityとlive handshakeを実施していない場合は成功扱いしません。rollbackではactive loopを止め、失敗したinstalled directoryを退避して対応するbackupを戻します。schema 3.3へ移行済みのnamespaceを古いruntimeでmutateしません。release gateは[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)にあります。
+通常配布におけるnativeインストールでは、CodexおよびClaudeの配置先に対してHLoopのみを配置します。同期後の新規セッションにおける接続確認では、外部アダプターの機能である`externally-planned-v1`やバージョン、ダイジェストではなく、HLoopスキルの検出と0.5.3のバージョン表示を確認します。外部アダプターの機能、バージョン、ダイジェスト、および配布時の接続確認が必要になるのは、明示的に外部レビュー（external-review）を選択した場合のみです。CodexとClaudeの双方の配置先において、リポジトリとのバイト単位の一致（byte parity）と新規セッションでの接続証明は引き続き必須条件であり、オフラインテストのみから実環境でのライブ検証完了とみなすことはできません。ロールバック時は実行中のループを停止し、失敗したインストールディレクトリを退避したうえで対応するバックアップを復元します。また、schema 3.3へ移行済みの名前空間を古いランタイムで変更することは禁止されています。現在のインストールおよびリリースの仕様契約は`references/migration-install.md`と`release-dependencies.json`に定められており、[`docs/2026-07-17-v0.5.3-release-notes.md`](docs/2026-07-17-v0.5.3-release-notes.md)は過去の記録であって現在の必須リリースゲートではありません。
 
 ## 公開時の注意
 

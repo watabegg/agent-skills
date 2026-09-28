@@ -2364,13 +2364,6 @@ def _prepare_final_review(fixture: dict[str, Any]) -> None:
         fixture,
         "final-review",
         "prepare",
-        "--protocol-capability",
-        str(
-            SKILL_ROOT.parent
-            / "external-review"
-            / "capabilities"
-            / "externally-planned-v1.json"
-        ),
         "--json",
     )
 

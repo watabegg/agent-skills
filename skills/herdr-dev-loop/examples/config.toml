@@ -26,8 +26,7 @@ model = "gpt-5.6-sol"
 effort = "xhigh"
 mode = "swarm"
 lane_count = 6
-protocol = "external-review"
-required_capabilities = ["externally-planned-v1"]
+protocol = "native"
 
 [defaults.reviewer.coordinator]
 provider = "codex"
@@ -88,8 +87,8 @@ effort = "max"
 
 [defaults.review]
 cadence = "batch"
-pre_final_protocol = "external-review"
-manual_final_protocol = "external-review"
+pre_final_protocol = "native"
+manual_final_protocol = "native"
 manual_final_execution = "independent"
 max_fix_rounds = 2
 scope_expansion_action = "follow_up"

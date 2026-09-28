@@ -9,38 +9,8 @@
   "required_release_evidence": [
     "hloop_codex_install_parity",
     "hloop_claude_install_parity",
-    "companion_codex_install_parity",
-    "companion_claude_install_parity",
     "codex_fresh_session_handshake",
     "claude_fresh_session_handshake"
   ],
-  "dependencies": [
-    {
-      "name": "external-review",
-      "kind": "external_review_protocol",
-      "required": true,
-      "availability": "available",
-      "blocking_reason": "",
-      "minimum_compatible_version": "2.1.0",
-      "distribution_identity": {
-        "source": "https://github.com/watabegg/agent-skills.git",
-        "immutable_id": "0000000000000000000000000000000000000000",
-        "version": "2.1.1",
-        "digest_algorithm": "sha256-tree-v1",
-        "content_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-      },
-      "capability_manifest": {
-        "relative_path": "capabilities/externally-planned-v1.json",
-        "record_type": "external_review_protocol_adapter",
-        "protocol": "external-review",
-        "required_capabilities": [
-          "externally-planned-v1"
-        ]
-      },
-      "install_destinations": {
-        "codex": "${CODEX_HOME:-$HOME/.codex}/skills/external-review",
-        "claude": "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/external-review"
-      }
-    }
-  ]
+  "dependencies": []
 }

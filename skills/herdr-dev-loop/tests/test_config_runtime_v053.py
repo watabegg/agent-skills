@@ -131,8 +131,11 @@ class ConfigProjectionRuntimeV053Tests(unittest.TestCase):
 
         self.assertIsNone(candidate)
         self.assertEqual(
-            resolution.get("reviewer", "protocol"), "external-review"
+            resolution.get("reviewer", "protocol"), "native"
         )
+        self.assertEqual(resolution.get("review", "pre_final_protocol"), "native")
+        self.assertEqual(resolution.get("review", "manual_final_protocol"), "native")
+        self.assertNotIn("required_capabilities", resolution.as_dict()["reviewer"])
         self.assertEqual(resolution.get("reviewer", "lane_count"), 6)
 
     def test_omitted_gap_and_advisor_flags_do_not_override_config(self):

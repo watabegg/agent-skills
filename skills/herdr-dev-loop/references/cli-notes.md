@@ -2,7 +2,7 @@
 
 These notes describe the local command assumptions used by `scripts/hloop`. Re-check with `hloop doctor` because Herdr, Codex CLI, and Claude Code CLI can change.
 
-`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements because Codex is the default fallback provider. It reports `claude` when available and role starts require Claude only when that role selects `--*-agent-provider claude`. `$codex-impl` remains an optional Worker compatibility skill. Fresh 0.5.3 defaults set ordinary `reviewer.protocol`, `review.pre_final_protocol`, and `review.manual_final_protocol` to `$external-review` with the canonical six-lane Reviewer topology. `--review-protocol native` changes only ordinary review. The supported native pre-final path is selected separately with `pre_final_protocol = "native"` in `[defaults.review]` or a matching scope. Manual-final has no native override and accepts only `external-review`. An execution that selects the external protocol requires its pinned `externally-planned-v1` companion capability. The shipped 0.5.3 record is release-ready and validates the vendored companion against an immutable hardened-fork commit, exact adapter version, and payload digest. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
+`hloop doctor` treats `git`, `herdr`, and `codex` as hard requirements because Codex is the default role-agent provider. It reports `claude` when available and role starts require Claude only when that role selects `--*-agent-provider claude`. `$codex-impl` remains an optional Worker compatibility skill. Fresh loops default ordinary review, pre-final, and manual-final to the HLoop Native Review Protocol with the canonical six-lane Reviewer topology. Native review does not require a companion. `external-review` is optional and can be selected explicitly when its exact source, version, payload digest, and `externally-planned-v1` capability are pinned. An unavailable pin blocks a saved external plan; it never falls back to native. The shipped release has no companion dependency. The `$herdr` skill file is useful context but the Herdr CLI is authoritative; a missing `$herdr` skill path is a warning unless `--strict-skills` is used.
 
 `hloop` is not assumed to be installed on `PATH`. Prefer an explicit shell variable in every Manager session:
 
@@ -48,8 +48,7 @@ hloop dispatch status --json
 hloop dispatch unfreeze --user-input-id U0002
 
 hloop review readiness --json
-hloop review epoch create --plan reviews/epochs/E001/PLAN.json \
-  --protocol-capability "$(dirname "$HLOOP_SKILL_DIR")/external-review/capabilities/externally-planned-v1.json"
+hloop review epoch create --plan reviews/epochs/E001/PLAN.json
 hloop review epoch reserve E001 --lease-id L001 --execution-id R001 \
   --process-id reviewer-R001 --expires-at 2026-07-17T12:00:00+00:00
 hloop review epoch record E001 --outcome reviews/epochs/E001/R001-outcome.json
@@ -77,6 +76,8 @@ hloop follow-up export --output docs/follow-ups.md
 ```
 
 `review epoch create` fixes the Reviewer/Gap plan, target, protocol capability, topology, and capacity policy. Reserve capacity before starting each process, record every terminal outcome, and require a closed collection barrier before triage. Candidate registration, approval, and materialization are separate idempotent transitions; classification conflict or digest drift blocks approval. `review convergence prepare` freezes a fixed integration SHA but does not start a Reviewer. `record` rejects stale targets, plan drift, incomplete lanes, verification shortfall, and nonzero actionable findings at the round limit. `review reopen` is the only path from failed/incomplete/exhausted certification back to task creation and requires a user input id. `final-review record` recomputes complete-zero evidence; a count of zero alone is insufficient.
+
+The example uses the native default and does not need `--protocol-capability`. For an explicitly configured `external-review` plan, pass the validated capability manifest through `--protocol-capability`; its source, version, digest, and `externally-planned-v1` value must match the selected pin. A missing or changed pin blocks that plan instead of changing its protocol.
 
 Mutating helper commands take `/tmp/herdr-dev-loop-<uid>/locks/<sha256>.lock` and write files atomically. The digest is derived from the canonical Git common directory and namespace. The fixed `/tmp` root does not follow `HLOOP_RUNTIME_DIR`, `XDG_RUNTIME_DIR`, or `TMPDIR`; its UID directory is secured to mode `0700`, lock files are mode `0600` and opened without following symlinks where the platform supports `O_NOFOLLOW`, and all lock state remains outside Git metadata. This protects the state from accidental concurrent invocations, but Manager should still run mutating helper commands serially so the journal and reasoning remain easy to audit.
 
@@ -212,7 +213,7 @@ hloop init ... --branch-strategy integration --worker-protocol native --review-p
 
 `--review-after-merges`と`--gap-after-merges`はstateへ保存されるlegacy/merge-count knobsであり、新規loopの`review_policy.cadence = "batch"`ではbatch closeと明示的な`review convergence`が優先されます。manual finalは`final-review prepare`と`final-review record`をManagerが実行し、complete-zero evidenceがなければfinishできません。
 
-この例の`--review-protocol native`はordinary reviewだけに適用されます。pre-finalのnative pathは`[defaults.review]`の`pre_final_protocol = "native"`で別途選択し、manual-finalはnative overrideをサポートしません。
+この例の`--review-protocol native`はordinary reviewだけに適用されます。pre-finalとmanual-finalの各プロトコルキーは独立していますが、現在はいずれもnativeが既定であり、manual-finalも`native`を受け付けます。
 
 Run `hloop selftest` after updating or installing the skill. It does not require `HERDR_ENV=1`; it checks skill-local frontmatter, agent metadata, JSON schemas, sample artifact parsing, and required field drift between `artifact-contract.md` and `state.schema.json`.
 

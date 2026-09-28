@@ -86,6 +86,7 @@ POLICY_AXES = (
 )
 
 EXTERNALLY_PLANNED_CAPABILITY = "externally-planned-v1"
+EXTERNAL_REVIEW_PROTOCOL = "external-review"
 _LABELLED_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -110,9 +111,9 @@ class ExternalReviewProtocolAdapter:
             if not isinstance(value, str) or not value.strip():
                 raise ReviewModelError(f"{field_name} must be a non-empty string")
             object.__setattr__(self, field_name, value.strip())
-        if self.protocol != "external-review":
+        if self.protocol != EXTERNAL_REVIEW_PROTOCOL:
             raise ReviewModelError(
-                "external review adapter supports only external-review"
+                f"external review adapter supports only {EXTERNAL_REVIEW_PROTOCOL}"
             )
         if not isinstance(self.content_digest, str) or not _LABELLED_DIGEST_RE.fullmatch(
             self.content_digest

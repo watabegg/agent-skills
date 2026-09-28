@@ -21,8 +21,6 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _REQUIRED_RELEASE_EVIDENCE = [
     "hloop_codex_install_parity",
     "hloop_claude_install_parity",
-    "companion_codex_install_parity",
-    "companion_claude_install_parity",
     "codex_fresh_session_handshake",
     "claude_fresh_session_handshake",
 ]
@@ -181,48 +179,11 @@ def _semver(value: Any, label: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))  # type: ignore[return-value]
 
 
-def validate_release_dependencies(value: Any) -> ExternalReviewProtocolAdapter:
-    """Validate the canonical release pin and return its exact runtime adapter.
+def _validate_dependency_catalog_entry(
+    dependency: Any,
+) -> ExternalReviewProtocolAdapter | None:
+    """Validate one catalog entry and return its declared available adapter."""
 
-    The unavailable branch is deliberately terminal. Placeholder distribution
-    values and mutable installed copies cannot turn it into an executable pin.
-    """
-
-    if not isinstance(value, Mapping):
-        raise ReleaseDependencyError("release dependency record must be an object")
-    _require_exact_fields(
-        value,
-        {
-            "record_type",
-            "schema_version",
-            "release",
-            "required_release_evidence",
-            "dependencies",
-        },
-        "release dependency record",
-    )
-    if value["record_type"] != "herdr_dev_loop_release_dependencies":
-        raise ReleaseDependencyError("release dependency record_type is invalid")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise ReleaseDependencyError("release dependency schema_version is invalid")
-
-    release = value["release"]
-    if not isinstance(release, Mapping):
-        raise ReleaseDependencyError("release must be an object")
-    _require_exact_fields(release, {"name", "version", "release_ready"}, "release")
-    if release.get("name") != "herdr-dev-loop" or release.get("version") != "0.5.3":
-        raise ReleaseDependencyError("release identity is not canonical 0.5.3")
-    if not isinstance(release.get("release_ready"), bool):
-        raise ReleaseDependencyError("release_ready must be boolean")
-    if value["required_release_evidence"] != _REQUIRED_RELEASE_EVIDENCE:
-        raise ReleaseDependencyError(
-            "Codex/Claude parity and fresh-session evidence are required"
-        )
-
-    dependencies = value["dependencies"]
-    if not isinstance(dependencies, list) or len(dependencies) != 1:
-        raise ReleaseDependencyError("exactly one release dependency is required")
-    dependency = dependencies[0]
     if not isinstance(dependency, Mapping):
         raise ReleaseDependencyError("release dependency must be an object")
     _require_exact_fields(
@@ -243,9 +204,10 @@ def validate_release_dependencies(value: Any) -> ExternalReviewProtocolAdapter:
     if (
         dependency["name"] != "external-review"
         or dependency["kind"] != "external_review_protocol"
-        or dependency["required"] is not True
     ):
-        raise ReleaseDependencyError("required companion identity is invalid")
+        raise ReleaseDependencyError("external-review adapter identity is invalid")
+    if type(dependency["required"]) is not bool:
+        raise ReleaseDependencyError("dependency required must be boolean")
 
     capability = dependency["capability_manifest"]
     if not isinstance(capability, Mapping):
@@ -262,46 +224,36 @@ def validate_release_dependencies(value: Any) -> ExternalReviewProtocolAdapter:
     if capability["required_capabilities"] != ["externally-planned-v1"]:
         raise ReleaseDependencyError("externally-planned-v1 is required")
     if dependency["install_destinations"] != _INSTALL_DESTINATIONS:
-        raise ReleaseDependencyError("Codex and Claude companion destinations are required")
+        raise ReleaseDependencyError("Codex and Claude adapter destinations are required")
 
     availability = dependency["availability"]
+    blocking_reason = dependency["blocking_reason"]
     if availability == "unavailable":
-        if release["release_ready"] is not False:
-            raise ReleaseDependencyError("unavailable companion requires release_ready false")
-        if (
-            not isinstance(dependency["blocking_reason"], str)
-            or not dependency["blocking_reason"].strip()
-        ):
-            raise ReleaseDependencyError("unavailable companion requires a blocking reason")
+        if not isinstance(blocking_reason, str) or not blocking_reason.strip():
+            raise ReleaseDependencyError("unavailable adapter requires a blocking reason")
         if dependency["minimum_compatible_version"] is not None:
             raise ReleaseDependencyError(
-                "unavailable companion cannot claim a minimum version"
+                "unavailable adapter cannot claim a minimum version"
             )
         if dependency["distribution_identity"] is not None:
             raise ReleaseDependencyError(
-                "unavailable companion cannot claim a distribution identity"
+                "unavailable adapter cannot claim a distribution identity"
             )
         if capability["relative_path"] is not None:
-            raise ReleaseDependencyError(
-                "unavailable companion cannot claim a manifest path"
-            )
-        raise ReleaseDependencyUnavailable("0.5.3 release_ready is false")
+            raise ReleaseDependencyError("unavailable adapter cannot claim a manifest path")
+        return None
     if availability != "available":
-        raise ReleaseDependencyError("companion availability is invalid")
-    if release["release_ready"] is not True:
-        raise ReleaseDependencyUnavailable(
-            "available companion requires release_ready true"
-        )
-    if dependency["blocking_reason"] != "":
+        raise ReleaseDependencyError("adapter availability is invalid")
+    if blocking_reason != "":
         raise ReleaseDependencyError(
-            "available dependency cannot retain a blocking reason"
+            "available adapter cannot retain a blocking reason"
         )
 
     minimum_text = dependency["minimum_compatible_version"]
-    minimum = _semver(minimum_text, "minimum compatible companion version")
+    minimum = _semver(minimum_text, "minimum compatible adapter version")
     distribution = dependency["distribution_identity"]
     if not isinstance(distribution, Mapping):
-        raise ReleaseDependencyUnavailable("immutable distribution identity is missing")
+        raise ReleaseDependencyUnavailable("immutable adapter identity is missing")
     _require_exact_fields(
         distribution,
         {"source", "immutable_id", "version", "digest_algorithm", "content_digest"},
@@ -311,30 +263,26 @@ def validate_release_dependencies(value: Any) -> ExternalReviewProtocolAdapter:
         isinstance(distribution[key], str) and distribution[key].strip()
         for key in ("source", "immutable_id")
     ):
-        raise ReleaseDependencyError(
-            "distribution source and immutable_id must be non-empty"
-        )
+        raise ReleaseDependencyError("distribution source and immutable_id must be non-empty")
     if not _COMMIT_RE.fullmatch(distribution["immutable_id"]):
         raise ReleaseDependencyError(
             "distribution immutable_id must be an exact lowercase Git commit SHA"
         )
     version_text = distribution["version"]
-    version = _semver(version_text, "exact companion version")
+    version = _semver(version_text, "exact adapter version")
     if version < minimum:
         raise ReleaseDependencyError(
-            "exact companion version is below minimum compatible version"
+            "exact adapter version is below minimum compatible version"
         )
     if distribution["digest_algorithm"] != "sha256-tree-v1":
-        raise ReleaseDependencyError("companion digest algorithm is invalid")
+        raise ReleaseDependencyError("adapter digest algorithm is invalid")
     digest = distribution["content_digest"]
     if not isinstance(digest, str) or not _DIGEST_RE.fullmatch(digest):
-        raise ReleaseDependencyError("companion content digest is invalid")
+        raise ReleaseDependencyError("adapter content digest is invalid")
 
     relative_path = capability["relative_path"]
     if not isinstance(relative_path, str):
-        raise ReleaseDependencyError(
-            "capability manifest path must be a safe relative path"
-        )
+        raise ReleaseDependencyError("capability manifest path must be a safe relative path")
     _safe_relative_path(relative_path, "capability manifest path")
     try:
         return ExternalReviewProtocolAdapter(
@@ -349,6 +297,93 @@ def validate_release_dependencies(value: Any) -> ExternalReviewProtocolAdapter:
         )
     except ReviewModelError as exc:
         raise ReleaseDependencyError(str(exc)) from exc
+
+
+def validate_release_catalog(value: Any) -> tuple[ExternalReviewProtocolAdapter, ...]:
+    """Validate the release's optional adapter catalog without checking installs.
+
+    A native-only release has an empty catalog. Available optional entries are
+    returned as immutable adapter declarations; unavailable optional entries
+    remain valid metadata and do not make the native release depend on them.
+    """
+    if not isinstance(value, Mapping):
+        raise ReleaseDependencyError("release catalog record must be an object")
+    _require_exact_fields(
+        value,
+        {
+            "record_type",
+            "schema_version",
+            "release",
+            "required_release_evidence",
+            "dependencies",
+        },
+        "release catalog record",
+    )
+    if value["record_type"] != "herdr_dev_loop_release_dependencies":
+        raise ReleaseDependencyError("release dependency record_type is invalid")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ReleaseDependencyError("release dependency schema_version is invalid")
+
+    release = value["release"]
+    if not isinstance(release, Mapping):
+        raise ReleaseDependencyError("release must be an object")
+    _require_exact_fields(release, {"name", "version", "release_ready"}, "release")
+    if release.get("name") != "herdr-dev-loop" or release.get("version") != "0.5.3":
+        raise ReleaseDependencyError("release identity is not canonical 0.5.3")
+    if not isinstance(release.get("release_ready"), bool):
+        raise ReleaseDependencyError("release_ready must be boolean")
+    if value["required_release_evidence"] != _REQUIRED_RELEASE_EVIDENCE:
+        raise ReleaseDependencyError("native install parity and fresh-session evidence are required")
+
+    dependencies = value["dependencies"]
+    if not isinstance(dependencies, list):
+        raise ReleaseDependencyError("release catalog dependencies must be an array")
+    adapters: list[ExternalReviewProtocolAdapter] = []
+    seen_names: set[str] = set()
+    for dependency in dependencies:
+        adapter = _validate_dependency_catalog_entry(dependency)
+        name = dependency["name"] if isinstance(dependency, Mapping) else None
+        if name in seen_names:
+            raise ReleaseDependencyError(f"duplicate release catalog adapter: {name}")
+        seen_names.add(name)
+        if adapter is not None:
+            adapters.append(adapter)
+    return tuple(adapters)
+
+
+def load_release_catalog(path: Path) -> tuple[ExternalReviewProtocolAdapter, ...]:
+    """Load optional adapter declarations without requiring installed packages."""
+
+    return validate_release_catalog(_load_json_object(path, "release catalog"))
+
+
+def validate_release_dependencies(value: Any) -> ExternalReviewProtocolAdapter:
+    """Require the one pinned adapter needed for optional external execution.
+
+    This strict lookup is intentionally separate from catalog validation: a
+    native-only release can publish with an empty catalog, while selecting the
+    external protocol still requires a complete immutable adapter pin.
+    """
+
+    adapters = validate_release_catalog(value)
+    dependencies = value["dependencies"]
+    if not dependencies:
+        raise ReleaseDependencyUnavailable(
+            "no external-review adapter is configured for external execution"
+        )
+    if len(dependencies) != 1:
+        raise ReleaseDependencyUnavailable(
+            "external execution requires exactly one configured external-review adapter"
+        )
+    if not adapters:
+        dependency = dependencies[0]
+        reason = dependency.get("blocking_reason", "adapter is unavailable")
+        raise ReleaseDependencyUnavailable(
+            f"external-review adapter is unavailable: {reason}"
+        )
+    if value["release"]["release_ready"] is not True:
+        raise ReleaseDependencyUnavailable("0.5.3 release_ready is false")
+    return adapters[0]
 
 
 def load_release_dependencies(path: Path) -> ExternalReviewProtocolAdapter:

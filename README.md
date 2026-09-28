@@ -157,7 +157,7 @@ Skill を入れ替えたので、再読み込みが必要か確認して。
 
 - 目的:
   - Herdr 上で Manager / Worker / Gap Auditor / Reviewer / Advisor の Codex・Claude agent を、git worktree、integration branch、`.ai/herdr-dev-loop/loops/<namespace>` artifact によって安全に協調させる。
-  - 0.5.3のWorkerはnativeを使い、ordinary review、pre-final、manual-finalはpin済みの`$external-review`を既定にする。0.5.5ではnative manual-finalを追加し、外部companionを明示選択時だけの任意依存へ移す計画である。
+  - 0.5.3のWorker、ordinary review、pre-final、manual-finalはnativeを既定にし、manual-finalもnativeを受け付けます。外部レビューは明示的に選択した場合のみの任意機能であり、暗黙のnative fallbackは行いません。
   - Gap Auditor には元 repo の plan/spec と統合ブランチ実装の相違確認を担当させ、仕様判断が必要な場合は `DECISIONS.md` と `USER_ACTION_REQUIRED.md` に分離して止める。
   - `scripts/hloop` で init、task 作成、Worker/Gap Auditor/Reviewer 起動、harvest、merge、validation、pump、triage、report を実行する。
   - namespaced `PROFILE.md` で branch strategy、roleごとのprovider/model/effort、Worker protocol、Review lanes、QA profileを調整する。
@@ -214,7 +214,7 @@ public repo に置く前に、秘密値、cookie、token、社内 URL、本番�
 
 ## 個人 skill の同期
 
-このマシンで使う個人 skill の配置は次のコマンドで確認できます。`--apply` を付けると Codex の配置を更新し、Claude 側を symlink に揃えます。external_review の固定版と HLoop は対象に含めません。
+このマシンで使う個人 skill の配置は次のコマンドで確認できます。`--apply` を付けると Codex の配置を更新し、Claude 側を symlink に揃えます。HLoop は対象に含めません。
 
 ```sh
 python3 scripts/sync_installed_skills.py

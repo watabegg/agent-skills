@@ -620,7 +620,7 @@
       "properties": {
         "cadence": {"type": "string", "enum": ["batch", "merge-count"]},
         "pre_final_protocol": {"type": "string", "enum": ["native", "external-review"]},
-        "manual_final_protocol": {"type": "string", "enum": ["external-review"]},
+        "manual_final_protocol": {"type": "string", "enum": ["native", "external-review"]},
         "manual_final_execution": {"enum": ["independent", "reuse_epoch_reviewer"]},
         "max_fix_rounds": {"type": "integer", "minimum": 0, "maximum": 2},
         "scope_expansion_action": {
