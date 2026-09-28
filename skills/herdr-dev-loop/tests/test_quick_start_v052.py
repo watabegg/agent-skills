@@ -4,11 +4,13 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SKILL_DIR = Path(__file__).parents[1]
@@ -24,11 +26,24 @@ class QuickStartV052Tests(unittest.TestCase):
     namespace = "quick-start-v052"
 
     def setUp(self) -> None:
+        self.config_tmp = tempfile.TemporaryDirectory(prefix="hloop-quick-start-config-")
+        config_root = Path(self.config_tmp.name)
+        self.config_env = mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(config_root / "home"),
+                "HLOOP_CONFIG_HOME": str(config_root / "hloop-config"),
+                "XDG_CONFIG_HOME": str(config_root / "xdg-config"),
+            },
+        )
+        self.config_env.start()
         self.previous_namespace = hloop.LOOP_NAMESPACE
         hloop.configure_loop_namespace(self.namespace)
 
     def tearDown(self) -> None:
         hloop.configure_loop_namespace(self.previous_namespace)
+        self.config_env.stop()
+        self.config_tmp.cleanup()
 
     def run_cli(self, repo: Path, *arguments: str) -> tuple[int, str]:
         output = io.StringIO()

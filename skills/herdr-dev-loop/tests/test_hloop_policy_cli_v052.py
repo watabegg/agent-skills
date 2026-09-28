@@ -32,11 +32,24 @@ class PolicyCliV052Tests(unittest.TestCase):
     namespace = "policy-cli-v052"
 
     def setUp(self) -> None:
+        self.config_tmp = tempfile.TemporaryDirectory(prefix="hloop-policy-config-")
+        config_root = Path(self.config_tmp.name)
+        self.config_env = mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(config_root / "home"),
+                "HLOOP_CONFIG_HOME": str(config_root / "hloop-config"),
+                "XDG_CONFIG_HOME": str(config_root / "xdg-config"),
+            },
+        )
+        self.config_env.start()
         self.previous_namespace = hloop.LOOP_NAMESPACE
         hloop.configure_loop_namespace(self.namespace)
 
     def tearDown(self) -> None:
         hloop.configure_loop_namespace(self.previous_namespace)
+        self.config_env.stop()
+        self.config_tmp.cleanup()
 
     def make_repo(self, root: Path) -> Path:
         repo = root / "repo"

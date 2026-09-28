@@ -897,7 +897,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
 
     def test_manual_final_reuse_binds_successful_epoch_reviewer_artifact(self):
         target = "a" * 40
-        plan = self.external_epoch_plan(target)
+        plan = self.epoch_plan(target)
         reviewer = plan.execution("R001")
         outcome = EpochExecutionOutcome.for_plan(
             plan,
@@ -913,7 +913,7 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
         )
         collection = argparse.Namespace(plan=plan, execution_outcomes=(outcome,))
         state = {
-            "review_protocol": hloop.hloop_certification.MANUAL_FINAL_PROTOCOL,
+            "review_protocol": "native",
             "review_policy": {
                 **hloop.hloop_config.V053_REVIEW_POLICY_DEFAULTS,
                 "manual_final_execution": "reuse_epoch_reviewer",
@@ -924,18 +924,13 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                 "protocol_capabilities": {},
             },
         }
-        release = self.ready_release_dependency()
-        adapter = hloop.hloop_release_dependency.validate_release_dependencies(
-            release
-        )
-        state["review_epochs"]["protocol_capabilities"][plan.plan_digest] = {
-            adapter.protocol: adapter.to_record()
-        }
         with (
             mock.patch.object(
                 hloop.hloop_release_dependency,
                 "load_release_dependencies",
-                return_value=adapter,
+                side_effect=AssertionError(
+                    "native manual-final reuse attempted an external adapter lookup"
+                ),
             ),
             mock.patch.object(
                 hloop, "require_review_epoch_collection", return_value=collection
@@ -947,12 +942,20 @@ class ReviewRemediationCliV053Tests(unittest.TestCase):
                 target,
                 argparse.Namespace(protocol_capability=[]),
             )
+            state["review_policy"]["manual_final_protocol"] = "external-review"
+            with self.assertRaisesRegex(
+                hloop.HLoopError, "matching ordinary and manual-final protocol"
+            ):
+                hloop._manual_final_execution_provenance(
+                    Path("/unused"), state, target,
+                    argparse.Namespace(protocol_capability=[]),
+                )
         self.assertEqual(provenance.execution_policy, "reuse_epoch_reviewer")
         self.assertEqual(provenance.execution_id, reviewer.execution_id)
         self.assertEqual(provenance.source_execution_id, reviewer.execution_id)
         self.assertEqual(provenance.source_artifact_ref, outcome.artifact_ref)
         self.assertEqual(provenance.source_artifact_digest, outcome.artifact_digest)
-        self.assertEqual(provenance.protocol_adapter, adapter)
+        self.assertIsNone(provenance.protocol_adapter)
 
     def test_triage_approval_consumes_once_then_materializes_exact_plan(self):
         with tempfile.TemporaryDirectory() as directory:
