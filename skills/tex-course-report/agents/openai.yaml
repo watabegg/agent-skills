@@ -1,0 +1,4 @@
+interface:
+  display_name: "TeX授業レポート"
+  short_description: "実験結果を確かめ、自然な日本語と既存TeXの体裁で授業レポートを作成・修正する"
+  default_prompt: "$tex-course-report を使って、課題の要件と実験結果を確認し、既存TeXテンプレートで読みやすいレポートとPDFを作成してください。"
