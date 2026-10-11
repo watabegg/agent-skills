@@ -13,6 +13,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ("tex-course-report", "agy-writer", "ealps-moodle-operator", "luna-impl", "pencil-pencli", "prepare-invoice-email", "prepare-pr",
           "semantic-commit-ja", "shinshu-portal-auth", "sync-teams-attendance")
+SKILLS += ("bass-tab-from-photos",)
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store")
 
 

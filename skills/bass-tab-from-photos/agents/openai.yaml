@@ -1,0 +1,4 @@
+interface:
+  display_name: "写真からベースTABを作成"
+  short_description: "譜面写真の弦・音程を照合し、繰り返し展開したMuseScore TABを作成"
+  default_prompt: "Use $bass-tab-from-photos to transcribe these score photos into a pitch-checked, unfolded bass TAB and PDF."
