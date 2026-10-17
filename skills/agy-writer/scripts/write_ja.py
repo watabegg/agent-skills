@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 
 
-MODEL = "gemini-3.8-flash-high"
+MODEL = "gemini-4-argon-high"
 
 
 def read_text(path):

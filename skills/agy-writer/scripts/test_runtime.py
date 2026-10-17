@@ -79,7 +79,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 23)
         output = json.loads(result.stdout)
         self.assertEqual(output["cwd"], str(self.workspace))
-        self.assertEqual(output["argv"], ["--mode", "accept-edits", "--model", "gemini-3.8-flash-high", "--effort", "high", *extra])
+        self.assertEqual(output["argv"], ["--mode", "accept-edits", "--model", "gemini-4-argon-high", "--effort", "high", *extra])
 
     def test_sync_command_installs_codex_claude_and_runtime_together(self):
         codex, claude = self.root / "codex", self.root / "claude"
