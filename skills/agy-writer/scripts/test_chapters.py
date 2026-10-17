@@ -137,6 +137,32 @@ class ChapterTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 2)
         self.assertIn(b"finished single", self.output.read_bytes())
 
+    def test_output_language_reaches_every_writer_editor_and_later_repair(self):
+        _, base = self.invoke(extra=["--language", "en"])
+        for call in self.calls():
+            prompt = call["argv"][-1]
+            self.assertIn("文書の出力言語: en", prompt)
+            self.assertNotIn("章題も自然な日本語", prompt)
+        run = Path(base["run_dir"])
+        self.assertEqual(json.loads((run / "run.json").read_text())["language"], "en")
+        findings = self.root / "findings.json"
+        findings.write_text(json.dumps([{"before": "finished A", "evidence": "Original condition",
+                                        "issue": "Condition changed"}]))
+        code, result = self.invoke(operation="repair", extra=["--run", base["run_dir"], "--findings", str(findings)])
+        self.assertEqual((code, result["status"]), (0, "needs_review"))
+        prompt = next(x for x in self.calls() if x["phase"] == "repair")["argv"][-1]
+        self.assertIn("文書の出力言語: en", prompt)
+        self.assertEqual(json.loads((Path(result["run_dir"]) / "run.json").read_text())["language"], "en")
+
+    def test_invalid_language_does_not_invoke_models_or_replace_output(self):
+        self.output.write_text("EXISTING")
+        for language in ["", "en\nja"]:
+            with self.subTest(language=language):
+                code, result = self.invoke(extra=["--language", language])
+                self.assertEqual((code, result["status"]), (1, "failed"))
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.output.read_text(), "EXISTING")
+
     def test_parent_run_supports_targeted_repair_with_full_source_and_unchanged_bytes(self):
         _, base = self.invoke()
         before = self.output.read_bytes()

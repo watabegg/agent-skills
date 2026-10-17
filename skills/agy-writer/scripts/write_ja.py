@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write Japanese documents with agy-writer; stdout is a compact result, not prose."""
+"""Write technical documents with agy-writer; stdout is a compact result, not prose."""
 
 import argparse
 import difflib
@@ -113,6 +113,7 @@ def make_parser():
         command.add_argument("--timeout", type=int, default=1200, help="seconds; default 1200")
         command.add_argument("--writer", default="agy-writer", help="writer executable, without shell arguments")
         command.add_argument("--profile", type=Path, help="optional extra style instructions for this request")
+        command.add_argument("--language", help="output language name/code; follows packet instructions by default")
         if operation in {"chapters", "draft"}:
             command.add_argument("--packet", type=Path, required=True)
             command.add_argument("--out", type=Path, required=True)
@@ -123,6 +124,15 @@ def make_parser():
             command.add_argument("--run", type=Path, required=True)
             command.add_argument("--findings", type=Path, required=True)
     return parser
+
+
+def language_instruction(language):
+    if language is None:
+        return "出力言語は原資料の指定に従い、指定がなければ日本語にしてください。"
+    if not isinstance(language, str) or not language.strip() or "\n" in language or "\r" in language:
+        raise ValueError("Output language must be a non-empty single line")
+    return (f"文書の出力言語: {language.strip()}。本文と見出しをこの言語で書き、"
+            "原資料や作業指示の言語に引きずられないでください。校閲と修正でもこの出力言語を維持します。")
 
 
 def generate(args, run, record, prompt):
@@ -191,8 +201,11 @@ def execute(args, run, record):
     if output.is_relative_to(run):
         raise ValueError("Output must be outside the run directory")
     record["output"] = str(output)
+    language = args.language if args.language is not None else (base.get("language") if args.operation == "repair" else None)
+    record["language"] = language
     (run / "packet.md").write_bytes(packet.encode("utf-8"))
     prompt = "この workspace の GEMINI.md に従って執筆してください。必要な材料はこの依頼に含まれています。ツールは不要です。"
+    prompt += "\n" + language_instruction(language)
     if args.profile:
         prompt += "\n今回の追加の語彙設定:\n" + read_text(args.profile)
     prompt += "\n\n原資料:\n" + packet

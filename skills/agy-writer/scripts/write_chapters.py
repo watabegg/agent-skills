@@ -5,7 +5,7 @@ import re
 import subprocess
 import time
 
-from write_ja import atomic_write, read_text, save_json
+from write_ja import atomic_write, read_text, save_json, language_instruction
 
 
 def sections(packet):
@@ -102,7 +102,8 @@ def execute_chapters(args, run, record, generate):
     if plan is not None:
         save_json(run / "plan.json", plan)
     record.update(output=str(output), status="running", chapters=len(tasks), review_mode="continue",
-                  model_requested=args.model, effort="high")
+                  model_requested=args.model, effort="high", language=args.language)
+    language = language_instruction(args.language)
     save_json(run / "run.json", record)
 
     def chapter(index, task):
@@ -112,11 +113,11 @@ def execute_chapters(args, run, record, generate):
         (folder / "packet.md").write_bytes(evidence.encode("utf-8"))
         layout = ("文書全体の Markdown 本文を書いてください。" if task["title"] is None else
                   f"文書「{title}」の一章を書いてください。章題の案: {task['title']}。\n"
-                  "先頭は ## の章見出しとし、章内の見出しには ### 以下を使ってください。章題も自然な日本語に整えてかまいません。")
+                  "先頭は ## の章見出しとし、章内の見出しには ### 以下を使ってください。章題も指定された出力言語として自然に整えてかまいません。")
         target = task.get("target_chars")
         length = (f"\nこの章は {target} 字程度を目安にします。" if target else "")
         common = ("この workspace の GEMINI.md に従ってください。材料はすべて以下にあり、ツールは不要です。\n"
-                  + layout + length
+                  + language + "\n" + layout + length
                   + "\n目的、課題、解決方法、理由が自然につながる文章にしてください。章の材料をすべて説明し、"
                   "共通の背景は理解と条件の維持に使います。他の章の説明や前置き、章末の要約を繰り返して増やさないでください。"
                   "情報を削って短くせず、材料にない仕様を補わないでください。\n")

@@ -25,7 +25,9 @@ For example, a packet with sections named `読者と制約`, `現状`, `課題`,
 agent-write-ja chapters --packet packet.md --plan chapters.json --out draft.md
 ```
 
-`--jobs` controls concurrent chapters (default 3). Each chapter uses two independent Gemini conversations: writing, then editing against that chapter's original material. The editor checks missing conditions and unsupported additions while retaining natural Japanese. The helper assembles the edited chapters in plan order and saves the full original packet for the subsequent Codex review and repairs.
+`--jobs` controls concurrent chapters (default 3). Each chapter uses two independent Gemini conversations: writing, then editing against that chapter's original material. The editor checks missing conditions and unsupported additions while retaining natural prose in the requested output language. The helper assembles the edited chapters in plan order and saves the full original packet for the subsequent Codex review and repairs.
+
+`--language en` selects English; other language names/codes are accepted. Without the option, follow the packet's language instruction and default to Japanese when none is present. The language choice reaches both writer and editor and is inherited by targeted repairs.
 
 The return value includes `output`, `run_dir`, elapsed seconds, the chapter count and `review_mode: "continue"`. Inspect the whole assembled document against the original packet, then keep corrections with that same Codex reviewer. Gemini's editor and the helper's section-coverage checks do not replace this meaning review.
 

@@ -78,6 +78,17 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), before.replace("外部キー列を追加する。".encode(), "参照を追加する。".encode()))
         self.assertTrue(Path(result["changes"]).is_file())
 
+    def test_draft_language_override_and_packet_language_default(self):
+        code, result = self.run_cli("draft", ["--language", "English", "--packet", str(self.packet),
+                                             "--out", str(self.output)], "# English draft\n")
+        self.assertEqual((code, result["status"]), (0, "needs_review"))
+        argv = json.loads((self.root / "args.json").read_text())
+        self.assertIn("文書の出力言語: English", argv[-1])
+        self.assertEqual(json.loads((Path(result["run_dir"]) / "run.json").read_text())["language"], "English")
+        self.draft()
+        argv = json.loads((self.root / "args.json").read_text())
+        self.assertIn("出力言語は原資料の指定に従い", argv[-1])
+
     def test_failures_and_missing_material_preserve_existing_output(self):
         _, base = self.draft()
         before = self.output.read_bytes()

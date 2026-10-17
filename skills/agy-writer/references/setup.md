@@ -18,7 +18,7 @@ python3 scripts/sync_installed_skills.py --only agy-writer --writer-runtime --ap
 | `scripts/document_writer_policy.py`, `scripts/agy-doc-count` | Copied into `~/agy-writer/bin/` |
 | Generated workspace hook | `~/agy-writer/.agents/hooks.json` |
 
-Gemini reads the workspace `GEMINI.md` at startup. It contains both meaning-preservation and Japanese vocabulary preferences. The old `style-profile.md` path links to this file for existing callers. The automation no longer repeats those instructions in each prompt; `--profile <file>` supplies an optional request-specific addition.
+Gemini reads the workspace `GEMINI.md` at startup. It contains meaning-preservation rules and language-specific vocabulary preferences; the Japanese preferences apply only to Japanese output. `--language <name-or-code>` selects the document language for writing, editing, and later repairs. The old `style-profile.md` path links to this file for existing callers. The automation no longer repeats those workspace instructions in each prompt; `--profile <file>` supplies an optional request-specific addition.
 
 `agy-writer` defaults to Gemini 4 Argon High with high effort. Its remaining arguments are passed literally to `agy`, so explicit `--model` or `--effort` options override the defaults. Set `AGY_WRITER_DIR` when using a separately installed workspace; changing this variable alone does not install its instructions or hook. `agent-write-ja` requests a new **Gemini** conversation for each writing, editing or repair call. This is separate from the continuing **Codex** meaning-review conversation. Interactive `agy-writer` follows the CLI's normal conversation selection.
 
