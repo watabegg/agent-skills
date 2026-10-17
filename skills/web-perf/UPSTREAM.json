@@ -1,0 +1,10 @@
+{
+  "repo": "cloudflare/skills",
+  "path": "skills/web-perf",
+  "ref": "41e0d19858946d18af9ee2c2feebbe2e11d829ff",
+  "local_changes": [
+    "ChatGPT App browser support",
+    "measurement contract",
+    "documented browser capability routing"
+  ]
+}

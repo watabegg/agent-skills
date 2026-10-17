@@ -1,0 +1,4 @@
+interface:
+  display_name: "実装計画書を作成"
+  short_description: "調査と画面証跡に基づくHTML実装計画書"
+  default_prompt: "$create-implementation-plan を使い、既存コードを調査して、現行フローの画面注釈、ProblemのAS-ISとSolutionのTO-BE、画面変更一覧からAPI、DB、ステータスへ進む仕様説明、必要な図を内包した詳細実装Step、TodoList、Unclear Points、末尾Appendixの調査結果とHard Gateを含むHTML実装計画書を作成してください。"

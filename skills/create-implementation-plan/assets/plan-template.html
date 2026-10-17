@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="implementation-plan build_plan_html.py">
+<meta name="source-markdown" content="__SOURCE_PATH__">
+<title>__TITLE__</title>
+<style>
+:root{
+  --bg:#FAFAF7;--surface:#FFF;--ink:#20242E;--ink2:#5A6372;
+  --accent:#31567F;--accent-soft:#EAF0F6;--border:#E2E3DE;
+  --code-bg:#EFF1F3;--ok:#2E7D4F;--warn:#A8741A;--bad:#B03A2E;
+}
+@media (prefers-color-scheme: dark){
+  :root{--bg:#15181D;--surface:#1C2026;--ink:#E4E6E9;--ink2:#9AA3AF;
+  --accent:#8AAED6;--accent-soft:#243244;--border:#2C313A;
+  --code-bg:#262B33;--ok:#6FBF8F;--warn:#D2A24C;--bad:#E08578;}
+}
+*{box-sizing:border-box}
+body{font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic Medium",sans-serif;
+  background:var(--bg);color:var(--ink);line-height:1.8;margin:0;font-feature-settings:"palt"}
+main{max-width:900px;margin:0 auto;padding:40px 24px 80px}
+h1{font-size:1.5rem;line-height:1.5;margin:.2em 0}
+h2{font-size:1.2rem;margin:2.2em 0 .6em;padding-top:1em;border-top:1px solid var(--border)}
+h3{font-size:1.02rem;margin:1.6em 0 .4em}
+h4{font-size:.95rem;margin:1.2em 0 .3em}
+a{color:var(--accent)}
+code{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:.84em;
+  background:var(--code-bg);padding:.1em .35em;border-radius:3px;word-break:break-all}
+pre{background:var(--code-bg);padding:12px 16px;overflow-x:auto;font-size:.84rem;line-height:1.6}
+pre code{background:none;padding:0}
+blockquote{margin:.8em 0;padding:8px 14px;background:var(--surface);
+  border-left:3px solid var(--border);color:var(--ink2)}
+.tablewrap{overflow-x:auto;margin:.8em 0;border:1px solid var(--border)}
+table{border-collapse:collapse;width:100%;font-size:.87rem}
+th{text-align:left;font-size:.78rem;color:var(--ink2);background:var(--surface);
+  padding:7px 11px;border-bottom:2px solid var(--border);white-space:nowrap}
+td{padding:8px 11px;border-bottom:1px solid var(--border);vertical-align:top;background:var(--surface)}
+tr:last-child td{border-bottom:none}
+.meta{color:var(--ink2);font-size:.83rem}
+.chips{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.chip{background:var(--surface);border:1px solid var(--border);padding:8px 14px;min-width:110px}
+.chip .n{font-size:1.25rem;font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums}
+.chip .l{font-size:.74rem;color:var(--ink2)}
+.chip.mode .n{font-size:1rem}
+.toc{background:var(--surface);border:1px solid var(--border);padding:10px 20px;font-size:.9rem;margin:16px 0}
+.toc a{text-decoration:none}
+.progress{height:8px;background:var(--code-bg);border-radius:4px;overflow:hidden;margin:6px 0}
+.progress>div{height:100%;background:var(--ok);width:0%}
+li.task{list-style:none;margin-left:-1.2em}
+li.task input{accent-color:var(--accent);margin-right:.4em}
+li.task.done{color:var(--ink2);text-decoration:line-through}
+li.task.blocked::marker{content:""}
+.status-b{color:var(--bad);font-weight:700;font-size:.78em;margin-right:.3em}
+.status-c{color:var(--ink2);font-weight:700;font-size:.78em;margin-right:.3em}
+.note{font-size:.8rem;color:var(--ink2)}
+.svgwrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);padding:10px;margin:.8em 0}
+.svgwrap svg{max-width:100%;height:auto}
+hr{border:none;border-top:1px solid var(--border);margin:1.6em 0}
+details{margin:.6em 0}
+details summary{cursor:pointer;color:var(--accent)}
+@media (max-width:640px){main{padding:24px 14px 60px}}
+</style>
+</head>
+<body>
+<main>
+<p class="meta">実装計画書ビュー（正本: <code>__SOURCE_PATH__</code> ／ source hash: __SOURCE_HASH__）<br>
+このHTMLは閲覧用の派生ビュー。編集・レビュー反映は必ずMarkdown正本に対して行う。チェック状態はこのブラウザのlocalStorageにのみ保存される。</p>
+<h1>__TITLE__</h1>
+__META_HTML__
+<div class="chips">__SUMMARY_HTML__</div>
+<div id="todo-progress"></div>
+<nav class="toc"><strong>目次</strong>__TOC_HTML__</nav>
+__BODY_HTML__
+</main>
+<script id="plan-manifest" type="application/json">__MANIFEST_JSON__</script>
+<script>
+(function(){
+  var srcMeta = document.querySelector('meta[name="source-markdown"]');
+  var key = "plan-todo:" + ((srcMeta && srcMeta.content) || location.pathname);
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(key) || "{}"); } catch(e){}
+  var boxes = Array.prototype.slice.call(document.querySelectorAll("li.task input[type=checkbox]"));
+  function render(){
+    var done = 0;
+    boxes.forEach(function(b){
+      b.parentElement.classList.toggle("done", b.checked);
+      if (b.checked) done++;
+    });
+    var el = document.getElementById("todo-progress");
+    if (el && boxes.length){
+      el.innerHTML = '<div class="note">Todo 進捗（ローカル表示のみ・正本は todo.md）: ' + done + ' / ' + boxes.length +
+        '</div><div class="progress"><div style="width:' + Math.round(100*done/boxes.length) + '%"></div></div>';
+    }
+  }
+  boxes.forEach(function(b, i){
+    if (saved[i] !== undefined) b.checked = saved[i];
+    b.addEventListener("change", function(){
+      saved[i] = b.checked;
+      try { localStorage.setItem(key, JSON.stringify(saved)); } catch(e){}
+      render();
+    });
+  });
+  render();
+})();
+</script>
+</body>
+</html>

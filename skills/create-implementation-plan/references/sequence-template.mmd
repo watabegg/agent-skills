@@ -1,0 +1,20 @@
+sequenceDiagram
+    actor User
+    participant Frontend
+    participant Backend
+    participant External as External Service
+    participant DB
+
+    User->>Frontend: Trigger action
+    Frontend->>Backend: Call API
+    Backend->>External: Fetch/resolve data
+    External-->>Backend: Data/Error
+    Backend->>DB: Persist result
+    DB-->>Backend: OK
+    Backend-->>Frontend: Return response
+    Frontend-->>User: Update UI
+
+    alt Failure path
+        Backend-->>Frontend: Error response
+        Frontend-->>User: Show error
+    end

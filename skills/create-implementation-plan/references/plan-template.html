@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>実装計画書: [topic]</title>
+<style>
+:root{
+  --bg:#FAFAF7;--surface:#FFF;--ink:#20242E;--ink2:#5A6372;
+  --accent:#31567F;--accent-soft:#EAF0F6;--border:#E2E3DE;
+  --code-bg:#EFF1F3;--ok:#2E7D4F;--warn:#A8741A;--bad:#B03A2E;
+}
+@media (prefers-color-scheme: dark){
+  :root{--bg:#15181D;--surface:#1C2026;--ink:#E4E6E9;--ink2:#9AA3AF;
+  --accent:#8AAED6;--accent-soft:#243244;--border:#2C313A;
+  --code-bg:#262B33;--ok:#6FBF8F;--warn:#D2A24C;--bad:#E08578;}
+}
+*{box-sizing:border-box}
+body{font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic Medium",sans-serif;
+  background:var(--bg);color:var(--ink);line-height:1.8;margin:0;font-feature-settings:"palt"}
+main{max-width:900px;margin:0 auto;padding:40px 24px 80px}
+h1{font-size:1.5rem;line-height:1.5;margin:.2em 0}
+h2{font-size:1.2rem;margin:2.2em 0 .6em;padding-top:1em;border-top:1px solid var(--border)}
+h3{font-size:1.02rem;margin:1.6em 0 .4em}
+a{color:var(--accent)}
+code{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:.84em;
+  background:var(--code-bg);padding:.1em .35em;border-radius:3px;word-break:break-all}
+pre{background:var(--code-bg);padding:12px 16px;overflow-x:auto;font-size:.84rem;line-height:1.6}
+pre code{background:none;padding:0}
+pre.mermaid{background:var(--surface);border:1px solid var(--border)}
+.tablewrap{overflow-x:auto;margin:.8em 0;border:1px solid var(--border)}
+table{border-collapse:collapse;width:100%;font-size:.87rem}
+th{text-align:left;font-size:.78rem;color:var(--ink2);background:var(--surface);
+  padding:7px 11px;border-bottom:2px solid var(--border);white-space:nowrap}
+td{padding:8px 11px;border-bottom:1px solid var(--border);vertical-align:top;background:var(--surface)}
+tr:last-child td{border-bottom:none}
+.meta{color:var(--ink2);font-size:.83rem}
+.toc{background:var(--surface);border:1px solid var(--border);padding:10px 20px;font-size:.9rem;margin:16px 0;columns:2}
+.toc a{text-decoration:none}
+.progress{height:8px;background:var(--code-bg);border-radius:4px;overflow:hidden;margin:6px 0}
+.progress>div{height:100%;background:var(--ok);width:0%}
+ul.tasks{padding-left:1.2em}
+li.task{list-style:none;margin-left:-1.2em}
+li.task input{accent-color:var(--accent);margin-right:.4em}
+li.task.done{color:var(--ink2);text-decoration:line-through}
+.note{font-size:.8rem;color:var(--ink2)}
+.gate{background:var(--accent-soft);border-left:3px solid var(--accent);padding:8px 14px;margin:.6em 0;font-size:.9rem}
+@media (max-width:640px){main{padding:24px 14px 60px}.toc{columns:1}}
+
+/* PR俯瞰レポートと共通の情報設計 */
+.layout{display:grid;grid-template-columns:232px minmax(0,1fr);gap:28px;max-width:1360px;margin:0 auto;padding:28px 24px 80px}
+aside{position:sticky;top:28px;align-self:start;max-height:calc(100vh - 56px);overflow:auto;font-size:13px}
+.brand{margin:4px 0 14px;color:var(--ink2);font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+.toc{margin:0;padding:0;border:0;background:transparent;columns:1}.toc>strong{display:none}.toc ol{margin:0;padding:0;list-style:none}
+.toc a{display:block;margin:1px 0;padding:5px 10px;border-left:2px solid transparent;border-radius:6px;color:var(--ink2)}
+.toc a:hover,.toc a.active{background:var(--accent-soft);color:var(--accent)}
+.sidemeta{margin-top:18px;padding-top:12px;border-top:1px solid var(--border);color:var(--ink2);font-size:11.5px}
+main{min-width:0;max-width:1040px;margin:0;padding:0}
+header.hero,section{padding:24px 28px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+section{margin-top:20px}header.hero h1{margin:0 0 10px;font-size:1.55rem}
+section>h2{margin:0 0 14px;padding:0 0 10px;border-top:0;border-bottom:1px solid var(--border);font-size:1.08rem}
+.tablewrap{border-radius:10px}.diagram-card{margin:12px 0;padding:16px;overflow-x:auto;border:1px solid var(--border);border-radius:10px;background:var(--surface)}
+.screen-redline{display:grid;grid-template-columns:minmax(280px,1.25fr) minmax(240px,.75fr);gap:16px;align-items:start;margin:16px 0}
+.shot{margin:0}.shot-stage{position:relative;overflow:hidden;border:1px solid var(--border);border-radius:10px;background:var(--code-bg)}
+.shot-stage img{display:block;width:100%;height:auto}.shot figcaption{margin-top:6px;color:var(--ink2);font-size:.75rem}
+.redbox{position:absolute;border:3px solid var(--bad);border-radius:8px;background:color-mix(in srgb,var(--bad) 7%,transparent);box-shadow:0 0 0 2px rgba(255,255,255,.82)}
+.pin{position:absolute;display:grid;width:26px;height:26px;place-items:center;border:2px solid #fff;border-radius:50%;background:var(--bad);color:#fff;font-size:.78rem;font-weight:800;box-shadow:0 2px 7px rgba(0,0,0,.28)}
+.annotation-list{margin:0;padding:0;list-style:none;counter-reset:annotation}.annotation-list li{position:relative;margin:0 0 10px;padding:10px 12px 10px 42px;border:1px solid var(--border);border-radius:9px;background:var(--bg)}
+.annotation-list li::before{counter-increment:annotation;content:counter(annotation);position:absolute;left:10px;top:10px;display:grid;width:22px;height:22px;place-items:center;border-radius:50%;background:var(--bad);color:#fff;font-size:.72rem;font-weight:800}
+.annotation-list strong,.annotation-list span{display:block}.annotation-list span{margin-top:3px;color:var(--ink2);font-size:.82rem}
+.step-head{display:flex;align-items:center;gap:9px;margin-bottom:9px}.step-no{display:grid;flex:0 0 30px;width:30px;height:30px;place-items:center;border-radius:8px;background:var(--accent);color:#fff;font-weight:800}
+.step-layer{padding:2px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.7rem;font-weight:700;text-transform:uppercase}
+.problem-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}
+.problem-card{padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:var(--bg)}
+.problem-card.asis{border-top:4px solid var(--bad)}.problem-card.tobe{border-top:4px solid var(--ok)}
+.problem-card h3{margin:0 0 8px}.state-label{display:inline-block;margin-bottom:8px;padding:2px 9px;border-radius:999px;font-size:.7rem;font-weight:800;letter-spacing:.06em}
+.asis .state-label{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.tobe .state-label{background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}
+.implementation-step{margin:16px 0;padding:18px;border:1px solid var(--border);border-radius:12px;background:var(--bg)}
+.implementation-step .step-head{padding-bottom:12px;border-bottom:1px solid var(--border)}
+.implementation-step h3{margin:0}.implementation-step h4{margin:16px 0 7px;font-size:.9rem}
+.step-purpose{margin:0 0 12px;color:var(--ink2)}.step-gate{margin-top:14px;padding:10px 12px;border-left:3px solid var(--accent);background:var(--accent-soft);font-size:.86rem}
+@media (max-width:980px){.layout{display:block;padding:16px 12px 60px}aside{position:static;max-height:none;margin-bottom:16px}
+  .toc ol{display:flex;flex-wrap:wrap;gap:4px}.toc a{padding:3px 12px;border:1px solid var(--border);border-radius:999px}
+  .sidemeta{display:none}header.hero,section{padding:16px}.screen-redline,.problem-grid{grid-template-columns:1fr}}
+@media print{body{background:#fff}.layout{display:block;max-width:none;padding:0}aside{display:none!important}
+  header.hero,section{box-shadow:none;break-inside:avoid;border-right:0;border-left:0;border-radius:0}}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+<div class="brand">Implementation Plan</div>
+<nav class="toc" id="toc"><strong>目次</strong>
+<ol>
+<li><a href="#purpose">1. 目的と背景</a></li>
+<li><a href="#current">2. 既存実装の理解</a></li>
+<li><a href="#problem-solution">3. Problem と Solution</a></li>
+<li><a href="#decisions">4. 設計判断と代替案</a></li>
+<li><a href="#screens">5. 画面変更一覧</a></li>
+<li><a href="#api">6. API仕様の変更</a></li>
+<li><a href="#db">7. データモデル・DB変更</a></li>
+<li><a href="#states">8. ステータス・ライフサイクル変更</a></li>
+<li><a href="#files">9. 変更対象ファイル</a></li>
+<li><a href="#steps">10. 実装ステップ</a></li>
+<li><a href="#tests">11. テスト計画</a></li>
+<li><a href="#crosscutting">12. セキュリティ・プライバシー・可観測性</a></li>
+<li><a href="#rollout">13. ロールアウト</a></li>
+<li><a href="#risks">14. リスクと対策</a></li>
+<li><a href="#unclear">15. Unclear Points</a></li>
+<li><a href="#todo">16. TodoList</a></li>
+<li><a href="#dod">17. Definition of Done</a></li>
+<li><a href="#research">Appendix A. 事前調査結果</a></li>
+<li><a href="#gates">Appendix B. Hard Gate</a></li>
+</ol>
+</nav>
+<div class="sidemeta">[topic]<br>[branch]@[short-sha]</div>
+</aside>
+<main>
+<header class="hero">
+<h1>実装計画書: [topic]</h1>
+<p class="meta">
+作成日時: [YYYY-MM-DD HH:MM]（base: [branch]@[short-sha]）<br>
+進捗台帳: <code>[topic]-todo.md</code>（進捗の正本。この HTML のチェック状態はブラウザ内表示のみ）<br>
+改訂履歴: [YYYY-MM-DD HH:MM 初版]
+</p>
+<div class="chips">
+<div class="chip"><div class="n">[N]</div><div class="l">変更ファイル</div></div>
+<div class="chip"><div class="n">[N]</div><div class="l">実装 Step</div></div>
+<div class="chip"><div class="n">[None / N]</div><div class="l">Unclear Points</div></div>
+<div class="chip"><div class="n">[N]</div><div class="l">Hard Gate</div></div>
+</div>
+<div id="todo-progress"></div>
+</header>
+
+<h2 id="purpose">1. 目的と背景</h2>
+<p>[この変更で達成すること。1〜3文]</p>
+<p>[背景: なぜ今この変更が必要か。現状どうなっているか]</p>
+<ul>
+<li>In scope: [対象]</li>
+<li>Out of scope: [対象外]</li>
+</ul>
+
+<h2 id="current">2. 既存実装の理解</h2>
+<p>現状フローを、画面と処理の対応が分かる順に説明する。</p>
+<div class="screen-redline">
+  <figure class="shot">
+    <div class="shot-stage">
+      <img src="[topic]-assets/screenshots/[current-screen].png" alt="[現行画面名と状態]">
+      <span class="redbox" style="left:[N]%;top:[N]%;width:[N]%;height:[N]%"></span>
+      <span class="pin" style="left:[N]%;top:[N]%">1</span>
+    </div>
+    <figcaption>[Preview / local fixture]・<code>[URL path]</code>・[sha]・[取得日時]</figcaption>
+  </figure>
+  <ol class="annotation-list">
+    <li><strong>[操作入口]</strong><span>[ユーザー操作から API、主要処理、保存・表示までの現行フロー]</span></li>
+  </ol>
+</div>
+<p>既存の制約: [タイムアウト、上限、保存形式、依存ライブラリ]</p>
+<p>既存テストと欠けているテスト: [内容]</p>
+<p>読了ファイル一覧:</p>
+<ul>
+<li><code>[path]</code>: [役割]</li>
+</ul>
+
+<h2 id="problem-solution">3. Problem と Solution</h2>
+<p>変更理由を、現在起きることと変更後の挙動で対応づける。</p>
+<div class="screen-redline">
+  <figure class="shot">
+    <div class="shot-stage">
+      <img src="[topic]-assets/screenshots/[problem-screen].png" alt="[Problem を示す実画面]">
+      <span class="redbox" style="left:[N]%;top:[N]%;width:[N]%;height:[N]%"></span>
+      <span class="pin" style="left:[N]%;top:[N]%">1</span>
+    </div>
+    <figcaption>[Preview / local fixture]・<code>[URL path]</code>・[sha]・[取得日時]</figcaption>
+  </figure>
+  <ol class="annotation-list">
+    <li><strong>[Problem の対象 UI]</strong><span>[この操作で現在起きる困りごとと、変更後の体験]</span></li>
+  </ol>
+</div>
+<div class="problem-grid">
+  <article class="problem-card asis">
+    <span class="state-label">AS-IS</span>
+    <h3>[現在起きること]</h3>
+    <p>[なぜ困るかを平易に説明]</p>
+  </article>
+  <article class="problem-card tobe">
+    <span class="state-label">TO-BE</span>
+    <h3>[変更後の挙動]</h3>
+    <p>[利用者にとってどう良くなるかを平易に説明]</p>
+  </article>
+</div>
+
+<h2 id="decisions">4. 設計判断と代替案</h2>
+<h3>[判断項目 1]</h3>
+<ul>
+<li>採用: [内容]</li>
+<li>理由: [理由]</li>
+<li>非採用: [実在した代替案と却下理由。無ければ「比較不要: この案件固有の理由」]</li>
+</ul>
+
+<h2 id="screens">5. 画面変更一覧</h2>
+<p class="note">フロントエンドの変更がある場合は必須。対象は既存ページの変更のみ（新規ページは §9 と §10 で扱う）。フロント変更が無い場合は「フロントエンドの変更なし」と書いて閉じる。</p>
+<div class="tablewrap"><table>
+<tr><th>ページ（URL パス）</th><th>変更箇所</th><th>現状</th><th>変更後</th><th>表示条件</th></tr>
+<tr><td>[ページ名（<code>/path</code>）]</td><td>[コンポーネント・領域]</td><td>[現在の表示・挙動]</td><td>[変更後の表示・挙動]</td><td>[権限・状態。常時なら「常時」]</td></tr>
+</table></div>
+<h3>実画面への変更注釈</h3>
+<p class="note">安全に取得できる場合に使う。取得できない場合は理由を明記し、このブロックを削除する。元画像へ直接描画せず、赤枠と番号は HTML/CSS で重ねる。</p>
+<div class="screen-redline">
+  <figure class="shot">
+    <div class="shot-stage">
+      <img src="[topic]-assets/screenshots/[screen].png" alt="[画面名と状態]">
+      <span class="redbox" style="left:[N]%;top:[N]%;width:[N]%;height:[N]%"></span>
+      <span class="pin" style="left:[N]%;top:[N]%">1</span>
+    </div>
+    <figcaption>[Preview / local fixture]・<code>[URL path]</code>・[sha]・[取得日時]</figcaption>
+  </figure>
+  <ol class="annotation-list">
+    <li><strong>[対象 UI 名]</strong><span>[現在から何が変わるか。表示条件とエラー時挙動も書く]</span></li>
+  </ol>
+</div>
+
+<h2 id="api">6. API仕様の変更</h2>
+<p class="note">該当しない場合も「該当なし: API契約を変更しないため」と理由を書く。</p>
+<div class="tablewrap"><table>
+<tr><th>変更</th><th>API</th><th>互換性</th><th>認可</th><th>呼び出し元</th></tr>
+<tr><td>[追加/変更/削除]</td><td><code>[Service.Method / METHOD /path]</code></td><td>[互換/破壊的 + 理由]</td><td>[権限]</td><td><code>[path]</code></td></tr>
+</table></div>
+<h3>API-1: <code>[Service.Method]</code></h3>
+<pre><code> [proto / OpenAPI / 型定義]
+-[変更前]
++[変更後]</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Request</th><th>Response</th><th>Validation</th><th>エラー</th><th>副作用</th><th>同時更新・移行</th></tr>
+<tr><td>[fieldと必須性]</td><td>[fieldと欠損時の意味]</td><td>[境界値]</td><td>[codeと条件]</td><td>[DB/通知]</td><td>[lock/冪等性/deploy順]</td></tr>
+</table></div>
+
+<h2 id="db">7. データモデル・DB変更</h2>
+<p class="note">該当しない場合も「該当なし: 永続化モデルとDB schemaを変更しないため」と理由を書く。</p>
+<h3>変更後ER図</h3>
+<div class="diagram-card"><pre class="mermaid">
+erDiagram
+    PARENT ||--o{ CHILD : has
+    CHILD {
+        string id PK
+        string parent_id FK
+        string new_field "追加"
+    }
+</pre></div>
+<h3>テーブルとマイグレーション</h3>
+<div class="tablewrap"><table>
+<tr><th>対象</th><th>操作</th><th>列・index・一意性</th><th>relation・削除・監査</th><th>lock</th><th>backfill</th><th>可逆性・適用順</th></tr>
+<tr><td><code>[table / migration]</code></td><td>[追加/変更/削除]</td><td>[定義]</td><td>[方針]</td><td>[低/中/高 + 根拠]</td><td>[方法]</td><td>[戻し方と順序]</td></tr>
+</table></div>
+
+<h2 id="states">8. ステータス・ライフサイクル変更</h2>
+<p class="note">該当しない場合も「該当なし: 状態集合と遷移条件を変更しないため」と理由を書く。</p>
+<div class="diagram-card"><pre class="mermaid">
+stateDiagram-v2
+    [*] --> Current
+    Current --> NewState: [操作 / 条件]
+    NewState --> [*]
+</pre></div>
+<div class="tablewrap"><table>
+<tr><th>現在状態</th><th>操作</th><th>次状態</th><th>許可条件</th><th>副作用</th><th>再実行・禁止遷移</th></tr>
+<tr><td><code>[current]</code></td><td>[command/event]</td><td><code>[next]</code></td><td>[role/guard]</td><td>[保存/通知]</td><td>[冪等/エラー/禁止]</td></tr>
+</table></div>
+
+<h2 id="files">9. 変更対象ファイル</h2>
+<ul>
+<li>新規: <code>[path]</code>（[目的]）</li>
+<li>更新: <code>[path]</code>（[目的]）</li>
+</ul>
+
+<h2 id="steps">10. 実装ステップ</h2>
+<article class="implementation-step">
+  <div class="step-head"><span class="step-no">1</span><span class="step-layer">[API / DB / BE / FE]</span><h3>[Step 名]</h3></div>
+  <p class="step-purpose">目的: [この Step だけで成立させる変更と、なぜ最初に行うか]</p>
+  <h4>変更ファイル</h4>
+  <div class="tablewrap"><table>
+    <tr><th>ファイル</th><th>変更内容</th><th>理由</th></tr>
+    <tr><td><code>[path]</code></td><td>[具体的な編集]</td><td>[この Step の目的との対応]</td></tr>
+  </table></div>
+  <h4>実装手順</h4>
+  <ol>
+    <li>[最初に変更する定義、関数、処理]</li>
+    <li>[次に接続する呼び出し元または保存処理]</li>
+    <li>[エラー分岐と rollback / fallback]</li>
+  </ol>
+  <h4>この Step の処理シーケンス</h4>
+  <div class="diagram-card"><pre class="mermaid">
+sequenceDiagram
+    participant Caller
+    participant Target
+    participant Store
+    Caller->>Target: [入力]
+    Target->>Store: [保存または照会]
+    alt [失敗条件]
+        Store-->>Target: [error]
+        Target-->>Caller: [期待するエラー]
+    else [成功条件]
+        Store-->>Target: [result]
+        Target-->>Caller: [期待する結果]
+    end
+  </pre></div>
+  <h4>完了条件</h4>
+  <ul><li>[DB read-back、response、画面表示など観測可能な DoD]</li></ul>
+  <h4>失敗時の切り分け</h4>
+  <ul><li>[定義、mapping、domain、永続化、表示のどこをどう切り分けるか]</li></ul>
+  <div class="step-gate">Hard Gate: Appendix B / Step 1 の <code>[command]</code> が [期待結果]。</div>
+</article>
+
+<article class="implementation-step">
+  <div class="step-head"><span class="step-no">2</span><span class="step-layer">[層]</span><h3>[Step 名]</h3></div>
+  <p class="step-purpose">目的: [この Step で成立させる変更]</p>
+  <h4>変更ファイル</h4>
+  <div class="tablewrap"><table>
+    <tr><th>ファイル</th><th>変更内容</th><th>理由</th></tr>
+    <tr><td><code>[path]</code></td><td>[具体的な編集]</td><td>[理由]</td></tr>
+  </table></div>
+  <h4>実装手順</h4>
+  <ol><li>[処理順に記述]</li></ol>
+  <h4>完了条件</h4>
+  <ul><li>[観測可能な DoD]</li></ul>
+  <h4>失敗時の切り分け</h4>
+  <ul><li>[切り分け]</li></ul>
+  <div class="step-gate">Hard Gate: Appendix B / Step 2 の <code>[command]</code> が [期待結果]。</div>
+</article>
+
+<h2 id="tests">11. テスト計画</h2>
+<ul>
+<li>自動テスト: <code>[command]</code></li>
+<li>手動テスト: [ケース]</li>
+<li>実環境動作確認: [環境と手順]</li>
+</ul>
+
+<h2 id="crosscutting">12. セキュリティ・プライバシー・可観測性</h2>
+<ul>
+<li>セキュリティ: [認証・認可への影響、入力検証、新しい攻撃面。無ければ「該当なし: 理由」]</li>
+<li>プライバシー: [個人データの追加・移動・表示・ログ出力。無ければ「該当なし: 理由」]</li>
+<li>可観測性: [追加・変更するログ、メトリクス、アラート。障害時に何を見て切り分けるか]</li>
+</ul>
+
+<h2 id="rollout">13. ロールアウト</h2>
+<ul>
+<li>リリース手順: [手順]</li>
+<li>フラグ・段階公開: [要否と方法。不要なら「不要: 理由」]</li>
+<li>migration 適用順: [順序。無ければ「該当なし」]</li>
+<li>ロールバック手順: [戻し方]</li>
+</ul>
+
+<h2 id="risks">14. リスクと対策</h2>
+<ul>
+<li>[リスク] → 対策: [対策]</li>
+</ul>
+
+<h2 id="unclear">15. Unclear Points</h2>
+<p>[無い場合は「Unclear Points: None」]</p>
+<ol>
+<li>Point: [何が不明か]<br>
+Why: [なぜ決められないか]<br>
+Impact: [ブロッカーか、後回し可能か]<br>
+Need: [確認したい具体質問]<br>
+Fallback: [回答がない場合の暫定方針]</li>
+</ol>
+
+<h2 id="todo">16. TodoList</h2>
+<p class="note">進捗の正本は todo.md。ここは同内容の一覧（チェック状態はこのブラウザにのみ保存される）。</p>
+<ul class="tasks">
+<li class="task"><input type="checkbox"><code>[path]</code> [やること]（Gate: <code>[command]</code>）</li>
+<li class="task"><input type="checkbox">テスト: <code>[command]</code></li>
+<li class="task"><input type="checkbox">実環境動作確認: [手順]</li>
+<li class="task"><input type="checkbox">ドキュメント反映: <code>[path]</code></li>
+</ul>
+
+<h2 id="dod">17. Definition of Done</h2>
+<ol>
+<li>[達成条件]</li>
+<li>全 Step の Hard Gate が PASS</li>
+<li>todo.md の全行が消し込み済み</li>
+</ol>
+
+<h2 id="research">Appendix A. 事前調査結果</h2>
+<div class="tablewrap"><table>
+<tr><th>調査</th><th>コマンド / 対象</th><th>結果（実測）</th></tr>
+<tr><td>[ベースラインテスト]</td><td><code>[command]</code></td><td>[結果]</td></tr>
+<tr><td>[外部依存の実測]</td><td><code>[対象]</code></td><td>[正常系・異常系・境界系の結果]</td></tr>
+</table></div>
+<p>未実施の調査と理由: [項目 / 理由。無ければ「なし」]</p>
+
+<h2 id="gates">Appendix B. Hard Gate</h2>
+<p>着手前 Gate（Definition of Ready）:</p>
+<ul><li>[何が確定しないと着手不可か]</li></ul>
+<p>Step 完了 Gate（機械判定）:</p>
+<div class="tablewrap"><table>
+<tr><th>Step</th><th>Command</th><th>Expect</th></tr>
+<tr><td>1</td><td><code>[command]</code></td><td>[exit 0 / 0 件 など機械判定できる値]</td></tr>
+</table></div>
+<div class="gate">Gate 不通過時は次 Step に進まない。todo.md と Unclear Points を更新して再実施する。</div>
+
+</main>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.12.1/mermaid.min.js"></script>
+<script>
+(function(){
+  var main = document.querySelector("main");
+  var headings = Array.prototype.slice.call(main.querySelectorAll(":scope > h2"));
+  headings.forEach(function(h){
+    var section = document.createElement("section");
+    main.insertBefore(section, h);
+    var node = h;
+    while (node && (node === h || !(node.nodeType === 1 && node.tagName === "H2"))) {
+      var next = node.nextSibling;
+      section.appendChild(node);
+      node = next;
+    }
+  });
+  var links = Array.prototype.slice.call(document.querySelectorAll("#toc a"));
+  var byId = new Map(links.map(function(a){ return [a.getAttribute("href").slice(1), a]; }));
+  var spy = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (!e.isIntersecting) return;
+      links.forEach(function(a){ a.classList.remove("active"); });
+      var link = byId.get(e.target.id); if (link) link.classList.add("active");
+    });
+  }, {rootMargin:"-15% 0px -75% 0px"});
+  headings.forEach(function(h){ spy.observe(h); });
+})();
+if (window.mermaid) {
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default"
+  });
+}
+(function(){
+  var key = "plan-todo:" + location.pathname;
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(key) || "{}"); } catch(e){}
+  var boxes = Array.prototype.slice.call(document.querySelectorAll("li.task input[type=checkbox]"));
+  function render(){
+    var done = 0;
+    boxes.forEach(function(b){
+      b.parentElement.classList.toggle("done", b.checked);
+      if (b.checked) done++;
+    });
+    var el = document.getElementById("todo-progress");
+    if (el && boxes.length){
+      el.innerHTML = '<div class="note">Todo 進捗（ローカル表示のみ・正本は todo.md）: ' + done + ' / ' + boxes.length +
+        '</div><div class="progress"><div style="width:' + Math.round(100*done/boxes.length) + '%"></div></div>';
+    }
+  }
+  boxes.forEach(function(b, i){
+    if (saved[i] !== undefined) b.checked = saved[i];
+    b.addEventListener("change", function(){
+      saved[i] = b.checked;
+      try { localStorage.setItem(key, JSON.stringify(saved)); } catch(e){}
+      render();
+    });
+  });
+  render();
+})();
+</script>
+</body>
+</html>

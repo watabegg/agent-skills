@@ -22,6 +22,7 @@
 ├── AGENTS.md
 ├── README.md
 └── skills/
+    ├── create-implementation-plan/
     ├── agy-writer/
     ├── semantic-commit-ja/
     ├── pencil-pencli/
