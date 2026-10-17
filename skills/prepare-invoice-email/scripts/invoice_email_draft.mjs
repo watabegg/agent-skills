@@ -326,7 +326,7 @@ function verifyInvoicePdf(targetPath, targetMonth) {
   if (extracted.status !== 0) throw new Error('pdftotext could not read the invoice PDF');
   const text = extracted.stdout.replace(/\s+/g, ' ');
   const [year, monthNumber] = targetMonth.split('-').map(Number);
-  if (!text.includes('請求書')) throw new Error('The PDF does not contain an invoice title');
+  if (!/請\s*求\s*書/.test(text)) throw new Error('The PDF does not contain an invoice title');
   if (text.includes('勤怠明細') && !text.includes('ご請求')) throw new Error('The PDF appears to be an attendance sheet, not the invoice tab');
   if (!text.includes(String(year)) || !text.includes(`${monthNumber}月`)) throw new Error('The PDF does not contain the requested invoice month');
   console.log(`PDF_OK month=${targetMonth} pages=1 size=A4 invoice=true`);

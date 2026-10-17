@@ -338,7 +338,7 @@ async function revealBcc(cdp) {
   if (hasInput) return;
   const clicked = await evaluate(cdp, `(() => {
     const visible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-    const control = [...document.querySelectorAll('span,button,[role="button"]')].filter(visible)
+    const control = [...document.querySelectorAll('span.aB,button,[role="button"],[role="link"]')].filter(visible)
       .find((e) => /^(bcc|密送)$/i.test(String(e.innerText || e.textContent || '').trim()));
     if (!control) return false;
     control.click(); return true;
@@ -371,7 +371,11 @@ function verifyRecipientState(actual, recipientPlan) {
 async function updateDraft(cdp, config, recipientPlan) {
   await gmailSearch(cdp, config, `in:drafts has:attachment filename:"${targetAttachment.replaceAll('"', '')}" ${targetMonth}`);
   await openFirstRow(cdp, `new RegExp(${JSON.stringify(`${targetMonth}|${targetMonthNumber}月分`)})`);
-  await waitFor(cdp, async () => evaluate(cdp, `document.querySelector('input[name="subjectbox"]') ? true : null`), 'invoice draft');
+  await waitFor(cdp, async () => evaluate(cdp, `(() => {
+    const subject = document.querySelector('input[name="subjectbox"]')?.value || '';
+    const hasAttachment = String(document.body?.innerText || '').includes(${JSON.stringify(targetAttachment)});
+    return subject.includes(${JSON.stringify(targetMonth)}) && hasAttachment ? true : null;
+  })()`), 'invoice draft');
   const draft = await evaluate(cdp, `(() => ({
     subject: document.querySelector('input[name="subjectbox"]')?.value || '',
     hasAttachment: String(document.body?.innerText || '').includes(${JSON.stringify(targetAttachment)})
