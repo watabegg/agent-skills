@@ -1014,7 +1014,21 @@ async function scrapeTeamsEvents(cdp, cutoffDate, timeoutMs) {
     const signature = `${records.size}:${Math.min(...instants, Infinity)}:${batch.height}`;
     stagnant = signature === lastSignature ? stagnant + 1 : 0;
     lastSignature = signature;
-    if (stagnant >= 4 && Number(batch.top) === 0) break;
+    if (stagnant >= 4 && Number(batch.top) === 0) {
+      const point = await evaluate(cdp, `(() => {
+        const viewport = document.querySelector('[data-tid="message-pane-list-viewport"]')
+          || document.querySelector('[data-tid="chat-pane-list"]')
+          || document.querySelector('[data-tid="message-pane-list-runway"]')?.parentElement;
+        const rect = viewport?.getBoundingClientRect();
+        return rect ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null;
+      })()`);
+      if (point) await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x: point.x, y: point.y, deltaX: 0, deltaY: -900,
+      });
+      stagnant = 0;
+      await sleep(2500);
+      continue;
+    }
     await evaluate(cdp, `(() => {
       const viewport = document.querySelector('[data-tid="message-pane-list-viewport"]')
         || document.querySelector('[data-tid="chat-pane-list"]')
@@ -1025,6 +1039,9 @@ async function scrapeTeamsEvents(cdp, cutoffDate, timeoutMs) {
   }
   const events = [...records.values()].sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
   if (!events.length) throw new Error('No timestamped Teams chat messages were found');
+  if (new Date(events[0].datetime).valueOf() > cutoffInstant) {
+    throw new Error(`Teams chat history did not reach the requested cutoff ${cutoffDate}; refusing an incomplete sync`);
+  }
   return events;
 }
 
