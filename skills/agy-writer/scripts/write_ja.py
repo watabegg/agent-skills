@@ -5,6 +5,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 
 
 MODEL = "gemini-4-argon-high"
+FALLBACK_MODEL = "gemini-3.8-flash-high"
 
 
 def read_text(path):
@@ -110,6 +112,7 @@ def make_parser():
     for operation in ("chapters", "draft", "repair"):
         command = commands.add_parser(operation)
         command.add_argument("--model", default=MODEL)
+        command.add_argument("--no-fallback", action="store_true", help="disable Argon quota fallback to Flash High")
         command.add_argument("--timeout", type=int, default=1200, help="seconds; default 1200")
         command.add_argument("--writer", default="agy-writer", help="writer executable, without shell arguments")
         command.add_argument("--profile", type=Path, help="optional extra style instructions for this request")
@@ -135,29 +138,72 @@ def language_instruction(language):
             "原資料や作業指示の言語に引きずられないでください。校閲と修正でもこの出力言語を維持します。")
 
 
+def quota_exhausted(response):
+    """Match provider errors, never document text or arbitrary stderr."""
+    if not isinstance(response, dict) or response.get("status") != "ERROR":
+        return False
+    error = response.get("error")
+    if isinstance(error, dict):
+        error = error.get("message")
+    return isinstance(error, str) and bool(re.search(
+        r"\b(?:individual\s+)?quota\s+(?:reached|exceeded|exhausted)\b|"
+        r"\busage\s+limit(?:s)?\s+(?:reached|exceeded|exhausted)\b",
+        error, re.IGNORECASE))
+
+
 def generate(args, run, record, prompt):
-    """One fresh Gemini conversation; preserve its evidence without printing prose."""
+    """Use a fresh conversation per attempt; retry Argon quota errors once."""
     started = time.monotonic()
-    record.update(status="running", model_requested=args.model, effort="high")
+    record.update(status="running", model_requested=args.model, effort="high", attempts=[])
     record.setdefault("started_at", datetime.now(timezone.utc).isoformat())
     (run / "prompt.md").write_text(prompt, encoding="utf-8")
-    command = [args.writer, "--new-project", "--model", args.model, "--effort", "high",
-               "--output-format", "json", "--print-timeout", f"{args.timeout}s", "-p", prompt]
+    models = [args.model]
+    if args.model.startswith("gemini-4-argon-") and not args.no_fallback:
+        models.append(FALLBACK_MODEL)
     save_json(run / "run.json", record)
     try:
-        with (run / "response.json").open("wb") as stdout, (run / "stderr.log").open("wb") as stderr:
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                    timeout=args.timeout + 15, check=False)
-        if result.returncode:
-            raise ValueError(f"agy-writer exited with {result.returncode}; inspect stderr.log")
-        response = json.loads((run / "response.json").read_text(encoding="utf-8"))
-        if not isinstance(response, dict) or response.get("status") != "SUCCESS":
-            raise ValueError("agy-writer did not report SUCCESS; inspect response.json")
-        body = response.get("response")
-        if not isinstance(body, str) or not body.strip():
-            raise ValueError("agy-writer returned no document")
-        record.update(status="generated", conversation_id=response.get("conversation_id"), usage=response.get("usage"))
-        return body
+        for index, model in enumerate(models):
+            attempt = {"model": model, "effort": "high", "status": "running",
+                       "response": "response.json", "stderr": "stderr.log"}
+            record["attempts"].append(attempt)
+            command = [args.writer, "--new-project", "--model", model, "--effort", "high",
+                       "--output-format", "json", "--print-timeout", f"{args.timeout}s", "-p", prompt]
+            attempt_started = time.monotonic()
+            save_json(run / "run.json", record)
+            try:
+                with (run / "response.json").open("wb") as stdout, (run / "stderr.log").open("wb") as stderr:
+                    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                            timeout=args.timeout + 15, check=False)
+                attempt["returncode"] = result.returncode
+                try:
+                    response = json.loads((run / "response.json").read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    response = None
+                if index == 0 and len(models) > 1 and quota_exhausted(response):
+                    attempt["status"] = "quota_exhausted"
+                    record["fallback_reason"] = "argon_quota_exhausted"
+                    for key, filename in (("response", "response.json"), ("stderr", "stderr.log")):
+                        saved = "primary-" + filename
+                        (run / filename).rename(run / saved)
+                        attempt[key] = saved
+                    continue
+                if result.returncode:
+                    raise ValueError(f"agy-writer exited with {result.returncode}; inspect stderr.log and response.json")
+                if not isinstance(response, dict) or response.get("status") != "SUCCESS":
+                    raise ValueError("agy-writer did not report SUCCESS; inspect response.json")
+                body = response.get("response")
+                if not isinstance(body, str) or not body.strip():
+                    raise ValueError("agy-writer returned no document")
+                attempt["status"] = "generated"
+                record.update(status="generated", model_used=model,
+                              conversation_id=response.get("conversation_id"), usage=response.get("usage"))
+                return body
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                attempt["status"] = "failed"
+                raise
+            finally:
+                attempt["elapsed_seconds"] = round(time.monotonic() - attempt_started, 3)
+                save_json(run / "run.json", record)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         record["status"] = "failed"
         raise
@@ -264,7 +310,7 @@ def main():
     record["finished_at"] = datetime.now(timezone.utc).isoformat()
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
     save_json(run / "run.json", record)
-    fields = ("status", "operation", "output", "run_dir", "chapters", "review_mode", "elapsed_seconds", "changes", "reason", "error")
+    fields = ("status", "operation", "output", "run_dir", "chapters", "review_mode", "elapsed_seconds", "changes", "reason", "error", "model_used", "models_used", "fallback_reason")
     print(json.dumps({key: record[key] for key in fields if key in record}, ensure_ascii=False))
     return code
 

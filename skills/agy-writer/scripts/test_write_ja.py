@@ -69,6 +69,74 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(argv[-2], "-p")
         self.assertEqual(Path(result["run_dir"]).stat().st_mode & 0o777, 0o700)
 
+    def quota_fake(self, error="Individual quota reached. Resets in 127h12m6s.", primary_exit=1):
+        self.fake.write_text(r"""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with pathlib.Path(os.environ['TEST_ARGS']).with_suffix('.jsonl').open('a') as f:
+    f.write(json.dumps(args) + '\n')
+if args[args.index('--model') + 1].startswith('gemini-4-argon-'):
+    print(json.dumps({'status':'ERROR','error':os.environ['QUOTA_ERROR'],'response':''}))
+    raise SystemExit(int(os.environ['PRIMARY_EXIT']))
+print(os.environ['TEST_RESPONSE'])
+raise SystemExit(int(os.environ.get('TEST_EXIT','0')))
+""")
+        self.env.update(QUOTA_ERROR=error, PRIMARY_EXIT=str(primary_exit))
+
+    def test_quota_fallback_preserves_evidence_and_literal_request(self):
+        for exit_code in (0, 1):
+            with self.subTest(primary_exit=exit_code):
+                self.quota_fake(primary_exit=exit_code)
+                code, result = self.draft("Flash document")
+                self.assertEqual((code, result['model_used']), (0, writer.FALLBACK_MODEL))
+                run = Path(result['run_dir'])
+                metadata = json.loads((run/'run.json').read_text())
+                self.assertEqual(metadata['model_requested'], writer.MODEL)
+                self.assertEqual([a['model'] for a in metadata['attempts']], [writer.MODEL, writer.FALLBACK_MODEL])
+                self.assertEqual(metadata['attempts'][0]['status'], 'quota_exhausted')
+                self.assertEqual(json.loads((run/'primary-response.json').read_text())['status'], 'ERROR')
+                self.assertTrue((run/'primary-stderr.log').exists())
+                self.assertEqual(self.output.read_text(), 'Flash document')
+                calls = [json.loads(line) for line in (self.root/'args.jsonl').read_text().splitlines()][-2:]
+                self.assertEqual(calls[0][-1], calls[1][-1])
+                for call in calls:
+                    self.assertIn('--new-project', call)
+                    self.assertEqual(call[call.index('--effort')+1], 'high')
+
+    def test_no_fallback_for_other_errors_or_opt_out(self):
+        for error, extra in [('Unauthorized', []), ('Invalid model selection', []),
+                             ('HTTP 429 rate limit', []), ('Individual quota reached.', ['--no-fallback'])]:
+            with self.subTest(error=error, extra=extra):
+                self.quota_fake(error)
+                self.output.write_text('EXISTING')
+                code, result = self.run_cli('draft', ['--packet', str(self.packet), '--out', str(self.output), *extra], 'unused')
+                self.assertEqual(code, 1)
+                metadata = json.loads((Path(result['run_dir'])/'run.json').read_text())
+                self.assertEqual(len(metadata['attempts']), 1)
+                self.assertEqual(self.output.read_text(), 'EXISTING')
+        self.assertFalse(writer.quota_exhausted({'status':'SUCCESS', 'response':'Individual quota reached.'}))
+        self.assertFalse(writer.quota_exhausted(None))
+
+    def test_flash_failure_stops_and_preserves_output(self):
+        self.quota_fake()
+        self.output.write_text('EXISTING')
+        code, result = self.run_cli('draft', ['--packet', str(self.packet), '--out', str(self.output)],
+                                    'Individual quota reached.', provider_status='ERROR', exit_code=1)
+        self.assertEqual(code, 1)
+        metadata = json.loads((Path(result['run_dir'])/'run.json').read_text())
+        self.assertEqual(len(metadata['attempts']), 2)
+        self.assertEqual(metadata['attempts'][-1]['status'], 'failed')
+        self.assertEqual(self.output.read_text(), 'EXISTING')
+
+    def test_repair_uses_quota_fallback_without_changing_unrelated_bytes(self):
+        _, base = self.draft()
+        before = self.output.read_bytes()
+        self.quota_fake()
+        answer = {'replacements':[{'id':0,'text':'参照を追加する。'}], 'needs_input':''}
+        code, result = self.run_cli('repair', ['--run', base['run_dir'], '--findings', str(self.finding_file())], json.dumps(answer))
+        self.assertEqual((code, result['model_used']), (0, writer.FALLBACK_MODEL))
+        self.assertEqual(self.output.read_bytes(), before.replace('外部キー列を追加する。'.encode(), '参照を追加する。'.encode()))
+
     def test_repair_only_changes_requested_bytes(self):
         _, base = self.draft()
         before = self.output.read_bytes()

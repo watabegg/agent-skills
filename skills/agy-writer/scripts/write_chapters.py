@@ -146,6 +146,8 @@ def execute_chapters(args, run, record, generate):
             (destination / "draft.md").write_bytes(body.encode("utf-8"))
             bodies[phase] = body
             phases[phase] = {"run_dir": str(destination), "characters": len(body),
+                             "model_used": phase_record["model_used"],
+                             "fallback_reason": phase_record.get("fallback_reason"),
                              "elapsed_seconds": round(time.monotonic() - started, 3)}
         result = {"title_hint": task["title"], "sections": task["sections"],
                   "target_chars": target, **phases}
@@ -163,5 +165,7 @@ def execute_chapters(args, run, record, generate):
         raise ValueError("Output changed while Gemini was running; chapter results are saved")
     (run / "draft.md").write_bytes(body.encode("utf-8"))
     atomic_write(output, body)
-    record.update(status="needs_review", chapter_results=[result for _, result in results])
+    record.update(status="needs_review", chapter_results=[result for _, result in results],
+                  models_used=sorted({result[phase]["model_used"] for _, result in results
+                                      for phase in ("write", "edit")}))
     return 0

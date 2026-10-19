@@ -15,6 +15,9 @@ phase = 'repair' if '\"replacements\"' in prompt else ('edit' if '未確認の�
 tag = 'A' if 'A_ONLY' in prompt else ('B' if 'B_ONLY' in prompt else 'single')
 event = {'argv':sys.argv[1:], 'phase':phase, 'tag':tag}
 pathlib.Path(os.environ['EVENTS'], str(os.getpid())+'.json').write_text(json.dumps(event))
+if os.environ.get('QUOTA_ARGON') and sys.argv[sys.argv.index('--model')+1].startswith('gemini-4-argon-'):
+    print(json.dumps({'status':'ERROR','error':'Individual quota reached.','response':''}))
+    raise SystemExit(1)
 if tag == 'B':
     time.sleep(0.03)
 if os.environ.get('MODIFY_OUTPUT'):
@@ -65,6 +68,19 @@ class ChapterTests(unittest.TestCase):
 
     def calls(self):
         return [json.loads(p.read_text()) for p in self.events.glob("*.json")]
+
+    def test_parallel_writers_and_editors_fall_back_on_quota(self):
+        code, result = self.invoke(environment={'QUOTA_ARGON':'1'})
+        self.assertEqual(code, 0)
+        self.assertEqual(result['models_used'], ['gemini-3.8-flash-high'])
+        self.assertEqual(len(self.calls()), 8)
+        metadata = json.loads((Path(result['run_dir'])/'run.json').read_text())
+        for chapter in metadata['chapter_results']:
+            for phase in ('write', 'edit'):
+                self.assertEqual(chapter[phase]['model_used'], 'gemini-3.8-flash-high')
+                self.assertEqual(chapter[phase]['fallback_reason'], 'argon_quota_exhausted')
+        self.assertIn('finished A', self.output.read_text())
+        self.assertIn('finished B', self.output.read_text())
 
     def test_fresh_writer_and_editor_per_chapter_preserve_order_and_isolate_material(self):
         code, result = self.invoke()
