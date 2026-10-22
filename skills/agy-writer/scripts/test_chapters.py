@@ -134,6 +134,7 @@ class ChapterTests(unittest.TestCase):
         self.assertEqual((code, result["status"]), (1, "failed"))
         self.assertEqual(self.output.read_text(), "EXISTING")
         self.assertIn("edit failed", result["error"])
+        self.assertIn("exited with 9", result["error"])
         run = Path(result["run_dir"])
         self.assertTrue((run / "chapter-02/edit/draft.md").exists())
         self.assertFalse((run / "draft.md").exists())

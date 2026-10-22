@@ -142,12 +142,13 @@ def execute_chapters(args, run, record, generate):
             try:
                 body = generate(args, destination, phase_record, prompt)
             except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                raise ValueError(f"Chapter {index + 1} {phase} failed; inspect {destination}") from error
+                raise ValueError(f"Chapter {index + 1} {phase} failed: {phase_record.get('error', str(error))}; inspect {destination}") from error
             (destination / "draft.md").write_bytes(body.encode("utf-8"))
             bodies[phase] = body
             phases[phase] = {"run_dir": str(destination), "characters": len(body),
                              "model_used": phase_record["model_used"],
                              "fallback_reason": phase_record.get("fallback_reason"),
+                             "warnings": phase_record.get("warnings", []),
                              "elapsed_seconds": round(time.monotonic() - started, 3)}
         result = {"title_hint": task["title"], "sections": task["sections"],
                   "target_chars": target, **phases}
@@ -166,6 +167,8 @@ def execute_chapters(args, run, record, generate):
     (run / "draft.md").write_bytes(body.encode("utf-8"))
     atomic_write(output, body)
     record.update(status="needs_review", chapter_results=[result for _, result in results],
+                  warnings=[warning for _, result in results for phase in ("write", "edit")
+                            for warning in result[phase]["warnings"]],
                   models_used=sorted({result[phase]["model_used"] for _, result in results
                                       for phase in ("write", "edit")}))
     return 0

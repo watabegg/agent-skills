@@ -63,6 +63,7 @@ class WriterTests(unittest.TestCase):
         self.assertNotIn("response", result)
         argv = json.loads((self.root / "args.json").read_text())
         self.assertIn("--new-project", argv)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "0")
         self.assertEqual(argv[argv.index("--model") + 1], writer.MODEL)
         self.assertIn(self.packet.read_text(), argv[-1])
         self.assertIn(self.profile.read_text(), argv[-1])
@@ -179,11 +180,56 @@ raise SystemExit(int(os.environ.get('TEST_EXIT','0')))
         arguments = [str(SCRIPT), "draft", "--packet", str(self.packet), "--out", str(self.output),
                      "--profile", str(self.profile)]
         with patch.object(sys, "argv", arguments), patch.dict(os.environ, self.env), contextlib.redirect_stdout(stream):
-            with patch.object(writer.subprocess, "run", side_effect=subprocess.TimeoutExpired(["agy-writer", "-p", "PRIVATE_MATERIAL"], 30)):
+            with patch.object(writer, "run_writer", side_effect=subprocess.TimeoutExpired(["agy-writer", "-p", "PRIVATE_MATERIAL"], 30)):
                 self.assertEqual(writer.main(), 1)
         self.assertEqual(json.loads(stream.getvalue())["status"], "failed")
         self.assertNotIn("PRIVATE_MATERIAL", stream.getvalue())
         self.assertEqual(self.output.read_bytes(), before)
+
+    def transport_fake(self, program):
+        self.fake.write_text("#!/usr/bin/env python3\nimport json, os, sys, time\n" + program)
+
+    def test_completed_response_does_not_wait_for_hung_cli_exit(self):
+        self.transport_fake("print(json.dumps({'status':'SUCCESS','response':'Completed'}), flush=True)\ntime.sleep(30)\n")
+        code, result = self.run_cli('draft', ['--packet', str(self.packet), '--out', str(self.output),
+                                             '--timeout', '10'], 'unused')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.output.read_text(), 'Completed')
+        self.assertIn('cli_exit_timeout_after_response', result['warnings'])
+        self.assertLess(result['elapsed_seconds'], 6)
+
+    def test_generation_timeout_preserves_output_and_explains_recovery(self):
+        self.output.write_text('EXISTING')
+        self.transport_fake("print('{', flush=True)\ntime.sleep(30)\n")
+        code, result = self.run_cli('draft', ['--packet', str(self.packet), '--out', str(self.output),
+                                             '--timeout', '1'], 'unused')
+        self.assertEqual(code, 1)
+        self.assertIn('Generation timed out', result['error'])
+        self.assertIn('--plan', result['error'])
+        metadata = json.loads((Path(result['run_dir']) / 'run.json').read_text())
+        self.assertEqual(metadata['attempts'][-1]['error'], result['error'])
+        self.assertEqual(self.output.read_text(), 'EXISTING')
+        self.assertEqual((Path(result['run_dir']) / 'response.json').read_text(), '{\n')
+
+    def test_partial_success_from_cli_is_never_published(self):
+        self.output.write_text('EXISTING')
+        self.transport_fake("print('[agy] print timeout after 3m0s; returning partial output', file=sys.stderr)\n"
+                            "print(json.dumps({'status':'SUCCESS','response':'Truncated paragraph'}))\n")
+        code, result = self.draft()
+        self.assertEqual(code, 1)
+        self.assertIn('partial output', result['error'])
+        self.assertEqual(self.output.read_text(), 'EXISTING')
+
+    def test_terminal_error_with_hung_exit_still_falls_back(self):
+        self.transport_fake("model = sys.argv[sys.argv.index('--model') + 1]\n"
+                            "if model.startswith('gemini-4-argon-'):\n"
+                            " print(json.dumps({'status':'ERROR','error':'Individual quota reached.'}), flush=True)\n"
+                            " time.sleep(30)\n"
+                            "print(json.dumps({'status':'SUCCESS','response':'Fallback document'}))\n")
+        code, result = self.draft()
+        self.assertEqual(code, 0)
+        self.assertEqual(result['model_used'], writer.FALLBACK_MODEL)
+        self.assertEqual(self.output.read_text(), 'Fallback document')
 
     def test_changed_output_is_not_overwritten_or_sent_to_writer(self):
         _, base = self.draft()

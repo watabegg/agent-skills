@@ -6,6 +6,7 @@ import difflib
 import json
 import os
 import re
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -113,7 +114,7 @@ def make_parser():
         command = commands.add_parser(operation)
         command.add_argument("--model", default=MODEL)
         command.add_argument("--no-fallback", action="store_true", help="disable Argon quota fallback to Flash High")
-        command.add_argument("--timeout", type=int, default=1200, help="seconds; default 1200")
+        command.add_argument("--timeout", type=int, default=1200, help="generation seconds per attempt; default 1200; incomplete output is never published")
         command.add_argument("--writer", default="agy-writer", help="writer executable, without shell arguments")
         command.add_argument("--profile", type=Path, help="optional extra style instructions for this request")
         command.add_argument("--language", help="output language name/code; follows packet instructions by default")
@@ -151,6 +152,54 @@ def quota_exhausted(response):
         error, re.IGNORECASE))
 
 
+def read_response(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError):
+        return None
+
+
+def run_writer(command, run, timeout):
+    """Bound generation and reap a CLI that hangs after its terminal JSON result.
+
+    Disable agy's partial-success timeout. Only a terminal JSON result can start
+    the short exit grace period; the caller still validates status and body.
+    """
+    response_path = run / "response.json"
+    started = time.monotonic()
+    completed_at = None
+    with response_path.open("wb") as stdout, (run / "stderr.log").open("wb") as stderr:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                   start_new_session=True)
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                response = read_response(response_path)
+                terminal = isinstance(response, dict) and response.get("status") in {"SUCCESS", "ERROR"}
+                if terminal and completed_at is None:
+                    completed_at = now
+                elif not terminal:
+                    completed_at = None
+                if completed_at is not None and now - completed_at >= 2:
+                    return None, "cli_exit_timeout_after_response"
+                if now - started >= timeout:
+                    if terminal:
+                        return None, "cli_exit_timeout_after_response"
+                    raise ValueError(
+                        f"Generation timed out after {timeout}s; saved response is incomplete. "
+                        "Increase --timeout (default 1200), or split the packet with --plan; "
+                        "existing output was preserved.")
+                time.sleep(0.1)
+            return process.returncode, None
+        finally:
+            # This session belongs exclusively to this invocation, including children.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
 def generate(args, run, record, prompt):
     """Use a fresh conversation per attempt; retry Argon quota errors once."""
     started = time.monotonic()
@@ -167,18 +216,18 @@ def generate(args, run, record, prompt):
                        "response": "response.json", "stderr": "stderr.log"}
             record["attempts"].append(attempt)
             command = [args.writer, "--new-project", "--model", model, "--effort", "high",
-                       "--output-format", "json", "--print-timeout", f"{args.timeout}s", "-p", prompt]
+                       "--output-format", "json", "--print-timeout", "0", "-p", prompt]
             attempt_started = time.monotonic()
             save_json(run / "run.json", record)
             try:
-                with (run / "response.json").open("wb") as stdout, (run / "stderr.log").open("wb") as stderr:
-                    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                            timeout=args.timeout + 15, check=False)
-                attempt["returncode"] = result.returncode
-                try:
-                    response = json.loads((run / "response.json").read_text(encoding="utf-8"))
-                except (ValueError, UnicodeError):
-                    response = None
+                returncode, warning = run_writer(command, run, args.timeout)
+                attempt["returncode"] = returncode
+                if warning:
+                    attempt["warning"] = warning
+                    record.setdefault("warnings", []).append(warning)
+                response = read_response(run / "response.json")
+                if "print timeout" in (run / "stderr.log").read_text(encoding="utf-8", errors="replace").lower():
+                    raise ValueError("CLI returned partial output after print timeout; document was not published")
                 if index == 0 and len(models) > 1 and quota_exhausted(response):
                     attempt["status"] = "quota_exhausted"
                     record["fallback_reason"] = "argon_quota_exhausted"
@@ -187,10 +236,10 @@ def generate(args, run, record, prompt):
                         (run / filename).rename(run / saved)
                         attempt[key] = saved
                     continue
-                if result.returncode:
-                    raise ValueError(f"agy-writer exited with {result.returncode}; inspect stderr.log and response.json")
+                if returncode:
+                    raise ValueError(f"agy-writer exited with {returncode}; inspect stderr.log and response.json")
                 if not isinstance(response, dict) or response.get("status") != "SUCCESS":
-                    raise ValueError("agy-writer did not report SUCCESS; inspect response.json")
+                    raise ValueError("Provider did not report SUCCESS; inspect response.json for the provider error")
                 body = response.get("response")
                 if not isinstance(body, str) or not body.strip():
                     raise ValueError("agy-writer returned no document")
@@ -198,14 +247,16 @@ def generate(args, run, record, prompt):
                 record.update(status="generated", model_used=model,
                               conversation_id=response.get("conversation_id"), usage=response.get("usage"))
                 return body
-            except (OSError, ValueError, subprocess.TimeoutExpired):
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
                 attempt["status"] = "failed"
+                attempt["error"] = ("agy-writer timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error))
                 raise
             finally:
                 attempt["elapsed_seconds"] = round(time.monotonic() - attempt_started, 3)
                 save_json(run / "run.json", record)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         record["status"] = "failed"
+        record["error"] = ("agy-writer timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error))
         raise
     finally:
         record.update(elapsed_seconds=round(time.monotonic() - started, 3),
@@ -310,7 +361,7 @@ def main():
     record["finished_at"] = datetime.now(timezone.utc).isoformat()
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
     save_json(run / "run.json", record)
-    fields = ("status", "operation", "output", "run_dir", "chapters", "review_mode", "elapsed_seconds", "changes", "reason", "error", "model_used", "models_used", "fallback_reason")
+    fields = ("status", "operation", "output", "run_dir", "chapters", "review_mode", "elapsed_seconds", "changes", "reason", "error", "model_used", "models_used", "fallback_reason", "warnings")
     print(json.dumps({key: record[key] for key in fields if key in record}, ensure_ascii=False))
     return code
 
