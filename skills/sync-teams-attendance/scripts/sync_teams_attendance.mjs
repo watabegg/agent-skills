@@ -799,6 +799,16 @@ async function obtainVerificationCode(browser, config, timeoutMs, requestedAt) {
   }
 }
 
+function selectMicrosoftAccount(email, root = document) {
+  const visible = (element) => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const target = [...root.querySelectorAll('[role=button], [role=option], button')]
+    .filter(visible)
+    .find((element) => (element.innerText || element.textContent || '').trim().toLowerCase() === email.toLowerCase());
+  if (!target) return false;
+  target.click();
+  return true;
+}
+
 async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
   const started = Date.now();
   let emailSubmitted = false;
@@ -811,6 +821,7 @@ async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
   let authRecoveryAttempts = 0;
   let emailSubmitAttempts = 0;
   let emailSubmittedAt = null;
+  let accountSelectionAttempts = 0;
   while (Date.now() - started < timeoutMs) {
     await sleep(1000);
     const state = await pageState(cdp).catch(() => null);
@@ -836,6 +847,7 @@ async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
       codeSubmittedAt = null;
       emailSubmitAttempts = 0;
       emailSubmittedAt = null;
+      accountSelectionAttempts = 0;
       continue;
     }
     if (codeSubmittedAt && Date.now() - codeSubmittedAt > 1500 && /try again|もう一度お試しください|正しくありません|incorrect/i.test(haystack)) {
@@ -846,6 +858,15 @@ async function settleTeamsLogin(cdp, browser, config, timeoutMs, targetUrl) {
         emailSubmitted = true;
         emailSubmitAttempts += 1;
         emailSubmittedAt = Date.now();
+        continue;
+      }
+    }
+    if (state.host === 'login.microsoftonline.com' && !state.inputs.length && accountSelectionAttempts < 2) {
+      const selected = await evaluate(cdp, `(${selectMicrosoftAccount.toString()})(${JSON.stringify(config.accounts.teamsLoginEmail)})`);
+      if (selected) {
+        accountSelectionAttempts += 1;
+        console.log('AUTH selected configured Microsoft account');
+        await sleep(1200);
         continue;
       }
     }
@@ -1093,6 +1114,19 @@ function printableModel(model) {
 }
 
 function runSelfTest() {
+  const clickedAccounts = [];
+  const account = (text, visible = true) => ({
+    innerText: text, offsetWidth: visible ? 100 : 0, offsetHeight: 0,
+    getClientRects: () => [], click: () => clickedAccounts.push(text),
+  });
+  const accountPicker = { querySelectorAll: () => [
+    account('someone-else@example.com'), account('user@example.com', false),
+    account('  USER@example.com  '), account('user@example.com.attacker.test'),
+  ] };
+  assert.equal(selectMicrosoftAccount('user@example.com', accountPicker), true);
+  assert.deepEqual(clickedAccounts, ['  USER@example.com  ']);
+  assert.equal(selectMicrosoftAccount('missing@example.com', accountPicker), false);
+  assert.deepEqual(clickedAccounts, ['  USER@example.com  ']);
   assert.deepEqual(parseCsv('a,"b,b","c""d"\r\n1,2,3\n'), [['a', 'b,b', 'c"d'], ['1', '2', '3']]);
   const rows = [
     ['勤怠表', '', '', '', ''],

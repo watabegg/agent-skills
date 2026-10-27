@@ -20,7 +20,7 @@ Stdout is one JSON result; progress goes to stderr. Report `changed`, date range
 - `needs_input`/exit 2: punch-order anomaly. Use `anomalies` and the target dates to explain what remains unresolved; do not invent missing punches.
 - `failed`/exit 1: inspect the error. `reason: write_unverified` and `changed: null` mean a partial write may exist; inspect the live sheet before retrying.
 
-The script may request a Microsoft verification email and read its code from Gmail. It does not send Teams messages or mail. Never report verification codes or private chat content.
+The script selects the configured Microsoft account when an account picker appears, and may request a verification email and read its code from Gmail. It does not select a different account or send Teams messages or mail. Never report verification codes or private chat content.
 
 The configured contract is `integrated-attendance-v1`: row 1, A=`日付`, B=`出勤`, C=`退勤`, D=`労働時間`. Only missing date/start/end values may be appended to A:C of `勤怠明細`. The workbook owns formulas, rates, monthly totals, invoice, month selector and history. Do not paste whole rows or repair the workbook during routine sync. Layout/pairing failures need diagnosis before any write.
 
